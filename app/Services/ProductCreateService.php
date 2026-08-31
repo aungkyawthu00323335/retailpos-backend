@@ -443,9 +443,28 @@ class ProductCreateService
                 $updates['low_qty'] = $alert;
             }
 
-            // Stock is maintained by StockBalance/StockMovement. Product edit
-            // must never replace it with a stale form snapshot.
-            unset($updates['stock_quantity']);
+            if (array_key_exists('stock_quantity', $data) && $data['stock_quantity'] !== null) {
+                $newStock = (float)$data['stock_quantity'];
+                $updates['stock_quantity'] = $newStock;
+
+                $warehouseId = $data['warehouse_id'] ?? $data['outlet_id'] ?? Outlet::query()->value('id') ?? 1;
+                $balance = StockBalance::where('product_id', $product->id)
+                    ->whereNull('product_variant_id')
+                    ->first();
+                if ($balance) {
+                    $balance->quantity = $newStock;
+                    $balance->save();
+                } else {
+                    StockBalance::create([
+                        'warehouse_id' => $warehouseId,
+                        'product_id' => $product->id,
+                        'product_variant_id' => null,
+                        'quantity' => $newStock,
+                    ]);
+                }
+            } else {
+                unset($updates['stock_quantity']);
+            }
             $updates['updated_by'] = auth()->id() ?? $product->updated_by;
             $product->fill($updates);
             $product->save();
