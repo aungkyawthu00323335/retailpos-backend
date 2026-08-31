@@ -569,6 +569,64 @@ class ProductCreateService
                 );
             }
 
+            if (!empty($data['opening_stocks']) && is_array($data['opening_stocks'])) {
+                $defaultWarehouse = Outlet::orderBy('id')->first();
+                $defaultWarehouseId = $defaultWarehouse?->id;
+
+                foreach ($data['opening_stocks'] as $stockEntry) {
+                    $qty = (float) ($stockEntry['quantity'] ?? 0);
+                    if ($qty <= 0) continue;
+
+                    $wId = !empty($stockEntry['warehouse_id'])
+                        ? (int)$stockEntry['warehouse_id']
+                        : $defaultWarehouseId;
+                    if (!$wId) continue;
+
+                    $variantSku = $stockEntry['variant_sku'] ?? null;
+                    $vId = null;
+                    if ($variantSku && isset($createdVariants[$variantSku])) {
+                        $vId = $createdVariants[$variantSku]->id;
+                    }
+
+                    $unitService = app(ProductUnitConversionService::class);
+                    $resolvedUnit = $unitService->resolve(
+                        $product,
+                        $stockEntry['unit_type'] ?? 'base',
+                        isset($stockEntry['unit_id']) ? (int)$stockEntry['unit_id'] : null,
+                        $stockEntry['unit_name'] ?? null,
+                        $vId
+                    );
+                    $baseQty = $unitService->baseQuantity($qty, (float)$resolvedUnit['conversion_rate']);
+
+                    $balance = StockBalance::where('warehouse_id', $wId)
+                        ->where('product_id', $product->id)
+                        ->where('product_variant_id', $vId)
+                        ->first();
+
+                    if ($balance) {
+                        $balance->quantity = (float)$balance->quantity + $baseQty;
+                        $balance->save();
+                    } else {
+                        StockBalance::create([
+                            'warehouse_id' => $wId,
+                            'product_id' => $product->id,
+                            'product_variant_id' => $vId,
+                            'quantity' => $baseQty,
+                        ]);
+                    }
+
+                    StockMovement::create([
+                        'product_id' => $product->id,
+                        'product_variant_id' => $vId,
+                        'warehouse_id' => $wId,
+                        'type' => 'opening_stock',
+                        'quantity' => $baseQty,
+                        'cost_price' => (float)($product->cost_price ?? 0),
+                        'note' => 'Opening stock recorded from variant addition',
+                    ]);
+                }
+            }
+
             // The edit form uses remote image URLs. Keep existing images when
             // no new URL is supplied, and update the primary image in place.
             $imageUrl = trim((string)($data['image_url'] ?? ''));
