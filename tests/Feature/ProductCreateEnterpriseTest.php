@@ -589,4 +589,67 @@ class ProductCreateEnterpriseTest extends TestCase
         $showRes->assertStatus(200)
             ->assertJsonPath('data.variants_count', 2);
     }
+
+    /**
+     * 12. Cascade Variation Rename & Value Update to Connected Products (e.g. 32 -> 35)
+     */
+    public function test_update_variation_cascades_renamed_types_to_connected_products(): void
+    {
+        // 1. Create Variation 'blue' with types 32, 33, 34
+        $variation = Variation::create([
+            'name' => 'blue',
+            'variation_types' => ['32', '33', '34'],
+            'status' => 'Active',
+        ]);
+
+        // 2. Create Product with variant 'blue - 32'
+        $createRes = $this->postJson('/api/products', [
+            'name' => 'Blue Shoes',
+            'code' => '10095',
+            'sku' => '10095',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'blue - 32',
+                    'sku' => '1009501',
+                    'cost_price' => 50.00,
+                    'selling_price' => 100.00,
+                    'attribute_values' => [
+                        ['attribute_name' => 'blue', 'attribute_value' => '32'],
+                    ],
+                ],
+            ],
+        ]);
+        $createRes->assertStatus(201);
+        $prodId = $createRes->json('data.id');
+
+        // 3. Update Variation: change 32 to 35
+        $updateVarRes = $this->putJson("/api/variations/{$variation->id}", [
+            'name' => 'blue',
+            'variation_types' => ['35', '33', '34'],
+            'type_renames' => ['32' => '35'],
+            'status' => 'Active',
+        ]);
+        $updateVarRes->assertStatus(200);
+
+        // 4. Verify Product Variant updated from 'blue - 32' to 'blue - 35'
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'blue - 35',
+        ]);
+        $this->assertDatabaseMissing('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'blue - 32',
+        ]);
+
+        // 5. Verify ProductVariantValue updated from '32' to '35'
+        $this->assertDatabaseHas('product_variant_values', [
+            'attribute_name' => 'blue',
+            'attribute_value' => '35',
+        ]);
+        $this->assertDatabaseMissing('product_variant_values', [
+            'attribute_name' => 'blue',
+            'attribute_value' => '32',
+        ]);
+    }
 }
