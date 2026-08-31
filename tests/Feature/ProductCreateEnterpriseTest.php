@@ -764,4 +764,110 @@ class ProductCreateEnterpriseTest extends TestCase
         $showRes->assertStatus(200)
             ->assertJsonPath('data.variants.0.name', 'cyan - 22');
     }
+
+    /**
+     * 15. Adding New Variant (e.g. cyan - 44) to Existing Variable Product in Edit Mode
+     */
+    public function test_add_new_variant_to_existing_variable_product_during_edit(): void
+    {
+        // 1. Create Variable Product with 2 initial variants
+        $prodRes = $this->postJson('/api/products', [
+            'name' => 'Anker Testing Product',
+            'code' => '10410',
+            'sku' => '10410',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'cyan - 33',
+                    'sku' => '1041001',
+                    'cost_price' => 1000,
+                    'selling_price' => 1000,
+                    'retail_prices' => [1000, 200, 400],
+                    'wholesale_prices' => [1000, 500, 600],
+                    'attribute_values' => [
+                        ['attribute_name' => 'cyan', 'attribute_value' => '33'],
+                    ],
+                ],
+                [
+                    'name' => 'dark - 32',
+                    'sku' => '1041003',
+                    'cost_price' => 1000,
+                    'selling_price' => 1000,
+                    'retail_prices' => [1000, 1300, 1400],
+                    'wholesale_prices' => [1000, 1500, 1600],
+                    'attribute_values' => [
+                        ['attribute_name' => 'dark', 'attribute_value' => '32'],
+                    ],
+                ],
+            ],
+        ]);
+        $prodRes->assertStatus(201);
+        $prodId = $prodRes->json('data.id');
+
+        // 2. Update Product: Add 3rd variant 'cyan - 44'
+        $updateRes = $this->putJson("/api/products/{$prodId}", [
+            'name' => 'Anker Testing Product',
+            'code' => '10410',
+            'sku' => '10410',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'cyan - 33',
+                    'sku' => '1041001',
+                    'cost_price' => 1000,
+                    'selling_price' => 1000,
+                    'retail_prices' => [1000, 200, 400],
+                    'wholesale_prices' => [1000, 500, 600],
+                    'attribute_values' => [
+                        ['attribute_name' => 'cyan', 'attribute_value' => '33'],
+                    ],
+                ],
+                [
+                    'name' => 'dark - 32',
+                    'sku' => '1041003',
+                    'cost_price' => 1000,
+                    'selling_price' => 1000,
+                    'retail_prices' => [1000, 1300, 1400],
+                    'wholesale_prices' => [1000, 1500, 1600],
+                    'attribute_values' => [
+                        ['attribute_name' => 'dark', 'attribute_value' => '32'],
+                    ],
+                ],
+                [
+                    'name' => 'cyan - 44',
+                    'sku' => '1041004',
+                    'cost_price' => 1000,
+                    'selling_price' => 1000,
+                    'retail_prices' => [1000, 300, 500],
+                    'wholesale_prices' => [1000, 600, 700],
+                    'attribute_values' => [
+                        ['attribute_name' => 'cyan', 'attribute_value' => '44'],
+                    ],
+                ],
+            ],
+        ]);
+        $updateRes->assertStatus(200)
+            ->assertJsonPath('data.variants_count', 3);
+
+        // 3. Verify all 3 variants exist in database
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'cyan - 33',
+        ]);
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'dark - 32',
+        ]);
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'cyan - 44',
+            'sku' => '1041004',
+        ]);
+
+        // 4. Verify attribute values attached for newly added variant
+        $this->assertDatabaseHas('product_variant_values', [
+            'attribute_name' => 'cyan',
+            'attribute_value' => '44',
+        ]);
+    }
 }
