@@ -511,4 +511,82 @@ class ProductCreateEnterpriseTest extends TestCase
         $listRes->assertStatus(200);
         $this->assertEmpty($listRes->json('data'));
     }
+
+    /**
+     * 11. Multi-Variation Combinations CRUD (red - 32, blue - 32)
+     */
+    public function test_create_and_update_multi_variation_product_with_combinations_red_32_blue_32(): void
+    {
+        $payload = [
+            'name' => 'Nike Pegasus 39 Running Shoes',
+            'code' => '10090',
+            'sku' => '10090',
+            'category_name' => 'Footwear & Shoes',
+            'brand_name' => 'Nike',
+            'unit_name' => 'Pair',
+            'cost_price' => 50.00,
+            'selling_price' => 110.00,
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'red - 32',
+                    'sku' => '1009001',
+                    'cost_price' => 50.00,
+                    'selling_price' => 110.00,
+                    'retail_prices' => [110.00, 105.00, 100.00],
+                    'wholesale_prices' => [90.00, 85.00],
+                    'is_active' => true,
+                    'attribute_values' => [
+                        ['attribute_name' => 'red', 'attribute_value' => '32'],
+                    ],
+                ],
+                [
+                    'name' => 'blue - 32',
+                    'sku' => '1009002',
+                    'cost_price' => 52.00,
+                    'selling_price' => 115.00,
+                    'retail_prices' => [115.00, 110.00],
+                    'wholesale_prices' => [92.00],
+                    'is_active' => true,
+                    'attribute_values' => [
+                        ['attribute_name' => 'blue', 'attribute_value' => '32'],
+                    ],
+                ],
+            ],
+        ];
+
+        $res = $this->postJson('/api/products', $payload);
+        $res->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.has_variants', true);
+
+        $prodId = $res->json('data.id');
+
+        // Verify variants created in database
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'red - 32',
+            'sku' => '1009001',
+        ]);
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'blue - 32',
+            'sku' => '1009002',
+        ]);
+
+        // Verify attribute values attached
+        $this->assertDatabaseHas('product_variant_values', [
+            'attribute_name' => 'red',
+            'attribute_value' => '32',
+        ]);
+        $this->assertDatabaseHas('product_variant_values', [
+            'attribute_name' => 'blue',
+            'attribute_value' => '32',
+        ]);
+
+        // Read / Show Endpoint
+        $showRes = $this->getJson("/api/products/{$prodId}");
+        $showRes->assertStatus(200)
+            ->assertJsonPath('data.variants_count', 2);
+    }
 }
