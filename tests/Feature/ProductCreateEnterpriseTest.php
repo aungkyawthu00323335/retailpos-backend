@@ -652,4 +652,53 @@ class ProductCreateEnterpriseTest extends TestCase
             'attribute_value' => '32',
         ]);
     }
+
+    /**
+     * 13. Cascade Variation Across Multiple Colors (red - 32, blue - 32, green - 32, yellow - 32)
+     */
+    public function test_update_variation_cascades_across_multiple_colors_and_composite_variants(): void
+    {
+        // 1. Get or Create Size variation
+        $sizeVar = Variation::firstOrCreate(
+            ['name' => 'Size'],
+            ['variation_types' => ['32', '33', '34'], 'status' => 'Active']
+        );
+        $sizeVar->update(['variation_types' => ['32', '33', '34']]);
+
+        // 2. Create Multi-Color Product with 4 variants
+        $prodRes = $this->postJson('/api/products', [
+            'name' => 'Air Jordan High Top',
+            'code' => '10099',
+            'sku' => '10099',
+            'has_variants' => true,
+            'variants' => [
+                ['name' => 'red - 32', 'sku' => '1009901', 'cost_price' => 70, 'selling_price' => 150, 'attribute_values' => [['attribute_name' => 'red', 'attribute_value' => '32']]],
+                ['name' => 'blue - 32', 'sku' => '1009902', 'cost_price' => 70, 'selling_price' => 150, 'attribute_values' => [['attribute_name' => 'blue', 'attribute_value' => '32']]],
+                ['name' => 'green - 32', 'sku' => '1009903', 'cost_price' => 70, 'selling_price' => 150, 'attribute_values' => [['attribute_name' => 'green', 'attribute_value' => '32']]],
+                ['name' => 'yellow - 32', 'sku' => '1009904', 'cost_price' => 70, 'selling_price' => 150, 'attribute_values' => [['attribute_name' => 'yellow', 'attribute_value' => '32']]],
+            ],
+        ]);
+        $prodRes->assertStatus(201);
+        $prodId = $prodRes->json('data.id');
+
+        // 3. Update Size: Change 32 to 35
+        $updateRes = $this->putJson("/api/variations/{$sizeVar->id}", [
+            'name' => 'Size',
+            'variation_types' => ['35', '33', '34'],
+            'type_renames' => ['32' => '35'],
+            'status' => 'Active',
+        ]);
+        $updateRes->assertStatus(200);
+
+        // 4. Verify ALL colors are now updated to 35
+        $this->assertDatabaseHas('product_variants', ['product_id' => $prodId, 'name' => 'red - 35']);
+        $this->assertDatabaseHas('product_variants', ['product_id' => $prodId, 'name' => 'blue - 35']);
+        $this->assertDatabaseHas('product_variants', ['product_id' => $prodId, 'name' => 'green - 35']);
+        $this->assertDatabaseHas('product_variants', ['product_id' => $prodId, 'name' => 'yellow - 35']);
+
+        $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'red - 32']);
+        $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'blue - 32']);
+        $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'green - 32']);
+        $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'yellow - 32']);
+    }
 }

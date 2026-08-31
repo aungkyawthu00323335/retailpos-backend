@@ -163,40 +163,60 @@ class VariationController extends Controller
                 'status' => $validated['status'] ?? $variation->status,
             ]);
 
-            // Synchronize ProductVariantValue and ProductVariant records
+            // Synchronize ProductVariantValue and ProductVariant records across all combinations
             foreach ($renames as $oldVal => $newVal) {
-                // Update variant values
-                \App\Models\ProductVariantValue::where(function ($q) use ($oldName, $newName) {
+                // 1. Find all variant value records matching this old value
+                $variantValues = \App\Models\ProductVariantValue::where(function ($q) use ($oldName, $newName) {
                     $q->where('attribute_name', $oldName)
                       ->orWhere('attribute_name', $newName);
                 })
-                ->where('attribute_value', $oldVal)
-                ->update(['attribute_value' => $newVal]);
+                ->where('attribute_value', (string)$oldVal)
+                ->get();
 
-                // Find variants that need name update
-                $variants = \App\Models\ProductVariant::where('name', $oldVal)
-                    ->orWhere('name', 'like', "{$oldName} - {$oldVal}")
-                    ->orWhere('name', 'like', "{$newName} - {$oldVal}")
+                $variantIds = $variantValues->pluck('product_variant_id')->unique()->filter()->toArray();
+
+                // 2. Also find any ProductVariant having this value in name across any color/prefix/suffix
+                $directVariants = \App\Models\ProductVariant::where('name', (string)$oldVal)
+                    ->orWhere('name', 'like', "% - {$oldVal}")
+                    ->orWhere('name', 'like', "{$oldVal} - %")
+                    ->orWhere('name', 'like', "% - {$oldVal} - %")
                     ->orWhere('name', 'like', "% / {$oldVal}%")
                     ->orWhere('name', 'like', "%{$oldVal} / %")
                     ->get();
 
+                $allVariantIds = array_unique(array_merge($variantIds, $directVariants->pluck('id')->toArray()));
+
+                $variants = \App\Models\ProductVariant::whereIn('id', $allVariantIds)->get();
+
                 foreach ($variants as $variant) {
-                    $updatedName = $variant->name;
-                    if ($updatedName === $oldVal) {
-                        $updatedName = $newVal;
-                    } else if ($updatedName === "{$oldName} - {$oldVal}") {
-                        $updatedName = "{$newName} - {$newVal}";
-                    } else if ($updatedName === "{$newName} - {$oldVal}") {
-                        $updatedName = "{$newName} - {$newVal}";
-                    } else {
-                        $updatedName = str_replace($oldVal, $newVal, $updatedName);
+                    $originalName = $variant->name;
+                    $parts = explode(' - ', $originalName);
+                    $modified = false;
+                    for ($p = 0; $p < count($parts); $p++) {
+                        if (trim($parts[$p]) === (string)$oldVal) {
+                            $parts[$p] = (string)$newVal;
+                            $modified = true;
+                        }
                     }
-                    $variant->update(['name' => $updatedName]);
+                    if ($modified) {
+                        $variant->update(['name' => implode(' - ', $parts)]);
+                    } else if ($originalName === (string)$oldVal) {
+                        $variant->update(['name' => (string)$newVal]);
+                    } else if (str_contains($originalName, (string)$oldVal)) {
+                        $variant->update(['name' => str_replace((string)$oldVal, (string)$newVal, $originalName)]);
+                    }
                 }
+
+                // 3. Update the variant values records
+                \App\Models\ProductVariantValue::where(function ($q) use ($oldName, $newName) {
+                    $q->where('attribute_name', $oldName)
+                      ->orWhere('attribute_name', $newName);
+                })
+                ->where('attribute_value', (string)$oldVal)
+                ->update(['attribute_value' => (string)$newVal]);
             }
 
-            // If variation name changed (e.g. blue -> navy_blue)
+            // If variation name itself changed (e.g. blue -> navy_blue, or Size -> Shoe Size)
             if ($oldName !== $newName) {
                 \App\Models\ProductVariantValue::where('attribute_name', $oldName)
                     ->update(['attribute_name' => $newName]);
