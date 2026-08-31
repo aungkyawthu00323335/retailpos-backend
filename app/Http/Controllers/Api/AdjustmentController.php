@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\StockAdjustment;
 use App\Models\StockAdjustmentItem;
 use App\Models\Product;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -66,9 +67,10 @@ class AdjustmentController extends Controller
 
         DB::beginTransaction();
         try {
+            $prefix = Setting::get('adjustment_prefix', 'AD_');
             $refNo = !empty($validated['reference_no']) 
                 ? $validated['reference_no'] 
-                : ('ADJ-' . date('Ymd') . '-' . rand(1000, 9999));
+                : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
             $totalQty = 0;
 
             foreach ($validated['items'] as $item) {

@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\StockTransfer;
 use App\Models\StockTransferItem;
 use App\Models\Product;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -82,9 +83,10 @@ class TransferController extends Controller
 
         DB::beginTransaction();
         try {
+            $prefix = Setting::get('transfer_prefix', 'TR_');
             $refNo = !empty($validated['reference_no'])
                 ? $validated['reference_no']
-                : ('TRF-' . date('Ymd') . '-' . rand(1000, 9999));
+                : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
             $totalQty = 0;
 
             foreach ($validated['items'] as $item) {

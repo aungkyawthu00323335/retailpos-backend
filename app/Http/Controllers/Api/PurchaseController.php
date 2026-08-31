@@ -7,6 +7,7 @@ use App\Models\Purchase;
 use App\Models\PurchaseItem;
 use App\Models\Product;
 use App\Models\ProductVariant;
+use App\Models\Setting;
 use App\Services\ProductUnitConversionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -104,9 +105,10 @@ class PurchaseController extends Controller
 
         DB::beginTransaction();
         try {
+            $prefix = Setting::get('purchase_prefix', 'PO_');
             $refNo = !empty($validated['reference_no'])
                 ? $validated['reference_no']
-                : ('PO-' . date('Ymd') . '-' . rand(1000, 9999));
+                : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
             $grandTotal = (float)$validated['grand_total'];
             $paidAmount = (float)($validated['paid_amount'] ?? 0);
             $dueAmount = max(0, $grandTotal - $paidAmount);

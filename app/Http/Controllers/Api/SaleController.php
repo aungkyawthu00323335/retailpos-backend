@@ -9,6 +9,7 @@ use App\Models\SalePayment;
 use App\Models\Product;
 use App\Services\ProductUnitConversionService;
 use App\Models\Customer;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -102,9 +103,12 @@ class SaleController extends Controller
 
         DB::beginTransaction();
         try {
+            $prefix = !empty($validated['pos_flag'])
+                ? Setting::get('pos_prefix', Setting::get('sale_prefix', 'SA_'))
+                : Setting::get('sale_prefix', 'SA_');
             $refNo = !empty($validated['reference_no'])
                 ? $validated['reference_no']
-                : ('SA_' . rand(1000000, 9999999));
+                : ($prefix . rand(1000000, 9999999));
             $grandTotal = (float)$validated['grand_total'];
             $paidAmount = (float)($validated['paid_amount'] ?? $grandTotal);
             $dueAmount = max(0, $grandTotal - $paidAmount);

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Expense;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 
 class ExpenseController extends Controller
@@ -88,7 +89,8 @@ class ExpenseController extends Controller
             'created_by' => 'nullable|string|max:255',
         ]);
 
-        $refNo = 'EXP-' . date('Ymd') . '-' . rand(1000, 9999);
+        $prefix = Setting::get('expense_prefix', 'EXP_');
+        $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
 
         $expense = Expense::create([
             'reference_no' => $refNo,

@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Quotation;
 use App\Models\QuotationItem;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -111,7 +112,8 @@ class QuotationController extends Controller
         try {
             $refNo = $request->input('reference_no');
             if (empty($refNo)) {
-                $refNo = 'QUO-' . date('Ymd') . '-' . rand(1000, 9999);
+                $prefix = Setting::get('quotation_prefix', 'QUO_');
+                $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
             }
 
             $quotation = Quotation::create([

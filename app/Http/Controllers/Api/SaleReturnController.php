@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\SaleReturn;
 use App\Models\Product;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 
 class SaleReturnController extends Controller
@@ -80,9 +81,10 @@ class SaleReturnController extends Controller
             'created_by' => 'nullable|string|max:255',
         ]);
 
+        $prefix = Setting::get('sale_return_prefix', 'SR_');
         $refNo = !empty($validated['reference_no'])
             ? $validated['reference_no']
-            : ('SR-' . date('Ymd') . '-' . rand(1000, 9999));
+            : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
 
         $grandTotal = (float)$validated['grand_total'];
         $paidAmount = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $grandTotal;

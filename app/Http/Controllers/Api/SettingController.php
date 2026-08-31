@@ -31,10 +31,19 @@ class SettingController extends Controller
             'currency_symbol' => '$',
             'currency_position' => 'Prefix',
             'receipt_header' => 'Welcome to Infy Retail POS!',
-            'receipt_footer' => 'All rights reserved by InfyOm Technologies',
             'tax_rate' => '5',
             'barcode_symbology' => 'CODE128',
             'receipt_width' => '80mm',
+            // 🏷️ Transaction Reference Prefixes
+            'purchase_prefix' => 'PO_',
+            'purchase_return_prefix' => 'PR_',
+            'sale_prefix' => 'SA_',
+            'sale_return_prefix' => 'SR_',
+            'adjustment_prefix' => 'AD_',
+            'transfer_prefix' => 'TR_',
+            'expense_prefix' => 'EXP_',
+            'quotation_prefix' => 'QUO_',
+            'pos_prefix' => 'POS_',
         ];
 
         $settings = Setting::all()->pluck('value', 'key')->toArray();

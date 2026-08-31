@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\PurchaseReturn;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -76,9 +77,10 @@ class PurchaseReturnController extends Controller
             'created_by' => 'nullable|string|max:255',
         ]);
 
+        $prefix = Setting::get('purchase_return_prefix', 'PR_');
         $refNo = !empty($validated['reference_no'])
             ? $validated['reference_no']
-            : 'PR-' . date('Ymd') . '-' . rand(1000, 9999);
+            : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
         $grandTotal = (float)$validated['grand_total'];
         $paidAmount = (float)($validated['paid_amount'] ?? $grandTotal);
         $dueAmount = max(0, $grandTotal - $paidAmount);
