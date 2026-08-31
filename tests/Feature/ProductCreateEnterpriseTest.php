@@ -701,4 +701,67 @@ class ProductCreateEnterpriseTest extends TestCase
         $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'green - 32']);
         $this->assertDatabaseMissing('product_variants', ['product_id' => $prodId, 'name' => 'yellow - 32']);
     }
+
+    /**
+     * 14. Renaming Variation Name (blue -> cyan) and Variation Type (30 -> 22) Cascades to Product List
+     */
+    public function test_renaming_variation_name_blue_to_cyan_and_type_30_to_22_updates_product_list_variants(): void
+    {
+        // 1. Create Variation 'blue' with [30, 33, 34]
+        $blueVar = Variation::create([
+            'name' => 'blue',
+            'variation_types' => ['30', '33', '34'],
+            'status' => 'Active',
+        ]);
+
+        // 2. Create Product with variant 'blue - 30'
+        $prodRes = $this->postJson('/api/products', [
+            'name' => 'Summer Casual Sneakers',
+            'code' => '10111',
+            'sku' => '10111',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'blue - 30',
+                    'sku' => '1011101',
+                    'cost_price' => 45,
+                    'selling_price' => 90,
+                    'attribute_values' => [
+                        ['attribute_name' => 'blue', 'attribute_value' => '30'],
+                    ],
+                ],
+            ],
+        ]);
+        $prodRes->assertStatus(201);
+        $prodId = $prodRes->json('data.id');
+
+        // 3. Update Variation: Rename 'blue' -> 'cyan' AND Rename '30' -> '22'
+        $updateVarRes = $this->putJson("/api/variations/{$blueVar->id}", [
+            'name' => 'cyan',
+            'variation_types' => ['22', '33', '34'],
+            'type_renames' => ['30' => '22'],
+            'status' => 'Active',
+        ]);
+        $updateVarRes->assertStatus(200);
+
+        // 4. Verify Database Records
+        $this->assertDatabaseHas('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'cyan - 22',
+        ]);
+        $this->assertDatabaseMissing('product_variants', [
+            'product_id' => $prodId,
+            'name' => 'blue - 30',
+        ]);
+
+        $this->assertDatabaseHas('product_variant_values', [
+            'attribute_name' => 'cyan',
+            'attribute_value' => '22',
+        ]);
+
+        // 5. Verify Product Show / List API returns updated variant name
+        $showRes = $this->getJson("/api/products/{$prodId}");
+        $showRes->assertStatus(200)
+            ->assertJsonPath('data.variants.0.name', 'cyan - 22');
+    }
 }
