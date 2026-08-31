@@ -1,0 +1,153 @@
+<?php
+
+namespace App\Http\Resources;
+
+use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
+
+class ProductResource extends JsonResource
+{
+    public function toArray(Request $request): array
+    {
+        $primaryImgUrl = (string)($this->image_url ?? '');
+        if ($this->relationLoaded('primaryImage') && $this->primaryImage) {
+            $primaryImgUrl = $this->primaryImage->url;
+        } elseif ($this->relationLoaded('images')) {
+            $primaryImg = $this->images->firstWhere('is_primary', true);
+            if ($primaryImg) {
+                $primaryImgUrl = $primaryImg->url;
+            }
+        }
+
+        $unitLinks = $this->relationLoaded('unitLinks')
+            ? $this->unitLinks->where('is_active', true)->values()
+            : collect();
+        $serializedUnitLinks = $unitLinks->map(function ($link) {
+            return [
+                'id' => is_array($link) ? ($link['id'] ?? null) : $link->id,
+                'product_variant_id' => is_array($link) ? ($link['product_variant_id'] ?? null) : $link->product_variant_id,
+                'unit_type' => is_array($link) ? ($link['unit_type'] ?? '') : $link->unit_type,
+                'unit_id' => is_array($link) ? ($link['unit_id'] ?? null) : $link->unit_id,
+                'unit_name' => is_array($link) ? ($link['unit_name'] ?? '') : $link->unit_name,
+                'conversion_rate' => (float)(is_array($link) ? ($link['conversion_rate'] ?? 1) : $link->conversion_rate),
+                'is_default' => (bool)(is_array($link) ? ($link['is_default'] ?? false) : $link->is_default),
+                'is_active' => (bool)(is_array($link) ? ($link['is_active'] ?? true) : $link->is_active),
+            ];
+        })->values();
+
+        // Details/Edit loads the relation and receives the actual links. The
+        // list endpoint omits it to avoid transferring two links per row.
+        if ($this->relationLoaded('unitLinks') && $serializedUnitLinks->isEmpty()) {
+            $serializedUnitLinks = collect([
+                [
+                    'id' => null,
+                    'product_variant_id' => null,
+                    'unit_type' => 'purchase',
+                    'unit_id' => $this->purchase_unit_id,
+                    'unit_name' => $this->purchase_unit ?: ($this->unit_name ?: 'Piece'),
+                    'conversion_rate' => 1.0,
+                    'is_default' => true,
+                    'is_active' => true,
+                ],
+                [
+                    'id' => null,
+                    'product_variant_id' => null,
+                    'unit_type' => 'sale',
+                    'unit_id' => $this->sale_unit_id,
+                    'unit_name' => $this->sale_unit ?: ($this->unit_name ?: 'Piece'),
+                    'conversion_rate' => 1.0,
+                    'is_default' => true,
+                    'is_active' => true,
+                ],
+            ]);
+        }
+
+        return [
+            'id' => $this->id,
+            'uuid' => $this->uuid,
+            'name' => $this->name,
+            'alternative_name' => $this->alternative_name,
+            'sku' => $this->sku ?? $this->code,
+            'code' => $this->code ?? $this->sku,
+            'barcode' => $this->barcode,
+            'barcode_symbology' => $this->barcode_symbology ?? 'CODE128',
+            'category_id' => $this->category_id,
+            'category_name' => $this->category_name,
+            'sub_category_id' => $this->sub_category_id,
+            'sub_category_name' => $this->sub_category_name,
+            'brand_id' => $this->brand_id,
+            'brand_name' => $this->brand_name,
+            'supplier_id' => $this->supplier_id,
+            'supplier_name' => $this->supplier_name,
+            'base_unit_id' => $this->base_unit_id,
+            'unit_name' => $this->unit_name,
+            'sale_unit_id' => $this->sale_unit_id,
+            'sale_unit' => $this->sale_unit,
+            'purchase_unit_id' => $this->purchase_unit_id,
+            'purchase_unit' => $this->purchase_unit,
+            'unit_links' => $this->when(
+                $this->relationLoaded('unitLinks'),
+                fn () => $serializedUnitLinks,
+            ),
+            'cost_price' => (float) ($this->cost_price ?: $this->purchase_price),
+            'selling_price' => (float) ($this->selling_price ?: $this->retail_price),
+            'purchase_price' => (float) ($this->purchase_price ?: $this->cost_price),
+            'retail_price' => (float) ($this->retail_price ?: $this->selling_price),
+            'retail_prices' => $this->retail_prices ?? (($this->retail_price || $this->selling_price) ? [(float)($this->retail_price ?: $this->selling_price)] : []),
+            'selling_prices' => $this->retail_prices ?? (($this->retail_price || $this->selling_price) ? [(float)($this->retail_price ?: $this->selling_price)] : []),
+            'wholesale_price' => (float) ($this->wholesale_price ?? 0.0),
+            'wholesale_prices' => $this->wholesale_prices ?? ($this->wholesale_price ? [(float)$this->wholesale_price] : []),
+            'stock_quantity' => (float) $this->stock_quantity,
+            'alert_quantity' => (float) ($this->alert_quantity ?: $this->stock_alert),
+            'stock_alert' => (float) ($this->stock_alert ?: $this->alert_quantity),
+            'has_variants' => (bool) $this->has_variants,
+            'variants_count' => array_key_exists('variants_count', $this->attributes ?? [])
+                ? (int) ($this->attributes['variants_count'] ?? 0)
+                : ($this->relationLoaded('variants') ? $this->variants->count() : 0),
+            'variants' => $this->whenLoaded(
+                'variants',
+                fn () => ProductVariantResource::collection($this->variants),
+            ),
+            'images' => $this->whenLoaded(
+                'images',
+                fn () => $this->images->map(function ($img) {
+                    return [
+                        'id' => $img->id,
+                        'url' => $img->url,
+                        'is_primary' => (bool) $img->is_primary,
+                        'sort_order' => $img->sort_order,
+                    ];
+                }),
+            ),
+            'image_url' => $primaryImgUrl,
+            'primary_image_url' => $primaryImgUrl,
+            'warehouse_stocks' => $this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()
+                ? $this->stockBalances->map(function ($sb) {
+                    return [
+                        'warehouse_id' => $sb->warehouse_id,
+                        'warehouse_name' => $sb->warehouse?->name ?? (\App\Models\Outlet::find($sb->warehouse_id)?->name ?? (\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet')),
+                        'product_variant_id' => $sb->product_variant_id,
+                        'quantity' => (float)$sb->quantity,
+                    ];
+                })->values()
+                : ((float)$this->stock_quantity > 0
+                    ? [
+                        [
+                            'warehouse_id' => (int)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->id ?? 1),
+                            'warehouse_name' => (string)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet'),
+                            'product_variant_id' => null,
+                            'quantity' => (float)$this->stock_quantity,
+                        ]
+                    ]
+                    : []
+                ),
+            'note' => $this->note ?? $this->description,
+            'description' => $this->description ?? $this->note,
+            'status' => $this->status ?? ($this->is_active ? 'Active' : 'Inactive'),
+            'is_active' => (bool) $this->is_active,
+            'added_by' => $this->added_by,
+            'created_at' => $this->created_at?->toIso8601String(),
+            'updated_at' => $this->updated_at?->toIso8601String(),
+        ];
+    }
+}
