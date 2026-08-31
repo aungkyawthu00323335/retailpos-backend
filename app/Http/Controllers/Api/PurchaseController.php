@@ -15,7 +15,18 @@ class PurchaseController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Purchase::with(['items', 'supplier']);
+        $query = Purchase::query()
+            ->select([
+                'id', 'reference_no', 'supplier_id', 'supplier_name',
+                'warehouse_name', 'warehouse_id', 'date', 'status',
+                'tax_rate', 'tax_amount', 'discount', 'shipping',
+                'grand_total', 'paid_amount', 'due_amount',
+                'payment_status', 'payment_type', 'notes', 'created_by',
+                'created_at', 'updated_at',
+            ])
+            ->with([
+                'items:id,purchase_id,product_id,product_variant_id,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal',
+            ]);
 
         if ($request->filled('supplier_id')) {
             $query->where('supplier_id', $request->input('supplier_id'));
