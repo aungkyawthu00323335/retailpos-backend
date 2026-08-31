@@ -19,7 +19,7 @@ class PurchaseController extends Controller
         $query = Purchase::query()
             ->select([
                 'id', 'reference_no', 'supplier_id', 'supplier_name',
-                'warehouse_name', 'warehouse_id', 'date', 'status',
+                'warehouse_name', 'date', 'status',
                 'tax_rate', 'tax_amount', 'discount', 'shipping',
                 'grand_total', 'paid_amount', 'due_amount',
                 'payment_status', 'payment_type', 'notes', 'created_by',
