@@ -870,4 +870,85 @@ class ProductCreateEnterpriseTest extends TestCase
             'attribute_value' => '44',
         ]);
     }
+
+    /**
+     * 16. Add New Variant to Existing Product with Specific Warehouse Opening Stock
+     */
+    public function test_add_new_variant_with_specific_warehouse_opening_stock(): void
+    {
+        $wh1 = Outlet::create(['name' => 'Primary Warehouse', 'is_active' => true]);
+        $wh2 = Outlet::create(['name' => 'Secondary Warehouse', 'is_active' => true]);
+
+        // 1. Create Base Product
+        $prodRes = $this->postJson('/api/products', [
+            'name' => 'Multi Warehouse Variant Product',
+            'code' => '10550',
+            'sku' => '10550',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'red - Small',
+                    'sku' => '1055001',
+                    'cost_price' => 100,
+                    'selling_price' => 200,
+                    'attribute_values' => [
+                        ['attribute_name' => 'red', 'attribute_value' => 'Small'],
+                    ],
+                ],
+            ],
+        ]);
+        $prodRes->assertStatus(201);
+        $prodId = $prodRes->json('data.id');
+
+        // 2. Add 2nd Variant 'red - Medium' with 25 opening stock in Warehouse 2
+        $updateRes = $this->putJson("/api/products/{$prodId}", [
+            'name' => 'Multi Warehouse Variant Product',
+            'code' => '10550',
+            'sku' => '10550',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'name' => 'red - Small',
+                    'sku' => '1055001',
+                    'cost_price' => 100,
+                    'selling_price' => 200,
+                    'attribute_values' => [
+                        ['attribute_name' => 'red', 'attribute_value' => 'Small'],
+                    ],
+                ],
+                [
+                    'name' => 'red - Medium',
+                    'sku' => '1055002',
+                    'cost_price' => 120,
+                    'selling_price' => 240,
+                    'attribute_values' => [
+                        ['attribute_name' => 'red', 'attribute_value' => 'Medium'],
+                    ],
+                ],
+            ],
+            'opening_stocks' => [
+                [
+                    'warehouse_id' => $wh2->id,
+                    'variant_sku' => '1055002',
+                    'quantity' => 25,
+                ],
+            ],
+        ]);
+        $updateRes->assertStatus(200);
+
+        // 3. Verify StockBalance created for Warehouse 2 specifically
+        $this->assertDatabaseHas('stock_balances', [
+            'product_id' => $prodId,
+            'warehouse_id' => $wh2->id,
+            'quantity' => 25,
+        ]);
+
+        // 4. Verify StockMovement created for Warehouse 2 specifically
+        $this->assertDatabaseHas('stock_movements', [
+            'product_id' => $prodId,
+            'warehouse_id' => $wh2->id,
+            'movement_type' => 'opening_stock',
+            'quantity_in' => 25,
+        ]);
+    }
 }

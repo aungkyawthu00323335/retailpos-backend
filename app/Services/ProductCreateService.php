@@ -616,13 +616,18 @@ class ProductCreateService
                     }
 
                     StockMovement::create([
+                        'warehouse_id' => $wId,
                         'product_id' => $product->id,
                         'product_variant_id' => $vId,
-                        'warehouse_id' => $wId,
-                        'type' => 'opening_stock',
-                        'quantity' => $baseQty,
-                        'cost_price' => (float)($product->cost_price ?? 0),
+                        'movement_type' => 'opening_stock',
+                        'reference_type' => 'product_update',
+                        'reference_id' => (string) $product->id,
+                        'quantity_in' => $baseQty,
+                        'quantity_out' => 0.0,
+                        'balance_after' => $baseQty,
+                        'created_by' => auth()->id(),
                         'note' => 'Opening stock recorded from variant addition',
+                        'created_at' => now(),
                     ]);
                 }
             }
