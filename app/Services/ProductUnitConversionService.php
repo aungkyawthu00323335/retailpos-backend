@@ -209,7 +209,11 @@ class ProductUnitConversionService
         }
 
         $name = trim((string)$warehouseName);
-        $warehouse = $name !== '' ? Outlet::where('name', $name)->first() : null;
+        $warehouse = null;
+        if ($name !== '') {
+            $warehouse = Outlet::where('name', $name)->first()
+                ?? Outlet::where('name', 'LIKE', '%' . $name . '%')->first();
+        }
         $warehouse ??= Outlet::orderBy('id')->first();
 
         return $warehouse?->id;
