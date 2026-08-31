@@ -4,7 +4,16 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Setting;
+use App\Models\Purchase;
+use App\Models\PurchaseReturn;
+use App\Models\Sale;
+use App\Models\SaleReturn;
+use App\Models\StockAdjustment;
+use App\Models\StockTransfer;
+use App\Models\Expense;
+use App\Models\Quotation;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 class SettingController extends Controller
 {
@@ -59,16 +68,61 @@ class SettingController extends Controller
     {
         $data = $request->all();
 
+        $prefixModelMap = [
+            'purchase_prefix' => Purchase::class,
+            'purchase_return_prefix' => PurchaseReturn::class,
+            'sale_prefix' => Sale::class,
+            'sale_return_prefix' => SaleReturn::class,
+            'adjustment_prefix' => StockAdjustment::class,
+            'transfer_prefix' => StockTransfer::class,
+            'expense_prefix' => Expense::class,
+            'quotation_prefix' => Quotation::class,
+        ];
+
         foreach ($data as $key => $value) {
+            $strVal = is_array($value) ? json_encode($value) : (string)$value;
             Setting::updateOrCreate(
                 ['key' => $key],
-                ['value' => is_array($value) ? json_encode($value) : (string)$value]
+                ['value' => $strVal]
             );
+
+            // If a prefix changed, cascade the new prefix to existing transaction records
+            if (isset($prefixModelMap[$key]) && !empty($strVal)) {
+                $this->updateModelPrefixes($prefixModelMap[$key], trim($strVal));
+            }
         }
 
         return response()->json([
             'status' => 'success',
             'message' => 'Settings updated successfully',
         ]);
+    }
+
+    /**
+     * Updates all existing records of a model with the new prefix
+     */
+    protected function updateModelPrefixes($modelClass, string $newPrefix): void
+    {
+        if (empty($newPrefix)) return;
+        try {
+            $records = $modelClass::all();
+            foreach ($records as $record) {
+                $ref = (string) ($record->reference_no ?? '');
+                if (!empty($ref)) {
+                    // Extract suffix by removing any previous alpha characters and separators
+                    $suffix = preg_replace('/^[A-Za-z]+[_\-\/:]*/', '', $ref);
+                    if (empty($suffix)) {
+                        $suffix = $ref;
+                    }
+                    $newRef = $newPrefix . $suffix;
+                    if ($newRef !== $ref) {
+                        $record->reference_no = $newRef;
+                        $record->save();
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Error cascading prefix update for {$modelClass}: " . $e->getMessage());
+        }
     }
 }
