@@ -57,6 +57,7 @@ Route::get('products/check-identifier', [ProductController::class, 'checkIdentif
 Route::post('products/generate-sku', [ProductController::class, 'generateSku']);
 Route::post('products/generate-barcode', [ProductController::class, 'generateBarcode']);
 Route::get('products/template', [ProductController::class, 'downloadTemplate']);
+Route::get('products/export', [ProductController::class, 'export']);
 Route::post('products/bulk-import', [ProductController::class, 'bulkImport']);
 Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);

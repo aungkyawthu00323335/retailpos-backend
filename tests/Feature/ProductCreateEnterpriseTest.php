@@ -951,4 +951,60 @@ class ProductCreateEnterpriseTest extends TestCase
             'quantity_in' => 25,
         ]);
     }
+
+    /**
+     * 20. Product Export CSV with UTF-8 BOM, Myanmar Unicode, and 20 Columns
+     */
+    public function test_export_endpoint_returns_utf8_bom_csv_matching_template(): void
+    {
+        $single = Product::create([
+            'name' => 'Classic Burger',
+            'alternative_name' => 'ချိစ်ဘာဂါ',
+            'code' => 'SP-001',
+            'sku' => 'SP-001',
+            'category_name' => 'Fast Food',
+            'brand_name' => 'Burger Queen',
+            'unit_name' => 'Plate',
+            'purchase_unit' => 'Plate',
+            'sale_unit' => 'Plate',
+            'cost_price' => 3000,
+            'selling_price' => 5000,
+            'retail_price' => 5000,
+            'retail_prices' => [5000, 4800],
+            'wholesale_price' => 4500,
+            'wholesale_prices' => [4500, 4200],
+            'stock_quantity' => 100,
+            'stock_alert' => 10,
+            'has_variants' => false,
+            'is_active' => true,
+        ]);
+
+        ProductUnitLink::create([
+            'product_id' => $single->id,
+            'unit_type' => 'sale',
+            'unit_name' => 'Box',
+            'conversion_rate' => 10,
+            'is_active' => true,
+        ]);
+
+        $res = $this->get('/api/products/export');
+        $res->assertStatus(200);
+        $res->assertHeader('Content-Type', 'text/csv; charset=UTF-8');
+
+        $content = $res->streamedContent();
+        // Assert UTF-8 BOM
+        $this->assertStringStartsWith("\xEF\xBB\xBF", $content);
+        // Assert Headers
+        $this->assertStringContainsString('Product Type', $content);
+        $this->assertStringContainsString('Alternative Name (မြန်မာ)', $content);
+        $this->assertStringContainsString('Purchase Unit Links', $content);
+        $this->assertStringContainsString('Sale Unit Links', $content);
+        // Assert Content with Burmese characters
+        $this->assertStringContainsString('ချိစ်ဘာဂါ', $content);
+        $this->assertStringContainsString('SP-001', $content);
+        $this->assertStringContainsString('Single', $content);
+        $this->assertStringContainsString('Box:10', $content);
+        $this->assertStringContainsString('"5000, 4800"', $content);
+        $this->assertStringContainsString('"4500, 4200"', $content);
+    }
 }

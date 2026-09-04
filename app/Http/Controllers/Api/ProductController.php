@@ -547,6 +547,203 @@ class ProductController extends Controller
         return response()->stream($callback, 200, $headers);
     }
 
+    public function export(Request $request)
+    {
+        $query = Product::query()
+            ->with([
+                'variants.values',
+                'unitLinks' => function ($q) {
+                    $q->where('is_active', true);
+                },
+            ]);
+
+        if ($request->filled('search')) {
+            $search = trim($request->input('search'));
+            $query->where(function ($q) use ($search) {
+                $q->where('code', 'like', "%{$search}%")
+                  ->orWhere('sku', 'like', "%{$search}%")
+                  ->orWhere('barcode', 'like', "%{$search}%")
+                  ->orWhere('name', 'like', "%{$search}%")
+                  ->orWhere('alternative_name', 'like', "%{$search}%")
+                  ->orWhere('brand_name', 'like', "%{$search}%")
+                  ->orWhere('category_name', 'like', "%{$search}%");
+            });
+        }
+
+        if ($request->filled('category') && $request->input('category') !== 'All') {
+            $query->where('category_name', $request->input('category'));
+        }
+
+        if ($request->filled('brand') && $request->input('brand') !== 'All') {
+            $query->where('brand_name', $request->input('brand'));
+        }
+
+        if ($request->filled('status') && $request->input('status') !== 'All') {
+            $query->where('status', $request->input('status'));
+        }
+
+        $products = $query->orderBy('id', 'asc')->get();
+
+        $columns = [
+            'Product Type', 'Product Code', 'Product Name', 'Alternative Name (မြန်မာ)',
+            'Category', 'Brand', 'Base Unit', 'Purchase Unit', 'Sale Unit', 'Purchase Unit Links', 'Sale Unit Links',
+            'Product Cost', 'Retail Price', 'Wholesale Price', 'Stock Alert',
+            'Variation Name', 'Variation Type', 'Variation Code', 'Stock Qty', 'Status'
+        ];
+
+        $formatNum = function ($num) {
+            $floatVal = (float)$num;
+            return ($floatVal == (int)$floatVal) ? (string)(int)$floatVal : (string)$floatVal;
+        };
+
+        $formatPriceList = function ($prices, $defaultVal = 0) use ($formatNum) {
+            if (is_array($prices) && !empty($prices)) {
+                $formatted = [];
+                foreach ($prices as $p) {
+                    $val = (float)$p;
+                    if ($val > 0) {
+                        $formatted[] = $formatNum($val);
+                    }
+                }
+                if (!empty($formatted)) {
+                    return implode(', ', $formatted);
+                }
+            }
+            $single = (float)$defaultVal;
+            return $single > 0 ? $formatNum($single) : '0';
+        };
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="products_export_' . date('Ymd_His') . '.csv"',
+            'Pragma' => 'no-cache',
+            'Cache-Control' => 'must-revalidate, post-check=0, pre-check=0',
+            'Expires' => '0',
+        ];
+
+        $callback = function () use ($columns, $products, $formatNum, $formatPriceList) {
+            $file = fopen('php://output', 'w');
+            // Write UTF-8 BOM for Microsoft Excel on Windows
+            fwrite($file, "\xEF\xBB\xBF");
+            fputcsv($file, $columns);
+
+            foreach ($products as $product) {
+                $baseUnit = $product->unit_name ?: 'Piece';
+                $purchUnit = $product->purchase_unit ?: $baseUnit;
+                $saleUnit = $product->sale_unit ?: $baseUnit;
+
+                // Purchase unit links
+                $purchLinks = $product->unitLinks
+                    ->where('unit_type', 'purchase')
+                    ->map(function ($link) use ($formatNum) {
+                        return $link->unit_name . ':' . $formatNum($link->conversion_rate);
+                    })->implode(', ');
+
+                // Sale unit links
+                $saleLinks = $product->unitLinks
+                    ->where('unit_type', 'sale')
+                    ->map(function ($link) use ($formatNum) {
+                        return $link->unit_name . ':' . $formatNum($link->conversion_rate);
+                    })->implode(', ');
+
+                $alertVal = (float)($product->stock_alert ?: ($product->alert_quantity ?: 10));
+                $alertStr = $formatNum($alertVal);
+                $category = $product->category_name ?: 'General';
+                $brand = $product->brand_name ?: 'Generic';
+                $status = $product->status ?: ($product->is_active ? 'Active' : 'Inactive');
+
+                if ($product->has_variants && $product->variants->isNotEmpty()) {
+                    foreach ($product->variants as $variant) {
+                        $vCost = (float)($variant->cost_price ?: $product->cost_price);
+                        $vCostStr = $formatNum($vCost);
+
+                        $vRetailStr = $formatPriceList(
+                            $variant->retail_prices,
+                            $variant->selling_price ?: $product->retail_price
+                        );
+
+                        $vWholesaleStr = $formatPriceList(
+                            $variant->wholesale_prices,
+                            $variant->wholesale_price ?: $product->wholesale_price
+                        );
+
+                        $varName = 'Variation';
+                        $varType = $variant->name ?: 'Standard';
+
+                        if ($variant->values && $variant->values->isNotEmpty()) {
+                            $attrNames = $variant->values->pluck('attribute_name')->filter()->unique()->values();
+                            if ($attrNames->isNotEmpty()) {
+                                $varName = $attrNames->implode(' / ');
+                            }
+                            $attrVals = $variant->values->pluck('attribute_value')->filter()->values();
+                            if ($attrVals->isNotEmpty()) {
+                                $varType = $attrVals->implode(' - ');
+                            }
+                        }
+
+                        $vCode = $variant->sku ?: ($variant->barcode ?: $product->code);
+                        $vStockStr = $formatNum($variant->stock_quantity);
+
+                        fputcsv($file, [
+                            'Variation',
+                            $product->code,
+                            $product->name,
+                            $product->alternative_name ?? '',
+                            $category,
+                            $brand,
+                            $baseUnit,
+                            $purchUnit,
+                            $saleUnit,
+                            $purchLinks,
+                            $saleLinks,
+                            $vCostStr,
+                            $vRetailStr,
+                            $vWholesaleStr,
+                            $alertStr,
+                            $varName,
+                            $varType,
+                            $vCode,
+                            $vStockStr,
+                            $variant->is_active ? $status : 'Inactive',
+                        ]);
+                    }
+                } else {
+                    $pCostStr = $formatNum($product->cost_price);
+                    $pRetailStr = $formatPriceList($product->retail_prices, $product->retail_price);
+                    $pWholesaleStr = $formatPriceList($product->wholesale_prices, $product->wholesale_price);
+                    $pStockStr = $formatNum($product->stock_quantity);
+
+                    fputcsv($file, [
+                        'Single',
+                        $product->code,
+                        $product->name,
+                        $product->alternative_name ?? '',
+                        $category,
+                        $brand,
+                        $baseUnit,
+                        $purchUnit,
+                        $saleUnit,
+                        $purchLinks,
+                        $saleLinks,
+                        $pCostStr,
+                        $pRetailStr,
+                        $pWholesaleStr,
+                        $alertStr,
+                        '',
+                        '',
+                        $product->code,
+                        $pStockStr,
+                        $status,
+                    ]);
+                }
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
     public function bulkImport(Request $request, ProductCreateService $createService)
     {
         $items    = $request->input('products', []);
