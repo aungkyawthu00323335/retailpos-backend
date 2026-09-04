@@ -76,7 +76,7 @@ class StoreProductRequest extends FormRequest
 
             'variants' => ['nullable', 'array'],
             'variants.*.name' => ['required_with:variants', 'string', 'max:255'],
-            'variants.*.sku' => ['nullable', 'string', 'max:100'],
+            'variants.*.sku' => ['nullable', 'string', 'max:100', 'distinct'],
             'variants.*.barcode' => ['nullable', 'string', 'max:100'],
             'variants.*.cost_price' => ['nullable', 'numeric', 'min:0'],
             'variants.*.selling_price' => ['nullable', 'numeric', 'min:0'],
@@ -132,6 +132,8 @@ class StoreProductRequest extends FormRequest
             'sku.unique' => 'ဤ SKU / Product Code ကို အသုံးပြုပြီးဖြစ်ပါသည်။',
             'code.unique' => 'ဤ SKU / Product Code ကို အသုံးပြုပြီးဖြစ်ပါသည်။',
             'barcode.unique' => 'ဤ Barcode ကို အခြား Product သို့မဟုတ် Variant တွင် အသုံးပြုပြီးဖြစ်ပါသည်။',
+            'variants.*.sku.distinct' => 'Variation Product ID / Code များ ထပ်တူမဖြစ်ရပါ။ (Duplicate Variant SKU)',
+            'variants.*.sku.unique' => 'ဤ Variation Product ID ကို အခြား Product သို့မဟုတ် Variant တွင် အသုံးပြုပြီးဖြစ်ပါသည်။',
             'tax.prohibited' => 'Tax field များကို ဤ Product Create feature တွင် အသုံးမပြုပါ။',
             'tax_rate.prohibited' => 'Tax field များကို ဤ Product Create feature တွင် အသုံးမပြုပါ။',
             'tax_method.prohibited' => 'Tax field များကို ဤ Product Create feature တွင် အသုံးမပြုပါ။',

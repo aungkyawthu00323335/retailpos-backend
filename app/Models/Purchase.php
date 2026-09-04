@@ -13,6 +13,7 @@ class Purchase extends Model
         'reference_no',
         'supplier_id',
         'supplier_name',
+        'warehouse_id',
         'warehouse_name',
         'date',
         'status', // Received, Pending, Ordered
@@ -47,5 +48,37 @@ class Purchase extends Model
     public function supplier()
     {
         return $this->belongsTo(Supplier::class, 'supplier_id');
+    }
+
+    /**
+     * Generate next numeric reference number (e.g. 1001, 1002, 1003...)
+     */
+    public static function generateNextNumericReference(): string
+    {
+        $driver = \Illuminate\Support\Facades\DB::connection()->getDriverName();
+        if ($driver === 'sqlite') {
+            $last = static::query()
+                ->whereRaw("reference_no GLOB '[0-9]*'")
+                ->orderByRaw("CAST(reference_no AS INTEGER) DESC")
+                ->first();
+        } else {
+            $last = static::query()
+                ->whereRaw("reference_no REGEXP '^[0-9]+$'")
+                ->orderByRaw("CAST(reference_no AS UNSIGNED) DESC")
+                ->first();
+        }
+
+        if ($last && is_numeric($last->reference_no)) {
+            $next = (int)$last->reference_no + 1;
+        } else {
+            $maxId = (int)static::max('id');
+            $next = max(1001, $maxId + 1000);
+        }
+
+        while (static::where('reference_no', (string)$next)->exists()) {
+            $next++;
+        }
+
+        return (string)$next;
     }
 }

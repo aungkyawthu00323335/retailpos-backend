@@ -9,6 +9,9 @@ use App\Models\ProductImage;
 use App\Models\StockBalance;
 use App\Models\StockMovement;
 use App\Models\Outlet;
+use App\Models\Purchase;
+use App\Models\PurchaseItem;
+use App\Models\Setting;
 use App\Services\ProductUnitConversionService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -164,8 +167,9 @@ class ProductCreateService
                         ]);
 
                         // Link attribute values
-                        if (!empty($vData['attribute_values']) && is_array($vData['attribute_values'])) {
-                            foreach ($vData['attribute_values'] as $attrVal) {
+                        $rawAttrVals = $vData['attribute_values'] ?? $vData['values'] ?? [];
+                        if (!empty($rawAttrVals) && is_array($rawAttrVals)) {
+                            foreach ($rawAttrVals as $attrVal) {
                                 ProductVariantValue::create([
                                     'product_variant_id' => $variant->id,
                                     'attribute_name' => is_array($attrVal) ? ($attrVal['attribute_name'] ?? 'Variation') : 'Variation',
@@ -245,10 +249,14 @@ class ProductCreateService
                     ]);
                 }
 
-                // 5. Process Opening Stocks & Stock Movements
+                // 5. Process Opening Stocks, Stock Movements & Auto-Create Purchases
                 $totalStock = 0.0;
                 $defaultWarehouse = Outlet::orderBy('id')->first();
                 $defaultWarehouseId = $defaultWarehouse?->id;
+                $unitService = app(ProductUnitConversionService::class);
+
+                // Group entries by warehouse
+                $warehouseGroups = [];
 
                 if (!empty($data['opening_stocks']) && is_array($data['opening_stocks'])) {
                     foreach ($data['opening_stocks'] as $stockEntry) {
@@ -261,22 +269,57 @@ class ProductCreateService
                         if (!$wId) {
                             throw new \RuntimeException('A warehouse is required for opening stock.');
                         }
+
                         $variantSku = $stockEntry['variant_sku'] ?? null;
                         $vId = null;
+                        $variantModel = null;
 
                         if ($variantSku && isset($createdVariants[$variantSku])) {
-                            $vId = $createdVariants[$variantSku]->id;
+                            $variantModel = $createdVariants[$variantSku];
+                            $vId = $variantModel->id;
                         }
 
-                        $unitService = app(ProductUnitConversionService::class);
                         $resolvedUnit = $unitService->resolve(
                             $product,
-                            $stockEntry['unit_type'] ?? 'base',
+                            $stockEntry['unit_type'] ?? 'purchase',
                             isset($stockEntry['unit_id']) ? (int)$stockEntry['unit_id'] : null,
                             $stockEntry['unit_name'] ?? null,
                             $vId
                         );
-                        $baseQty = $unitService->baseQuantity($qty, (float)$resolvedUnit['conversion_rate']);
+                        $conversionRate = (float)($resolvedUnit['conversion_rate'] > 0 ? $resolvedUnit['conversion_rate'] : 1.0);
+                        $baseQty = $unitService->baseQuantity($qty, $conversionRate);
+
+                        // Determine unit cost
+                        $itemCost = $variantModel && $variantModel->cost_price > 0
+                            ? (float)$variantModel->cost_price
+                            : (float)$costPrice;
+                        $baseUnitCost = $conversionRate > 0 ? $itemCost / $conversionRate : $itemCost;
+
+                        if (!isset($warehouseGroups[$wId])) {
+                            $warehouseObj = Outlet::find($wId);
+                            $wName = $stockEntry['warehouse_name'] ?? ($warehouseObj?->name ?? 'Main Warehouse');
+                            $warehouseGroups[$wId] = [
+                                'warehouse_id' => $wId,
+                                'warehouse_name' => $wName,
+                                'items' => [],
+                            ];
+                        }
+
+                        $warehouseGroups[$wId]['items'][] = [
+                            'product_id' => $product->id,
+                            'product_variant_id' => $vId,
+                            'variant_sku' => $variantSku,
+                            'product_code' => $variantModel?->sku ?? $product->code,
+                            'product_name' => $variantModel ? ($product->name . ' (' . $variantModel->name . ')') : $product->name,
+                            'unit_id' => $resolvedUnit['unit_id'],
+                            'unit_name' => $resolvedUnit['unit_name'],
+                            'conversion_rate' => $conversionRate,
+                            'quantity' => $qty,
+                            'base_quantity' => $baseQty,
+                            'unit_cost' => $itemCost,
+                            'base_unit_cost' => $baseUnitCost,
+                            'subtotal' => $itemCost * $qty,
+                        ];
 
                         // Create/Update StockBalance in the canonical base unit.
                         $balance = StockBalance::where('warehouse_id', $wId)
@@ -296,53 +339,130 @@ class ProductCreateService
                             ]);
                         }
 
-                        // Create StockMovement audit record
-                        StockMovement::create([
-                            'warehouse_id' => $wId,
-                            'product_id' => $product->id,
-                            'product_variant_id' => $vId,
-                            'movement_type' => 'opening_stock',
-                            'reference_type' => 'product_create',
-                            'reference_id' => (string) $product->id,
-                            'quantity_in' => $baseQty,
-                            'quantity_out' => 0.0,
-                            'balance_after' => $qty,
-                            'created_by' => auth()->id(),
-                            'note' => 'Initial Opening Stock from Product Create',
-                            'created_at' => now(),
-                        ]);
-
                         $totalStock += $baseQty;
                     }
                 } elseif (!empty($data['stock_quantity'])) {
                     $qty = (float) $data['stock_quantity'];
                     if ($qty > 0) {
-                        if (!$defaultWarehouseId) {
+                        $wId = !empty($data['warehouse_id']) ? (int)$data['warehouse_id'] : $defaultWarehouseId;
+                        if (!$wId) {
                             throw new \RuntimeException('A warehouse is required for opening stock.');
                         }
+                        $warehouseObj = Outlet::find($wId);
+                        $wName = $data['warehouse_name'] ?? ($warehouseObj?->name ?? 'Main Warehouse');
+
+                        $resolvedUnit = $unitService->resolve(
+                            $product,
+                            'purchase',
+                            isset($data['purchase_unit_id']) ? (int)$data['purchase_unit_id'] : null,
+                            $data['purchase_unit'] ?? null,
+                            null
+                        );
+                        $conversionRate = (float)($resolvedUnit['conversion_rate'] > 0 ? $resolvedUnit['conversion_rate'] : 1.0);
+                        $baseQty = $unitService->baseQuantity($qty, $conversionRate);
+                        $itemCost = (float)$costPrice;
+                        $baseUnitCost = $conversionRate > 0 ? $itemCost / $conversionRate : $itemCost;
+
+                        $warehouseGroups[$wId] = [
+                            'warehouse_id' => $wId,
+                            'warehouse_name' => $wName,
+                            'items' => [
+                                [
+                                    'product_id' => $product->id,
+                                    'product_variant_id' => null,
+                                    'variant_sku' => null,
+                                    'product_code' => $product->code,
+                                    'product_name' => $product->name,
+                                    'unit_id' => $resolvedUnit['unit_id'],
+                                    'unit_name' => $resolvedUnit['unit_name'],
+                                    'conversion_rate' => $conversionRate,
+                                    'quantity' => $qty,
+                                    'base_quantity' => $baseQty,
+                                    'unit_cost' => $itemCost,
+                                    'base_unit_cost' => $baseUnitCost,
+                                    'subtotal' => $itemCost * $qty,
+                                ],
+                            ],
+                        ];
+
                         StockBalance::create([
-                            'warehouse_id' => $defaultWarehouseId,
+                            'warehouse_id' => $wId,
                             'product_id' => $product->id,
                             'product_variant_id' => null,
-                            'quantity' => $qty,
+                            'quantity' => $baseQty,
+                        ]);
+
+                        $totalStock = $baseQty;
+                    }
+                }
+
+                // Auto-create Purchase Order and StockMovements per warehouse
+                foreach ($warehouseGroups as $wId => $wGroup) {
+                    if (empty($wGroup['items'])) continue;
+
+                    $grandTotal = 0.0;
+                    foreach ($wGroup['items'] as $item) {
+                        $grandTotal += (float)$item['subtotal'];
+                    }
+
+                    $refNo = Purchase::generateNextNumericReference();
+
+                    $supplierName = !empty($product->supplier_name) ? $product->supplier_name : 'Opening Stock';
+
+                    $purchase = Purchase::create([
+                        'reference_no'   => $refNo,
+                        'supplier_id'    => $product->supplier_id,
+                        'supplier_name'  => $supplierName,
+                        'warehouse_id'   => $wGroup['warehouse_id'],
+                        'warehouse_name' => $wGroup['warehouse_name'],
+                        'date'           => date('Y-m-d'),
+                        'status'         => 'Received',
+                        'tax_rate'       => 0.0,
+                        'tax_amount'     => 0.0,
+                        'discount'       => 0.0,
+                        'shipping'       => 0.0,
+                        'grand_total'    => $grandTotal,
+                        'paid_amount'    => $grandTotal,
+                        'due_amount'     => 0.0,
+                        'payment_status' => 'Paid',
+                        'payment_type'   => 'Opening Stock',
+                        'notes'          => 'Initial Opening Stock from Product Creation: ' . $product->name,
+                        'created_by'     => $product->added_by ?: (auth()->user()?->name ?: 'Admin User'),
+                    ]);
+
+                    foreach ($wGroup['items'] as $itemData) {
+                        PurchaseItem::create([
+                            'purchase_id'        => $purchase->id,
+                            'product_id'         => $itemData['product_id'],
+                            'product_variant_id' => $itemData['product_variant_id'],
+                            'unit_id'            => $itemData['unit_id'],
+                            'unit_name'          => $itemData['unit_name'],
+                            'conversion_rate'    => $itemData['conversion_rate'],
+                            'product_code'       => $itemData['product_code'],
+                            'product_name'       => $itemData['product_name'],
+                            'unit_cost'          => $itemData['unit_cost'],
+                            'base_unit_cost'     => $itemData['base_unit_cost'],
+                            'quantity'           => $itemData['quantity'],
+                            'base_quantity'      => $itemData['base_quantity'],
+                            'tax'                => 0.0,
+                            'discount'           => 0.0,
+                            'subtotal'           => $itemData['subtotal'],
                         ]);
 
                         StockMovement::create([
-                            'warehouse_id' => $defaultWarehouseId,
-                            'product_id' => $product->id,
-                            'product_variant_id' => null,
-                            'movement_type' => 'opening_stock',
-                            'reference_type' => 'product_create',
-                            'reference_id' => (string) $product->id,
-                            'quantity_in' => $qty,
-                            'quantity_out' => 0.0,
-                            'balance_after' => $qty,
-                            'created_by' => auth()->id(),
-                            'note' => 'Initial Opening Stock from Product Create',
-                            'created_at' => now(),
+                            'warehouse_id'       => $wGroup['warehouse_id'],
+                            'product_id'         => $itemData['product_id'],
+                            'product_variant_id' => $itemData['product_variant_id'],
+                            'movement_type'      => 'opening_stock',
+                            'reference_type'     => 'purchase',
+                            'reference_id'       => (string) $purchase->id,
+                            'quantity_in'        => $itemData['base_quantity'],
+                            'quantity_out'       => 0.0,
+                            'balance_after'      => $itemData['quantity'],
+                            'created_by'         => auth()->id(),
+                            'note'               => 'Initial Opening Stock from Product Create (PO: ' . $refNo . ')',
+                            'created_at'         => now(),
                         ]);
-
-                        $totalStock = $qty;
                     }
                 }
 

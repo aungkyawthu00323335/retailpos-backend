@@ -14,7 +14,7 @@ class AdjustmentController extends Controller
 {
     public function index(Request $request)
     {
-        $query = StockAdjustment::with('items');
+        $query = StockAdjustment::with(['items:id,stock_adjustment_id,product_id,product_code,product_name,quantity,type,unit_cost']);
 
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
             $query->where('warehouse_name', $request->input('warehouse'));
@@ -22,6 +22,14 @@ class AdjustmentController extends Controller
 
         if ($request->filled('type') && $request->input('type') !== 'All') {
             $query->where('type', $request->input('type'));
+        }
+
+        if ($request->filled('date_from')) {
+            $query->where('date', '>=', $request->input('date_from'));
+        }
+
+        if ($request->filled('date_to')) {
+            $query->where('date', '<=', $request->input('date_to'));
         }
 
         if ($request->filled('search')) {
@@ -33,7 +41,15 @@ class AdjustmentController extends Controller
             });
         }
 
-        $adjustments = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $sortBy = $request->input('sort_by', 'id');
+        $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $allowedSorts = ['id', 'reference_no', 'warehouse_name', 'date', 'type', 'total_products', 'total_quantity', 'created_at'];
+        if (!in_array($sortBy, $allowedSorts)) {
+            $sortBy = 'id';
+        }
+
+        $perPage = min(max((int)$request->input('per_page', 25), 1), 100);
+        $adjustments = $query->orderBy($sortBy, $sortOrder)->paginate($perPage);
 
         return response()->json([
             'status' => 'success',

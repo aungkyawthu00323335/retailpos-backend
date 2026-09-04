@@ -56,6 +56,10 @@ class ProductListResource extends JsonResource
             'stock_alert' => (float)($this->stock_alert ?: $this->alert_quantity),
             'low_qty' => (float)($this->low_qty ?: $this->stock_alert),
             'has_variants' => (bool)$this->has_variants,
+            'variants_count' => $this->relationLoaded('variants') ? $this->variants->count() : 0,
+            'variants' => $this->relationLoaded('variants') && $this->variants->isNotEmpty()
+                ? ProductVariantResource::collection($this->variants)
+                : [],
             'image_url' => $imageUrl,
             'primary_image_url' => $imageUrl,
             'status' => $this->status ?? ($this->is_active ? 'Active' : 'Inactive'),

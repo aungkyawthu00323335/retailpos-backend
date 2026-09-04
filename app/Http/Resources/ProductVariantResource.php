@@ -24,12 +24,14 @@ class ProductVariantResource extends JsonResource
             'wholesale_prices' => $this->wholesale_prices ?? ($this->wholesale_price ? [(float)$this->wholesale_price] : []),
             'is_active' => (bool) $this->is_active,
             'sort_order' => $this->sort_order,
-            'values' => $this->values->map(function ($val) {
+            'stock_quantity' => (float) ($this->relationLoaded('stockBalances') ? $this->stockBalances->sum('quantity') : 0.0),
+            'stockQuantity' => (float) ($this->relationLoaded('stockBalances') ? $this->stockBalances->sum('quantity') : 0.0),
+            'values' => $this->relationLoaded('values') && $this->values ? $this->values->map(function ($val) {
                 return [
                     'attribute_name' => $val->attribute_name,
                     'attribute_value' => $val->attribute_value,
                 ];
-            }),
+            }) : [],
         ];
     }
 }

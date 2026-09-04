@@ -19,7 +19,7 @@ class PurchaseController extends Controller
         $query = Purchase::query()
             ->select([
                 'id', 'reference_no', 'supplier_id', 'supplier_name',
-                'warehouse_name', 'date', 'status',
+                'warehouse_id', 'warehouse_name', 'date', 'status',
                 'tax_rate', 'tax_amount', 'discount', 'shipping',
                 'grand_total', 'paid_amount', 'due_amount',
                 'payment_status', 'payment_type', 'notes', 'created_by',
@@ -47,9 +47,13 @@ class PurchaseController extends Controller
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
-            $query->where(function ($q) use ($search) {
+            $digits = preg_replace('/[^0-9]/', '', $search);
+            $query->where(function ($q) use ($search, $digits) {
                 $q->where('reference_no', 'like', "%{$search}%")
                   ->orWhere('supplier_name', 'like', "%{$search}%");
+                if (!empty($digits)) {
+                    $q->orWhere('reference_no', 'like', "%{$digits}%");
+                }
             });
         }
 
@@ -70,74 +74,81 @@ class PurchaseController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:100',
-            'supplier_id' => 'nullable|integer',
-            'supplier_name' => 'required|string|max:255',
-            'warehouse_name' => 'required|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'date' => 'required|string',
-            'status' => 'nullable|string|in:Received,Pending,Ordered',
-            'tax_rate' => 'nullable|numeric|min:0',
-            'tax_amount' => 'nullable|numeric|min:0',
-            'discount' => 'nullable|numeric|min:0',
-            'shipping' => 'nullable|numeric|min:0',
-            'grand_total' => 'required|numeric|min:0',
-            'paid_amount' => 'nullable|numeric|min:0',
-            'payment_type' => 'nullable|string',
-            'notes' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'items' => 'required|array|min:1',
-            'items.*.product_id' => 'nullable|integer',
-            'items.*.product_variant_id' => 'nullable|integer',
-            'items.*.unit_id' => 'nullable|integer',
-            'items.*.unit_name' => 'nullable|string|max:100',
-            'items.*.conversion_rate' => 'nullable|numeric|gt:0',
-            'items.*.base_quantity' => 'nullable|numeric|min:0',
-            'items.*.base_unit_cost' => 'nullable|numeric|min:0',
-            'items.*.product_code' => 'required|string',
-            'items.*.product_name' => 'required|string',
-            'items.*.unit_cost' => 'required|numeric|min:0',
-            'items.*.quantity' => 'required|numeric|min:0.01',
-            'items.*.tax' => 'nullable|numeric|min:0',
-            'items.*.discount' => 'nullable|numeric|min:0',
-            'items.*.subtotal' => 'required|numeric|min:0',
+            'reference_no'              => 'nullable|string|max:100',
+            'supplier_id'               => 'nullable|integer',
+            'supplier_name'             => 'required|string|max:255',
+            'warehouse_name'            => 'required|string|max:255',
+            'warehouse_id'              => 'nullable|integer',
+            'date'                      => 'required|string',
+            'status'                    => 'nullable|string|in:Received,Pending,Ordered',
+            'payment_status'            => 'nullable|string|in:Paid,Unpaid,Partial',
+            'tax_rate'                  => 'nullable|numeric|min:0',
+            'tax_amount'                => 'nullable|numeric|min:0',
+            'discount'                  => 'nullable|numeric|min:0',
+            'shipping'                  => 'nullable|numeric|min:0',
+            'grand_total'               => 'required|numeric|min:0',
+            'paid_amount'               => 'nullable|numeric|min:0',
+            'payment_type'              => 'nullable|string',
+            'notes'                     => 'nullable|string',
+            'created_by'                => 'nullable|string|max:255',
+            'items'                     => 'required|array|min:1',
+            'items.*.product_id'        => 'nullable|integer',
+            'items.*.product_variant_id'=> 'nullable|integer',
+            'items.*.unit_id'           => 'nullable|integer',
+            'items.*.unit_name'         => 'nullable|string|max:100',
+            'items.*.conversion_rate'   => 'nullable|numeric|gt:0',
+            'items.*.base_quantity'     => 'nullable|numeric|min:0',
+            'items.*.base_unit_cost'    => 'nullable|numeric|min:0',
+            'items.*.product_code'      => 'required|string',
+            'items.*.product_name'      => 'required|string',
+            'items.*.unit_cost'         => 'required|numeric|min:0',
+            'items.*.quantity'          => 'required|numeric|min:0.01',
+            'items.*.tax'               => 'nullable|numeric|min:0',
+            'items.*.discount'          => 'nullable|numeric|min:0',
+            'items.*.subtotal'          => 'required|numeric|min:0',
         ]);
 
         DB::beginTransaction();
         try {
-            $prefix = Setting::get('purchase_prefix', 'PO_');
-            $refNo = !empty($validated['reference_no'])
-                ? $validated['reference_no']
-                : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
+            $rawRef = trim((string)($validated['reference_no'] ?? ''));
+            $digitsOnly = preg_replace('/[^0-9]/', '', $rawRef);
+            $refNo = !empty($digitsOnly)
+                ? $digitsOnly
+                : Purchase::generateNextNumericReference();
             $grandTotal = (float)$validated['grand_total'];
             $paidAmount = (float)($validated['paid_amount'] ?? 0);
-            $dueAmount = max(0, $grandTotal - $paidAmount);
+            $dueAmount  = max(0, $grandTotal - $paidAmount);
 
-            $paymentStatus = 'Unpaid';
-            if ($paidAmount >= $grandTotal && $grandTotal > 0) {
+            // Honour explicit payment_status from frontend; fall back to amount-based logic
+            if (!empty($validated['payment_status'])) {
+                $paymentStatus = $validated['payment_status'];
+            } elseif ($paidAmount >= $grandTotal && $grandTotal > 0) {
                 $paymentStatus = 'Paid';
             } elseif ($paidAmount > 0) {
                 $paymentStatus = 'Partial';
+            } else {
+                $paymentStatus = 'Unpaid';
             }
 
             $purchase = Purchase::create([
-                'reference_no' => $refNo,
-                'supplier_id' => $validated['supplier_id'] ?? null,
-                'supplier_name' => $validated['supplier_name'],
+                'reference_no'   => $refNo,
+                'supplier_id'    => $validated['supplier_id'] ?? null,
+                'supplier_name'  => $validated['supplier_name'],
+                'warehouse_id'   => $validated['warehouse_id'] ?? null,
                 'warehouse_name' => $validated['warehouse_name'],
-                'date' => $validated['date'],
-                'status' => $validated['status'] ?? 'Received',
-                'tax_rate' => (float)($validated['tax_rate'] ?? 0),
-                'tax_amount' => (float)($validated['tax_amount'] ?? 0),
-                'discount' => (float)($validated['discount'] ?? 0),
-                'shipping' => (float)($validated['shipping'] ?? 0),
-                'grand_total' => $grandTotal,
-                'paid_amount' => $paidAmount,
-                'due_amount' => $dueAmount,
+                'date'           => $validated['date'],
+                'status'         => $validated['status'] ?? 'Received',
+                'tax_rate'       => (float)($validated['tax_rate'] ?? 0),
+                'tax_amount'     => (float)($validated['tax_amount'] ?? 0),
+                'discount'       => (float)($validated['discount'] ?? 0),
+                'shipping'       => (float)($validated['shipping'] ?? 0),
+                'grand_total'    => $grandTotal,
+                'paid_amount'    => $paidAmount,
+                'due_amount'     => $dueAmount,
                 'payment_status' => $paymentStatus,
-                'payment_type' => $validated['payment_type'] ?? 'Cash',
-                'notes' => $validated['notes'] ?? null,
-                'created_by' => $validated['created_by'] ?? 'Admin User',
+                'payment_type'   => $validated['payment_type'] ?? ($paymentStatus === 'Unpaid' ? 'N/A' : 'Cash'),
+                'notes'          => $validated['notes'] ?? null,
+                'created_by'     => $validated['created_by'] ?? 'Admin User',
             ]);
 
             $unitService = app(ProductUnitConversionService::class);
@@ -227,7 +238,9 @@ class PurchaseController extends Controller
         }
 
         $validated = $request->validate([
+            'supplier_id' => 'nullable|integer',
             'supplier_name' => 'nullable|string|max:255',
+            'warehouse_id' => 'nullable|integer',
             'warehouse_name' => 'nullable|string|max:255',
             'date' => 'nullable|string',
             'status' => 'nullable|string|in:Received,Pending,Ordered',

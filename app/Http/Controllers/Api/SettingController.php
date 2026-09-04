@@ -69,7 +69,6 @@ class SettingController extends Controller
         $data = $request->all();
 
         $prefixModelMap = [
-            'purchase_prefix' => Purchase::class,
             'purchase_return_prefix' => PurchaseReturn::class,
             'sale_prefix' => Sale::class,
             'sale_return_prefix' => SaleReturn::class,

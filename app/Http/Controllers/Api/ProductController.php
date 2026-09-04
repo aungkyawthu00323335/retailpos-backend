@@ -43,7 +43,11 @@ class ProductController extends Controller
             // Products that already have image_url set do not need the extra
             // JOIN on product_images — this eliminates N eager-load queries for
             // catalogs that were migrated with the legacy image_url column.
-            ->with(['primaryImage:id,product_id,disk,path,is_primary,sort_order']);
+            ->with([
+                'primaryImage:id,product_id,disk,path,is_primary,sort_order',
+                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
+                'variants.values:id,product_variant_id,attribute_name,attribute_value',
+            ]);
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
@@ -52,8 +56,18 @@ class ProductController extends Controller
                   ->orWhere('sku', 'like', "%{$search}%")
                   ->orWhere('barcode', 'like', "%{$search}%")
                   ->orWhere('name', 'like', "%{$search}%")
+                  ->orWhere('alternative_name', 'like', "%{$search}%")
                   ->orWhere('brand_name', 'like', "%{$search}%")
-                  ->orWhere('category_name', 'like', "%{$search}%");
+                  ->orWhere('category_name', 'like', "%{$search}%")
+                  ->orWhereHas('variants', function ($vq) use ($search) {
+                      $vq->where('name', 'like', "%{$search}%")
+                         ->orWhere('sku', 'like', "%{$search}%")
+                         ->orWhere('barcode', 'like', "%{$search}%")
+                         ->orWhereHas('values', function ($valQ) use ($search) {
+                             $valQ->where('attribute_value', 'like', "%{$search}%")
+                                  ->orWhere('attribute_name', 'like', "%{$search}%");
+                         });
+                  });
             });
         }
 
@@ -106,6 +120,10 @@ class ProductController extends Controller
         // Cache-Control: private (user-specific data), max-age matches the
         //   Flutter client's _pageCacheTtl so downstream caches stay in sync.
         $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}") . '"';
+
+        if ($request->header('If-None-Match') === $etag) {
+            return response(null, 304)->header('ETag', $etag);
+        }
 
         return response()->json([
             'status'     => 'success',
@@ -206,25 +224,49 @@ class ProductController extends Controller
 
     public function checkIdentifier(Request $request)
     {
-        $sku = $request->input('sku');
-        $barcode = $request->input('barcode');
+        $sku = trim((string)$request->input('sku', ''));
+        $barcode = trim((string)$request->input('barcode', ''));
+        $ignoreId = $request->input('ignore_id') ?: $request->input('product_id');
+        $ignoreVariantId = $request->input('ignore_variant_id') ?: $request->input('variant_id');
 
         $isAvailable = true;
         $reason = null;
 
-        if (!empty($sku)) {
-            $exists = Product::where('code', $sku)->orWhere('sku', $sku)->exists() ||
-                      ProductVariant::where('sku', $sku)->exists();
-            if ($exists) {
+        if ($sku !== '') {
+            $productQuery = Product::withTrashed()->where(function ($q) use ($sku) {
+                $q->where('code', $sku)->orWhere('sku', $sku);
+            });
+            if (!empty($ignoreId)) {
+                $productQuery->where('id', '!=', $ignoreId);
+            }
+            $existsInProducts = $productQuery->exists();
+
+            $variantQuery = ProductVariant::withTrashed()->where('sku', $sku);
+            if (!empty($ignoreVariantId)) {
+                $variantQuery->where('id', '!=', $ignoreVariantId);
+            }
+            $existsInVariants = $variantQuery->exists();
+
+            if ($existsInProducts || $existsInVariants) {
                 $isAvailable = false;
-                $reason = 'SKU is already taken.';
+                $reason = 'Product Code / ID is already in use.';
             }
         }
 
-        if ($isAvailable && !empty($barcode)) {
-            $exists = Product::where('barcode', $barcode)->orWhere('code', $barcode)->exists() ||
-                      ProductVariant::where('barcode', $barcode)->exists();
-            if ($exists) {
+        if ($isAvailable && $barcode !== '') {
+            $productQuery = Product::withTrashed()->where('barcode', $barcode);
+            if (!empty($ignoreId)) {
+                $productQuery->where('id', '!=', $ignoreId);
+            }
+            $existsInProducts = $productQuery->exists();
+
+            $variantQuery = ProductVariant::withTrashed()->where('barcode', $barcode);
+            if (!empty($ignoreVariantId)) {
+                $variantQuery->where('id', '!=', $ignoreVariantId);
+            }
+            $existsInVariants = $variantQuery->exists();
+
+            if ($existsInProducts || $existsInVariants) {
                 $isAvailable = false;
                 $reason = 'Barcode is already in use.';
             }
@@ -470,32 +512,42 @@ class ProductController extends Controller
     public function downloadTemplate()
     {
         $headers = [
-            'Content-Type' => 'text/csv',
-            'Content-Disposition' => 'attachment; filename="product_import_template.csv"',
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="product_import_template_utf8.csv"',
         ];
 
         $columns = [
-            'code', 'name', 'brand_name', 'category_name', 'sub_category_name',
-            'unit_name', 'purchase_unit', 'sale_unit', 'purchase_price',
-            'retail_price', 'stock_quantity', 'alert_quantity', 'status'
+            'Product Type', 'Product Code', 'Product Name', 'Alternative Name (မြန်မာ)',
+            'Category', 'Brand', 'Base Unit', 'Purchase Unit', 'Sale Unit', 'Purchase Unit Links', 'Sale Unit Links',
+            'Product Cost', 'Retail Price', 'Wholesale Price', 'Stock Alert',
+            'Variation Name', 'Variation Type', 'Variation Code', 'Stock Qty', 'Status'
         ];
 
-        $sampleRow = [
-            'PRD-0001', 'Sample Nike Shoe', 'Nike', 'Footwear & Shoes', 'Running',
-            'Pair', 'Pair', 'Pair', '65.00', '120.00', '50', '10', 'Active'
+        $sampleRows = [
+            ['Single', '10001', 'Classic Cheeseburger Deluxe', 'ချိစ်ဘာဂါ (Classic)', 'Main Dishes', 'Burger Club', 'Plate', 'Plate', 'Plate', '', 'Box:10, Plate:1', '4500', '8500, 8000, 7500', '7500, 7000', '10', '', '', '10001', '50', 'Active'],
+            ['Single', '10002', 'Spicy Seafood Fried Rice', 'ပင်လယ်စာ ထမင်းကြော်စပ်စပ်', 'Rice Dishes', 'Chef Special', 'Plate', 'Plate', 'Plate', '', 'Plate:1', '3500', '7000, 6500', '6000, 5500', '15', '', '', '10002', '40', 'Active'],
+            ['Variation', '10428', 'Cyan Sports Jersey', 'အားကစားအင်္ကျီ (Cyan)', 'Apparel', 'Adidas', 'Piece', 'Box', 'Piece', 'Box:20, Piece:1', 'Box:20, Pack:5, Piece:1', '5000', '12000, 11000, 10000', '10000, 9500', '10', 'cyan', 'cyan - 44', '1042801', '20', 'Active'],
+            ['Variation', '10428', 'Cyan Sports Jersey', 'အားကစားအင်္ကျီ (Cyan)', 'Apparel', 'Adidas', 'Piece', 'Box', 'Piece', 'Box:20, Piece:1', 'Box:20, Pack:5, Piece:1', '5000', '12000, 11000, 10000', '10000, 9500', '10', 'cyan', 'cyan - 33', '1042802', '25', 'Active'],
+            ['Variation', '10408', 'Premium Cotton Polo T-Shirt', 'ပိုလိုတီရှပ်', 'Apparel', 'Polo Classic', 'Piece', 'Box', 'Piece', 'Box:24, Piece:1', 'Box:24, Pack:6, Piece:1', '5000', '12000, 11500', '10000, 9500', '10', 'Color', 'Red', '1040801', '20', 'Active'],
+            ['Variation', '10408', 'Premium Cotton Polo T-Shirt', 'ပိုလိုတီရှပ်', 'Apparel', 'Polo Classic', 'Piece', 'Box', 'Piece', 'Box:24, Piece:1', 'Box:24, Pack:6, Piece:1', '5000', '12000, 11500', '10000, 9500', '10', 'Color', 'Blue', '1040802', '25', 'Active'],
+            ['Variation', '10408', 'Premium Cotton Polo T-Shirt', 'ပိုလိုတီရှပ်', 'Apparel', 'Polo Classic', 'Piece', 'Box', 'Piece', 'Box:24, Piece:1', 'Box:24, Pack:6, Piece:1', '5000', '12000, 11500', '10000, 9500', '10', 'Color', 'Black', '1040803', '30', 'Active'],
         ];
 
-        $callback = function () use ($columns, $sampleRow) {
+        $callback = function () use ($columns, $sampleRows) {
             $file = fopen('php://output', 'w');
+            // Write UTF-8 BOM for Microsoft Excel on Windows
+            fwrite($file, "\xEF\xBB\xBF");
             fputcsv($file, $columns);
-            fputcsv($file, $sampleRow);
+            foreach ($sampleRows as $row) {
+                fputcsv($file, $row);
+            }
             fclose($file);
         };
 
         return response()->stream($callback, 200, $headers);
     }
 
-    public function bulkImport(Request $request)
+    public function bulkImport(Request $request, ProductCreateService $createService)
     {
         $items    = $request->input('products', []);
         $strategy = $request->input('duplicate_strategy', 'update');
@@ -507,76 +559,38 @@ class ProductController extends Controller
             ], 400);
         }
 
-        // ── Validate + partition rows ──────────────────────────────────────
-        $valid   = [];
-        $skipped = 0;
+        $imported = 0;
+        $updated  = 0;
+        $skipped  = 0;
 
         foreach ($items as $item) {
             $code = trim($item['code'] ?? '');
-            if (empty($code) || empty(trim($item['name'] ?? ''))) {
+            $name = trim($item['name'] ?? '');
+            if (empty($code) || empty($name)) {
                 $skipped++;
                 continue;
             }
-            $item['code'] = $code;
-            $valid[] = $item;
-        }
 
-        if (empty($valid)) {
-            return response()->json([
-                'status'  => 'error',
-                'message' => 'All rows were invalid or missing required fields.',
-                'summary' => ['imported' => 0, 'updated' => 0, 'skipped' => $skipped],
-            ], 422);
-        }
+            $existing = Product::where('code', $code)->orWhere('sku', $code)->first();
 
-        // ── Single batch lookup — replaces N individual WHERE code = ? queries ──
-        $codes        = array_column($valid, 'code');
-        $existingMap  = Product::withTrashed()
-            ->whereIn('code', $codes)
-            ->pluck('id', 'code')
-            ->toArray();
-
-        $toInsert  = [];
-        $toUpdate  = [];   // only used when strategy === 'update'
-        $imported  = 0;
-        $updated   = 0;
-        $now       = now();
-
-        foreach ($valid as $item) {
-            $code = $item['code'];
-            if (isset($existingMap[$code])) {
+            if ($existing) {
                 if ($strategy === 'skip') {
                     $skipped++;
                     continue;
                 }
-                // Accumulate update rows — upsert() will handle them in one query.
-                $item['updated_at'] = $now;
-                $toUpdate[] = $item;
+                if ($strategy === 'auto_code') {
+                    $item['code'] = $createService->generateNextSku();
+                    $item['sku'] = $item['code'];
+                    $createService->create($item);
+                    $imported++;
+                    continue;
+                }
+                // Update existing product
+                $createService->update($existing, $item);
+                $updated++;
             } else {
-                $item['created_at'] = $now;
-                $item['updated_at'] = $now;
-                $toInsert[]  = $item;
-            }
-        }
-
-        // ── Batch INSERT (new records) ─────────────────────────────────────
-        if (!empty($toInsert)) {
-            // Chunk to avoid hitting SQLite/MySQL placeholder limits (999/65535).
-            foreach (array_chunk($toInsert, 50) as $chunk) {
-                Product::insert($chunk);
-                $imported += count($chunk);
-            }
-        }
-
-        // ── Batch UPSERT (existing records to update) ──────────────────────
-        if (!empty($toUpdate)) {
-            $updateCols = array_keys(reset($toUpdate));
-            // Remove the unique key column from the update list.
-            $updateCols = array_filter($updateCols, fn($c) => $c !== 'code');
-
-            foreach (array_chunk($toUpdate, 50) as $chunk) {
-                Product::upsert($chunk, ['code'], array_values($updateCols));
-                $updated += count($chunk);
+                $createService->create($item);
+                $imported++;
             }
         }
 
