@@ -613,6 +613,17 @@ class ProductController extends Controller
             return $single > 0 ? $formatNum($single) : '0';
         };
 
+        $formatBarcode = function ($code) {
+            $code = trim((string)$code);
+            if ($code === '') return '';
+            // If code has 10 or more digits or starts with 0 followed by digits, format as ="<code>"
+            // so Microsoft Excel displays it as exact text instead of scientific notation (e.g. 8.93E+12)
+            if (preg_match('/^\d{10,}$/', $code) || (strlen($code) > 1 && $code[0] === '0' && ctype_digit($code))) {
+                return '="' . $code . '"';
+            }
+            return $code;
+        };
+
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="products_export_' . date('Ymd_His') . '.csv"',
@@ -621,7 +632,7 @@ class ProductController extends Controller
             'Expires' => '0',
         ];
 
-        $callback = function () use ($columns, $products, $formatNum, $formatPriceList) {
+        $callback = function () use ($columns, $products, $formatNum, $formatPriceList, $formatBarcode) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
@@ -651,6 +662,7 @@ class ProductController extends Controller
                 $category = $product->category_name ?: 'General';
                 $brand = $product->brand_name ?: 'Generic';
                 $status = $product->status ?: ($product->is_active ? 'Active' : 'Inactive');
+                $pCodeFormatted = $formatBarcode($product->code);
 
                 if ($product->has_variants && $product->variants->isNotEmpty()) {
                     foreach ($product->variants as $variant) {
@@ -683,10 +695,11 @@ class ProductController extends Controller
 
                         $vCode = $variant->sku ?: ($variant->barcode ?: $product->code);
                         $vStockStr = $formatNum($variant->stock_quantity);
+                        $vCodeFormatted = $formatBarcode($vCode);
 
                         fputcsv($file, [
                             'Variation',
-                            $product->code,
+                            $pCodeFormatted,
                             $product->name,
                             $product->alternative_name ?? '',
                             $category,
@@ -702,7 +715,7 @@ class ProductController extends Controller
                             $alertStr,
                             $varName,
                             $varType,
-                            $vCode,
+                            $vCodeFormatted,
                             $vStockStr,
                             $variant->is_active ? $status : 'Inactive',
                         ]);
@@ -715,7 +728,7 @@ class ProductController extends Controller
 
                     fputcsv($file, [
                         'Single',
-                        $product->code,
+                        $pCodeFormatted,
                         $product->name,
                         $product->alternative_name ?? '',
                         $category,
@@ -731,7 +744,7 @@ class ProductController extends Controller
                         $alertStr,
                         '',
                         '',
-                        $product->code,
+                        $pCodeFormatted,
                         $pStockStr,
                         $status,
                     ]);
@@ -756,16 +769,42 @@ class ProductController extends Controller
             ], 400);
         }
 
+        $cleanBarcode = function ($val) {
+            $val = trim((string)$val);
+            if (str_starts_with($val, '="') && str_ends_with($val, '"')) {
+                return substr($val, 2, -1);
+            }
+            if (str_starts_with($val, '=')) {
+                return trim(ltrim($val, '='), '"\'');
+            }
+            return $val;
+        };
+
         $imported = 0;
         $updated  = 0;
         $skipped  = 0;
 
         foreach ($items as $item) {
-            $code = trim($item['code'] ?? '');
+            $code = $cleanBarcode($item['code'] ?? '');
             $name = trim($item['name'] ?? '');
             if (empty($code) || empty($name)) {
                 $skipped++;
                 continue;
+            }
+
+            $item['code'] = $code;
+            if (!empty($item['sku'])) {
+                $item['sku'] = $cleanBarcode($item['sku']);
+            }
+            if (!empty($item['barcode'])) {
+                $item['barcode'] = $cleanBarcode($item['barcode']);
+            }
+            if (!empty($item['variants']) && is_array($item['variants'])) {
+                foreach ($item['variants'] as &$v) {
+                    if (!empty($v['sku'])) $v['sku'] = $cleanBarcode($v['sku']);
+                    if (!empty($v['barcode'])) $v['barcode'] = $cleanBarcode($v['barcode']);
+                }
+                unset($v);
             }
 
             $existing = Product::where('code', $code)->orWhere('sku', $code)->first();

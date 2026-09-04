@@ -30,11 +30,27 @@ class ProductCreateService
             return DB::transaction(function () use ($data, $uploadedFiles, &$savedFilePaths) {
                 // 1. Resolve & Auto-generate SKU & Barcode
                 $sku = $data['sku'] ?? $data['code'] ?? null;
+                if (is_string($sku)) {
+                    $sku = trim($sku);
+                    if (str_starts_with($sku, '="') && str_ends_with($sku, '"')) {
+                        $sku = substr($sku, 2, -1);
+                    } elseif (str_starts_with($sku, '=')) {
+                        $sku = trim(ltrim($sku, '='), '"\'');
+                    }
+                }
                 if (empty($sku) || !empty($data['auto_generate_sku'])) {
                     $sku = $this->generateNextSku();
                 }
 
                 $barcode = $data['barcode'] ?? null;
+                if (is_string($barcode)) {
+                    $barcode = trim($barcode);
+                    if (str_starts_with($barcode, '="') && str_ends_with($barcode, '"')) {
+                        $barcode = substr($barcode, 2, -1);
+                    } elseif (str_starts_with($barcode, '=')) {
+                        $barcode = trim(ltrim($barcode, '='), '"\'');
+                    }
+                }
                 if (empty($barcode) && !empty($data['auto_generate_barcode'])) {
                     $barcode = $this->generateNextBarcode();
                 }
