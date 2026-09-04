@@ -239,4 +239,185 @@ class AdjustmentEnterpriseTest extends TestCase
 
         $res->assertStatus(422);
     }
+
+    /**
+     * Test 7: Store adjustment with both Single product and Variation product updates StockBalance per warehouse
+     */
+    public function test_store_adjustment_with_single_and_variation_items_updates_warehouse_stock_balances(): void
+    {
+        $warehouse = \App\Models\Outlet::create([
+            'name' => 'Main Warehouse Branch',
+            'is_active' => true,
+        ]);
+
+        // 1. Single Product
+        $singleProduct = Product::create([
+            'code' => 'PROD-SINGLE-001',
+            'name' => 'Standard Backpack',
+            'cost_price' => 20.0,
+            'price' => 45.0,
+            'stock_quantity' => 10.0,
+            'low_qty' => 2.0,
+            'product_unit' => 'Piece',
+            'barcode_symbol' => 'CODE128',
+            'has_variants' => false,
+        ]);
+
+        // 2. Variable Product with Variation
+        $variableProduct = Product::create([
+            'code' => 'PROD-VAR-001',
+            'name' => 'Cotton T-Shirt',
+            'cost_price' => 10.0,
+            'price' => 25.0,
+            'stock_quantity' => 30.0,
+            'low_qty' => 5.0,
+            'product_unit' => 'Piece',
+            'barcode_symbol' => 'CODE128',
+            'has_variants' => true,
+        ]);
+
+        $variant = \App\Models\ProductVariant::create([
+            'product_id' => $variableProduct->id,
+            'name' => 'Red / XL',
+            'sku' => 'TSHIRT-RED-XL',
+            'barcode' => '893000000001',
+            'cost_price' => 12.0,
+            'selling_price' => 28.0,
+            'is_active' => true,
+        ]);
+
+        // Seed initial warehouse balances
+        \App\Models\StockBalance::create([
+            'warehouse_id' => $warehouse->id,
+            'product_id' => $singleProduct->id,
+            'product_variant_id' => null,
+            'quantity' => 10.0,
+        ]);
+
+        \App\Models\StockBalance::create([
+            'warehouse_id' => $warehouse->id,
+            'product_id' => $variableProduct->id,
+            'product_variant_id' => $variant->id,
+            'quantity' => 30.0,
+        ]);
+
+        // Create adjustment: Single product (+5), Variation product (-8)
+        $payload = [
+            'reference_no' => 'ADJ-COMBO-001',
+            'warehouse_name' => $warehouse->name,
+            'date' => '2026-09-05',
+            'type' => 'Addition',
+            'notes' => 'Testing combo adjustment of single and variation items',
+            'items' => [
+                [
+                    'product_id' => $singleProduct->id,
+                    'product_code' => $singleProduct->code,
+                    'product_name' => $singleProduct->name,
+                    'quantity' => 5.0,
+                    'type' => 'Addition',
+                    'unit_cost' => 20.0,
+                ],
+                [
+                    'product_id' => $variableProduct->id,
+                    'product_variant_id' => $variant->id,
+                    'variant_name' => $variant->name,
+                    'product_code' => $variant->sku,
+                    'product_name' => $variableProduct->name,
+                    'quantity' => 8.0,
+                    'type' => 'Subtraction',
+                    'unit_cost' => 12.0,
+                ],
+            ],
+        ];
+
+        $response = $this->postJson('/api/adjustments', $payload);
+        $response->assertStatus(201);
+        $response->assertJsonPath('status', 'success');
+        $response->assertJsonCount(2, 'data.items');
+
+        // Verify Single Product warehouse balance (10 + 5 = 15)
+        $singleBalance = \App\Models\StockBalance::where('warehouse_id', $warehouse->id)
+            ->where('product_id', $singleProduct->id)
+            ->whereNull('product_variant_id')
+            ->first();
+        $this->assertNotNull($singleBalance);
+        $this->assertEquals(15.0, (float)$singleBalance->quantity);
+
+        // Verify Variation Product warehouse balance (30 - 8 = 22)
+        $variantBalance = \App\Models\StockBalance::where('warehouse_id', $warehouse->id)
+            ->where('product_id', $variableProduct->id)
+            ->where('product_variant_id', $variant->id)
+            ->first();
+        $this->assertNotNull($variantBalance);
+        $this->assertEquals(22.0, (float)$variantBalance->quantity);
+
+        // Verify StockMovements created
+        $this->assertDatabaseHas('stock_movements', [
+            'product_id' => $singleProduct->id,
+            'warehouse_id' => $warehouse->id,
+            'movement_type' => 'adjustment',
+            'reference_type' => 'stock_adjustment',
+        ]);
+
+        $this->assertDatabaseHas('stock_movements', [
+            'product_id' => $variableProduct->id,
+            'product_variant_id' => $variant->id,
+            'warehouse_id' => $warehouse->id,
+            'movement_type' => 'adjustment',
+            'reference_type' => 'stock_adjustment',
+        ]);
+    }
+
+    /**
+     * Test 10: Store adjustment with string created_by resolves to integer or null for StockMovement
+     */
+    public function test_store_adjustment_with_string_created_by_resolves_integer_stock_movement(): void
+    {
+        $user = \App\Models\User::factory()->create([
+            'name' => 'Admin User',
+            'email' => 'admin@pos.com',
+        ]);
+
+        $product = Product::create([
+            'code' => 'ADJ-USER-TEST',
+            'name' => 'Adjustment User Test Product',
+            'cost_price' => 50.0,
+            'price' => 100.0,
+            'stock_quantity' => 10.0,
+            'low_qty' => 2.0,
+            'product_unit' => 'Piece',
+            'barcode_symbol' => 'CODE128',
+        ]);
+
+        $payload = [
+            'reference_no' => 'ADJ-USER-001',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-09-05',
+            'type' => 'Addition',
+            'created_by' => 'Admin User',
+            'items' => [
+                [
+                    'product_id' => $product->id,
+                    'product_code' => $product->code,
+                    'product_name' => $product->name,
+                    'quantity' => 5.0,
+                    'type' => 'Addition',
+                    'unit_cost' => 50.0,
+                ],
+            ],
+        ];
+
+        $response = $this->postJson('/api/adjustments', $payload);
+        $response->assertStatus(201);
+
+        $movement = \App\Models\StockMovement::where('product_id', $product->id)
+            ->where('movement_type', 'adjustment')
+            ->first();
+
+        $this->assertNotNull($movement);
+        $this->assertEquals($user->id, $movement->created_by);
+        $this->assertIsNumeric($movement->created_by);
+    }
 }
+
+

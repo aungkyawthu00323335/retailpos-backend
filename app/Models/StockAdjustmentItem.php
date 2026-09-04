@@ -12,14 +12,18 @@ class StockAdjustmentItem extends Model
     protected $fillable = [
         'stock_adjustment_id',
         'product_id',
+        'product_variant_id',
         'product_code',
         'product_name',
+        'variant_name',
         'quantity',
         'type', // Addition, Subtraction
         'unit_cost',
     ];
 
     protected $casts = [
+        'product_id' => 'integer',
+        'product_variant_id' => 'integer',
         'quantity' => 'float',
         'unit_cost' => 'float',
     ];
@@ -32,5 +36,10 @@ class StockAdjustmentItem extends Model
     public function product()
     {
         return $this->belongsTo(Product::class, 'product_id');
+    }
+
+    public function variant()
+    {
+        return $this->belongsTo(ProductVariant::class, 'product_variant_id');
     }
 }
