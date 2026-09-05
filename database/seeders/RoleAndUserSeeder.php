@@ -43,84 +43,8 @@ class RoleAndUserSeeder extends Seeder
             ]
         );
 
-        $manager = Role::updateOrCreate(
-            ['slug' => 'manager'],
-            [
-                'name' => 'Store Manager',
-                'description' => 'Branch operations, store staff management, retail pricing, purchasing & sales analytics.',
-                'color' => '#2563EB',
-                'permissions' => [
-                    'Dashboard',
-                    'POS Terminal',
-                    'Products & Barcode',
-                    'Brands & Categories',
-                    'Sales & Returns',
-                    'Quotations',
-                    'Purchases & Returns',
-                    'Inventory Transfers & Adjustments',
-                    'Expenses',
-                    'Customers & CRM',
-                    'Suppliers',
-                    'Executive Reports',
-                ],
-                'is_default' => false,
-                'status' => 'Active',
-            ]
-        );
-
-        $cashier = Role::updateOrCreate(
-            ['slug' => 'cashier'],
-            [
-                'name' => 'Cashier',
-                'description' => 'POS counter cashier terminal, barcode scanning, tender payments checkout & receipt printing.',
-                'color' => '#059669',
-                'permissions' => [
-                    'POS Terminal',
-                    'Sales Receipts',
-                    'Quotations',
-                    'Customers & CRM',
-                ],
-                'is_default' => false,
-                'status' => 'Active',
-            ]
-        );
-
-        $warehouseManager = Role::updateOrCreate(
-            ['slug' => 'warehouse_manager'],
-            [
-                'name' => 'Inventory & Warehouse Manager',
-                'description' => 'Multi-warehouse stock counts, physical audits, inter-branch transfers & barcode labels.',
-                'color' => '#D97706',
-                'permissions' => [
-                    'Dashboard',
-                    'Products & Barcode',
-                    'Brands & Categories',
-                    'Purchases & Returns',
-                    'Inventory Transfers & Adjustments',
-                    'Suppliers',
-                    'Executive Reports',
-                ],
-                'is_default' => false,
-                'status' => 'Active',
-            ]
-        );
-
-        $purchasing = Role::updateOrCreate(
-            ['slug' => 'purchasing_officer'],
-            [
-                'name' => 'Procurement Officer',
-                'description' => 'Vendor purchase orders, goods receiving restock & supplier account balances.',
-                'color' => '#E11D48',
-                'permissions' => [
-                    'Purchases & Returns',
-                    'Suppliers',
-                    'Products & Barcode',
-                    'Executive Reports',
-                ],
-                'is_default' => false,
-                'status' => 'Active',
-            ]
-        );
+        // Delete any legacy non-super-admin roles so only Super Admin exists initially
+        Role::where('slug', '!=', 'super_admin')->delete();
 
         // 2. Seed ONLY ONE Super Admin User (as requested)
         $admin = User::updateOrCreate(
