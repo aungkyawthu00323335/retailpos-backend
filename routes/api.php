@@ -29,12 +29,18 @@ use App\Http\Controllers\Api\ReportController;
 use App\Http\Controllers\Api\SettingController;
 use App\Http\Controllers\Api\CurrencyController;
 use App\Http\Controllers\Api\VariationController;
+use App\Http\Controllers\Api\AuthController;
 
 /*
 |--------------------------------------------------------------------------
 | Infy Retail POS API Routes
 |--------------------------------------------------------------------------
 */
+
+// Authentication & Session
+Route::post('login', [AuthController::class, 'login']);
+Route::post('logout', [AuthController::class, 'logout']);
+Route::get('me', [AuthController::class, 'me']);
 
 // Outlets & Warehouses
 Route::apiResource('outlets', OutletController::class);

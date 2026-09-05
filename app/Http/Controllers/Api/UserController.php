@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Outlet;
 use App\Models\Role;
 use App\Models\User;
 use Illuminate\Http\Request;
@@ -15,7 +16,7 @@ class UserController extends Controller
      */
     public function index(Request $request)
     {
-        $query = User::with('roleModel');
+        $query = User::with(['roleModel', 'outlets']);
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -36,7 +37,11 @@ class UserController extends Controller
             $query->where('branch', $request->input('branch'));
         }
 
-        $users = $query->orderBy('id', 'asc')->get();
+        $users = $query->orderBy('id', 'asc')->get()->map(function ($u) {
+            $u->is_super_admin = $u->isSuperAdmin();
+            $u->outlet_ids = $u->outlets->pluck('id')->toArray();
+            return $u;
+        });
 
         return response()->json([
             'status' => 'success',
@@ -61,6 +66,8 @@ class UserController extends Controller
             'role_id' => 'nullable|exists:roles,id',
             'role' => 'nullable|string|max:100',
             'branch' => 'nullable|string|max:255',
+            'outlet_ids' => 'nullable|array',
+            'outlet_ids.*' => 'exists:outlets,id',
             'avatar' => 'nullable|string',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
@@ -75,6 +82,15 @@ class UserController extends Controller
             }
         }
 
+        $outletIds = $validated['outlet_ids'] ?? [];
+        $branchName = $validated['branch'] ?? null;
+        if (empty($branchName) && !empty($outletIds)) {
+            $branchName = Outlet::whereIn('id', $outletIds)->pluck('name')->join(', ');
+        }
+        if (empty($branchName)) {
+            $branchName = 'Main Branch Outlet';
+        }
+
         $user = User::create([
             'name' => $validated['name'],
             'email' => $validated['email'],
@@ -82,15 +98,29 @@ class UserController extends Controller
             'password' => Hash::make($validated['password'] ?? 'password123'),
             'role_id' => $roleId,
             'role' => $roleName,
-            'branch' => $validated['branch'] ?? 'Main Branch Outlet',
+            'branch' => $branchName,
             'avatar' => $validated['avatar'] ?? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
             'status' => $validated['status'] ?? 'Active',
         ]);
 
+        if (!empty($outletIds)) {
+            $user->outlets()->sync($outletIds);
+        } else {
+            // Default to first active outlet if none provided
+            $defaultOutlet = Outlet::where('is_active', true)->first();
+            if ($defaultOutlet) {
+                $user->outlets()->sync([$defaultOutlet->id]);
+            }
+        }
+
+        $user->load(['roleModel', 'outlets']);
+        $user->is_super_admin = $user->isSuperAdmin();
+        $user->outlet_ids = $user->outlets->pluck('id')->toArray();
+
         return response()->json([
             'status' => 'success',
             'message' => 'User account created successfully',
-            'data' => $user->load('roleModel'),
+            'data' => $user,
         ], 201);
     }
 
@@ -99,7 +129,7 @@ class UserController extends Controller
      */
     public function show($id)
     {
-        $user = User::with('roleModel')->find($id);
+        $user = User::with(['roleModel', 'outlets'])->find($id);
 
         if (!$user) {
             return response()->json([
@@ -107,6 +137,9 @@ class UserController extends Controller
                 'message' => 'User account not found',
             ], 404);
         }
+
+        $user->is_super_admin = $user->isSuperAdmin();
+        $user->outlet_ids = $user->outlets->pluck('id')->toArray();
 
         return response()->json([
             'status' => 'success',
@@ -136,6 +169,8 @@ class UserController extends Controller
             'role_id' => 'nullable|exists:roles,id',
             'role' => 'nullable|string|max:100',
             'branch' => 'nullable|string|max:255',
+            'outlet_ids' => 'nullable|array',
+            'outlet_ids.*' => 'exists:outlets,id',
             'avatar' => 'nullable|string',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
@@ -153,12 +188,27 @@ class UserController extends Controller
             }
         }
 
+        if (array_key_exists('outlet_ids', $validated)) {
+            $outletIds = $validated['outlet_ids'] ?? [];
+            $user->outlets()->sync($outletIds);
+
+            if (!isset($validated['branch']) || empty($validated['branch'])) {
+                if (!empty($outletIds)) {
+                    $validated['branch'] = Outlet::whereIn('id', $outletIds)->pluck('name')->join(', ');
+                }
+            }
+        }
+
         $user->update($validated);
+
+        $user->load(['roleModel', 'outlets']);
+        $user->is_super_admin = $user->isSuperAdmin();
+        $user->outlet_ids = $user->outlets->pluck('id')->toArray();
 
         return response()->json([
             'status' => 'success',
             'message' => 'User account updated successfully',
-            'data' => $user->load('roleModel'),
+            'data' => $user,
         ]);
     }
 
@@ -176,6 +226,14 @@ class UserController extends Controller
             ], 404);
         }
 
+        if ($user->isSuperAdmin()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Super Admin user cannot be deleted.',
+            ], 422);
+        }
+
+        $user->outlets()->detach();
         $user->delete();
 
         return response()->json([

@@ -2,6 +2,7 @@
 
 namespace Database\Seeders;
 
+use App\Models\Outlet;
 use App\Models\Role;
 use App\Models\User;
 use Illuminate\Database\Seeder;
@@ -121,61 +122,23 @@ class RoleAndUserSeeder extends Seeder
             ]
         );
 
-        // 2. Seed Default Retail Staff Users
-        User::updateOrCreate(
+        // 2. Seed ONLY ONE Super Admin User (as requested)
+        $admin = User::updateOrCreate(
             ['email' => 'admin@infypos.com'],
             [
-                'name' => 'Admin Owner',
+                'name' => 'Super Admin',
                 'phone' => '+95 9 790 123 456',
                 'password' => Hash::make('admin123'),
                 'role_id' => $superAdmin->id,
                 'role' => 'Super Admin',
-                'branch' => 'Main Warehouse Branch',
+                'branch' => 'All Outlets & Warehouses',
                 'avatar' => 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
                 'status' => 'Active',
             ]
         );
 
-        User::updateOrCreate(
-            ['email' => 'manager@infypos.com'],
-            [
-                'name' => 'Daw Sandar Win (Manager)',
-                'phone' => '+95 9 795 234 567',
-                'password' => Hash::make('password123'),
-                'role_id' => $manager->id,
-                'role' => 'Store Manager',
-                'branch' => 'Downtown Store Branch',
-                'avatar' => 'https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150',
-                'status' => 'Active',
-            ]
-        );
-
-        User::updateOrCreate(
-            ['email' => 'cashier@infypos.com'],
-            [
-                'name' => 'Mg Kyaw Zin (POS Cashier)',
-                'phone' => '+95 9 799 345 678',
-                'password' => Hash::make('password123'),
-                'role_id' => $cashier->id,
-                'role' => 'Cashier',
-                'branch' => 'Downtown Store Branch',
-                'avatar' => 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150',
-                'status' => 'Active',
-            ]
-        );
-
-        User::updateOrCreate(
-            ['email' => 'warehouse@infypos.com'],
-            [
-                'name' => 'Ko Aung Myat (Stock Manager)',
-                'phone' => '+95 9 770 456 789',
-                'password' => Hash::make('password123'),
-                'role_id' => $warehouseManager->id,
-                'role' => 'Inventory & Warehouse Manager',
-                'branch' => 'Main Warehouse Branch',
-                'avatar' => 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150',
-                'status' => 'Active',
-            ]
-        );
+        // Attach all active outlets to Super Admin
+        $activeOutletIds = Outlet::where('is_active', true)->pluck('id')->toArray();
+        $admin->outlets()->sync($activeOutletIds);
     }
 }
