@@ -21,6 +21,35 @@ class ProductListResource extends JsonResource
             $imageUrl = $this->primaryImage->url;
         }
 
+        $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
+        $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
+            ? (int)$warehouseParam
+            : null;
+
+        $stockQty = (float)$this->stock_quantity;
+        if ($warehouseId !== null) {
+            if ($this->relationLoaded('stockBalances')) {
+                $stockQty = (float)$this->stockBalances->where('warehouse_id', $warehouseId)->sum('quantity');
+            } elseif ($this->relationLoaded('variants') && $this->variants->isNotEmpty()) {
+                $stockQty = (float)$this->variants->sum(function ($v) use ($warehouseId) {
+                    return $v->relationLoaded('stockBalances')
+                        ? $v->stockBalances->where('warehouse_id', $warehouseId)->sum('quantity')
+                        : 0.0;
+                });
+            }
+        } elseif ($this->relationLoaded('variants') && $this->variants->isNotEmpty()) {
+            $variantStockSum = $this->variants->sum(function ($v) {
+                return $v->relationLoaded('stockBalances')
+                    ? $v->stockBalances->sum('quantity')
+                    : 0.0;
+            });
+            if ($variantStockSum > 0 || ($this->variants->first() && $this->variants->first()->relationLoaded('stockBalances'))) {
+                $stockQty = (float)$variantStockSum;
+            }
+        } elseif ($this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()) {
+            $stockQty = (float)$this->stockBalances->sum('quantity');
+        }
+
         return [
             'id' => $this->id,
             'uuid' => $this->uuid,
@@ -51,7 +80,8 @@ class ProductListResource extends JsonResource
             'retail_prices' => $this->retail_prices ?? [],
             'wholesale_price' => (float)($this->wholesale_price ?? 0),
             'wholesale_prices' => $this->wholesale_prices ?? [],
-            'stock_quantity' => (float)$this->stock_quantity,
+            'stock_quantity' => $stockQty,
+            'stockQuantity' => $stockQty,
             'alert_quantity' => (float)($this->alert_quantity ?: $this->stock_alert),
             'stock_alert' => (float)($this->stock_alert ?: $this->alert_quantity),
             'low_qty' => (float)($this->low_qty ?: $this->stock_alert),

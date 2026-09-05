@@ -25,6 +25,11 @@ class ProductController extends Controller
 {
     public function index(Request $request)
     {
+        $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
+        $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
+            ? (int)$warehouseParam
+            : null;
+
         // The list only needs summary fields and the primary image. Full
         // variants/images/unit links are loaded by show() for Details/Edit.
         $query = Product::query()
@@ -47,6 +52,16 @@ class ProductController extends Controller
                 'primaryImage:id,product_id,disk,path,is_primary,sort_order',
                 'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
                 'variants.values:id,product_variant_id,attribute_name,attribute_value',
+                'variants.stockBalances' => function ($q) use ($warehouseId) {
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
+                'stockBalances' => function ($q) use ($warehouseId) {
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
             ]);
 
         if ($request->filled('search')) {
@@ -116,10 +131,10 @@ class ProductController extends Controller
         $items    = $paginator->getCollection();
 
         // ── HTTP caching headers ───────────────────────────────────────────
-        // ETag: changes whenever total count, page or per_page changes.
+        // ETag: changes whenever total count, page, per_page or warehouse filter changes.
         // Cache-Control: private (user-specific data), max-age matches the
         //   Flutter client's _pageCacheTtl so downstream caches stay in sync.
-        $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}") . '"';
+        $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all')) . '"';
 
         if ($request->header('If-None-Match') === $etag) {
             return response(null, 304)->header('ETag', $etag);
@@ -503,6 +518,7 @@ class ProductController extends Controller
         return [
             'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
             'variants.values:id,product_variant_id,variation_attribute_id,variation_value_id,attribute_name,attribute_value',
+            'variants.stockBalances.warehouse',
             'images:id,product_id,disk,path,original_name,is_primary,sort_order',
             'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
             'stockBalances.warehouse',

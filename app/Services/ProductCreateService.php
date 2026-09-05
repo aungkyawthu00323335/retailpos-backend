@@ -382,31 +382,67 @@ class ProductCreateService
                         $warehouseGroups[$wId] = [
                             'warehouse_id' => $wId,
                             'warehouse_name' => $wName,
-                            'items' => [
-                                [
+                            'items' => [],
+                        ];
+
+                        if ($hasVariants && !empty($createdVariants)) {
+                            $vCount = count($createdVariants);
+                            $qtyPerVar = round($qty / $vCount, 4);
+                            $baseQtyPerVar = round($baseQty / $vCount, 4);
+                            $vIdx = 0;
+                            foreach ($createdVariants as $vSku => $vModel) {
+                                $isLast = ($vIdx === $vCount - 1);
+                                $vBaseQty = $isLast ? ($baseQty - ($baseQtyPerVar * ($vCount - 1))) : $baseQtyPerVar;
+                                $vQty = $isLast ? ($qty - ($qtyPerVar * ($vCount - 1))) : $qtyPerVar;
+                                $vIdx++;
+
+                                $warehouseGroups[$wId]['items'][] = [
                                     'product_id' => $product->id,
-                                    'product_variant_id' => null,
-                                    'variant_sku' => null,
-                                    'product_code' => $product->code,
-                                    'product_name' => $product->name,
+                                    'product_variant_id' => $vModel->id,
+                                    'variant_sku' => $vModel->sku,
+                                    'product_code' => $vModel->sku,
+                                    'product_name' => $product->name . ' (' . $vModel->name . ')',
                                     'unit_id' => $resolvedUnit['unit_id'],
                                     'unit_name' => $resolvedUnit['unit_name'],
                                     'conversion_rate' => $conversionRate,
-                                    'quantity' => $qty,
-                                    'base_quantity' => $baseQty,
+                                    'quantity' => $vQty,
+                                    'base_quantity' => $vBaseQty,
                                     'unit_cost' => $itemCost,
                                     'base_unit_cost' => $baseUnitCost,
-                                    'subtotal' => $itemCost * $qty,
-                                ],
-                            ],
-                        ];
+                                    'subtotal' => $itemCost * $vQty,
+                                ];
 
-                        StockBalance::create([
-                            'warehouse_id' => $wId,
-                            'product_id' => $product->id,
-                            'product_variant_id' => null,
-                            'quantity' => $baseQty,
-                        ]);
+                                StockBalance::create([
+                                    'warehouse_id' => $wId,
+                                    'product_id' => $product->id,
+                                    'product_variant_id' => $vModel->id,
+                                    'quantity' => $vBaseQty,
+                                ]);
+                            }
+                        } else {
+                            $warehouseGroups[$wId]['items'][] = [
+                                'product_id' => $product->id,
+                                'product_variant_id' => null,
+                                'variant_sku' => null,
+                                'product_code' => $product->code,
+                                'product_name' => $product->name,
+                                'unit_id' => $resolvedUnit['unit_id'],
+                                'unit_name' => $resolvedUnit['unit_name'],
+                                'conversion_rate' => $conversionRate,
+                                'quantity' => $qty,
+                                'base_quantity' => $baseQty,
+                                'unit_cost' => $itemCost,
+                                'base_unit_cost' => $baseUnitCost,
+                                'subtotal' => $itemCost * $qty,
+                            ];
+
+                            StockBalance::create([
+                                'warehouse_id' => $wId,
+                                'product_id' => $product->id,
+                                'product_variant_id' => null,
+                                'quantity' => $baseQty,
+                            ]);
+                        }
 
                         $totalStock = $baseQty;
                     }
@@ -583,20 +619,23 @@ class ProductCreateService
                 $newStock = (float)$data['stock_quantity'];
                 $updates['stock_quantity'] = $newStock;
 
-                $warehouseId = $data['warehouse_id'] ?? $data['outlet_id'] ?? Outlet::query()->value('id') ?? 1;
-                $balance = StockBalance::where('product_id', $product->id)
-                    ->whereNull('product_variant_id')
-                    ->first();
-                if ($balance) {
-                    $balance->quantity = $newStock;
-                    $balance->save();
-                } else {
-                    StockBalance::create([
-                        'warehouse_id' => $warehouseId,
-                        'product_id' => $product->id,
-                        'product_variant_id' => null,
-                        'quantity' => $newStock,
-                    ]);
+                $hasVariants = (bool)($data['has_variants'] ?? $product->has_variants);
+                if (!$hasVariants) {
+                    $warehouseId = $data['warehouse_id'] ?? $data['outlet_id'] ?? Outlet::query()->value('id') ?? 1;
+                    $balance = StockBalance::where('product_id', $product->id)
+                        ->whereNull('product_variant_id')
+                        ->first();
+                    if ($balance) {
+                        $balance->quantity = $newStock;
+                        $balance->save();
+                    } else {
+                        StockBalance::create([
+                            'warehouse_id' => $warehouseId,
+                            'product_id' => $product->id,
+                            'product_variant_id' => null,
+                            'quantity' => $newStock,
+                        ]);
+                    }
                 }
             } else {
                 unset($updates['stock_quantity']);
