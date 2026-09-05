@@ -102,6 +102,7 @@ Route::apiResource('suppliers', SupplierController::class);
 Route::apiResource('supplier-categories', SupplierCategoryController::class);
 
 // Users & RBAC Roles
+Route::get('users/generate-id', [UserController::class, 'generateUserId']);
 Route::apiResource('users', UserController::class);
 Route::apiResource('roles', RoleController::class);
 

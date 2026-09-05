@@ -8,9 +8,30 @@ use App\Models\Role;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
 
 class UserController extends Controller
 {
+    /**
+     * Generate the next sequential numeric user ID (numbers only).
+     */
+    public function generateUserId(Request $request)
+    {
+        $maxNum = User::whereNotNull('user_id')
+            ->where('user_id', 'REGEXP', '^[0-9]+$')
+            ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
+            ->value('max_id');
+
+        $nextId = ($maxNum && (int)$maxNum >= 100000) ? (int)$maxNum + 1 : 100001;
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'user_id' => (string)$nextId,
+            ],
+        ]);
+    }
+
     /**
      * Display a listing of user accounts.
      */
@@ -22,6 +43,7 @@ class UserController extends Controller
             $search = $request->input('search');
             $query->where(function ($q) use ($search) {
                 $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('user_id', 'like', "%{$search}%")
                   ->orWhere('email', 'like', "%{$search}%")
                   ->orWhere('phone', 'like', "%{$search}%")
                   ->orWhere('role', 'like', "%{$search}%")
@@ -59,6 +81,7 @@ class UserController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
+            'user_id' => 'nullable|string|max:50|unique:users,user_id',
             'name' => 'required|string|max:255',
             'email' => 'required|email|max:255|unique:users,email',
             'phone' => 'nullable|string|max:50',
@@ -71,6 +94,15 @@ class UserController extends Controller
             'avatar' => 'nullable|string',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
+
+        $userId = !empty($validated['user_id']) ? trim($validated['user_id']) : null;
+        if (!$userId) {
+            $maxNum = User::whereNotNull('user_id')
+                ->where('user_id', 'REGEXP', '^[0-9]+$')
+                ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
+                ->value('max_id');
+            $userId = (string)(($maxNum && (int)$maxNum >= 100000) ? (int)$maxNum + 1 : 100001);
+        }
 
         $roleName = $validated['role'] ?? 'Cashier';
         $roleId = $validated['role_id'] ?? null;
@@ -92,6 +124,7 @@ class UserController extends Controller
         }
 
         $user = User::create([
+            'user_id' => $userId,
             'name' => $validated['name'],
             'email' => $validated['email'],
             'phone' => $validated['phone'] ?? null,
@@ -162,6 +195,7 @@ class UserController extends Controller
         }
 
         $validated = $request->validate([
+            'user_id' => 'sometimes|nullable|string|max:50|unique:users,user_id,' . $id,
             'name' => 'sometimes|required|string|max:255',
             'email' => 'sometimes|required|email|max:255|unique:users,email,' . $id,
             'phone' => 'nullable|string|max:50',
