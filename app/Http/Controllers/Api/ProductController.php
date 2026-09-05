@@ -200,8 +200,10 @@ class ProductController extends Controller
         $warehouses = Outlet::select('id', 'name', 'is_active')
             ->where('is_active', true)
             ->orWhereNull('is_active')
-            ->orderBy('name')
-            ->get();
+            ->orderBy('id')
+            ->get()
+            ->unique('name')
+            ->values();
 
         return response()->json([
             'success' => true,
