@@ -465,6 +465,58 @@ class AdjustmentEnterpriseTest extends TestCase
         $this->assertEquals('David Manager', $indexRes->json('data.0.created_by'));
         $this->assertEquals('Store Manager', $indexRes->json('data.0.user_role'));
     }
+
+    /**
+     * Test 10: Index filters by date_from and date_to accurately including timestamps
+     */
+    public function test_index_filters_by_date_from_and_date_to_accurately(): void
+    {
+        StockAdjustment::create([
+            'reference_no' => 'ADJ-DATE-01',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-08-01 10:00:00',
+            'total_products' => 1,
+            'total_quantity' => 1.0,
+            'type' => 'Addition',
+            'notes' => 'August early',
+        ]);
+
+        StockAdjustment::create([
+            'reference_no' => 'ADJ-DATE-02',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-08-15 19:30:00',
+            'total_products' => 1,
+            'total_quantity' => 2.0,
+            'type' => 'Addition',
+            'notes' => 'August mid',
+        ]);
+
+        StockAdjustment::create([
+            'reference_no' => 'ADJ-DATE-03',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-09-06 22:00:00',
+            'total_products' => 1,
+            'total_quantity' => 3.0,
+            'type' => 'Addition',
+            'notes' => 'September record',
+        ]);
+
+        // Filter date range: August 10 to August 15 (should only return ADJ-DATE-02)
+        $res = $this->getJson('/api/adjustments?date_from=2026-08-10&date_to=2026-08-15');
+        $res->assertStatus(200);
+        $refs = collect($res->json('data'))->pluck('reference_no')->all();
+        $this->assertContains('ADJ-DATE-02', $refs);
+        $this->assertNotContains('ADJ-DATE-01', $refs);
+        $this->assertNotContains('ADJ-DATE-03', $refs);
+
+        // Filter full August range
+        $augRes = $this->getJson('/api/adjustments?date_from=2026-08-01&date_to=2026-08-31');
+        $augRes->assertStatus(200);
+        $augRefs = collect($augRes->json('data'))->pluck('reference_no')->all();
+        $this->assertContains('ADJ-DATE-01', $augRefs);
+        $this->assertContains('ADJ-DATE-02', $augRefs);
+        $this->assertNotContains('ADJ-DATE-03', $augRefs);
+    }
 }
 
 

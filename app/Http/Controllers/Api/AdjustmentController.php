@@ -31,11 +31,20 @@ class AdjustmentController extends Controller
         }
 
         if ($request->filled('date_from')) {
-            $query->where('date', '>=', $request->input('date_from'));
+            $dateFrom = trim($request->input('date_from'));
+            $fromStr = strlen($dateFrom) === 10 ? ($dateFrom . ' 00:00:00') : $dateFrom;
+            $query->where(function ($q) use ($dateFrom, $fromStr) {
+                $q->where('date', '>=', $dateFrom)
+                  ->orWhere('date', '>=', $fromStr);
+            });
         }
 
         if ($request->filled('date_to')) {
-            $query->where('date', '<=', $request->input('date_to'));
+            $dateTo = trim($request->input('date_to'));
+            $toStr = strlen($dateTo) === 10 ? ($dateTo . ' 23:59:59') : $dateTo;
+            $query->where(function ($q) use ($dateTo, $toStr) {
+                $q->where('date', '<=', $toStr);
+            });
         }
 
         if ($request->filled('search')) {
