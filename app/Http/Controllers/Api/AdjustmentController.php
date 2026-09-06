@@ -43,13 +43,15 @@ class AdjustmentController extends Controller
             $query->where(function ($q) use ($search) {
                 $q->where('reference_no', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
-                  ->orWhere('notes', 'like', "%{$search}%");
+                  ->orWhere('notes', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_role', 'like', "%{$search}%");
             });
         }
 
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'reference_no', 'warehouse_name', 'date', 'type', 'total_products', 'total_quantity', 'created_at'];
+        $allowedSorts = ['id', 'reference_no', 'warehouse_name', 'date', 'type', 'total_products', 'total_quantity', 'created_at', 'created_by', 'user_role'];
         if (!in_array($sortBy, $allowedSorts)) {
             $sortBy = 'id';
         }
@@ -78,7 +80,9 @@ class AdjustmentController extends Controller
             'date' => 'required|string',
             'type' => 'required|string|in:Addition,Subtraction',
             'notes' => 'nullable|string',
+            'user_id' => 'nullable|integer',
             'created_by' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:255',
             'items' => 'required|array|min:1',
             'items.*.product_id' => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
@@ -104,6 +108,17 @@ class AdjustmentController extends Controller
                 $totalQty += (float)$item['quantity'];
             }
 
+            $user = $request->user();
+            $createdByName = !empty($validated['created_by'])
+                ? $validated['created_by']
+                : ($user ? $user->name : 'Super Admin');
+            $userRole = !empty($validated['user_role'])
+                ? $validated['user_role']
+                : ($user ? ($user->role?->name ?? $user->role ?? 'Super Admin') : 'Super Admin');
+            $userId = !empty($validated['user_id'])
+                ? $validated['user_id']
+                : ($user ? $user->id : null);
+
             $adjustment = StockAdjustment::create([
                 'reference_no' => $refNo,
                 'warehouse_name' => $validated['warehouse_name'],
@@ -112,7 +127,9 @@ class AdjustmentController extends Controller
                 'total_quantity' => $totalQty,
                 'type' => $validated['type'],
                 'notes' => $validated['notes'] ?? null,
-                'created_by' => $validated['created_by'] ?? 'Admin User',
+                'user_id' => $userId,
+                'created_by' => $createdByName,
+                'user_role' => $userRole,
             ]);
 
             foreach ($validated['items'] as $itemData) {
@@ -134,7 +151,7 @@ class AdjustmentController extends Controller
                     $adjustment->id,
                     $refNo,
                     $validated['notes'] ?? null,
-                    $validated['created_by'] ?? 'Admin User',
+                    $createdByName,
                     false
                 );
             }
@@ -177,7 +194,9 @@ class AdjustmentController extends Controller
             'date' => 'required|string',
             'type' => 'nullable|string|in:Addition,Subtraction',
             'notes' => 'nullable|string',
+            'user_id' => 'nullable|integer',
             'created_by' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:255',
             'items' => 'required|array|min:1',
             'items.*.product_id' => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
@@ -213,15 +232,25 @@ class AdjustmentController extends Controller
                 $totalQty += (float)$item['quantity'];
             }
 
-            $adjustment->update([
+            $updateData = [
                 'warehouse_name' => $validated['warehouse_name'],
                 'date' => $validated['date'],
                 'total_products' => count($validated['items']),
                 'total_quantity' => $totalQty,
                 'type' => $validated['type'] ?? $adjustment->type,
                 'notes' => $validated['notes'] ?? $adjustment->notes,
-                'created_by' => $validated['created_by'] ?? $adjustment->created_by,
-            ]);
+            ];
+            if (isset($validated['created_by'])) {
+                $updateData['created_by'] = $validated['created_by'];
+            }
+            if (isset($validated['user_role'])) {
+                $updateData['user_role'] = $validated['user_role'];
+            }
+            if (isset($validated['user_id'])) {
+                $updateData['user_id'] = $validated['user_id'];
+            }
+
+            $adjustment->update($updateData);
 
             foreach ($validated['items'] as $itemData) {
                 $adjItem = StockAdjustmentItem::create([

@@ -68,7 +68,9 @@ return new class extends Migration
                 $table->decimal('total_quantity', 15, 2)->default(0);
                 $table->string('type')->default('Addition');
                 $table->text('notes')->nullable();
+                $table->unsignedBigInteger('user_id')->nullable();
                 $table->string('created_by')->nullable();
+                $table->string('user_role')->nullable();
                 $table->timestamps();
             });
         }

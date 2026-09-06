@@ -17,8 +17,15 @@ class StockAdjustment extends Model
         'total_quantity',
         'type', // Addition, Subtraction
         'notes',
+        'user_id',
         'created_by',
+        'user_role',
     ];
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
 
     public function items()
     {

@@ -418,6 +418,54 @@ class AdjustmentEnterpriseTest extends TestCase
         $this->assertEquals($user->id, $movement->created_by);
         $this->assertIsNumeric($movement->created_by);
     }
+
+    /**
+     * Test 9: Store adjustment persists created_by and user_role and returns them in index
+     */
+    public function test_store_adjustment_persists_user_name_and_role_and_returns_in_index(): void
+    {
+        $product = Product::create([
+            'code' => 'ADJ-ROLE-01',
+            'name' => 'Adjustment Role Test Product',
+            'cost_price' => 30.0,
+            'price' => 60.0,
+            'stock_quantity' => 10.0,
+            'low_qty' => 2.0,
+            'product_unit' => 'Piece',
+            'barcode_symbol' => 'CODE128',
+        ]);
+
+        $payload = [
+            'reference_no' => 'ADJ-ROLE-REF-01',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-09-06 14:30:00',
+            'type' => 'Addition',
+            'created_by' => 'David Manager',
+            'user_role' => 'Store Manager',
+            'items' => [
+                [
+                    'product_id' => $product->id,
+                    'product_code' => $product->code,
+                    'product_name' => $product->name,
+                    'quantity' => 2.0,
+                    'type' => 'Addition',
+                    'unit_cost' => 30.0,
+                ],
+            ],
+        ];
+
+        $res = $this->postJson('/api/adjustments', $payload);
+        $res->assertStatus(201);
+        $res->assertJsonPath('data.created_by', 'David Manager');
+        $res->assertJsonPath('data.user_role', 'Store Manager');
+
+        $indexRes = $this->getJson('/api/adjustments?search=David');
+        $indexRes->assertStatus(200);
+        $this->assertCount(1, $indexRes->json('data'));
+        $this->assertEquals('David Manager', $indexRes->json('data.0.created_by'));
+        $this->assertEquals('Store Manager', $indexRes->json('data.0.user_role'));
+    }
 }
+
 
 
