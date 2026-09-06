@@ -17,10 +17,17 @@ class UserController extends Controller
      */
     public function generateUserId(Request $request)
     {
-        $maxNum = User::whereNotNull('user_id')
-            ->where('user_id', 'REGEXP', '^[0-9]+$')
-            ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
-            ->value('max_id');
+        $driver = \Illuminate\Support\Facades\DB::connection()->getDriverName();
+        if ($driver === 'sqlite') {
+            $existing = User::whereNotNull('user_id')->pluck('user_id');
+            $numericIds = $existing->filter(fn($id) => ctype_digit((string)$id))->map(fn($id) => (int)$id);
+            $maxNum = $numericIds->max();
+        } else {
+            $maxNum = User::whereNotNull('user_id')
+                ->where('user_id', 'REGEXP', '^[0-9]+$')
+                ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
+                ->value('max_id');
+        }
 
         $nextId = ($maxNum && (int)$maxNum >= 100000) ? (int)$maxNum + 1 : 100001;
 
@@ -97,10 +104,17 @@ class UserController extends Controller
 
         $userId = !empty($validated['user_id']) ? trim($validated['user_id']) : null;
         if (!$userId) {
-            $maxNum = User::whereNotNull('user_id')
-                ->where('user_id', 'REGEXP', '^[0-9]+$')
-                ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
-                ->value('max_id');
+            $driver = \Illuminate\Support\Facades\DB::connection()->getDriverName();
+            if ($driver === 'sqlite') {
+                $existing = User::whereNotNull('user_id')->pluck('user_id');
+                $numericIds = $existing->filter(fn($id) => ctype_digit((string)$id))->map(fn($id) => (int)$id);
+                $maxNum = $numericIds->max();
+            } else {
+                $maxNum = User::whereNotNull('user_id')
+                    ->where('user_id', 'REGEXP', '^[0-9]+$')
+                    ->selectRaw('MAX(CAST(user_id AS UNSIGNED)) as max_id')
+                    ->value('max_id');
+            }
             $userId = (string)(($maxNum && (int)$maxNum >= 100000) ? (int)$maxNum + 1 : 100001);
         }
 

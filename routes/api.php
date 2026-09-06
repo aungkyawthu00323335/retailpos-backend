@@ -98,6 +98,9 @@ Route::apiResource('customers', CustomerController::class);
 Route::apiResource('customer-groups', CustomerGroupController::class);
 
 // Suppliers & Supplier Categories
+Route::get('suppliers/template', [SupplierController::class, 'downloadTemplate']);
+Route::get('suppliers/export', [SupplierController::class, 'export']);
+Route::post('suppliers/bulk-import', [SupplierController::class, 'bulkImport']);
 Route::apiResource('suppliers', SupplierController::class);
 Route::apiResource('supplier-categories', SupplierCategoryController::class);
 

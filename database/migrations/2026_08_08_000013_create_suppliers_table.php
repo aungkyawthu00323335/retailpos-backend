@@ -18,6 +18,8 @@ return new class extends Migration
             $table->string('phone')->index();
             $table->string('email')->nullable();
             $table->string('category')->default('Meat & Poultry');
+            $table->string('country')->nullable();
+            $table->string('city')->nullable();
             $table->text('address')->nullable();
             $table->decimal('balance_due', 10, 2)->default(0.00);
             $table->string('payment_terms')->default('Net 30 Days');
