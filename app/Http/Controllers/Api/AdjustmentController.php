@@ -18,9 +18,38 @@ use Illuminate\Support\Facades\Log;
 
 class AdjustmentController extends Controller
 {
+    /**
+     * Generate next numeric adjustment code (numbers only).
+     */
+    public function generateCode()
+    {
+        $adjustments = StockAdjustment::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
+        $maxNum = 100000;
+        foreach ($adjustments as $adj) {
+            $digits = preg_replace('/\D/', '', (string)$adj->reference_no);
+            if (!empty($digits)) {
+                $val = (int)$digits;
+                if ($val >= 100000 && $val < 999999999 && $val > $maxNum) {
+                    $maxNum = $val;
+                }
+            }
+        }
+        $nextCode = (string)($maxNum + 1);
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'code' => $nextCode,
+            ],
+        ]);
+    }
+
     public function index(Request $request)
     {
-        $query = StockAdjustment::with(['items:id,stock_adjustment_id,product_id,product_variant_id,product_code,product_name,variant_name,quantity,type,unit_cost']);
+        $query = StockAdjustment::with([
+            'user:id,name,role',
+            'items:id,stock_adjustment_id,product_id,product_variant_id,product_code,product_name,variant_name,quantity,type,unit_cost'
+        ]);
 
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
             $query->where('warehouse_name', $request->input('warehouse'));
@@ -54,7 +83,15 @@ class AdjustmentController extends Controller
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('notes', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
-                  ->orWhere('user_role', 'like', "%{$search}%");
+                  ->orWhere('user_role', 'like', "%{$search}%")
+                  ->orWhereHas('user', function ($uq) use ($search) {
+                      $uq->where('name', 'like', "%{$search}%")
+                        ->orWhere('role', 'like', "%{$search}%");
+                  })
+                  ->orWhereHas('items', function ($iq) use ($search) {
+                      $iq->where('product_name', 'like', "%{$search}%")
+                        ->orWhere('product_code', 'like', "%{$search}%");
+                  });
             });
         }
 
@@ -68,9 +105,19 @@ class AdjustmentController extends Controller
         $perPage = min(max((int)$request->input('per_page', 25), 1), 100);
         $adjustments = $query->orderBy($sortBy, $sortOrder)->paginate($perPage);
 
+        $data = collect($adjustments->items())->map(function ($adj) {
+            if ($adj->user) {
+                $adj->created_by = $adj->user->name;
+                if (!empty($adj->user->role)) {
+                    $adj->user_role = $adj->user->role;
+                }
+            }
+            return $adj;
+        });
+
         return response()->json([
             'status' => 'success',
-            'data' => $adjustments->items(),
+            'data' => $data,
             'pagination' => [
                 'current_page' => $adjustments->currentPage(),
                 'per_page' => $adjustments->perPage(),
@@ -117,16 +164,27 @@ class AdjustmentController extends Controller
                 $totalQty += (float)$item['quantity'];
             }
 
-            $user = $request->user();
+            $targetUser = $request->user();
+            if (!$targetUser && !empty($validated['user_id'])) {
+                $targetUser = User::find($validated['user_id']);
+            }
+            if (!$targetUser) {
+                $targetUser = User::first();
+            }
+
             $createdByName = !empty($validated['created_by'])
                 ? $validated['created_by']
-                : ($user ? $user->name : 'Super Admin');
+                : ($targetUser ? $targetUser->name : 'Super Admin');
+            if ($targetUser && (empty($validated['created_by']) || $validated['created_by'] === 'Super Admin')) {
+                $createdByName = $targetUser->name;
+            }
+
             $userRole = !empty($validated['user_role'])
                 ? $validated['user_role']
-                : ($user ? ($user->role?->name ?? $user->role ?? 'Super Admin') : 'Super Admin');
+                : ($targetUser ? ($targetUser->roleModel?->name ?? $targetUser->role ?? 'Super Admin') : 'Super Admin');
             $userId = !empty($validated['user_id'])
                 ? $validated['user_id']
-                : ($user ? $user->id : null);
+                : ($targetUser ? $targetUser->id : null);
 
             $adjustment = StockAdjustment::create([
                 'reference_no' => $refNo,
@@ -183,9 +241,15 @@ class AdjustmentController extends Controller
 
     public function show($id)
     {
-        $adjustment = StockAdjustment::with('items')->find($id);
+        $adjustment = StockAdjustment::with(['user:id,name,role', 'items'])->find($id);
         if (!$adjustment) {
             return response()->json(['status' => 'error', 'message' => 'Adjustment not found'], 404);
+        }
+        if ($adjustment->user) {
+            $adjustment->created_by = $adjustment->user->name;
+            if (!empty($adjustment->user->role)) {
+                $adjustment->user_role = $adjustment->user->role;
+            }
         }
         return response()->json(['status' => 'success', 'data' => $adjustment]);
     }

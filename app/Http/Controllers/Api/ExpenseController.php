@@ -33,6 +33,10 @@ class ExpenseController extends Controller
             $query->where('date', '<=', $request->input('date_to'));
         }
 
+        if ($request->filled('created_by') && $request->input('created_by') !== 'All') {
+            $query->where('created_by', $request->input('created_by'));
+        }
+
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $query->where(function ($q) use ($search) {
@@ -40,6 +44,8 @@ class ExpenseController extends Controller
                   ->orWhere('title', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('expense_category_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_role', 'like', "%{$search}%")
                   ->orWhere('details', 'like', "%{$search}%");
             });
         }
@@ -50,7 +56,7 @@ class ExpenseController extends Controller
         // High-performance sorting
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name'];
+        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'created_by'];
         if (in_array($sortBy, $allowedSorts, true)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
@@ -87,6 +93,8 @@ class ExpenseController extends Controller
             'date' => 'required|string',
             'details' => 'nullable|string',
             'created_by' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:255',
+            'user_id' => 'nullable|integer',
         ]);
 
         $prefix = Setting::get('expense_prefix', 'EXP_');
@@ -101,7 +109,9 @@ class ExpenseController extends Controller
             'amount' => (float)$validated['amount'],
             'date' => $validated['date'],
             'details' => $validated['details'] ?? null,
-            'created_by' => $validated['created_by'] ?? 'Admin User',
+            'created_by' => $validated['created_by'] ?? ($request->user()?->name ?? 'Admin User'),
+            'user_role' => $validated['user_role'] ?? ($request->user()?->role ?? 'Super Admin'),
+            'user_id' => $validated['user_id'] ?? $request->user()?->id,
         ]);
 
         return response()->json([
@@ -135,6 +145,9 @@ class ExpenseController extends Controller
             'amount' => 'sometimes|required|numeric|min:0.01',
             'date' => 'sometimes|required|string',
             'details' => 'nullable|string',
+            'created_by' => 'sometimes|nullable|string|max:255',
+            'user_role' => 'sometimes|nullable|string|max:255',
+            'user_id' => 'sometimes|nullable|integer',
         ]);
 
         $expense->update($validated);

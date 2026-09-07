@@ -14,12 +14,15 @@ class StockTransfer extends Model
         'from_warehouse',
         'to_warehouse',
         'date',
+        'transfer_time',
         'items_count',
         'total_quantity',
         'shipping_charge',
         'status', // Sent, Pending, Completed
         'notes',
         'created_by',
+        'user_id',
+        'user_role',
     ];
 
     protected $casts = [
@@ -31,5 +34,10 @@ class StockTransfer extends Model
     public function items()
     {
         return $this->hasMany(StockTransferItem::class, 'stock_transfer_id');
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class, 'user_id');
     }
 }

@@ -19,6 +19,8 @@ class Expense extends Model
         'date',
         'details',
         'created_by',
+        'user_id',
+        'user_role',
     ];
 
     protected $casts = [

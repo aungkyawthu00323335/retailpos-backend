@@ -70,7 +70,9 @@ Route::get('categories/{category}/subcategories', [SubCategoryController::class,
 Route::apiResource('products', ProductController::class);
 
 // Stock Adjustments & Transfers
+Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateCode']);
 Route::apiResource('adjustments', AdjustmentController::class);
+Route::get('transfers/generate-code', [TransferController::class, 'generateCode']);
 Route::apiResource('transfers', TransferController::class);
 
 // Purchases & Purchase Returns

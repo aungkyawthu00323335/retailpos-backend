@@ -247,7 +247,27 @@ class UserController extends Controller
             }
         }
 
+        $oldName = $user->name;
         $user->update($validated);
+
+        // Propagate user name & role updates to existing stock adjustments
+        if (isset($validated['name']) || isset($validated['role'])) {
+            $adjUpdate = [];
+            if (isset($validated['name'])) {
+                $adjUpdate['created_by'] = $validated['name'];
+            }
+            if (isset($validated['role'])) {
+                $adjUpdate['user_role'] = $validated['role'];
+            }
+            if (!empty($adjUpdate)) {
+                \App\Models\StockAdjustment::where('user_id', $user->id)
+                    ->orWhere('created_by', $oldName)
+                    ->update($adjUpdate);
+                \App\Models\StockTransfer::where('user_id', $user->id)
+                    ->orWhere('created_by', $oldName)
+                    ->update($adjUpdate);
+            }
+        }
 
         $user->load(['roleModel', 'outlets']);
         $user->is_super_admin = $user->isSuperAdmin();
