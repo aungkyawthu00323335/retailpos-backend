@@ -13,23 +13,22 @@ use Illuminate\Support\Facades\DB;
 class TransferController extends Controller
 {
     /**
-     * Generate next transfer reference code.
+     * Generate next numeric transfer reference code (numbers only).
      */
     public function generateCode()
     {
-        $prefix = Setting::get('transfer_prefix', 'TR_');
         $transfers = StockTransfer::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
-        $maxNum = 10000;
+        $maxNum = 100000;
         foreach ($transfers as $trf) {
             $digits = preg_replace('/\D/', '', (string)$trf->reference_no);
             if (!empty($digits)) {
                 $val = (int)$digits;
-                if ($val >= 10000 && $val < 999999999 && $val > $maxNum) {
+                if ($val >= 100000 && $val < 999999999 && $val > $maxNum) {
                     $maxNum = $val;
                 }
             }
         }
-        $nextCode = $prefix . ($maxNum + 1);
+        $nextCode = (string)($maxNum + 1);
 
         return response()->json([
             'status' => 'success',
@@ -130,10 +129,9 @@ class TransferController extends Controller
 
         DB::beginTransaction();
         try {
-            $prefix = Setting::get('transfer_prefix', 'TR_');
             $refNo = !empty($validated['reference_no'])
                 ? $validated['reference_no']
-                : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
+                : (date('Ymd') . rand(1000, 9999));
             $totalQty = 0;
 
             foreach ($validated['items'] as $item) {
