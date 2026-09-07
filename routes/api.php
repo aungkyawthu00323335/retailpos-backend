@@ -89,6 +89,7 @@ Route::apiResource('quotations', QuotationController::class);
 
 // Expenses & Expense Categories
 Route::apiResource('expense-categories', ExpenseCategoryController::class);
+Route::get('expenses/generate-code', [ExpenseController::class, 'generateCode']);
 Route::apiResource('expenses', ExpenseController::class);
 
 // Payment Methods (InfyPOS /app/payment-methods)

@@ -9,6 +9,32 @@ use Illuminate\Http\Request;
 
 class ExpenseController extends Controller
 {
+    /**
+     * Generate next numeric expense code (numbers only).
+     */
+    public function generateCode()
+    {
+        $expenses = Expense::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
+        $maxNum = 100000;
+        foreach ($expenses as $exp) {
+            $digits = preg_replace('/\D/', '', (string)$exp->reference_no);
+            if (!empty($digits)) {
+                $val = (int)$digits;
+                if ($val >= 100000 && $val < 999999999 && $val > $maxNum) {
+                    $maxNum = $val;
+                }
+            }
+        }
+        $nextCode = (string)($maxNum + 1);
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'code' => $nextCode,
+            ],
+        ]);
+    }
+
     public function index(Request $request)
     {
         $query = Expense::with('category');
@@ -85,6 +111,7 @@ class ExpenseController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
+            'reference_no' => 'nullable|string|max:255',
             'warehouse_name' => 'required|string|max:255',
             'expense_category_id' => 'nullable|integer',
             'expense_category_name' => 'required|string|max:255',
@@ -97,8 +124,11 @@ class ExpenseController extends Controller
             'user_id' => 'nullable|integer',
         ]);
 
-        $prefix = Setting::get('expense_prefix', 'EXP_');
-        $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
+        $refNo = !empty($validated['reference_no']) ? trim($validated['reference_no']) : null;
+        if (empty($refNo)) {
+            $prefix = Setting::get('expense_prefix', 'EXP_');
+            $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
+        }
 
         $expense = Expense::create([
             'reference_no' => $refNo,
@@ -138,6 +168,7 @@ class ExpenseController extends Controller
         }
 
         $validated = $request->validate([
+            'reference_no' => 'sometimes|nullable|string|max:255',
             'warehouse_name' => 'sometimes|required|string|max:255',
             'expense_category_id' => 'nullable|integer',
             'expense_category_name' => 'sometimes|required|string|max:255',
