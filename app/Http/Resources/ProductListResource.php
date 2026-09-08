@@ -73,6 +73,23 @@ class ProductListResource extends JsonResource
             'sale_unit' => $this->sale_unit,
             'purchase_unit_id' => $this->purchase_unit_id,
             'purchase_unit' => $this->purchase_unit,
+            'unit_links' => $this->relationLoaded('unitLinks')
+                ? $this->unitLinks
+                    ->where('is_active', true)
+                    ->map(fn ($link) => [
+                        'id' => $link->id,
+                        'product_id' => $link->product_id,
+                        'product_variant_id' => $link->product_variant_id,
+                        'unit_id' => $link->unit_id,
+                        'unit_name' => $link->unit_name,
+                        'unit_type' => $link->unit_type,
+                        'conversion_rate' => (float)$link->conversion_rate,
+                        'is_default' => (bool)$link->is_default,
+                        'is_active' => (bool)$link->is_active,
+                    ])
+                    ->values()
+                    ->all()
+                : [],
             'cost_price' => (float)($this->cost_price ?: $this->purchase_price),
             'selling_price' => (float)($this->selling_price ?: $this->retail_price),
             'purchase_price' => (float)($this->purchase_price ?: $this->cost_price),
