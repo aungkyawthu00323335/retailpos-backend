@@ -107,6 +107,26 @@ class ProductListResource extends JsonResource
             'variants' => $this->relationLoaded('variants') && $this->variants->isNotEmpty()
                 ? ProductVariantResource::collection($this->variants)
                 : [],
+            'warehouse_stocks' => $this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()
+                ? $this->stockBalances->map(function ($sb) {
+                    return [
+                        'warehouse_id' => (int)$sb->warehouse_id,
+                        'warehouse_name' => (string)($sb->warehouse?->name ?? 'Main Branch Outlet'),
+                        'product_variant_id' => $sb->product_variant_id ? (int)$sb->product_variant_id : null,
+                        'quantity' => (float)$sb->quantity,
+                    ];
+                })->values()->all()
+                : ((float)$this->stock_quantity > 0
+                    ? [
+                        [
+                            'warehouse_id' => 1,
+                            'warehouse_name' => 'Main Branch Outlet',
+                            'product_variant_id' => null,
+                            'quantity' => (float)$this->stock_quantity,
+                        ]
+                    ]
+                    : []
+                ),
             'image_url' => $imageUrl,
             'primary_image_url' => $imageUrl,
             'status' => $this->status ?? ($this->is_active ? 'Active' : 'Inactive'),
