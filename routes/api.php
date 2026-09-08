@@ -76,6 +76,7 @@ Route::get('transfers/generate-code', [TransferController::class, 'generateCode'
 Route::apiResource('transfers', TransferController::class);
 
 // Purchases & Purchase Returns
+Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']);
 Route::apiResource('purchases', PurchaseController::class);
 Route::apiResource('purchase-returns', PurchaseReturnController::class);
 
@@ -85,6 +86,7 @@ Route::apiResource('sales', SaleController::class);
 Route::apiResource('sale-returns', SaleReturnController::class);
 
 // Quotations
+Route::post('quotations/{id}/convert-to-sale', [QuotationController::class, 'convertToSale']);
 Route::apiResource('quotations', QuotationController::class);
 
 // Expenses & Expense Categories

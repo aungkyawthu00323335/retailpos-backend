@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Quotation;
 use App\Models\QuotationItem;
+use App\Models\Sale;
+use App\Models\SaleItem;
 use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -294,6 +296,100 @@ class QuotationController extends Controller
                 'status' => 'success',
                 'message' => 'Quotation deleted successfully',
             ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Convert the specified quotation into a completed sale, and mark quotation as Ordered.
+     */
+    public function convertToSale(Request $request, $id)
+    {
+        $quotation = Quotation::with('items')->find($id);
+        if (!$quotation) {
+            return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
+        }
+
+        DB::beginTransaction();
+        try {
+            $prefix = Setting::get('sale_prefix', 'SA_');
+            $refNo = $prefix . rand(1000000, 9999999);
+
+            $grandTotal = (float)$quotation->grand_total;
+            $paidAmount = (float)($request->input('paid_amount', $grandTotal));
+            $dueAmount = max(0, $grandTotal - $paidAmount);
+            $paymentStatus = $paidAmount >= $grandTotal ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid');
+
+            $subtotal = 0;
+            foreach ($quotation->items as $item) {
+                $subtotal += (float)$item->subtotal;
+            }
+
+            $sale = Sale::create([
+                'reference_no' => $refNo,
+                'customer_id' => $quotation->customer_id,
+                'customer_name' => $quotation->customer_name,
+                'warehouse_name' => $quotation->warehouse_name,
+                'date' => date('Y-m-d H:i:s'),
+                'status' => 'Completed',
+                'tax_rate' => (float)$quotation->tax_rate,
+                'tax_amount' => (float)$quotation->tax_amount,
+                'discount' => (float)$quotation->discount,
+                'shipping' => (float)$quotation->shipping,
+                'subtotal' => $subtotal > 0 ? $subtotal : $grandTotal,
+                'grand_total' => $grandTotal,
+                'paid_amount' => $paidAmount,
+                'due_amount' => $dueAmount,
+                'change_amount' => 0,
+                'payment_status' => $paymentStatus,
+                'payment_type' => $request->input('payment_type', 'Cash'),
+                'notes' => 'Converted from Quotation: ' . $quotation->reference_no . ($quotation->notes ? ' | ' . $quotation->notes : ''),
+                'created_by' => $request->input('created_by', $quotation->created_by ?? 'Sales Staff'),
+            ]);
+
+            $saleItemsData = [];
+            $now = now();
+            foreach ($quotation->items as $item) {
+                $saleItemsData[] = [
+                    'sale_id' => $sale->id,
+                    'product_id' => $item->product_id,
+                    'product_variant_id' => null,
+                    'unit_id' => null,
+                    'unit_name' => 'pcs',
+                    'conversion_rate' => 1,
+                    'base_quantity' => (float)$item->quantity,
+                    'base_unit_price' => (float)$item->unit_price,
+                    'product_code' => $item->product_code,
+                    'product_name' => $item->product_name,
+                    'unit_price' => (float)$item->unit_price,
+                    'quantity' => (float)$item->quantity,
+                    'tax' => (float)$item->tax,
+                    'discount' => (float)$item->discount,
+                    'subtotal' => (float)$item->subtotal,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ];
+            }
+
+            if (!empty($saleItemsData)) {
+                SaleItem::insert($saleItemsData);
+            }
+
+            // Mark quotation status as Ordered
+            $quotation->update(['status' => 'Ordered']);
+
+            DB::commit();
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Quotation successfully converted to Sale ' . $sale->reference_no,
+                'data' => [
+                    'sale' => $sale->load('items'),
+                    'quotation' => $quotation->fresh('items'),
+                ],
+            ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);

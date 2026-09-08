@@ -282,12 +282,92 @@ class PurchaseController extends Controller
 
     public function destroy($id)
     {
-        $purchase = Purchase::find($id) ?? Purchase::where('reference_no', $id)->first();
+        $purchase = Purchase::with('items')->find($id) ?? Purchase::with('items')->where('reference_no', $id)->first();
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }
-        $purchase->items()->delete();
-        $purchase->delete();
-        return response()->json(['status' => 'success', 'message' => 'Purchase deleted successfully']);
+
+        DB::beginTransaction();
+        try {
+            if ($purchase->status === 'Received') {
+                $unitService = app(ProductUnitConversionService::class);
+                $warehouseId = $unitService->warehouseId($purchase->warehouse_id, $purchase->warehouse_name);
+
+                foreach ($purchase->items as $item) {
+                    $product = !empty($item->product_id)
+                        ? Product::find($item->product_id)
+                        : Product::where('code', $item->product_code)->first();
+
+                    if ($product) {
+                        $baseQty = $item->base_quantity > 0 ? (float)$item->base_quantity : (float)$item->quantity;
+                        $unitService->applyStock(
+                            $product,
+                            $warehouseId,
+                            $item->product_variant_id,
+                            $baseQty,
+                            'out',
+                            'purchase_deletion',
+                            'purchase',
+                            (string)$purchase->id,
+                            'Stock reduced due to purchase deletion'
+                        );
+                    }
+                }
+            }
+
+            $purchase->items()->delete();
+            $purchase->delete();
+
+            DB::commit();
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Purchase deleted and stock reverted successfully',
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    public function addPayment(Request $request, $id)
+    {
+        $purchase = Purchase::with('items')->find($id) ?? Purchase::with('items')->where('reference_no', $id)->first();
+        if (!$purchase) {
+            return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'amount' => 'required|numeric|min:0.01',
+            'payment_type' => 'required|string',
+            'payment_date' => 'nullable|string',
+            'notes' => 'nullable|string',
+        ]);
+
+        $payingAmount = (float)$validated['amount'];
+        $newPaid = (float)$purchase->paid_amount + $payingAmount;
+        $newDue = max(0, (float)$purchase->grand_total - $newPaid);
+        $newStatus = $newDue <= 0 ? 'Paid' : 'Partial';
+
+        DB::beginTransaction();
+        try {
+            $purchase->update([
+                'paid_amount' => $newPaid,
+                'due_amount' => $newDue,
+                'payment_status' => $newStatus,
+                'payment_type' => $validated['payment_type'],
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Payment added successfully',
+                'data' => $purchase->fresh()->load('items'),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
     }
 }
