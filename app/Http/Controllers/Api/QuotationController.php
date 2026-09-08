@@ -18,7 +18,7 @@ class QuotationController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Quotation::with('items');
+        $query = Quotation::with(['items', 'customer']);
 
         // Filter: Warehouse
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
@@ -159,7 +159,7 @@ class QuotationController extends Controller
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation created successfully',
-                'data' => $quotation->load('items'),
+                'data' => $quotation->load(['items', 'customer']),
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -172,7 +172,7 @@ class QuotationController extends Controller
      */
     public function show($id)
     {
-        $quotation = Quotation::with('items')->find($id);
+        $quotation = Quotation::with(['items', 'customer'])->find($id);
         if (!$quotation) {
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
@@ -268,7 +268,7 @@ class QuotationController extends Controller
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation updated successfully',
-                'data' => $quotation->fresh('items'),
+                'data' => $quotation->fresh(['items', 'customer']),
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();

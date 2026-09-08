@@ -37,4 +37,9 @@ class Quotation extends Model
     {
         return $this->hasMany(QuotationItem::class, 'quotation_id');
     }
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class, 'customer_id');
+    }
 }
