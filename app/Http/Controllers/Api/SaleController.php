@@ -99,6 +99,12 @@ class SaleController extends Controller
             'items.*.tax' => 'nullable|numeric|min:0',
             'items.*.discount' => 'nullable|numeric|min:0',
             'items.*.subtotal' => 'required|numeric|min:0',
+            'payments' => 'nullable|array',
+            'payments.*.payment_type' => 'nullable|string',
+            'payments.*.amount' => 'nullable|numeric|min:0',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount' => 'nullable|numeric|min:0',
+            'payments.*.notes' => 'nullable|string',
         ]);
 
         DB::beginTransaction();
@@ -229,8 +235,24 @@ class SaleController extends Controller
                 }
             }
 
-            // Record payment transaction
-            if ($paidAmount > 0) {
+            // Record payment transaction(s) - supporting Split Payments & multi-tenders
+            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                foreach ($validated['payments'] as $idx => $p) {
+                    $pAmount = (float)($p['amount'] ?? 0);
+                    if ($pAmount <= 0) continue;
+                    SalePayment::create([
+                        'sale_id' => $sale->id,
+                        'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999) . '-' . ($idx + 1),
+                        'payment_date' => $p['payment_date'] ?? $sale->date,
+                        'payment_type' => $p['payment_type'] ?? $sale->payment_type,
+                        'amount' => $pAmount,
+                        'received_amount' => (float)($p['received_amount'] ?? $pAmount),
+                        'change_amount' => (float)($p['change_amount'] ?? 0),
+                        'notes' => $p['notes'] ?? ($sale->payment_type === 'Split Payment' ? 'Split payment line' : 'Payment recorded at POS checkout'),
+                        'created_by' => $sale->created_by,
+                    ]);
+                }
+            } elseif ($paidAmount > 0) {
                 SalePayment::create([
                     'sale_id' => $sale->id,
                     'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
@@ -359,13 +381,46 @@ class SaleController extends Controller
 
     public function destroy($id)
     {
-        $sale = Sale::find($id) ?? Sale::where('reference_no', $id)->first();
+        $sale = Sale::with('items')->find($id) ?? Sale::with('items')->where('reference_no', $id)->first();
         if (!$sale) {
             return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
         }
-        $sale->items()->delete();
-        $sale->payments()->delete();
-        $sale->delete();
-        return response()->json(['status' => 'success', 'message' => 'Sale deleted successfully']);
+
+        DB::beginTransaction();
+        try {
+            // If sale was completed, revert inventory stock back ('in')
+            if ($sale->status === 'Completed') {
+                $unitService = app(ProductUnitConversionService::class);
+                $warehouseId = $unitService->warehouseId($sale->warehouse_id ?? null, $sale->warehouse_name);
+
+                foreach ($sale->items as $item) {
+                    $product = Product::find($item->product_id);
+                    if ($product) {
+                        $baseQuantity = (float)($item->base_quantity > 0 ? $item->base_quantity : ($item->quantity * ($item->conversion_rate ?: 1)));
+                        $unitService->applyStock(
+                            $product,
+                            $warehouseId,
+                            $item->product_variant_id,
+                            $baseQuantity,
+                            'in', // Restores stock back to inventory on sale deletion
+                            'sale_delete',
+                            'sale',
+                            (string)$sale->id,
+                            'Sale #' . $sale->reference_no . ' deleted - Stock restored'
+                        );
+                    }
+                }
+            }
+
+            $sale->items()->delete();
+            $sale->payments()->delete();
+            $sale->delete();
+
+            DB::commit();
+            return response()->json(['status' => 'success', 'message' => 'Sale deleted successfully and stock restored']);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
     }
 }
