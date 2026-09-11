@@ -17,11 +17,28 @@ class SaleController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Sale::with([
-            'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,unit_price,quantity,tax,discount,subtotal',
-            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
-            'customer:id,name',
+        $includeFull = $request->boolean('full', false);
+
+        $query = Sale::select([
+            'id', 'reference_no', 'customer_id', 'customer_name', 'warehouse_id', 'warehouse_name',
+            'date', 'status', 'tax_rate', 'tax_amount', 'discount', 'shipping', 'subtotal',
+            'grand_total', 'paid_amount', 'due_amount', 'change_amount', 'payment_status',
+            'payment_type', 'notes', 'pos_flag', 'created_by'
         ]);
+
+        if ($includeFull) {
+            $query->with([
+                'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,unit_price,quantity,tax,discount,subtotal',
+                'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
+                'customer:id,name',
+            ]);
+        } else {
+            $query->with([
+                'items:id,sale_id,product_id,product_code,product_name,unit_name,unit_price,quantity,subtotal',
+                'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
+                'customer:id,name',
+            ]);
+        }
 
         if ($request->filled('customer_id')) {
             $query->where('customer_id', $request->input('customer_id'));
@@ -47,7 +64,8 @@ class SaleController extends Controller
             });
         }
 
-        $sales = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $perPage = min(500, max(1, (int)$request->input('per_page', 25)));
+        $sales = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
             'status' => 'success',
