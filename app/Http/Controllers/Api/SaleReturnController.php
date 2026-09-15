@@ -91,13 +91,18 @@ class SaleReturnController extends Controller
         $dueAmount = isset($validated['due_amount']) ? (float)$validated['due_amount'] : max(0, $grandTotal - $paidAmount);
         $paymentStatus = $validated['payment_status'] ?? ($dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid'));
 
+        $txDate = trim($validated['date']);
+        if (!str_contains($txDate, ':')) {
+            $txDate .= ' ' . now()->format('H:i:s');
+        }
+
         $return = SaleReturn::create([
             'reference_no' => $refNo,
             'sale_reference_no' => $validated['sale_reference_no'] ?? null,
             'customer_id' => $validated['customer_id'] ?? null,
             'customer_name' => $validated['customer_name'],
             'warehouse_name' => $validated['warehouse_name'],
-            'date' => $validated['date'],
+            'date' => $txDate,
             'status' => $validated['status'] ?? 'Completed',
             'grand_total' => $grandTotal,
             'paid_amount' => $paidAmount,

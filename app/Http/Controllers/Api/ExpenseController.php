@@ -39,6 +39,10 @@ class ExpenseController extends Controller
     {
         $query = Expense::with('category');
 
+        if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
+            $query->where('warehouse_id', $request->input('warehouse_id'));
+        }
+
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
             $query->where('warehouse_name', $request->input('warehouse'));
         }
@@ -71,6 +75,7 @@ class ExpenseController extends Controller
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('expense_category_name', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
                   ->orWhere('user_role', 'like', "%{$search}%")
                   ->orWhere('details', 'like', "%{$search}%");
             });
@@ -82,7 +87,7 @@ class ExpenseController extends Controller
         // High-performance sorting
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'created_by'];
+        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'created_by', 'user_name'];
         if (in_array($sortBy, $allowedSorts, true)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
@@ -112,6 +117,7 @@ class ExpenseController extends Controller
     {
         $validated = $request->validate([
             'reference_no' => 'nullable|string|max:255',
+            'warehouse_id' => 'nullable|integer',
             'warehouse_name' => 'required|string|max:255',
             'expense_category_id' => 'nullable|integer',
             'expense_category_name' => 'required|string|max:255',
@@ -120,6 +126,7 @@ class ExpenseController extends Controller
             'date' => 'required|string',
             'details' => 'nullable|string',
             'created_by' => 'nullable|string|max:255',
+            'user_name' => 'nullable|string|max:255',
             'user_role' => 'nullable|string|max:255',
             'user_id' => 'nullable|integer',
         ]);
@@ -130,16 +137,25 @@ class ExpenseController extends Controller
             $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
         }
 
+        $userName = $validated['user_name'] ?? ($validated['created_by'] ?? ($request->user()?->name ?? 'Admin User'));
+
+        $txDate = trim($validated['date']);
+        if (!str_contains($txDate, ':')) {
+            $txDate .= ' ' . now()->format('H:i:s');
+        }
+
         $expense = Expense::create([
             'reference_no' => $refNo,
+            'warehouse_id' => $validated['warehouse_id'] ?? null,
             'warehouse_name' => $validated['warehouse_name'],
             'expense_category_id' => $validated['expense_category_id'] ?? null,
             'expense_category_name' => $validated['expense_category_name'],
             'title' => $validated['title'],
             'amount' => (float)$validated['amount'],
-            'date' => $validated['date'],
+            'date' => $txDate,
             'details' => $validated['details'] ?? null,
-            'created_by' => $validated['created_by'] ?? ($request->user()?->name ?? 'Admin User'),
+            'created_by' => $userName,
+            'user_name' => $userName,
             'user_role' => $validated['user_role'] ?? ($request->user()?->role ?? 'Super Admin'),
             'user_id' => $validated['user_id'] ?? $request->user()?->id,
         ]);
@@ -169,6 +185,7 @@ class ExpenseController extends Controller
 
         $validated = $request->validate([
             'reference_no' => 'sometimes|nullable|string|max:255',
+            'warehouse_id' => 'sometimes|nullable|integer',
             'warehouse_name' => 'sometimes|required|string|max:255',
             'expense_category_id' => 'nullable|integer',
             'expense_category_name' => 'sometimes|required|string|max:255',
@@ -177,9 +194,16 @@ class ExpenseController extends Controller
             'date' => 'sometimes|required|string',
             'details' => 'nullable|string',
             'created_by' => 'sometimes|nullable|string|max:255',
+            'user_name' => 'sometimes|nullable|string|max:255',
             'user_role' => 'sometimes|nullable|string|max:255',
             'user_id' => 'sometimes|nullable|integer',
         ]);
+
+        if (isset($validated['user_name']) && empty($validated['created_by'])) {
+            $validated['created_by'] = $validated['user_name'];
+        } elseif (isset($validated['created_by']) && empty($validated['user_name'])) {
+            $validated['user_name'] = $validated['created_by'];
+        }
 
         $expense->update($validated);
 

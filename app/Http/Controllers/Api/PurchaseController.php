@@ -22,7 +22,8 @@ class PurchaseController extends Controller
                 'warehouse_id', 'warehouse_name', 'date', 'status',
                 'tax_rate', 'tax_amount', 'discount', 'shipping',
                 'grand_total', 'paid_amount', 'due_amount',
-                'payment_status', 'payment_type', 'notes', 'created_by',
+                'payment_status', 'payment_type', 'notes',
+                'created_by', 'user_id', 'user_name', 'user_role',
                 'created_at', 'updated_at',
             ])
             ->with([
@@ -45,12 +46,25 @@ class PurchaseController extends Controller
             $query->where('payment_status', $request->input('payment_status'));
         }
 
+        $startDate = $request->input('start_date') ?? $request->input('from_date');
+        $endDate = $request->input('end_date') ?? $request->input('to_date');
+        if (!empty($startDate) && !empty($endDate)) {
+            $query->whereBetween('date', [$startDate, $endDate]);
+        } elseif (!empty($startDate)) {
+            $query->where('date', '>=', $startDate);
+        } elseif (!empty($endDate)) {
+            $query->where('date', '<=', $endDate);
+        }
+
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $digits = preg_replace('/[^0-9]/', '', $search);
             $query->where(function ($q) use ($search, $digits) {
                 $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('supplier_name', 'like', "%{$search}%");
+                  ->orWhere('supplier_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
+                  ->orWhere('user_role', 'like', "%{$search}%");
                 if (!empty($digits)) {
                     $q->orWhere('reference_no', 'like', "%{$digits}%");
                 }
@@ -91,6 +105,9 @@ class PurchaseController extends Controller
             'payment_type'              => 'nullable|string',
             'notes'                     => 'nullable|string',
             'created_by'                => 'nullable|string|max:255',
+            'user_id'                   => 'nullable|integer',
+            'user_name'                 => 'nullable|string|max:255',
+            'user_role'                 => 'nullable|string|max:255',
             'items'                     => 'required|array|min:1',
             'items.*.product_id'        => 'nullable|integer',
             'items.*.product_variant_id'=> 'nullable|integer',
@@ -130,13 +147,52 @@ class PurchaseController extends Controller
                 $paymentStatus = 'Unpaid';
             }
 
+            $token = $request->bearerToken();
+            $authUser = null;
+            if ($token) {
+                $authUser = \App\Models\User::where('api_token', $token)->first();
+            }
+            if (!$authUser && !empty($validated['user_id'])) {
+                $authUser = \App\Models\User::find($validated['user_id']);
+            }
+
+            $userName = !empty($validated['user_name'])
+                ? $validated['user_name']
+                : ($authUser?->name ?? ($request->user()?->name ?? null));
+            $userRole = !empty($validated['user_role'])
+                ? $validated['user_role']
+                : ($authUser?->role ?? ($request->user()?->role ?? null));
+
+            if (empty($userName) && !empty($validated['created_by'])) {
+                if (preg_match('/^(.*?)\s*\((.*?)\)$/', $validated['created_by'], $m)) {
+                    $userName = trim($m[1]);
+                    $userRole = $userRole ?: trim($m[2]);
+                } else {
+                    $userName = trim($validated['created_by']);
+                }
+            }
+            if (empty($userName)) {
+                $userName = $authUser?->name ?: 'Super Admin';
+            }
+            if (empty($userRole)) {
+                $userRole = $authUser?->role ?: 'Super Admin';
+            }
+            $createdBy = !empty($validated['created_by'])
+                ? $validated['created_by']
+                : "$userName ($userRole)";
+
+            $txDate = trim($validated['date']);
+            if (!str_contains($txDate, ':')) {
+                $txDate .= ' ' . now()->format('H:i:s');
+            }
+
             $purchase = Purchase::create([
                 'reference_no'   => $refNo,
                 'supplier_id'    => $validated['supplier_id'] ?? null,
                 'supplier_name'  => $validated['supplier_name'],
                 'warehouse_id'   => $validated['warehouse_id'] ?? null,
                 'warehouse_name' => $validated['warehouse_name'],
-                'date'           => $validated['date'],
+                'date'           => $txDate,
                 'status'         => $validated['status'] ?? 'Received',
                 'tax_rate'       => (float)($validated['tax_rate'] ?? 0),
                 'tax_amount'     => (float)($validated['tax_amount'] ?? 0),
@@ -148,7 +204,10 @@ class PurchaseController extends Controller
                 'payment_status' => $paymentStatus,
                 'payment_type'   => $validated['payment_type'] ?? ($paymentStatus === 'Unpaid' ? 'N/A' : 'Cash'),
                 'notes'          => $validated['notes'] ?? null,
-                'created_by'     => $validated['created_by'] ?? 'Admin User',
+                'created_by'     => $createdBy,
+                'user_id'        => $validated['user_id'] ?? ($authUser?->id ?? $request->user()?->id),
+                'user_name'      => $userName,
+                'user_role'      => $userRole,
             ]);
 
             $unitService = app(ProductUnitConversionService::class);
@@ -232,7 +291,7 @@ class PurchaseController extends Controller
 
     public function update(Request $request, $id)
     {
-        $purchase = Purchase::find($id) ?? Purchase::where('reference_no', $id)->first();
+        $purchase = Purchase::where('reference_no', (string)$id)->first() ?? Purchase::find($id);
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }
@@ -249,6 +308,10 @@ class PurchaseController extends Controller
             'payment_status' => 'nullable|string',
             'payment_type' => 'nullable|string',
             'notes' => 'nullable|string',
+            'created_by' => 'nullable|string|max:255',
+            'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:255',
         ]);
 
         $grandTotal = isset($validated['grand_total']) ? (float)$validated['grand_total'] : (float)$purchase->grand_total;
@@ -273,7 +336,7 @@ class PurchaseController extends Controller
 
     public function show($id)
     {
-        $purchase = Purchase::with(['items', 'supplier'])->find($id) ?? Purchase::with(['items', 'supplier'])->where('reference_no', $id)->first();
+        $purchase = Purchase::with(['items', 'supplier'])->where('reference_no', (string)$id)->first() ?? Purchase::with(['items', 'supplier'])->find($id);
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }
@@ -282,7 +345,7 @@ class PurchaseController extends Controller
 
     public function destroy($id)
     {
-        $purchase = Purchase::with('items')->find($id) ?? Purchase::with('items')->where('reference_no', $id)->first();
+        $purchase = Purchase::with('items')->where('reference_no', (string)$id)->first() ?? Purchase::with('items')->find($id);
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }
@@ -300,17 +363,21 @@ class PurchaseController extends Controller
 
                     if ($product) {
                         $baseQty = $item->base_quantity > 0 ? (float)$item->base_quantity : (float)$item->quantity;
-                        $unitService->applyStock(
-                            $product,
-                            $warehouseId,
-                            $item->product_variant_id,
-                            $baseQty,
-                            'out',
-                            'purchase_deletion',
-                            'purchase',
-                            (string)$purchase->id,
-                            'Stock reduced due to purchase deletion'
-                        );
+                        try {
+                            $unitService->applyStock(
+                                $product,
+                                $warehouseId,
+                                $item->product_variant_id,
+                                $baseQty,
+                                'out',
+                                'purchase_deletion',
+                                'purchase',
+                                (string)$purchase->id,
+                                'Stock reduced due to purchase deletion'
+                            );
+                        } catch (\Throwable $e) {
+                            \Illuminate\Support\Facades\Log::warning("Stock deduction on purchase delete skipped: " . $e->getMessage());
+                        }
                     }
                 }
             }

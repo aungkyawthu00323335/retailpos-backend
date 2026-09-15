@@ -29,6 +29,7 @@ class SettingController extends Controller
             'footer' => 'All rights reserved by InfyOm Technologies',
             'default_customer' => 'walk-in-customer',
             'default_warehouse' => 'warehouse',
+            'timezone' => 'Asia/Yangon',
             'country' => 'Myanmar',
             'state' => 'Yangon',
             'city' => 'Yangon',
@@ -88,6 +89,12 @@ class SettingController extends Controller
             // If a prefix changed, cascade the new prefix to existing transaction records
             if (isset($prefixModelMap[$key]) && !empty($strVal)) {
                 $this->updateModelPrefixes($prefixModelMap[$key], trim($strVal));
+            }
+
+            // If timezone changed, dynamically set PHP and Laravel timezone immediately
+            if ($key === 'timezone' && !empty($strVal) && in_array($strVal, timezone_identifiers_list(), true)) {
+                date_default_timezone_set($strVal);
+                config(['app.timezone' => $strVal]);
             }
         }
 

@@ -53,37 +53,51 @@ class ProductController extends Controller
                 'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
                 'variants.values:id,product_variant_id,attribute_name,attribute_value',
                 'variants.stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
                     if ($warehouseId !== null) {
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
                 'stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
                     if ($warehouseId !== null) {
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
-                'stockBalances.warehouse:id,name',
-                'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
             ]);
+
+        if ($warehouseId !== null) {
+            $query->withSum(['stockBalances as warehouse_stock' => function ($q) use ($warehouseId) {
+                $q->where('warehouse_id', $warehouseId);
+            }], 'quantity');
+        }
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $query->where(function ($q) use ($search) {
-                $q->where('code', 'like', "%{$search}%")
+                $q->where('code', $search)
+                  ->orWhere('sku', $search)
+                  ->orWhere('barcode', $search)
+                  ->orWhere('code', 'like', "%{$search}%")
                   ->orWhere('sku', 'like', "%{$search}%")
                   ->orWhere('barcode', 'like', "%{$search}%")
                   ->orWhere('name', 'like', "%{$search}%")
                   ->orWhere('alternative_name', 'like', "%{$search}%")
                   ->orWhere('brand_name', 'like', "%{$search}%")
                   ->orWhere('category_name', 'like', "%{$search}%")
-                  ->orWhereHas('variants', function ($vq) use ($search) {
-                      $vq->where('name', 'like', "%{$search}%")
-                         ->orWhere('sku', 'like', "%{$search}%")
-                         ->orWhere('barcode', 'like', "%{$search}%")
-                         ->orWhereHas('values', function ($valQ) use ($search) {
-                             $valQ->where('attribute_value', 'like', "%{$search}%")
-                                  ->orWhere('attribute_name', 'like', "%{$search}%");
-                         });
+                  ->orWhereIn('id', function ($sub) use ($search) {
+                      $sub->select('product_id')
+                          ->from('product_variants')
+                          ->where('name', 'like', "%{$search}%")
+                          ->orWhere('sku', 'like', "%{$search}%")
+                          ->orWhere('barcode', 'like', "%{$search}%");
+                  })
+                  ->orWhereIn('id', function ($sub) use ($search) {
+                      $sub->select('pv.product_id')
+                          ->from('product_variants as pv')
+                          ->join('product_variant_values as pvv', 'pv.id', '=', 'pvv.product_variant_id')
+                          ->where('pvv.attribute_value', 'like', "%{$search}%")
+                          ->orWhere('pvv.attribute_name', 'like', "%{$search}%");
                   });
             });
         }
@@ -114,12 +128,24 @@ class ProductController extends Controller
             $query->orderBy('id', 'desc');
         }
 
-        $perPage = (int)$request->input('per_page', 20);
-        if ($perPage <= 0) $perPage = 20;
+        $perPage = (int)$request->input('per_page', 50);
+        if ($perPage <= 0) $perPage = 50;
         if ($perPage > 100) $perPage = 100;
 
         $page = (int)$request->input('page', 1);
         if ($page <= 0) $page = 1;
+
+        $search = trim((string)$request->input('search', ''));
+        $category = (string)$request->input('category', '');
+        $brand = (string)$request->input('brand', '');
+        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}");
+
+        if (!$request->boolean('force_refresh') && \Illuminate\Support\Facades\Cache::store('file')->has($cacheKey)) {
+            $cached = \Illuminate\Support\Facades\Cache::store('file')->get($cacheKey);
+            return response()->json($cached)
+                ->header('Cache-Control', 'private, max-age=60')
+                ->header('X-Cache', 'HIT');
+        }
 
         // ── Single query via paginate() ────────────────────────────────────
         // Replaces the previous `(clone $query)->count()` + `offset()->limit()`
@@ -142,17 +168,23 @@ class ProductController extends Controller
             return response(null, 304)->header('ETag', $etag);
         }
 
-        return response()->json([
+        $responseData = [
             'status'     => 'success',
-            'data'       => ProductListResource::collection($items),
+            'data'       => ProductListResource::collection($items)->resolve(),
             'pagination' => [
                 'current_page' => $page,
                 'per_page'     => $perPage,
                 'total'        => $total,
                 'last_page'    => $lastPage,
             ],
-        ])->header('Cache-Control', 'private, max-age=60')
-          ->header('ETag', $etag);
+        ];
+
+        \Illuminate\Support\Facades\Cache::store('file')->put($cacheKey, $responseData, 60);
+
+        return response()->json($responseData)
+            ->header('Cache-Control', 'private, max-age=60')
+            ->header('ETag', $etag)
+            ->header('X-Cache', 'MISS');
     }
 
 
@@ -376,6 +408,10 @@ class ProductController extends Controller
 
         $product = $createService->create($data, $images);
 
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
+
         return response()->json([
             'success' => true,
             'status' => 'success',
@@ -488,6 +524,10 @@ class ProductController extends Controller
 
         $updated = $updateService->update($product, $validated);
 
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
+
         return response()->json([
             'success' => true,
             'status' => 'success',
@@ -505,6 +545,10 @@ class ProductController extends Controller
         }
 
         $product->delete();
+
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
 
         return response()->json([
             'success' => true,

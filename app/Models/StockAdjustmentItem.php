@@ -16,16 +16,27 @@ class StockAdjustmentItem extends Model
         'product_code',
         'product_name',
         'variant_name',
+        'unit_id',
+        'unit_name',
+        'conversion_rate',
         'quantity',
+        'base_quantity',
         'type', // Addition, Subtraction
         'unit_cost',
+        'base_unit_cost',
+        'subtotal',
     ];
 
     protected $casts = [
         'product_id' => 'integer',
         'product_variant_id' => 'integer',
+        'unit_id' => 'integer',
+        'conversion_rate' => 'float',
         'quantity' => 'float',
+        'base_quantity' => 'float',
         'unit_cost' => 'float',
+        'base_unit_cost' => 'float',
+        'subtotal' => 'float',
     ];
 
     public function adjustment()

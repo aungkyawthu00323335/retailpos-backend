@@ -28,6 +28,9 @@ class Purchase extends Model
         'payment_type', // Cash, Card, Bank Transfer, Cheque, etc.
         'notes',
         'created_by',
+        'user_id',
+        'user_name',
+        'user_role',
     ];
 
     protected $casts = [
@@ -48,6 +51,11 @@ class Purchase extends Model
     public function supplier()
     {
         return $this->belongsTo(Supplier::class, 'supplier_id');
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class, 'user_id');
     }
 
     /**

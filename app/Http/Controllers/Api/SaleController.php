@@ -23,7 +23,7 @@ class SaleController extends Controller
             'id', 'reference_no', 'customer_id', 'customer_name', 'warehouse_id', 'warehouse_name',
             'date', 'status', 'tax_rate', 'tax_amount', 'discount', 'shipping', 'subtotal',
             'grand_total', 'paid_amount', 'due_amount', 'change_amount', 'payment_status',
-            'payment_type', 'notes', 'pos_flag', 'created_by'
+            'payment_type', 'notes', 'pos_flag', 'created_by', 'user_id', 'user_name', 'user_role'
         ]);
 
         if ($includeFull) {
@@ -101,7 +101,11 @@ class SaleController extends Controller
             'payment_type' => 'nullable|string',
             'notes' => 'nullable|string',
             'pos_flag' => 'nullable|boolean',
+            'cash_register_id' => 'nullable|integer',
             'created_by' => 'nullable|string|max:255',
+            'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:100',
             'items' => 'required|array|min:1',
             'items.*.product_id' => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
@@ -146,12 +150,67 @@ class SaleController extends Controller
                 $paymentStatus = 'Partial';
             }
 
+            $txDate = trim($validated['date']);
+            if (!str_contains($txDate, ':')) {
+                $txDate .= ' ' . now()->format('H:i:s');
+            }
+
+            $token = $request->bearerToken();
+            $authUser = null;
+            if ($token) {
+                $authUser = \App\Models\User::where('api_token', $token)->first();
+            }
+            if (!$authUser && !empty($validated['user_id'])) {
+                $authUser = \App\Models\User::find($validated['user_id']);
+            }
+
+            $userName = !empty($validated['user_name'])
+                ? $validated['user_name']
+                : ($authUser?->name ?? ($request->user()?->name ?? null));
+            $userRole = !empty($validated['user_role'])
+                ? $validated['user_role']
+                : ($authUser?->role ?? ($request->user()?->role ?? null));
+
+            if (empty($userName) && !empty($validated['created_by'])) {
+                if (preg_match('/^(.*?)\s*\((.*?)\)$/', $validated['created_by'], $m)) {
+                    $userName = trim($m[1]);
+                    $userRole = $userRole ?: trim($m[2]);
+                } else {
+                    $userName = trim($validated['created_by']);
+                }
+            }
+            if (empty($userName)) {
+                $userName = $authUser?->name ?: 'Super Admin';
+            }
+            if (empty($userRole)) {
+                $userRole = $authUser?->role ?: ((!empty($userName) && str_contains(strtolower($userName), 'cashier')) ? 'Cashier' : 'Super Admin');
+            }
+            $createdBy = !empty($validated['created_by'])
+                ? $validated['created_by']
+                : "$userName ($userRole)";
+
+            $cashRegisterId = $validated['cash_register_id'] ?? null;
+            if (!$cashRegisterId) {
+                $activeReg = \App\Models\CashRegister::where('status', 'open')
+                    ->where(function ($q) use ($validated, $authUser, $userName) {
+                        $uId = $validated['user_id'] ?? $authUser?->id;
+                        if ($uId) $q->where('user_id', $uId);
+                        if ($userName) $q->orWhere('user_name', $userName);
+                    })
+                    ->where('warehouse_name', $validated['warehouse_name'])
+                    ->orderBy('id', 'desc')
+                    ->first();
+                if ($activeReg) {
+                    $cashRegisterId = $activeReg->id;
+                }
+            }
+
             $sale = Sale::create([
                 'reference_no' => $refNo,
                 'customer_id' => $validated['customer_id'] ?? null,
                 'customer_name' => $validated['customer_name'],
                 'warehouse_name' => $validated['warehouse_name'],
-                'date' => $validated['date'],
+                'date' => $txDate,
                 'status' => $validated['status'] ?? 'Completed',
                 'tax_rate' => (float)($validated['tax_rate'] ?? 0),
                 'tax_amount' => (float)($validated['tax_amount'] ?? 0),
@@ -165,8 +224,12 @@ class SaleController extends Controller
                 'payment_status' => $paymentStatus,
                 'payment_type' => $validated['payment_type'] ?? 'Cash',
                 'notes' => $validated['notes'] ?? null,
-                'pos_flag' => $validated['pos_flag'] ?? true,
-                'created_by' => $validated['created_by'] ?? 'Cashier',
+                'pos_flag'       => $validated['pos_flag'] ?? true,
+                'cash_register_id' => $cashRegisterId,
+                'created_by'     => $createdBy,
+                'user_id'        => $validated['user_id'] ?? ($authUser?->id ?? $request->user()?->id),
+                'user_name'      => $userName,
+                'user_role'      => $userRole,
             ]);
 
             $unitService = app(ProductUnitConversionService::class);
@@ -286,6 +349,11 @@ class SaleController extends Controller
 
             DB::commit();
 
+            // Clear product cache so inventory reductions reflect immediately
+            try {
+                \Illuminate\Support\Facades\Cache::store('file')->flush();
+            } catch (\Throwable $e) {}
+
             return response()->json([
                 'status' => 'success',
                 'message' => 'Sale completed successfully',
@@ -375,6 +443,10 @@ class SaleController extends Controller
             'payment_status' => 'nullable|string',
             'payment_type' => 'nullable|string',
             'notes' => 'nullable|string',
+            'created_by' => 'nullable|string|max:255',
+            'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:100',
         ]);
 
         $grandTotal = isset($validated['grand_total']) ? (float)$validated['grand_total'] : (float)$sale->grand_total;

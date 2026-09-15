@@ -29,7 +29,11 @@ class Sale extends Model
         'payment_type', // Cash, Credit Card, Bank Transfer, Cheque, WavePay, KBZPay, etc.
         'notes',
         'pos_flag',
+        'cash_register_id',
         'created_by',
+        'user_id',
+        'user_name',
+        'user_role',
     ];
 
     protected $casts = [
@@ -43,6 +47,7 @@ class Sale extends Model
         'due_amount' => 'float',
         'change_amount' => 'float',
         'pos_flag' => 'boolean',
+        'cash_register_id' => 'integer',
     ];
 
     public function items()
@@ -58,5 +63,10 @@ class Sale extends Model
     public function customer()
     {
         return $this->belongsTo(Customer::class, 'customer_id');
+    }
+
+    public function cashRegister()
+    {
+        return $this->belongsTo(CashRegister::class, 'cash_register_id');
     }
 }

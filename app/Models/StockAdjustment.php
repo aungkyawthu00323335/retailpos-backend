@@ -11,6 +11,7 @@ class StockAdjustment extends Model
 
     protected $fillable = [
         'reference_no',
+        'warehouse_id',
         'warehouse_name',
         'date',
         'total_products',
@@ -18,8 +19,16 @@ class StockAdjustment extends Model
         'type', // Addition, Subtraction
         'notes',
         'user_id',
+        'user_name',
         'created_by',
         'user_role',
+    ];
+
+    protected $casts = [
+        'warehouse_id' => 'integer',
+        'user_id' => 'integer',
+        'total_products' => 'integer',
+        'total_quantity' => 'float',
     ];
 
     public function user()

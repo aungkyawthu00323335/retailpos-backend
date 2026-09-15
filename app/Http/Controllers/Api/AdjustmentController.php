@@ -48,11 +48,15 @@ class AdjustmentController extends Controller
     {
         $query = StockAdjustment::with([
             'user:id,name,role',
-            'items:id,stock_adjustment_id,product_id,product_variant_id,product_code,product_name,variant_name,quantity,type,unit_cost'
+            'items'
         ]);
 
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
             $query->where('warehouse_name', $request->input('warehouse'));
+        }
+
+        if ($request->filled('warehouse_id')) {
+            $query->where('warehouse_id', (int)$request->input('warehouse_id'));
         }
 
         if ($request->filled('type') && $request->input('type') !== 'All') {
@@ -83,6 +87,7 @@ class AdjustmentController extends Controller
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('notes', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
                   ->orWhere('user_role', 'like', "%{$search}%")
                   ->orWhereHas('user', function ($uq) use ($search) {
                       $uq->where('name', 'like', "%{$search}%")
@@ -137,6 +142,7 @@ class AdjustmentController extends Controller
             'type' => 'required|string|in:Addition,Subtraction',
             'notes' => 'nullable|string',
             'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
             'created_by' => 'nullable|string|max:255',
             'user_role' => 'nullable|string|max:255',
             'items' => 'required|array|min:1',
@@ -145,9 +151,15 @@ class AdjustmentController extends Controller
             'items.*.product_code' => 'required|string',
             'items.*.product_name' => 'required|string',
             'items.*.variant_name' => 'nullable|string',
+            'items.*.unit_id' => 'nullable|integer',
+            'items.*.unit_name' => 'nullable|string|max:100',
+            'items.*.conversion_rate' => 'nullable|numeric|min:0.0001',
             'items.*.quantity' => 'required|numeric|min:0.01',
+            'items.*.base_quantity' => 'nullable|numeric|min:0',
             'items.*.type' => 'nullable|string|in:Addition,Subtraction',
             'items.*.unit_cost' => 'nullable|numeric|min:0',
+            'items.*.base_unit_cost' => 'nullable|numeric|min:0',
+            'items.*.subtotal' => 'nullable|numeric|min:0',
         ]);
 
         DB::beginTransaction();
@@ -172,10 +184,10 @@ class AdjustmentController extends Controller
                 $targetUser = User::first();
             }
 
-            $createdByName = !empty($validated['created_by'])
-                ? $validated['created_by']
-                : ($targetUser ? $targetUser->name : 'Super Admin');
-            if ($targetUser && (empty($validated['created_by']) || $validated['created_by'] === 'Super Admin')) {
+            $createdByName = !empty($validated['user_name'])
+                ? $validated['user_name']
+                : (!empty($validated['created_by']) ? $validated['created_by'] : ($targetUser ? $targetUser->name : 'Super Admin'));
+            if ($targetUser && (empty($createdByName) || $createdByName === 'Super Admin')) {
                 $createdByName = $targetUser->name;
             }
 
@@ -186,20 +198,34 @@ class AdjustmentController extends Controller
                 ? $validated['user_id']
                 : ($targetUser ? $targetUser->id : null);
 
+            $txDate = trim($validated['date']);
+            if (!str_contains($txDate, ':')) {
+                $txDate .= ' ' . now()->format('H:i:s');
+            }
+
             $adjustment = StockAdjustment::create([
                 'reference_no' => $refNo,
+                'warehouse_id' => $warehouseId,
                 'warehouse_name' => $validated['warehouse_name'],
-                'date' => $validated['date'],
+                'date' => $txDate,
                 'total_products' => count($validated['items']),
                 'total_quantity' => $totalQty,
                 'type' => $validated['type'],
                 'notes' => $validated['notes'] ?? null,
                 'user_id' => $userId,
+                'user_name' => $createdByName,
                 'created_by' => $createdByName,
                 'user_role' => $userRole,
             ]);
 
             foreach ($validated['items'] as $itemData) {
+                $conversionRate = isset($itemData['conversion_rate']) ? (float)$itemData['conversion_rate'] : 1.0;
+                $quantity = (float)$itemData['quantity'];
+                $unitCost = (float)($itemData['unit_cost'] ?? 0);
+                $baseQty = isset($itemData['base_quantity']) ? (float)$itemData['base_quantity'] : ($quantity * $conversionRate);
+                $baseCost = isset($itemData['base_unit_cost']) ? (float)$itemData['base_unit_cost'] : ($conversionRate > 0 ? $unitCost / $conversionRate : $unitCost);
+                $subtotal = isset($itemData['subtotal']) ? (float)$itemData['subtotal'] : ($quantity * $unitCost);
+
                 $adjItem = StockAdjustmentItem::create([
                     'stock_adjustment_id' => $adjustment->id,
                     'product_id' => $itemData['product_id'] ?? null,
@@ -207,9 +233,15 @@ class AdjustmentController extends Controller
                     'product_code' => $itemData['product_code'],
                     'product_name' => $itemData['product_name'],
                     'variant_name' => $itemData['variant_name'] ?? null,
-                    'quantity' => (float)$itemData['quantity'],
+                    'unit_id' => $itemData['unit_id'] ?? null,
+                    'unit_name' => $itemData['unit_name'] ?? 'Pcs',
+                    'conversion_rate' => $conversionRate,
+                    'quantity' => $quantity,
+                    'base_quantity' => $baseQty,
                     'type' => $itemData['type'] ?? $validated['type'],
-                    'unit_cost' => (float)($itemData['unit_cost'] ?? 0),
+                    'unit_cost' => $unitCost,
+                    'base_unit_cost' => $baseCost,
+                    'subtotal' => $subtotal,
                 ]);
 
                 $this->applyItemStock(
@@ -268,6 +300,7 @@ class AdjustmentController extends Controller
             'type' => 'nullable|string|in:Addition,Subtraction',
             'notes' => 'nullable|string',
             'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
             'created_by' => 'nullable|string|max:255',
             'user_role' => 'nullable|string|max:255',
             'items' => 'required|array|min:1',
@@ -276,9 +309,15 @@ class AdjustmentController extends Controller
             'items.*.product_code' => 'required|string',
             'items.*.product_name' => 'required|string',
             'items.*.variant_name' => 'nullable|string',
+            'items.*.unit_id' => 'nullable|integer',
+            'items.*.unit_name' => 'nullable|string|max:100',
+            'items.*.conversion_rate' => 'nullable|numeric|min:0.0001',
             'items.*.quantity' => 'required|numeric|min:0.01',
+            'items.*.base_quantity' => 'nullable|numeric|min:0',
             'items.*.type' => 'nullable|string|in:Addition,Subtraction',
             'items.*.unit_cost' => 'nullable|numeric|min:0',
+            'items.*.base_unit_cost' => 'nullable|numeric|min:0',
+            'items.*.subtotal' => 'nullable|numeric|min:0',
         ]);
 
         DB::beginTransaction();
@@ -306,6 +345,7 @@ class AdjustmentController extends Controller
             }
 
             $updateData = [
+                'warehouse_id' => $newWarehouseId,
                 'warehouse_name' => $validated['warehouse_name'],
                 'date' => $validated['date'],
                 'total_products' => count($validated['items']),
@@ -313,7 +353,11 @@ class AdjustmentController extends Controller
                 'type' => $validated['type'] ?? $adjustment->type,
                 'notes' => $validated['notes'] ?? $adjustment->notes,
             ];
-            if (isset($validated['created_by'])) {
+            if (isset($validated['user_name'])) {
+                $updateData['user_name'] = $validated['user_name'];
+                $updateData['created_by'] = $validated['user_name'];
+            } elseif (isset($validated['created_by'])) {
+                $updateData['user_name'] = $validated['created_by'];
                 $updateData['created_by'] = $validated['created_by'];
             }
             if (isset($validated['user_role'])) {
@@ -326,6 +370,13 @@ class AdjustmentController extends Controller
             $adjustment->update($updateData);
 
             foreach ($validated['items'] as $itemData) {
+                $conversionRate = isset($itemData['conversion_rate']) ? (float)$itemData['conversion_rate'] : 1.0;
+                $quantity = (float)$itemData['quantity'];
+                $unitCost = (float)($itemData['unit_cost'] ?? 0);
+                $baseQty = isset($itemData['base_quantity']) ? (float)$itemData['base_quantity'] : ($quantity * $conversionRate);
+                $baseCost = isset($itemData['base_unit_cost']) ? (float)$itemData['base_unit_cost'] : ($conversionRate > 0 ? $unitCost / $conversionRate : $unitCost);
+                $subtotal = isset($itemData['subtotal']) ? (float)$itemData['subtotal'] : ($quantity * $unitCost);
+
                 $adjItem = StockAdjustmentItem::create([
                     'stock_adjustment_id' => $adjustment->id,
                     'product_id' => $itemData['product_id'] ?? null,
@@ -333,9 +384,15 @@ class AdjustmentController extends Controller
                     'product_code' => $itemData['product_code'],
                     'product_name' => $itemData['product_name'],
                     'variant_name' => $itemData['variant_name'] ?? null,
-                    'quantity' => (float)$itemData['quantity'],
+                    'unit_id' => $itemData['unit_id'] ?? null,
+                    'unit_name' => $itemData['unit_name'] ?? 'Pcs',
+                    'conversion_rate' => $conversionRate,
+                    'quantity' => $quantity,
+                    'base_quantity' => $baseQty,
                     'type' => $itemData['type'] ?? $adjustment->type,
-                    'unit_cost' => (float)($itemData['unit_cost'] ?? 0),
+                    'unit_cost' => $unitCost,
+                    'base_unit_cost' => $baseCost,
+                    'subtotal' => $subtotal,
                 ]);
 
                 $this->applyItemStock(
@@ -436,6 +493,9 @@ class AdjustmentController extends Controller
         $productId = $item->product_id;
         $variantId = $item->product_variant_id;
         $qty = (float)$item->quantity;
+        $conversionRate = (float)($item->conversion_rate ?: 1.0);
+        $baseQty = (float)($item->base_quantity ?: ($qty * $conversionRate));
+        $effectiveQty = $baseQty > 0 ? $baseQty : $qty;
         $type = $item->type; // 'Addition' or 'Subtraction'
 
         if (!$productId) {
@@ -482,17 +542,17 @@ class AdjustmentController extends Controller
         }
 
         if ($isAddition) {
-            $balance->increment('quantity', $qty);
+            $balance->increment('quantity', $effectiveQty);
         } else {
-            $balance->decrement('quantity', $qty);
+            $balance->decrement('quantity', $effectiveQty);
         }
         $balance->refresh();
 
         // 2. Update parent Product global stock_quantity
         if ($isAddition) {
-            $prod->increment('stock_quantity', $qty);
+            $prod->increment('stock_quantity', $effectiveQty);
         } else {
-            $prod->decrement('stock_quantity', $qty);
+            $prod->decrement('stock_quantity', $effectiveQty);
         }
 
         // 3. Record StockMovement audit entry
@@ -518,8 +578,8 @@ class AdjustmentController extends Controller
                 'movement_type' => 'adjustment',
                 'reference_type' => 'stock_adjustment',
                 'reference_id' => $adjustmentId,
-                'quantity_in' => $isAddition ? $qty : 0,
-                'quantity_out' => !$isAddition ? $qty : 0,
+                'quantity_in' => $isAddition ? $effectiveQty : 0,
+                'quantity_out' => !$isAddition ? $effectiveQty : 0,
                 'balance_after' => (float)$balance->quantity,
                 'created_by' => $movementCreatedBy,
                 'note' => $notes ?: "Stock Adjustment ($adjustmentRef)",

@@ -11,6 +11,7 @@ class Expense extends Model
 
     protected $fillable = [
         'reference_no',
+        'warehouse_id',
         'warehouse_name',
         'expense_category_id',
         'expense_category_name',
@@ -20,10 +21,13 @@ class Expense extends Model
         'details',
         'created_by',
         'user_id',
+        'user_name',
         'user_role',
     ];
 
     protected $casts = [
+        'warehouse_id' => 'integer',
+        'user_id' => 'integer',
         'amount' => 'float',
     ];
 

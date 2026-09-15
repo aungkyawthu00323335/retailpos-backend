@@ -30,6 +30,7 @@ use App\Http\Controllers\Api\SettingController;
 use App\Http\Controllers\Api\CurrencyController;
 use App\Http\Controllers\Api\VariationController;
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\CashRegisterController;
 
 /*
 |--------------------------------------------------------------------------
@@ -80,6 +81,12 @@ Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']
 Route::apiResource('purchases', PurchaseController::class);
 Route::apiResource('purchase-returns', PurchaseReturnController::class);
 
+// Cash Register & POS Shift Management
+Route::get('cash-register/status', [CashRegisterController::class, 'status']);
+Route::post('cash-register/open', [CashRegisterController::class, 'open']);
+Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'details']);
+Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
+
 // Sales, POS Checkout & Sales Returns
 Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
 Route::apiResource('sales', SaleController::class);
@@ -118,12 +125,19 @@ Route::apiResource('roles', RoleController::class);
 Route::get('reports/dashboard-summary', [ReportController::class, 'dashboardSummary']);
 Route::get('reports/profit-loss', [ReportController::class, 'profitLoss']);
 Route::get('reports/stock', [ReportController::class, 'stockReport']);
+Route::get('reports/stock/export', [ReportController::class, 'exportStock']);
+Route::get('reports/stock/{id}/details', [ReportController::class, 'stockProductDetails']);
+Route::get('reports/stock-alert', [ReportController::class, 'stockAlertReport']);
 Route::get('reports/sales', [ReportController::class, 'salesReport']);
 Route::get('reports/purchases', [ReportController::class, 'purchasesReport']);
+Route::get('reports/sale-returns', [ReportController::class, 'saleReturnsReport']);
+Route::get('reports/purchase-returns', [ReportController::class, 'purchaseReturnsReport']);
 Route::get('reports/top-selling', [ReportController::class, 'topSellingReport']);
 Route::get('reports/customers', [ReportController::class, 'customerReport']);
 Route::get('reports/suppliers', [ReportController::class, 'supplierReport']);
 Route::get('reports/expenses', [ReportController::class, 'expenseReport']);
+Route::get('reports/register', [ReportController::class, 'registerReport']);
+Route::get('reports/z-report', [ReportController::class, 'zReport']);
 
 // General Settings & Multi-Currency
 Route::get('settings', [SettingController::class, 'getSettings']);

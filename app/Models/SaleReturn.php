@@ -14,6 +14,7 @@ class SaleReturn extends Model
         'sale_reference_no',
         'customer_id',
         'customer_name',
+        'warehouse_id',
         'warehouse_name',
         'date',
         'status', // Completed, Pending
@@ -21,6 +22,7 @@ class SaleReturn extends Model
         'paid_amount',
         'due_amount',
         'payment_status',
+        'payment_type',
         'notes',
         'created_by',
     ];
