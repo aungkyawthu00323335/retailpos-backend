@@ -262,8 +262,10 @@ class CashRegisterController extends Controller
             foreach ($payments as $p) {
                 $pType = strtolower(trim((string)$p->payment_type));
                 $amount = (float)$p->amount;
+                $change = (float)($p->change_amount ?? 0);
                 if ($pType === 'cash') {
-                    $cashSales += $amount;
+                    // Net cash retained in till drawer = amount collected minus change given back to customer
+                    $cashSales += max(0, $amount - $change);
                 } elseif (in_array($pType, ['card', 'credit card', 'pos card', 'visa', 'mastercard'])) {
                     $cardSales += $amount;
                 } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer'])) {
