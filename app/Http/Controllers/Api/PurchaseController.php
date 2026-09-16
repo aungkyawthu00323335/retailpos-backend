@@ -239,7 +239,7 @@ class PurchaseController extends Controller
                 $baseQuantity = $unitService->baseQuantity($quantity, (float)$linkedUnit['conversion_rate']);
                 $baseUnitCost = $unitService->basePrice((float)$item['unit_cost'], (float)$linkedUnit['conversion_rate']);
 
-                PurchaseItem::create([
+                $purchaseItem = PurchaseItem::create([
                     'purchase_id' => $purchase->id,
                     'product_id' => $product?->id,
                     'product_variant_id' => $variantId,
@@ -272,6 +272,20 @@ class PurchaseController extends Controller
                             'Purchase received in ' . $linkedUnit['unit_name']
                         );
                         $product->update(['purchase_price' => (float)$item['unit_cost']]);
+
+                        // Register into FIFO Inventory Batches
+                        app(\App\Services\FifoInventoryService::class)->recordBatch(
+                            warehouseId: (int)$warehouseId,
+                            productId: (int)$product->id,
+                            variantId: $variantId,
+                            baseQuantity: (float)$baseQuantity,
+                            baseUnitCost: (float)$baseUnitCost,
+                            sourceType: 'purchase',
+                            sourceReference: (string)$purchase->reference_no,
+                            receivedDate: (string)$purchase->date,
+                            purchaseItemId: (int)$purchaseItem->id,
+                            notes: "Purchase #{$purchase->reference_no} received"
+                        );
                     }
                 }
             }
@@ -381,6 +395,9 @@ class PurchaseController extends Controller
                     }
                 }
             }
+
+            // Clean up related FIFO inventory batches
+            \App\Models\InventoryBatch::whereIn('purchase_item_id', $purchase->items->pluck('id'))->delete();
 
             $purchase->items()->delete();
             $purchase->delete();

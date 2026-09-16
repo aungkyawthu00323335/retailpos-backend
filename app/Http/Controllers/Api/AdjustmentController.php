@@ -226,9 +226,15 @@ class AdjustmentController extends Controller
                 $baseCost = isset($itemData['base_unit_cost']) ? (float)$itemData['base_unit_cost'] : ($conversionRate > 0 ? $unitCost / $conversionRate : $unitCost);
                 $subtotal = isset($itemData['subtotal']) ? (float)$itemData['subtotal'] : ($quantity * $unitCost);
 
+                $resolvedProductId = $itemData['product_id'] ?? null;
+                if (!$resolvedProductId && !empty($itemData['product_code'])) {
+                    $prod = Product::where('code', $itemData['product_code'])->first();
+                    $resolvedProductId = $prod?->id;
+                }
+
                 $adjItem = StockAdjustmentItem::create([
                     'stock_adjustment_id' => $adjustment->id,
-                    'product_id' => $itemData['product_id'] ?? null,
+                    'product_id' => $resolvedProductId,
                     'product_variant_id' => $itemData['product_variant_id'] ?? null,
                     'product_code' => $itemData['product_code'],
                     'product_name' => $itemData['product_name'],
@@ -253,6 +259,33 @@ class AdjustmentController extends Controller
                     $createdByName,
                     false
                 );
+
+                // FIFO Batch integration for additions and subtractions
+                if ($resolvedProductId) {
+                    $fifoService = app(\App\Services\FifoInventoryService::class);
+                    if ($adjItem->type === 'Addition') {
+                        $fifoService->recordBatch(
+                            warehouseId: (int)$warehouseId,
+                            productId: (int)$resolvedProductId,
+                            variantId: $adjItem->product_variant_id,
+                            baseQuantity: (float)$baseQty,
+                            baseUnitCost: (float)$baseCost,
+                            sourceType: 'adjustment_addition',
+                            sourceReference: (string)$refNo,
+                            receivedDate: (string)$adjustment->date,
+                            notes: $validated['notes'] ?? 'Stock adjustment addition'
+                        );
+                    } elseif ($adjItem->type === 'Subtraction') {
+                        $fifoService->depleteForAdjustment(
+                            warehouseId: (int)$warehouseId,
+                            productId: (int)$resolvedProductId,
+                            variantId: $adjItem->product_variant_id,
+                            baseQty: (float)$baseQty,
+                            referenceNo: (string)$refNo,
+                            fallbackCost: (float)$baseCost
+                        );
+                    }
+                }
             }
 
             DB::commit();

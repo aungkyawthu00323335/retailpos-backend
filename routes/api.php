@@ -138,6 +138,13 @@ Route::get('reports/suppliers', [ReportController::class, 'supplierReport']);
 Route::get('reports/expenses', [ReportController::class, 'expenseReport']);
 Route::get('reports/register', [ReportController::class, 'registerReport']);
 Route::get('reports/z-report', [ReportController::class, 'zReport']);
+Route::get('reports/ar-aging', [ReportController::class, 'arAgingReport']);
+Route::get('reports/ap-aging', [ReportController::class, 'apAgingReport']);
+Route::get('reports/cash-flow', [ReportController::class, 'cashFlowReport']);
+Route::get('reports/stock-ledger', [ReportController::class, 'stockLedgerReport']);
+Route::get('reports/product-margins', [ReportController::class, 'productMarginsReport']);
+Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport']);
+Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport']);
 
 // General Settings & Multi-Currency
 Route::get('settings', [SettingController::class, 'getSettings']);

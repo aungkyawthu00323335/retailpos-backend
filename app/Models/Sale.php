@@ -13,6 +13,7 @@ class Sale extends Model
         'reference_no',
         'customer_id',
         'customer_name',
+        'warehouse_id',
         'warehouse_name',
         'date',
         'status', // Completed, Pending, Draft
@@ -34,15 +35,18 @@ class Sale extends Model
         'user_id',
         'user_name',
         'user_role',
+        'total_cogs',
     ];
 
     protected $casts = [
+        'warehouse_id' => 'integer',
         'tax_rate' => 'float',
         'tax_amount' => 'float',
         'discount' => 'float',
         'shipping' => 'float',
         'subtotal' => 'float',
         'grand_total' => 'float',
+        'total_cogs' => 'float',
         'paid_amount' => 'float',
         'due_amount' => 'float',
         'change_amount' => 'float',
@@ -53,6 +57,11 @@ class Sale extends Model
     public function items()
     {
         return $this->hasMany(SaleItem::class, 'sale_id');
+    }
+
+    public function costLayers()
+    {
+        return $this->hasMany(SaleItemCostLayer::class, 'sale_id');
     }
 
     public function payments()

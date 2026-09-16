@@ -25,6 +25,8 @@ class SaleItem extends Model
         'tax',
         'discount',
         'subtotal',
+        'base_unit_cost',
+        'total_cogs',
     ];
 
     protected $casts = [
@@ -36,10 +38,17 @@ class SaleItem extends Model
         'tax' => 'float',
         'discount' => 'float',
         'subtotal' => 'float',
+        'base_unit_cost' => 'float',
+        'total_cogs' => 'float',
     ];
 
     public function sale()
     {
         return $this->belongsTo(Sale::class, 'sale_id');
+    }
+
+    public function costLayers()
+    {
+        return $this->hasMany(SaleItemCostLayer::class, 'sale_item_id');
     }
 }

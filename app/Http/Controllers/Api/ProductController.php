@@ -128,9 +128,11 @@ class ProductController extends Controller
             $query->orderBy('id', 'desc');
         }
 
+        $isPos = $request->boolean('is_pos') || $request->filled('for_pos') || $request->boolean('all_pages');
+        $maxAllowedPerPage = $isPos ? 250 : 100;
         $perPage = (int)$request->input('per_page', 50);
         if ($perPage <= 0) $perPage = 50;
-        if ($perPage > 100) $perPage = 100;
+        if ($perPage > $maxAllowedPerPage) $perPage = $maxAllowedPerPage;
 
         $page = (int)$request->input('page', 1);
         if ($page <= 0) $page = 1;
@@ -138,7 +140,7 @@ class ProductController extends Controller
         $search = trim((string)$request->input('search', ''));
         $category = (string)$request->input('category', '');
         $brand = (string)$request->input('brand', '');
-        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}");
+        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0'));
 
         if (!$request->boolean('force_refresh') && \Illuminate\Support\Facades\Cache::store('file')->has($cacheKey)) {
             $cached = \Illuminate\Support\Facades\Cache::store('file')->get($cacheKey);

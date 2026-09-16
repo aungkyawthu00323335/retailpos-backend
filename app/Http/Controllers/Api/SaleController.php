@@ -205,10 +205,14 @@ class SaleController extends Controller
                 }
             }
 
+            $unitService = app(ProductUnitConversionService::class);
+            $warehouseId = $unitService->warehouseId($validated['warehouse_id'] ?? null, $validated['warehouse_name'] ?? null);
+
             $sale = Sale::create([
                 'reference_no' => $refNo,
                 'customer_id' => $validated['customer_id'] ?? null,
                 'customer_name' => $validated['customer_name'],
+                'warehouse_id' => $warehouseId,
                 'warehouse_name' => $validated['warehouse_name'],
                 'date' => $txDate,
                 'status' => $validated['status'] ?? 'Completed',
@@ -232,9 +236,6 @@ class SaleController extends Controller
                 'user_role'      => $userRole,
             ]);
 
-            $unitService = app(ProductUnitConversionService::class);
-            $warehouseId = $unitService->warehouseId($validated['warehouse_id'] ?? null, $sale->warehouse_name);
-
             // Pre-fetch all products & variants in a single bulk query to eliminate N+1 queries
             $itemProductIds = array_values(array_filter(array_column($validated['items'], 'product_id')));
             $itemProductCodes = array_values(array_filter(array_column($validated['items'], 'product_code')));
@@ -252,6 +253,9 @@ class SaleController extends Controller
 
             $productsById = $productsMap->keyBy('id');
             $productsByCode = $productsMap->keyBy('code');
+
+            $fifoService = app(\App\Services\FifoInventoryService::class);
+            $totalSaleCogs = 0.0;
 
             foreach ($validated['items'] as $item) {
                 $product = (!empty($item['product_id']) && isset($productsById[$item['product_id']]))
@@ -280,7 +284,7 @@ class SaleController extends Controller
                 $baseQuantity = $unitService->baseQuantity($quantity, (float)$linkedUnit['conversion_rate']);
                 $baseUnitPrice = $unitService->basePrice((float)$item['unit_price'], (float)$linkedUnit['conversion_rate']);
 
-                SaleItem::create([
+                $saleItem = SaleItem::create([
                     'sale_id' => $sale->id,
                     'product_id' => $product?->id,
                     'product_variant_id' => $variantId,
@@ -298,7 +302,7 @@ class SaleController extends Controller
                     'subtotal' => (float)$item['subtotal'],
                 ]);
 
-                // Reduce inventory stock if completed
+                // Reduce inventory stock if completed and deplete FIFO batches
                 if ($sale->status === 'Completed') {
                     if ($product) {
                         $unitService->applyStock(
@@ -312,8 +316,39 @@ class SaleController extends Controller
                             (string)$sale->id,
                             'Sale completed in ' . $linkedUnit['unit_name']
                         );
+
+                        // FIFO Inventory COGS Depletion
+                        $fallbackCost = 0.0;
+                        if ($variantId && $product->relationLoaded('variants')) {
+                            $varObj = $product->variants->firstWhere('id', $variantId);
+                            $fallbackCost = (float)($varObj?->cost_price ?: 0);
+                        }
+                        if ($fallbackCost <= 0) {
+                            $fallbackCost = (float)($product->cost_price ?: ($product->purchase_price ?: 0));
+                        }
+
+                        $depletion = $fifoService->depleteFifo(
+                            warehouseId: (int)$warehouseId,
+                            productId: (int)$product->id,
+                            variantId: $variantId,
+                            neededBaseQty: (float)$baseQuantity,
+                            saleId: (int)$sale->id,
+                            saleItemId: (int)$saleItem->id,
+                            saleDate: (string)$sale->date,
+                            fallbackCost: $fallbackCost
+                        );
+
+                        $saleItem->update([
+                            'base_unit_cost' => $depletion['avg_unit_cost'],
+                            'total_cogs' => $depletion['total_cogs'],
+                        ]);
+                        $totalSaleCogs += (float)$depletion['total_cogs'];
                     }
                 }
+            }
+
+            if ($sale->status === 'Completed' && $totalSaleCogs > 0) {
+                $sale->update(['total_cogs' => round($totalSaleCogs, 2)]);
             }
 
             // Record payment transaction(s) - supporting Split Payments & multi-tenders
@@ -345,6 +380,30 @@ class SaleController extends Controller
                     'notes' => 'Payment recorded at POS checkout',
                     'created_by' => $sale->created_by,
                 ]);
+            }
+
+            // Accumulate customer loyalty points, total spend, and visit count
+            if ($sale->status === 'Completed' && !empty($validated['customer_id'])) {
+                $cust = Customer::find($validated['customer_id']);
+                if ($cust) {
+                    $earnedPoints = (int) floor($grandTotal / 1000);
+                    $newTotalSpent = (float)$cust->total_spent + $grandTotal;
+                    $tier = $cust->tier ?? 'Standard';
+                    if ($newTotalSpent >= 1000000) {
+                        $tier = 'VIP';
+                    } elseif ($newTotalSpent >= 500000) {
+                        $tier = 'Gold';
+                    } elseif ($newTotalSpent >= 200000) {
+                        $tier = 'Silver';
+                    }
+
+                    $cust->update([
+                        'total_spent' => $newTotalSpent,
+                        'total_visits' => (int)$cust->total_visits + 1,
+                        'reward_points' => (int)$cust->reward_points + $earnedPoints,
+                        'tier' => $tier,
+                    ]);
+                }
             }
 
             DB::commit();
@@ -499,6 +558,33 @@ class SaleController extends Controller
                             'Sale #' . $sale->reference_no . ' deleted - Stock restored'
                         );
                     }
+                }
+            }
+
+            // Reverse FIFO cost layers and replenish batch quantities
+            app(\App\Services\FifoInventoryService::class)->reverseSaleFifo($sale);
+
+            // Revert customer loyalty points and total spend if sale is deleted
+            if ($sale->customer_id) {
+                $cust = Customer::find($sale->customer_id);
+                if ($cust) {
+                    $earnedPoints = (int) floor((float)$sale->grand_total / 1000);
+                    $newTotalSpent = max(0, (float)$cust->total_spent - (float)$sale->grand_total);
+                    $tier = 'Standard';
+                    if ($newTotalSpent >= 1000000) {
+                        $tier = 'VIP';
+                    } elseif ($newTotalSpent >= 500000) {
+                        $tier = 'Gold';
+                    } elseif ($newTotalSpent >= 200000) {
+                        $tier = 'Silver';
+                    }
+
+                    $cust->update([
+                        'total_spent' => $newTotalSpent,
+                        'total_visits' => max(0, (int)$cust->total_visits - 1),
+                        'reward_points' => max(0, (int)$cust->reward_points - $earnedPoints),
+                        'tier' => $tier,
+                    ]);
                 }
             }
 
