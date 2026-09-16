@@ -123,10 +123,18 @@ class ProductResource extends JsonResource
             'primary_image_url' => $primaryImgUrl,
             'warehouse_stocks' => $this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()
                 ? $this->stockBalances->map(function ($sb) {
+                    static $outletsMap = null;
+                    if ($outletsMap === null) {
+                        $outletsMap = \App\Models\Outlet::pluck('name', 'id')->toArray();
+                    }
+                    $variantsMap = $this->relationLoaded('variants')
+                        ? $this->variants->pluck('name', 'id')->toArray()
+                        : [];
                     return [
-                        'warehouse_id' => $sb->warehouse_id,
-                        'warehouse_name' => $sb->warehouse?->name ?? (\App\Models\Outlet::find($sb->warehouse_id)?->name ?? (\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet')),
-                        'product_variant_id' => $sb->product_variant_id,
+                        'warehouse_id' => (int)$sb->warehouse_id,
+                        'warehouse_name' => $outletsMap[$sb->warehouse_id] ?? ('Warehouse #' . $sb->warehouse_id),
+                        'product_variant_id' => $sb->product_variant_id ? (int)$sb->product_variant_id : null,
+                        'variant_name' => $sb->product_variant_id ? ($variantsMap[$sb->product_variant_id] ?? '') : '',
                         'quantity' => (float)$sb->quantity,
                     ];
                 })->values()

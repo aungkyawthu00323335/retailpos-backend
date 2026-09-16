@@ -111,19 +111,28 @@ class ProductListResource extends JsonResource
                 : [],
             'warehouse_stocks' => $this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()
                 ? $this->stockBalances->map(function ($sb) {
+                    static $outletsMap = null;
+                    if ($outletsMap === null) {
+                        $outletsMap = \App\Models\Outlet::pluck('name', 'id')->toArray();
+                    }
+                    $variantsMap = $this->relationLoaded('variants')
+                        ? $this->variants->pluck('name', 'id')->toArray()
+                        : [];
                     return [
                         'warehouse_id' => (int)$sb->warehouse_id,
-                        'warehouse_name' => 'Main Branch Outlet',
+                        'warehouse_name' => $outletsMap[$sb->warehouse_id] ?? ('Warehouse #' . $sb->warehouse_id),
                         'product_variant_id' => $sb->product_variant_id ? (int)$sb->product_variant_id : null,
+                        'variant_name' => $sb->product_variant_id ? ($variantsMap[$sb->product_variant_id] ?? '') : '',
                         'quantity' => (float)$sb->quantity,
                     ];
                 })->values()->all()
                 : ((float)$this->stock_quantity > 0
                     ? [
                         [
-                            'warehouse_id' => 1,
-                            'warehouse_name' => 'Main Branch Outlet',
+                            'warehouse_id' => (int)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->id ?? 1),
+                            'warehouse_name' => (string)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet'),
                             'product_variant_id' => null,
+                            'variant_name' => '',
                             'quantity' => (float)$this->stock_quantity,
                         ]
                     ]

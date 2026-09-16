@@ -4081,13 +4081,14 @@ class ReportController extends Controller
     public function stockLedgerReport(Request $request)
     {
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
-        $startDate = $request->input('start_date') ?? Carbon::now()->startOfMonth()->toDateString();
-        $endDate = $request->input('end_date') ?? Carbon::now()->toDateString();
+        $startDate = $request->input('start_date') ?? $request->input('from_date', Carbon::now()->startOfMonth()->toDateString());
+        $endDate = $request->input('end_date') ?? $request->input('to_date', Carbon::now()->toDateString());
+        $movementType = $request->input('movement_type', 'All');
         $category = $request->input('category', 'All');
         $search = trim($request->input('search', ''));
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_stock_ledger_' . md5(json_encode([$warehouse, $startDate, $endDate, $category, $search]));
+        $cacheKey = 'pos_stock_ledger_v2_' . md5(json_encode([$warehouse, $startDate, $endDate, $movementType, $category, $search]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -4097,64 +4098,239 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
+        $fromDateTime = $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : '');
+        $toDateTime = $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : '');
+
+        // ── 1. Unified Stock Movements Journal (Sales, Purchases, Adjustments, Transfers) ──
+        // A. Sales Movements (Stock Out)
+        $salesMvQuery = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+            ->where('sales.date', '>=', $fromDateTime)
+            ->where('sales.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesMvQuery->where('sales.warehouse_name', $warehouse);
+        }
+        $salesMovements = $salesMvQuery->select([
+            'sales.id as source_id',
+            'sales.reference_no as reference_no',
+            DB::raw("'sale' as movement_type"),
+            DB::raw("'Sale Out' as type_label"),
+            'sale_items.product_id',
+            'sale_items.product_name',
+            'sale_items.product_code',
+            'products.category_name',
+            'sales.warehouse_name',
+            'sales.warehouse_id',
+            DB::raw('0 as quantity_in'),
+            'sale_items.quantity as quantity_out',
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(products.cost_price, products.purchase_price, 0) as unit_cost'),
+            'sales.created_by',
+            'sales.user_name',
+            'sales.user_role',
+            'sales.date as date',
+        ]);
+
+        // B. Purchase Movements (Stock In)
+        $purchMvQuery = DB::table('purchase_items')
+            ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
+            ->leftJoin('products', 'purchase_items.product_id', '=', 'products.id')
+            ->where('purchases.date', '>=', $fromDateTime)
+            ->where('purchases.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $purchMvQuery->where('purchases.warehouse_name', $warehouse);
+        }
+        $purchMovements = $purchMvQuery->select([
+            'purchases.id as source_id',
+            'purchases.reference_no as reference_no',
+            DB::raw("'purchase' as movement_type"),
+            DB::raw("'Purchase In' as type_label"),
+            'purchase_items.product_id',
+            'purchase_items.product_name',
+            'purchase_items.product_code',
+            'products.category_name',
+            'purchases.warehouse_name',
+            'purchases.warehouse_id',
+            'purchase_items.quantity as quantity_in',
+            DB::raw('0 as quantity_out'),
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(purchase_items.unit_cost, products.cost_price, 0) as unit_cost'),
+            'purchases.created_by',
+            'purchases.user_name',
+            'purchases.user_role',
+            'purchases.date as date',
+        ]);
+
+        // C. Adjustment Movements (Stock In / Out)
+        $adjMvQuery = DB::table('stock_adjustment_items')
+            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+            ->leftJoin('products', 'stock_adjustment_items.product_id', '=', 'products.id')
+            ->where('stock_adjustments.date', '>=', $fromDateTime)
+            ->where('stock_adjustments.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $adjMvQuery->where('stock_adjustments.warehouse_name', $warehouse);
+        }
+        $adjMovements = $adjMvQuery->select([
+            'stock_adjustments.id as source_id',
+            'stock_adjustments.reference_no as reference_no',
+            DB::raw("CASE WHEN stock_adjustment_items.type = 'Addition' THEN 'adjustment_in' ELSE 'adjustment_out' END as movement_type"),
+            DB::raw("CASE WHEN stock_adjustment_items.type = 'Addition' THEN 'Adjust In' ELSE 'Adjust Out' END as type_label"),
+            'stock_adjustment_items.product_id',
+            'stock_adjustment_items.product_name',
+            'stock_adjustment_items.product_code',
+            'products.category_name',
+            'stock_adjustments.warehouse_name',
+            'stock_adjustments.warehouse_id',
+            DB::raw("CASE WHEN stock_adjustment_items.type = 'Addition' THEN stock_adjustment_items.quantity ELSE 0 END as quantity_in"),
+            DB::raw("CASE WHEN stock_adjustment_items.type = 'Addition' THEN 0 ELSE stock_adjustment_items.quantity END as quantity_out"),
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(stock_adjustment_items.unit_cost, products.cost_price, 0) as unit_cost'),
+            'stock_adjustments.created_by',
+            'stock_adjustments.user_name',
+            'stock_adjustments.user_role',
+            'stock_adjustments.date as date',
+        ]);
+
+        // D. Transfer Movements (Stock Out from Source)
+        $transMvQuery = DB::table('stock_transfer_items')
+            ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
+            ->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id')
+            ->where('stock_transfers.date', '>=', $fromDateTime)
+            ->where('stock_transfers.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $transMvQuery->where(function($q) use ($warehouse) {
+                $q->where('stock_transfers.from_warehouse', $warehouse)
+                  ->orWhere('stock_transfers.to_warehouse', $warehouse);
+            });
+        }
+        $transMovements = $transMvQuery->select([
+            'stock_transfers.id as source_id',
+            'stock_transfers.reference_no as reference_no',
+            DB::raw("'transfer' as movement_type"),
+            DB::raw("'Transfer' as type_label"),
+            'stock_transfer_items.product_id',
+            'stock_transfer_items.product_name',
+            'stock_transfer_items.product_code',
+            'products.category_name',
+            'stock_transfers.from_warehouse as warehouse_name',
+            DB::raw('0 as warehouse_id'),
+            DB::raw('0 as quantity_in'),
+            'stock_transfer_items.quantity as quantity_out',
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(stock_transfer_items.unit_cost, products.cost_price, 0) as unit_cost'),
+            'stock_transfers.created_by',
+            'stock_transfers.user_name',
+            DB::raw("'' as user_role"),
+            'stock_transfers.date as date',
+        ]);
+
+        $unionQuery = $salesMovements->unionAll($purchMovements)->unionAll($adjMovements)->unionAll($transMovements);
+        $movementsSub = DB::query()->fromSub($unionQuery, 'mv');
+
+        if (!empty($category) && $category !== 'All') {
+            $movementsSub->where('category_name', $category);
+        }
+
+        if (!empty($movementType) && $movementType !== 'All') {
+            if ($movementType === 'sale' || $movementType === 'sales') {
+                $movementsSub->where('movement_type', 'sale');
+            } elseif ($movementType === 'purchase' || $movementType === 'purchases') {
+                $movementsSub->where('movement_type', 'purchase');
+            } elseif ($movementType === 'adjustment' || $movementType === 'adjustments') {
+                $movementsSub->whereIn('movement_type', ['adjustment_in', 'adjustment_out']);
+            } elseif ($movementType === 'transfer' || $movementType === 'transfers') {
+                $movementsSub->where('movement_type', 'transfer');
+            } else {
+                $movementsSub->where('movement_type', $movementType);
+            }
+        }
+
+        if (!empty($search)) {
+            $movementsSub->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('product_name', 'like', "%{$search}%")
+                  ->orWhere('product_code', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%");
+            });
+        }
+
+        $totalMovements = (clone $movementsSub)->count();
+        $totalInflowQty = (float)(clone $movementsSub)->sum('quantity_in');
+        $totalOutflowQty = (float)(clone $movementsSub)->sum('quantity_out');
+        $netMovementQty = round($totalInflowQty - $totalOutflowQty, 2);
+
+        $movementsData = (clone $movementsSub)
+            ->orderByDesc('date')
+            ->limit(1000)
+            ->get()
+            ->map(function ($row, $idx) {
+                $qtyIn = (float)$row->quantity_in;
+                $qtyOut = (float)$row->quantity_out;
+                $unitCost = (float)$row->unit_cost;
+                $qty = $qtyIn > 0 ? $qtyIn : $qtyOut;
+                $val = round($qty * $unitCost, 2);
+                $userName = !empty($row->user_name) ? (string)$row->user_name : (!empty($row->created_by) ? (string)$row->created_by : 'Super Admin');
+                $userRole = !empty($row->user_role) ? (string)$row->user_role : 'Super Admin';
+                return [
+                    'id' => (int)($row->source_id ?? ($idx + 1)),
+                    'reference_no' => (string)($row->reference_no ?? 'REF-'.($idx + 1)),
+                    'movement_type' => (string)$row->movement_type,
+                    'type_label' => (string)$row->type_label,
+                    'product_id' => (int)($row->product_id ?? 0),
+                    'product_name' => (string)($row->product_name ?? ''),
+                    'product_code' => (string)($row->product_code ?? ''),
+                    'category_name' => (string)($row->category_name ?? 'General'),
+                    'warehouse_name' => (string)($row->warehouse_name ?? 'Main Outlet'),
+                    'warehouse_id' => (int)($row->warehouse_id ?? 0),
+                    'quantity_in' => $qtyIn,
+                    'quantity_out' => $qtyOut,
+                    'balance_qty' => (float)$row->balance_qty,
+                    'unit_cost' => $unitCost,
+                    'total_value' => $val,
+                    'created_by' => $userName,
+                    'user_name' => $userName,
+                    'user_role' => $userRole,
+                    'date' => (string)$row->date,
+                ];
+            });
+
+        $totalMovementValue = (float)$movementsData->sum('total_value');
+
+        // ── 2. Product-Level Bin Card Summary (SKU View) ──
         $prodQuery = DB::table('products')->select([
             'id', 'code', 'name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity'
         ]);
-
         if ($category !== 'All' && !empty($category)) {
             $prodQuery->where('category_name', $category);
         }
-
         if (!empty($search)) {
             $prodQuery->where(function ($q) use ($search) {
                 $q->where('code', 'like', "%{$search}%")
                   ->orWhere('name', 'like', "%{$search}%");
             });
         }
-
         $products = $prodQuery->get();
 
-        // 1. Purchases during period
-        $purchQuery = DB::table('purchase_items')
-            ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
-            ->where('purchases.date', '>=', $startDate . ' 00:00:00')
-            ->where('purchases.date', '<=', $endDate . ' 23:59:59');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $purchQuery->where('purchases.warehouse_name', $warehouse);
-        }
-        $purchByProd = $purchQuery
+        $purchByProd = (clone $purchMvQuery)
             ->select('purchase_items.product_id', DB::raw('SUM(purchase_items.quantity) as qty'))
             ->groupBy('purchase_items.product_id')
             ->pluck('qty', 'product_id');
 
-        // 2. Sales during period
-        $salesQuery = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->where('sales.date', '>=', $startDate . ' 00:00:00')
-            ->where('sales.date', '<=', $endDate . ' 23:59:59');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where('sales.warehouse_name', $warehouse);
-        }
-        $salesByProd = $salesQuery
+        $salesByProd = (clone $salesMvQuery)
             ->select('sale_items.product_id', DB::raw('SUM(sale_items.quantity) as qty'))
             ->groupBy('sale_items.product_id')
             ->pluck('qty', 'product_id');
 
-        // 3. Stock Adjustments (Additions & Subtractions)
-        $adjQuery = DB::table('stock_adjustment_items')
-            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-            ->where('stock_adjustments.date', '>=', $startDate . ' 00:00:00')
-            ->where('stock_adjustments.date', '<=', $endDate . ' 23:59:59');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $adjQuery->where('stock_adjustments.warehouse_name', $warehouse);
-        }
-        $adjAddByProd = (clone $adjQuery)
+        $adjAddByProd = (clone $adjMvQuery)
             ->where('stock_adjustment_items.type', 'Addition')
             ->select('stock_adjustment_items.product_id', DB::raw('SUM(stock_adjustment_items.quantity) as qty'))
             ->groupBy('stock_adjustment_items.product_id')
             ->pluck('qty', 'product_id');
 
-        $adjSubByProd = (clone $adjQuery)
+        $adjSubByProd = (clone $adjMvQuery)
             ->where('stock_adjustment_items.type', 'Subtraction')
             ->select('stock_adjustment_items.product_id', DB::raw('SUM(stock_adjustment_items.quantity) as qty'))
             ->groupBy('stock_adjustment_items.product_id')
@@ -4177,9 +4353,9 @@ class ReportController extends Controller
             $adjustIn = (float)($adjAddByProd[$pId] ?? 0);
             $adjustOut = (float)($adjSubByProd[$pId] ?? 0);
 
-            $netMovement = ($purchQty + $adjustIn) - ($soldQty + $adjustOut);
+            $netMv = ($purchQty + $adjustIn) - ($soldQty + $adjustOut);
             $closingStock = max(0.0, $currentStock);
-            $openingStock = max(0.0, $closingStock - $netMovement);
+            $openingStock = max(0.0, $closingStock - $netMv);
 
             $totalOpeningCost += ($openingStock * $cost);
             $totalClosingCost += ($closingStock * $cost);
@@ -4201,7 +4377,7 @@ class ReportController extends Controller
                 'sales_out' => round($soldQty, 2),
                 'adjustments_out' => round($adjustOut, 2),
                 'total_outflow' => round($soldQty + $adjustOut, 2),
-                'net_movement' => round($netMovement, 2),
+                'net_movement' => round($netMv, 2),
                 'closing_stock' => round($closingStock, 2),
                 'closing_cost_value' => round($closingStock * $cost, 2),
                 'closing_retail_value' => round($closingStock * $selling, 2),
@@ -4211,6 +4387,11 @@ class ReportController extends Controller
         $responsePayload = [
             'status' => 'success',
             'summary' => [
+                'total_movements' => $totalMovements,
+                'total_inflow_qty' => round($totalInflowQty, 2),
+                'total_outflow_qty' => round($totalOutflowQty, 2),
+                'net_movement_qty' => $netMovementQty,
+                'total_movement_value' => round($totalMovementValue, 2),
                 'total_products' => count($items),
                 'total_opening_cost' => round($totalOpeningCost, 2),
                 'total_closing_cost' => round($totalClosingCost, 2),
@@ -4219,7 +4400,9 @@ class ReportController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
+                'movement_type' => $movementType,
             ],
+            'movements' => $movementsData,
             'data' => $items,
         ];
 
