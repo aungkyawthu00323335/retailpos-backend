@@ -10,6 +10,17 @@ use Illuminate\Support\Facades\DB;
 
 class PurchaseReturnController extends Controller
 {
+    /** Return reason options for purchase returns */
+    public const RETURN_REASONS = [
+        'Defective / Damaged Product',
+        'Wrong Item Received',
+        'Expired Product',
+        'Quality Not Meeting Standard',
+        'Excess Stock Returned',
+        'Price Dispute',
+        'Other',
+    ];
+
     public function index(Request $request)
     {
         $query = PurchaseReturn::query();
@@ -30,6 +41,10 @@ class PurchaseReturnController extends Controller
             $query->where('status', $request->input('status'));
         }
 
+        if ($request->filled('return_reason') && $request->input('return_reason') !== 'All') {
+            $query->where('return_reason', $request->input('return_reason'));
+        }
+
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $query->where(function ($q) use ($search) {
@@ -38,6 +53,7 @@ class PurchaseReturnController extends Controller
                   ->orWhere('supplier_name', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('user_name', 'like', "%{$search}%")
+                  ->orWhere('return_reason', 'like', "%{$search}%")
                   ->orWhere('notes', 'like', "%{$search}%");
             });
         }
@@ -46,12 +62,12 @@ class PurchaseReturnController extends Controller
 
         return response()->json([
             'status' => 'success',
-            'data' => $returns->items(),
+            'data'   => $returns->items(),
             'pagination' => [
                 'current_page' => $returns->currentPage(),
-                'per_page' => $returns->perPage(),
-                'total' => $returns->total(),
-                'last_page' => $returns->lastPage(),
+                'per_page'     => $returns->perPage(),
+                'total'        => $returns->total(),
+                'last_page'    => $returns->lastPage(),
             ],
         ]);
     }
@@ -65,86 +81,180 @@ class PurchaseReturnController extends Controller
 
         return response()->json([
             'status' => 'success',
-            'data' => $return,
+            'data'   => $return,
         ]);
     }
 
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:100',
+            'reference_no'          => 'nullable|string|max:100',
             'purchase_reference_no' => 'nullable|string|max:100',
-            'supplier_id' => 'nullable|integer',
-            'supplier_name' => 'required|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'warehouse_name' => 'required|string|max:255',
-            'outlet_id' => 'nullable|integer',
-            'date' => 'required|string',
-            'grand_total' => 'required|numeric|min:0',
-            'paid_amount' => 'nullable|numeric|min:0',
-            'status' => 'nullable|string|in:Completed,Pending,Received',
-            'payment_status' => 'nullable|string',
-            'notes' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'user_id' => 'nullable|integer',
-            'user_name' => 'nullable|string|max:255',
-            'user_role' => 'nullable|string|max:255',
+            'supplier_id'           => 'nullable|integer',
+            'supplier_name'         => 'required|string|max:255',
+            'warehouse_id'          => 'nullable|integer',
+            'warehouse_name'        => 'required|string|max:255',
+            'outlet_id'             => 'nullable|integer',
+            'date'                  => 'required|string',
+            'grand_total'           => 'required|numeric|min:0',
+            'paid_amount'           => 'nullable|numeric|min:0',
+            'status'                => 'nullable|string|in:Completed,Pending,Received',
+            'payment_status'        => 'nullable|string',
+            'payment_type'          => 'nullable|string|max:100',
+            'subtotal'              => 'nullable|numeric|min:0',
+            'tax_rate'              => 'nullable|numeric|min:0',
+            'tax_amount'            => 'nullable|numeric|min:0',
+            'discount'              => 'nullable|numeric|min:0',
+            'shipping'              => 'nullable|numeric|min:0',
+            'notes'                 => 'nullable|string',
+            'return_reason'         => 'nullable|string|max:255',
+            'items'                 => 'nullable|array',
+            'created_by'            => 'nullable|string|max:255',
+            'user_id'               => 'nullable|integer',
+            'user_name'             => 'nullable|string|max:255',
+            'user_role'             => 'nullable|string|max:255',
         ]);
 
-        $prefix = Setting::get('purchase_return_prefix', 'PR_');
-        $refNo = !empty($validated['reference_no'])
+        $prefix     = Setting::get('purchase_return_prefix', 'PR_');
+        $refNo      = !empty($validated['reference_no'])
             ? $validated['reference_no']
             : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
-        $grandTotal = (float)$validated['grand_total'];
-        $paidAmount = (float)($validated['paid_amount'] ?? $grandTotal);
-        $dueAmount = max(0, $grandTotal - $paidAmount);
 
+        $grandTotal    = (float)$validated['grand_total'];
+        $paidAmount    = (float)($validated['paid_amount'] ?? $grandTotal);
+        $dueAmount     = max(0, $grandTotal - $paidAmount);
         $paymentStatus = $validated['payment_status'] ?? ($dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid'));
+        $returnStatus  = $validated['status'] ?? 'Completed';
 
-        $userName = !empty($validated['user_name'])
+        $userName  = !empty($validated['user_name'])
             ? $validated['user_name']
             : ($request->user()?->name ?? 'Admin User');
-        $userRole = !empty($validated['user_role'])
+        $userRole  = !empty($validated['user_role'])
             ? $validated['user_role']
             : ($request->user()?->role ?? 'Super Admin');
         $createdBy = !empty($validated['created_by'])
             ? $validated['created_by']
-            : (!empty($userName) ? "$userName ($userRole)" : 'Admin User');
-        $userId = $validated['user_id'] ?? $request->user()?->id;
-        $warehouseId = $validated['warehouse_id'] ?? $validated['outlet_id'] ?? null;
-        $outletId = $validated['outlet_id'] ?? $validated['warehouse_id'] ?? null;
+            : (!empty($userName) ? "{$userName} ({$userRole})" : 'Admin User');
+        $userId       = $validated['user_id'] ?? $request->user()?->id;
+        $warehouseId  = $validated['warehouse_id'] ?? $validated['outlet_id'] ?? null;
+        $outletId     = $validated['outlet_id'] ?? $validated['warehouse_id'] ?? null;
 
         $txDate = trim($validated['date']);
         if (!str_contains($txDate, ':')) {
             $txDate .= ' ' . now()->format('H:i:s');
         }
 
-        $return = PurchaseReturn::create([
-            'reference_no' => $refNo,
-            'purchase_reference_no' => $validated['purchase_reference_no'] ?? null,
-            'supplier_id' => $validated['supplier_id'] ?? null,
-            'supplier_name' => $validated['supplier_name'],
-            'warehouse_id' => $warehouseId,
-            'warehouse_name' => $validated['warehouse_name'],
-            'outlet_id' => $outletId,
-            'date' => $txDate,
-            'status' => $validated['status'] ?? 'Completed',
-            'grand_total' => $grandTotal,
-            'paid_amount' => $paidAmount,
-            'due_amount' => $dueAmount,
-            'payment_status' => $paymentStatus,
-            'notes' => $validated['notes'] ?? null,
-            'created_by' => $createdBy,
-            'user_id' => $userId,
-            'user_name' => $userName,
-            'user_role' => $userRole,
-        ]);
+        // Auto-resolve warehouseId by name if not provided
+        if (!$warehouseId && !empty($validated['warehouse_name'])) {
+            $unitService = app(\App\Services\ProductUnitConversionService::class);
+            $warehouseId = $unitService->warehouseId(null, $validated['warehouse_name']);
+            $outletId    = $outletId ?? $warehouseId;
+        }
 
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Purchase return recorded successfully',
-            'data' => $return,
-        ], 201);
+        // Build items payload
+        $itemsPayload = !empty($validated['items']) ? json_encode($validated['items']) : null;
+
+        // Credit note notes
+        $creditNoteNote = "Credit Note: Returned to {$validated['supplier_name']} on " . now()->toDateString();
+        $combinedNotes  = trim(($validated['notes'] ?? '') . "\n" . $creditNoteNote);
+
+        DB::beginTransaction();
+        try {
+            $return = PurchaseReturn::create([
+                'reference_no'          => $refNo,
+                'purchase_reference_no' => $validated['purchase_reference_no'] ?? null,
+                'supplier_id'           => $validated['supplier_id'] ?? null,
+                'supplier_name'         => $validated['supplier_name'],
+                'warehouse_id'          => $warehouseId,
+                'warehouse_name'        => $validated['warehouse_name'],
+                'outlet_id'             => $outletId,
+                'date'                  => $txDate,
+                'status'                => $returnStatus,
+                'grand_total'           => $grandTotal,
+                'paid_amount'           => $paidAmount,
+                'due_amount'            => $dueAmount,
+                'payment_status'        => $paymentStatus,
+                'payment_type'          => $validated['payment_type'] ?? 'Cash',
+                'subtotal'              => $validated['subtotal'] ?? 0.0,
+                'tax_rate'              => $validated['tax_rate'] ?? 0.0,
+                'tax_amount'            => $validated['tax_amount'] ?? 0.0,
+                'discount'              => $validated['discount'] ?? 0.0,
+                'shipping'              => $validated['shipping'] ?? 0.0,
+                'notes'                 => $combinedNotes,
+                'return_reason'         => $validated['return_reason'] ?? null,
+                'items_payload'         => $itemsPayload,
+                'created_by'            => $createdBy,
+                'user_id'               => $userId,
+                'user_name'             => $userName,
+                'user_role'             => $userRole,
+            ]);
+
+            // ── Stock Deduction (Goods leaving warehouse to return to supplier) ──
+            // Only on Completed status
+            if ($returnStatus === 'Completed' && !empty($validated['items']) && is_array($validated['items']) && $warehouseId) {
+                $unitService = app(\App\Services\ProductUnitConversionService::class);
+                $fifoService = app(\App\Services\FifoInventoryService::class);
+
+                foreach ($validated['items'] as $it) {
+                    $productId = $it['product_id'] ?? null;
+                    $variantId = !empty($it['product_variant_id']) ? (int)$it['product_variant_id'] : null;
+                    $product   = $productId
+                        ? \App\Models\Product::find($productId)
+                        : \App\Models\Product::where('code', $it['product_code'] ?? '')->first();
+
+                    if ($product) {
+                        $conversionRate = (float)($it['conversion_rate'] ?? 1.0);
+                        $qty            = (float)($it['quantity'] ?? 0);
+                        $baseQty        = (float)($it['base_quantity'] ?? ($qty * $conversionRate));
+                        $unitCost       = (float)($it['unit_cost'] ?? $it['unit_price'] ?? $product->cost_price ?? $product->purchase_price ?? 0);
+                        $fallbackCost   = $conversionRate > 0 ? ($unitCost / $conversionRate) : $unitCost;
+
+                        if ($baseQty > 0) {
+                            try {
+                                // Reduce stock in warehouse
+                                $unitService->applyStock(
+                                    $product,
+                                    (int)$warehouseId,
+                                    $variantId,
+                                    $baseQty,
+                                    'out',
+                                    'purchase_return',
+                                    'purchase_return',
+                                    (string)$return->id,
+                                    'Purchase return to supplier #' . $return->reference_no
+                                );
+
+                                // Consume FIFO batches (oldest cost layers first)
+                                $fifoService->depleteFifo(
+                                    warehouseId:   (int)$warehouseId,
+                                    productId:     (int)$product->id,
+                                    variantId:     $variantId,
+                                    neededBaseQty: (float)$baseQty,
+                                    saleId:        (int)$return->id,
+                                    saleItemId:    0,
+                                    saleDate:      $txDate,
+                                    fallbackCost:  (float)$fallbackCost
+                                );
+                            } catch (\Throwable $e) {
+                                \Illuminate\Support\Facades\Log::warning('Stock deduction on purchase return failed: ' . $e->getMessage());
+                            }
+                        }
+                    }
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Purchase return recorded successfully',
+                'data'    => $return,
+            ], 201);
+
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
     }
 
     public function update(Request $request, $id)
@@ -155,65 +265,86 @@ class PurchaseReturnController extends Controller
         }
 
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:100',
+            'reference_no'          => 'nullable|string|max:100',
             'purchase_reference_no' => 'nullable|string|max:100',
-            'supplier_id' => 'nullable|integer',
-            'supplier_name' => 'required|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'warehouse_name' => 'required|string|max:255',
-            'outlet_id' => 'nullable|integer',
-            'date' => 'required|string',
-            'grand_total' => 'required|numeric|min:0',
-            'paid_amount' => 'nullable|numeric|min:0',
-            'status' => 'nullable|string|in:Completed,Pending,Received',
-            'payment_status' => 'nullable|string',
-            'notes' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'user_id' => 'nullable|integer',
-            'user_name' => 'nullable|string|max:255',
-            'user_role' => 'nullable|string|max:255',
+            'supplier_id'           => 'nullable|integer',
+            'supplier_name'         => 'required|string|max:255',
+            'warehouse_id'          => 'nullable|integer',
+            'warehouse_name'        => 'required|string|max:255',
+            'outlet_id'             => 'nullable|integer',
+            'date'                  => 'required|string',
+            'grand_total'           => 'required|numeric|min:0',
+            'paid_amount'           => 'nullable|numeric|min:0',
+            'status'                => 'nullable|string|in:Completed,Pending,Received',
+            'payment_status'        => 'nullable|string',
+            'payment_type'          => 'nullable|string|max:100',
+            'subtotal'              => 'nullable|numeric|min:0',
+            'tax_rate'              => 'nullable|numeric|min:0',
+            'tax_amount'            => 'nullable|numeric|min:0',
+            'discount'              => 'nullable|numeric|min:0',
+            'shipping'              => 'nullable|numeric|min:0',
+            'notes'                 => 'nullable|string',
+            'return_reason'         => 'nullable|string|max:255',
+            'items'                 => 'nullable|array',
+            'created_by'            => 'nullable|string|max:255',
+            'user_id'               => 'nullable|integer',
+            'user_name'             => 'nullable|string|max:255',
+            'user_role'             => 'nullable|string|max:255',
         ]);
 
-        $grandTotal = (float)$validated['grand_total'];
-        $paidAmount = (float)($validated['paid_amount'] ?? $return->paid_amount);
-        $dueAmount = max(0, $grandTotal - $paidAmount);
+        $grandTotal    = (float)$validated['grand_total'];
+        $paidAmount    = (float)($validated['paid_amount'] ?? $return->paid_amount);
+        $dueAmount     = max(0, $grandTotal - $paidAmount);
         $paymentStatus = $validated['payment_status'] ?? ($dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid'));
 
-        $userName = !empty($validated['user_name'])
+        $userName  = !empty($validated['user_name'])
             ? $validated['user_name']
             : ($return->user_name ?? $request->user()?->name ?? 'Admin User');
-        $userRole = !empty($validated['user_role'])
+        $userRole  = !empty($validated['user_role'])
             ? $validated['user_role']
             : ($return->user_role ?? $request->user()?->role ?? 'Super Admin');
         $createdBy = !empty($validated['created_by'])
             ? $validated['created_by']
-            : ($return->created_by ?? (!empty($userName) ? "$userName ($userRole)" : 'Admin User'));
+            : ($return->created_by ?? (!empty($userName) ? "{$userName} ({$userRole})" : 'Admin User'));
 
-        $return->update([
-            'reference_no' => $validated['reference_no'] ?? $return->reference_no,
+        $updateData = [
+            'reference_no'          => $validated['reference_no'] ?? $return->reference_no,
             'purchase_reference_no' => $validated['purchase_reference_no'] ?? $return->purchase_reference_no,
-            'supplier_id' => $validated['supplier_id'] ?? $return->supplier_id,
-            'supplier_name' => $validated['supplier_name'],
-            'warehouse_id' => $validated['warehouse_id'] ?? $validated['outlet_id'] ?? $return->warehouse_id,
-            'warehouse_name' => $validated['warehouse_name'],
-            'outlet_id' => $validated['outlet_id'] ?? $validated['warehouse_id'] ?? $return->outlet_id,
-            'date' => $validated['date'],
-            'status' => $validated['status'] ?? $return->status,
-            'grand_total' => $grandTotal,
-            'paid_amount' => $paidAmount,
-            'due_amount' => $dueAmount,
-            'payment_status' => $paymentStatus,
-            'notes' => $validated['notes'] ?? $return->notes,
-            'created_by' => $createdBy,
-            'user_id' => $validated['user_id'] ?? $return->user_id ?? $request->user()?->id,
-            'user_name' => $userName,
-            'user_role' => $userRole,
-        ]);
+            'supplier_id'           => $validated['supplier_id'] ?? $return->supplier_id,
+            'supplier_name'         => $validated['supplier_name'],
+            'warehouse_id'          => $validated['warehouse_id'] ?? $validated['outlet_id'] ?? $return->warehouse_id,
+            'warehouse_name'        => $validated['warehouse_name'],
+            'outlet_id'             => $validated['outlet_id'] ?? $validated['warehouse_id'] ?? $return->outlet_id,
+            'date'                  => $validated['date'],
+            'status'                => $validated['status'] ?? $return->status,
+            'grand_total'           => $grandTotal,
+            'paid_amount'           => $paidAmount,
+            'due_amount'            => $dueAmount,
+            'payment_status'        => $paymentStatus,
+            'payment_type'          => $validated['payment_type'] ?? $return->payment_type,
+            'subtotal'              => $validated['subtotal'] ?? $return->subtotal,
+            'tax_rate'              => $validated['tax_rate'] ?? $return->tax_rate,
+            'tax_amount'            => $validated['tax_amount'] ?? $return->tax_amount,
+            'discount'              => $validated['discount'] ?? $return->discount,
+            'shipping'              => $validated['shipping'] ?? $return->shipping,
+            'notes'                 => $validated['notes'] ?? $return->notes,
+            'return_reason'         => $validated['return_reason'] ?? $return->return_reason,
+            'created_by'            => $createdBy,
+            'user_id'               => $validated['user_id'] ?? $return->user_id ?? $request->user()?->id,
+            'user_name'             => $userName,
+            'user_role'             => $userRole,
+        ];
+
+        if (isset($validated['items'])) {
+            $updateData['items_payload'] = json_encode($validated['items']);
+        }
+
+        $return->update($updateData);
 
         return response()->json([
-            'status' => 'success',
+            'status'  => 'success',
             'message' => 'Purchase return updated successfully',
-            'data' => $return,
+            'data'    => $return,
         ]);
     }
 
@@ -223,8 +354,72 @@ class PurchaseReturnController extends Controller
         if (!$return) {
             return response()->json(['status' => 'error', 'message' => 'Record not found'], 404);
         }
+
+        // ── Reverse Stock on Delete ───────────────────────────────────────────
+        // If Completed, goods were removed from warehouse. Deleting reverses that:
+        // goods come back into warehouse (re-add stock).
+        if ($return->status === 'Completed') {
+            $warehouseId = $return->warehouse_id ?? $return->outlet_id;
+
+            if (!$warehouseId && !empty($return->warehouse_name)) {
+                $unitService = app(\App\Services\ProductUnitConversionService::class);
+                $warehouseId = $unitService->warehouseId(null, $return->warehouse_name);
+            }
+
+            $items = $return->items;
+            if (!empty($items) && is_array($items) && $warehouseId) {
+                $unitService = app(\App\Services\ProductUnitConversionService::class);
+                $fifoService = app(\App\Services\FifoInventoryService::class);
+
+                foreach ($items as $it) {
+                    $productId = $it['product_id'] ?? null;
+                    $variantId = !empty($it['product_variant_id']) ? (int)$it['product_variant_id'] : null;
+                    $product   = $productId ? \App\Models\Product::find($productId) : null;
+
+                    if ($product) {
+                        $conversionRate = (float)($it['conversion_rate'] ?? 1.0);
+                        $qty            = (float)($it['quantity'] ?? 0);
+                        $baseQty        = (float)($it['base_quantity'] ?? ($qty * $conversionRate));
+                        $unitCost       = (float)($it['unit_cost'] ?? $it['unit_price'] ?? $product->cost_price ?? $product->purchase_price ?? 0);
+                        $baseUnitCost   = $conversionRate > 0 ? ($unitCost / $conversionRate) : $unitCost;
+
+                        if ($baseQty > 0) {
+                            try {
+                                // Stock comes back into warehouse (return was voided)
+                                $unitService->applyStock(
+                                    $product,
+                                    (int)$warehouseId,
+                                    $variantId,
+                                    $baseQty,
+                                    'in',
+                                    'purchase_return_void',
+                                    'purchase_return',
+                                    (string)$return->id,
+                                    'Purchase return voided #' . $return->reference_no
+                                );
+
+                                // Re-add FIFO cost layer
+                                $fifoService->recordBatch(
+                                    warehouseId:     (int)$warehouseId,
+                                    productId:       (int)$product->id,
+                                    variantId:       $variantId,
+                                    baseQuantity:    (float)$baseQty,
+                                    baseUnitCost:    (float)$baseUnitCost,
+                                    sourceType:      'purchase_return_void',
+                                    sourceReference: (string)$return->reference_no,
+                                    receivedDate:    (string)$return->date,
+                                    notes:           'Purchase return voided — stock restored'
+                                );
+                            } catch (\Throwable $e) {
+                                \Illuminate\Support\Facades\Log::warning('Stock reversal on purchase return delete failed: ' . $e->getMessage());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         $return->delete();
         return response()->json(['status' => 'success', 'message' => 'Purchase return deleted']);
     }
 }
-

@@ -77,6 +77,7 @@ class SettingController extends Controller
         $data = $request->all();
 
         $prefixModelMap = [
+            'purchase_prefix' => Purchase::class,
             'purchase_return_prefix' => PurchaseReturn::class,
             'sale_prefix' => Sale::class,
             'sale_return_prefix' => SaleReturn::class,
@@ -122,10 +123,15 @@ class SettingController extends Controller
             foreach ($records as $record) {
                 $ref = (string) ($record->reference_no ?? '');
                 if (!empty($ref)) {
-                    // Extract suffix by removing any previous alpha characters and separators
-                    $suffix = preg_replace('/^[A-Za-z]+[_\-\/:]*/', '', $ref);
-                    if (empty($suffix)) {
-                        $suffix = $ref;
+                    // Extract pure numeric or sequential suffix starting from first digit (e.g. "2026-00976", "1114187")
+                    if (preg_match('/(\d.*)$/', $ref, $matches)) {
+                        $suffix = $matches[1];
+                    } else {
+                        // Fallback: strip all leading alpha-separator chunks
+                        $suffix = preg_replace('/^([A-Za-z]+[_\-\/:]*)+/', '', $ref);
+                        if (empty($suffix)) {
+                            $suffix = (string) ($record->id ?? '1');
+                        }
                     }
                     $newRef = $newPrefix . $suffix;
                     if ($newRef !== $ref) {
