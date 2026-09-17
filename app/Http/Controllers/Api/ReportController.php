@@ -3633,6 +3633,7 @@ class ReportController extends Controller
                     'customer_name' => $cName,
                     'phone' => '',
                     'email' => '',
+                    'tier' => 'Regular',
                     'credit_limit' => 0.0,
                     'total_due' => 0.0,
                     'current' => 0.0,
@@ -3667,7 +3668,7 @@ class ReportController extends Controller
 
             $totalReceivable += $due;
 
-            if (count($customerMap[$key]['invoices']) < 5) {
+            if (count($customerMap[$key]['invoices']) < 15) {
                 $customerMap[$key]['invoices'][] = [
                     'id' => $s->id,
                     'reference_no' => $s->reference_no,
@@ -3689,6 +3690,7 @@ class ReportController extends Controller
                     $cd = $customerDetails[$cust['customer_id']];
                     $cust['phone'] = $cd->phone ?? '';
                     $cust['email'] = $cd->email ?? '';
+                    $cust['tier'] = $cd->tier ?? 'Regular';
                     $cust['credit_limit'] = (float)($cd->credit_limit ?? 0);
                 }
             }
@@ -3701,7 +3703,9 @@ class ReportController extends Controller
             $q = strtolower($search);
             $items = array_filter($items, function ($it) use ($q) {
                 return str_contains(strtolower($it['customer_name']), $q) ||
-                       str_contains(strtolower($it['phone']), $q);
+                       str_contains(strtolower($it['phone']), $q) ||
+                       str_contains(strtolower($it['email']), $q) ||
+                       str_contains(strtolower($it['tier'] ?? ''), $q);
             });
             $items = array_values($items);
         }
@@ -3719,6 +3723,8 @@ class ReportController extends Controller
         }
         unset($it);
 
+        $totalOverdue = $totalDays31_60 + $totalDays61_90 + $totalDays90Plus;
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
@@ -3727,6 +3733,7 @@ class ReportController extends Controller
                 'days_31_60' => round($totalDays31_60, 2),
                 'days_61_90' => round($totalDays61_90, 2),
                 'days_90_plus' => round($totalDays90Plus, 2),
+                'total_overdue' => round($totalOverdue, 2),
                 'total_customers' => count($items),
                 'as_of_date' => $asOfDate,
             ],
@@ -3808,6 +3815,7 @@ class ReportController extends Controller
                     'contact_person' => '',
                     'phone' => '',
                     'email' => '',
+                    'category' => 'General',
                     'payment_terms' => 'Net 30',
                     'total_due' => 0.0,
                     'current' => 0.0,
@@ -3842,7 +3850,7 @@ class ReportController extends Controller
 
             $totalPayable += $due;
 
-            if (count($supplierMap[$key]['invoices']) < 5) {
+            if (count($supplierMap[$key]['invoices']) < 15) {
                 $supplierMap[$key]['invoices'][] = [
                     'id' => $p->id,
                     'reference_no' => $p->reference_no,
@@ -3865,6 +3873,7 @@ class ReportController extends Controller
                     $supp['contact_person'] = $sd->contact_person ?? '';
                     $supp['phone'] = $sd->phone ?? '';
                     $supp['email'] = $sd->email ?? '';
+                    $supp['category'] = $sd->category ?? 'General';
                     $supp['payment_terms'] = $sd->payment_terms ?? 'Net 30';
                 }
             }
@@ -3877,7 +3886,10 @@ class ReportController extends Controller
             $q = strtolower($search);
             $items = array_filter($items, function ($it) use ($q) {
                 return str_contains(strtolower($it['supplier_name']), $q) ||
-                       str_contains(strtolower($it['phone']), $q);
+                       str_contains(strtolower($it['contact_person']), $q) ||
+                       str_contains(strtolower($it['phone']), $q) ||
+                       str_contains(strtolower($it['email']), $q) ||
+                       str_contains(strtolower($it['category'] ?? ''), $q);
             });
             $items = array_values($items);
         }
@@ -3895,6 +3907,8 @@ class ReportController extends Controller
         }
         unset($it);
 
+        $totalOverdue = $totalDays31_60 + $totalDays61_90 + $totalDays90Plus;
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
@@ -3903,6 +3917,7 @@ class ReportController extends Controller
                 'days_31_60' => round($totalDays31_60, 2),
                 'days_61_90' => round($totalDays61_90, 2),
                 'days_90_plus' => round($totalDays90Plus, 2),
+                'total_overdue' => round($totalOverdue, 2),
                 'total_suppliers' => count($items),
                 'as_of_date' => $asOfDate,
             ],
@@ -3923,8 +3938,8 @@ class ReportController extends Controller
     public function cashFlowReport(Request $request)
     {
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
-        $startDate = $request->input('start_date') ?? Carbon::now()->startOfMonth()->toDateString();
-        $endDate = $request->input('end_date') ?? Carbon::now()->toDateString();
+        $startDate = $request->input('start_date') ?? $request->input('from_date');
+        $endDate = $request->input('end_date') ?? $request->input('to_date');
         $forceRefresh = $request->boolean('force_refresh');
 
         $cacheKey = 'pos_cash_flow_' . md5(json_encode([$warehouse, $startDate, $endDate]));
@@ -3938,9 +3953,13 @@ class ReportController extends Controller
         }
 
         // 1. Cash Inflows: Sales Cash Received
-        $salesQuery = DB::table('sales')
-            ->where('date', '>=', $startDate . ' 00:00:00')
-            ->where('date', '<=', $endDate . ' 23:59:59');
+        $salesQuery = DB::table('sales');
+        if (!empty($startDate)) {
+            $salesQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
+        }
+        if (!empty($endDate)) {
+            $salesQuery->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $salesQuery->where('warehouse_name', $warehouse);
         }
@@ -3963,17 +3982,25 @@ class ReportController extends Controller
         $totalInflows = $salesCashReceived;
 
         // 2. Cash Outflows: Purchases Paid + Expenses Paid + Sale Return Refunds Paid
-        $purchQuery = DB::table('purchases')
-            ->where('date', '>=', $startDate . ' 00:00:00')
-            ->where('date', '<=', $endDate . ' 23:59:59');
+        $purchQuery = DB::table('purchases');
+        if (!empty($startDate)) {
+            $purchQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
+        }
+        if (!empty($endDate)) {
+            $purchQuery->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $purchQuery->where('warehouse_name', $warehouse);
         }
         $purchCashPaid = (float)$purchQuery->sum('paid_amount');
 
-        $expQuery = DB::table('expenses')
-            ->where('date', '>=', $startDate . ' 00:00:00')
-            ->where('date', '<=', $endDate . ' 23:59:59');
+        $expQuery = DB::table('expenses');
+        if (!empty($startDate)) {
+            $expQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
+        }
+        if (!empty($endDate)) {
+            $expQuery->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $expQuery->where('warehouse_name', $warehouse);
         }
@@ -3992,9 +4019,13 @@ class ReportController extends Controller
                 ];
             });
 
-        $retQuery = DB::table('sale_returns')
-            ->where('date', '>=', $startDate . ' 00:00:00')
-            ->where('date', '<=', $endDate . ' 23:59:59');
+        $retQuery = DB::table('sale_returns');
+        if (!empty($startDate)) {
+            $retQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
+        }
+        if (!empty($endDate)) {
+            $retQuery->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $retQuery->where('warehouse_name', $warehouse);
         }
@@ -4048,6 +4079,129 @@ class ReportController extends Controller
             ];
         }
 
+        // 4. Unified Granular Cash Flow Transactions Journal (IAS 7 Standard Direct Method)
+        $salesTxns = (clone $salesQuery)
+            ->where('paid_amount', '>', 0)
+            ->select([
+                'id',
+                'reference_no',
+                'date',
+                DB::raw("'sale' as type"),
+                DB::raw("'Operating Inflow (Sale)' as type_label"),
+                DB::raw("'Operating' as activity"),
+                DB::raw("COALESCE(customer_name, 'Walk-in Customer') as party_name"),
+                'warehouse_name',
+                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
+                'paid_amount as amount_in',
+                DB::raw('0 as amount_out'),
+                DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
+                DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
+                DB::raw("COALESCE(status, 'Completed') as status"),
+                DB::raw("COALESCE(notes, '') as notes"),
+            ])
+            ->get();
+
+        $purchTxns = (clone $purchQuery)
+            ->where('paid_amount', '>', 0)
+            ->select([
+                'id',
+                'reference_no',
+                'date',
+                DB::raw("'purchase' as type"),
+                DB::raw("'Operating Outflow (Purchase)' as type_label"),
+                DB::raw("'Operating' as activity"),
+                DB::raw("COALESCE(supplier_name, 'Supplier') as party_name"),
+                'warehouse_name',
+                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
+                DB::raw('0 as amount_in'),
+                'paid_amount as amount_out',
+                DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
+                DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
+                DB::raw("COALESCE(status, 'Completed') as status"),
+                DB::raw("COALESCE(notes, '') as notes"),
+            ])
+            ->get();
+
+        $expTxns = (clone $expQuery)
+            ->where('amount', '>', 0)
+            ->select([
+                'id',
+                'reference_no',
+                'date',
+                DB::raw("'expense' as type"),
+                DB::raw("'Operating Outflow (Expense)' as type_label"),
+                DB::raw("'Operating' as activity"),
+                DB::raw("COALESCE(title, expense_category_name, 'General Expense') as party_name"),
+                'warehouse_name',
+                DB::raw("COALESCE(payment_method, 'Cash') as payment_method"),
+                DB::raw('0 as amount_in'),
+                'amount as amount_out',
+                DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
+                DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
+                DB::raw("'Completed' as status"),
+                DB::raw("COALESCE(details, '') as notes"),
+            ])
+            ->get();
+
+        $retTxns = (clone $retQuery)
+            ->where('paid_amount', '>', 0)
+            ->select([
+                'id',
+                'reference_no',
+                'date',
+                DB::raw("'sale_return' as type"),
+                DB::raw("'Operating Outflow (Refund)' as type_label"),
+                DB::raw("'Operating' as activity"),
+                DB::raw("COALESCE(customer_name, 'Walk-in Customer') as party_name"),
+                'warehouse_name',
+                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
+                DB::raw('0 as amount_in'),
+                'paid_amount as amount_out',
+                DB::raw("COALESCE(created_by, 'Super Admin') as created_by"),
+                DB::raw("'Super Admin' as user_role"),
+                DB::raw("COALESCE(status, 'Completed') as status"),
+                DB::raw("COALESCE(notes, '') as notes"),
+            ])
+            ->get();
+
+        $mergedTxns = collect([])
+            ->concat($salesTxns)
+            ->concat($purchTxns)
+            ->concat($expTxns)
+            ->concat($retTxns)
+            ->sortBy('date')
+            ->values();
+
+        $runningTxnBal = 0.0;
+        $transactions = [];
+        foreach ($mergedTxns as $t) {
+            $in = (float)($t->amount_in ?? 0);
+            $out = (float)($t->amount_out ?? 0);
+            $runningTxnBal += ($in - $out);
+
+            $transactions[] = [
+                'id' => (int)$t->id,
+                'reference_no' => (string)$t->reference_no,
+                'date' => (string)$t->date,
+                'type' => (string)$t->type,
+                'type_label' => (string)$t->type_label,
+                'activity' => (string)$t->activity,
+                'party_name' => (string)$t->party_name,
+                'warehouse_name' => (string)($t->warehouse_name ?: 'Main Branch Outlet'),
+                'payment_method' => (string)($t->payment_method ?: 'Cash'),
+                'amount_in' => round($in, 2),
+                'amount_out' => round($out, 2),
+                'running_balance' => round($runningTxnBal, 2),
+                'created_by' => (string)($t->created_by ?: 'Super Admin'),
+                'user_role' => (string)($t->user_role ?: 'Super Admin'),
+                'status' => (string)($t->status ?: 'Completed'),
+                'notes' => (string)($t->notes ?: ''),
+            ];
+        }
+
+        // Reverse for newest first in table
+        $transactions = array_reverse($transactions);
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
@@ -4058,6 +4212,8 @@ class ReportController extends Controller
                 'purchases_cash_paid' => round($purchCashPaid, 2),
                 'operating_expenses_paid' => round($totalExpenses, 2),
                 'refunds_paid' => round($refundsPaid, 2),
+                'closing_balance' => round($netCashFlow, 2),
+                'total_transactions' => count($transactions),
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
@@ -4065,6 +4221,8 @@ class ReportController extends Controller
             'tender_inflows' => $tenderInflows,
             'expense_outflows' => $expenseCategories,
             'timeline' => $timeline,
+            'transactions' => $transactions,
+            'data' => $transactions,
         ];
 
         try {
@@ -4119,6 +4277,7 @@ class ReportController extends Controller
             'sale_items.product_id',
             'sale_items.product_name',
             'sale_items.product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
             'products.category_name',
             'sales.warehouse_name',
             'sales.warehouse_id',
@@ -4149,6 +4308,7 @@ class ReportController extends Controller
             'purchase_items.product_id',
             'purchase_items.product_name',
             'purchase_items.product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
             'products.category_name',
             'purchases.warehouse_name',
             'purchases.warehouse_id',
@@ -4179,6 +4339,7 @@ class ReportController extends Controller
             'stock_adjustment_items.product_id',
             'stock_adjustment_items.product_name',
             'stock_adjustment_items.product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
             'products.category_name',
             'stock_adjustments.warehouse_name',
             'stock_adjustments.warehouse_id',
@@ -4212,6 +4373,7 @@ class ReportController extends Controller
             'stock_transfer_items.product_id',
             'stock_transfer_items.product_name',
             'stock_transfer_items.product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
             'products.category_name',
             'stock_transfers.from_warehouse as warehouse_name',
             DB::raw('0 as warehouse_id'),
@@ -4251,6 +4413,7 @@ class ReportController extends Controller
                 $q->where('reference_no', 'like', "%{$search}%")
                   ->orWhere('product_name', 'like', "%{$search}%")
                   ->orWhere('product_code', 'like', "%{$search}%")
+                  ->orWhere('alternative_name', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
                   ->orWhere('user_name', 'like', "%{$search}%");
@@ -4282,6 +4445,7 @@ class ReportController extends Controller
                     'product_id' => (int)($row->product_id ?? 0),
                     'product_name' => (string)($row->product_name ?? ''),
                     'product_code' => (string)($row->product_code ?? ''),
+                    'alternative_name' => (string)($row->alternative_name ?? ''),
                     'category_name' => (string)($row->category_name ?? 'General'),
                     'warehouse_name' => (string)($row->warehouse_name ?? 'Main Outlet'),
                     'warehouse_id' => (int)($row->warehouse_id ?? 0),
@@ -4301,7 +4465,7 @@ class ReportController extends Controller
 
         // ── 2. Product-Level Bin Card Summary (SKU View) ──
         $prodQuery = DB::table('products')->select([
-            'id', 'code', 'name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity'
+            'id', 'code', 'name', 'alternative_name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity'
         ]);
         if ($category !== 'All' && !empty($category)) {
             $prodQuery->where('category_name', $category);
@@ -4309,29 +4473,59 @@ class ReportController extends Controller
         if (!empty($search)) {
             $prodQuery->where(function ($q) use ($search) {
                 $q->where('code', 'like', "%{$search}%")
-                  ->orWhere('name', 'like', "%{$search}%");
+                  ->orWhere('name', 'like', "%{$search}%")
+                  ->orWhere('alternative_name', 'like', "%{$search}%");
             });
         }
         $products = $prodQuery->get();
 
-        $purchByProd = (clone $purchMvQuery)
+        // Independent aggregation queries (avoids union contamination)
+        $purchAggQuery = DB::table('purchase_items')
+            ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
+            ->where('purchases.date', '>=', $fromDateTime)
+            ->where('purchases.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $purchAggQuery->where('purchases.warehouse_name', $warehouse);
+        }
+        $purchByProd = $purchAggQuery
             ->select('purchase_items.product_id', DB::raw('SUM(purchase_items.quantity) as qty'))
             ->groupBy('purchase_items.product_id')
             ->pluck('qty', 'product_id');
 
-        $salesByProd = (clone $salesMvQuery)
+        $salesAggQuery = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->where('sales.date', '>=', $fromDateTime)
+            ->where('sales.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesAggQuery->where('sales.warehouse_name', $warehouse);
+        }
+        $salesByProd = $salesAggQuery
             ->select('sale_items.product_id', DB::raw('SUM(sale_items.quantity) as qty'))
             ->groupBy('sale_items.product_id')
             ->pluck('qty', 'product_id');
 
-        $adjAddByProd = (clone $adjMvQuery)
-            ->where('stock_adjustment_items.type', 'Addition')
+        $adjAddAggQuery = DB::table('stock_adjustment_items')
+            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+            ->where('stock_adjustments.date', '>=', $fromDateTime)
+            ->where('stock_adjustments.date', '<=', $toDateTime)
+            ->where('stock_adjustment_items.type', 'Addition');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $adjAddAggQuery->where('stock_adjustments.warehouse_name', $warehouse);
+        }
+        $adjAddByProd = $adjAddAggQuery
             ->select('stock_adjustment_items.product_id', DB::raw('SUM(stock_adjustment_items.quantity) as qty'))
             ->groupBy('stock_adjustment_items.product_id')
             ->pluck('qty', 'product_id');
 
-        $adjSubByProd = (clone $adjMvQuery)
-            ->where('stock_adjustment_items.type', 'Subtraction')
+        $adjSubAggQuery = DB::table('stock_adjustment_items')
+            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+            ->where('stock_adjustments.date', '>=', $fromDateTime)
+            ->where('stock_adjustments.date', '<=', $toDateTime)
+            ->where('stock_adjustment_items.type', 'Subtraction');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $adjSubAggQuery->where('stock_adjustments.warehouse_name', $warehouse);
+        }
+        $adjSubByProd = $adjSubAggQuery
             ->select('stock_adjustment_items.product_id', DB::raw('SUM(stock_adjustment_items.quantity) as qty'))
             ->groupBy('stock_adjustment_items.product_id')
             ->pluck('qty', 'product_id');
@@ -4366,6 +4560,7 @@ class ReportController extends Controller
                 'product_id' => $pId,
                 'code' => $p->code,
                 'name' => $p->name,
+                'alternative_name' => (string)($p->alternative_name ?? ''),
                 'category_name' => $p->category_name ?? 'General',
                 'unit_name' => $p->unit_name ?? 'Pcs',
                 'cost_price' => round($cost, 2),
@@ -4455,7 +4650,10 @@ class ReportController extends Controller
         if (!empty($search)) {
             $query->where(function ($q) use ($search) {
                 $q->where('sale_items.product_name', 'like', "%{$search}%")
-                  ->orWhere('sale_items.product_code', 'like', "%{$search}%");
+                  ->orWhere('sale_items.product_code', 'like', "%{$search}%")
+                  ->orWhere('products.name', 'like', "%{$search}%")
+                  ->orWhere('products.code', 'like', "%{$search}%")
+                  ->orWhere('products.alternative_name', 'like', "%{$search}%");
             });
         }
 
@@ -4463,12 +4661,13 @@ class ReportController extends Controller
             sale_items.product_id,
             COALESCE(sale_items.product_code, products.code, 'N/A') as code,
             COALESCE(sale_items.product_name, products.name, 'Unnamed Product') as name,
+            COALESCE(products.alternative_name, '') as alternative_name,
             COALESCE(products.category_name, 'General') as category_name,
             SUM(sale_items.quantity) as units_sold,
             SUM(sale_items.subtotal) as gross_revenue,
             SUM({$cogsExpr}) as total_cogs
         ")
-        ->groupBy('sale_items.product_id', 'sale_items.product_code', 'sale_items.product_name', 'products.code', 'products.name', 'products.category_name')
+        ->groupBy('sale_items.product_id', 'sale_items.product_code', 'sale_items.product_name', 'products.code', 'products.name', 'products.alternative_name', 'products.category_name')
         ->get();
 
         $totalRevenue = 0.0;
@@ -4489,20 +4688,28 @@ class ReportController extends Controller
         foreach ($rawItems as $it) {
             $rev = (float)$it->gross_revenue;
             $cg = (float)$it->total_cogs;
+            $uSold = (float)$it->units_sold;
             $gp = $rev - $cg;
             $marginPct = $rev > 0 ? round(($gp / $rev) * 100, 2) : 0.0;
+            $markupPct = $cg > 0 ? round(($gp / $cg) * 100, 2) : 0.0;
             $contribPct = $totalProfit > 0 ? round(($gp / $totalProfit) * 100, 2) : 0.0;
+            $avgPrice = $uSold > 0 ? round($rev / $uSold, 2) : 0.0;
+            $avgCost = $uSold > 0 ? round($cg / $uSold, 2) : 0.0;
 
             $items[] = [
                 'product_id' => $it->product_id,
                 'code' => $it->code,
                 'name' => $it->name,
+                'alternative_name' => (string)($it->alternative_name ?? ''),
                 'category_name' => $it->category_name,
-                'units_sold' => (float)$it->units_sold,
+                'units_sold' => $uSold,
+                'avg_selling_price' => $avgPrice,
+                'avg_cost_price' => $avgCost,
                 'gross_revenue' => round($rev, 2),
                 'cogs' => round($cg, 2),
                 'gross_profit' => round($gp, 2),
                 'gross_margin_pct' => $marginPct,
+                'markup_pct' => $markupPct,
                 'contribution_pct' => $contribPct,
             ];
         }
@@ -4525,6 +4732,7 @@ class ReportController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
+                'category' => $category,
             ],
             'data' => $items,
         ];
@@ -4547,9 +4755,10 @@ class ReportController extends Controller
         if ($daysInactive <= 0) $daysInactive = 60;
         $category = $request->input('category', 'All');
         $search = trim($request->input('search', ''));
+        $velocityStatusFilter = $request->input('velocity_status', 'All'); // 'All', 'dead', 'slow'
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_dead_stock_' . md5(json_encode([$warehouse, $daysInactive, $category, $search]));
+        $cacheKey = 'pos_dead_stock_' . md5(json_encode([$warehouse, $daysInactive, $category, $search, $velocityStatusFilter]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -4559,34 +4768,91 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
-        // Get last sale date per product
-        $lastSales = DB::table('sale_items')
+        // Resolve outlet/warehouse ID if specified
+        $warehouseId = null;
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $matchedOutlet = DB::table('outlets')
+                ->where('name', $warehouse)
+                ->orWhere('id', $warehouse)
+                ->first();
+            if ($matchedOutlet) {
+                $warehouseId = $matchedOutlet->id;
+                $warehouse = $matchedOutlet->name;
+            }
+        }
+
+        // Get last sale date per product (optionally scoped to warehouse/outlet)
+        $saleQuery = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->select('sale_items.product_id', DB::raw('MAX(sales.date) as last_sale_date'))
-            ->groupBy('sale_items.product_id')
+            ->select('sale_items.product_id', DB::raw('MAX(sales.date) as last_sale_date'));
+
+        if ($warehouseId !== null) {
+            $saleQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                $q->where('sales.warehouse_id', $warehouseId)
+                  ->orWhere('sales.warehouse_name', $warehouse);
+            });
+        }
+
+        $lastSales = $saleQuery->groupBy('sale_items.product_id')
             ->pluck('last_sale_date', 'product_id');
 
-        $prodQuery = DB::table('products')
-            ->where('stock_quantity', '>', 0);
+        $prodQuery = DB::table('products');
+
+        if ($warehouseId !== null) {
+            // Join stock_balances for this warehouse/outlet
+            $prodQuery->join('stock_balances', function ($join) use ($warehouseId) {
+                $join->on('products.id', '=', 'stock_balances.product_id')
+                     ->where('stock_balances.warehouse_id', '=', $warehouseId);
+            })->where('stock_balances.quantity', '>', 0);
+        } else {
+            $prodQuery->where('products.stock_quantity', '>', 0);
+        }
 
         if ($category !== 'All' && !empty($category)) {
-            $prodQuery->where('category_name', $category);
+            $prodQuery->where('products.category_name', $category);
         }
 
         if (!empty($search)) {
             $prodQuery->where(function ($q) use ($search) {
-                $q->where('code', 'like', "%{$search}%")
-                  ->orWhere('name', 'like', "%{$search}%");
+                $q->where('products.code', 'like', "%{$search}%")
+                  ->orWhere('products.sku', 'like', "%{$search}%")
+                  ->orWhere('products.barcode', 'like', "%{$search}%")
+                  ->orWhere('products.name', 'like', "%{$search}%")
+                  ->orWhere('products.alternative_name', 'like', "%{$search}%")
+                  ->orWhere('products.brand_name', 'like', "%{$search}%")
+                  ->orWhere('products.category_name', 'like', "%{$search}%");
             });
         }
 
-        $products = $prodQuery->select([
-            'id', 'code', 'name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity', 'created_at'
-        ])->get();
+        $selectFields = [
+            'products.id',
+            'products.code',
+            'products.sku',
+            'products.barcode',
+            'products.name',
+            'products.alternative_name',
+            'products.category_name',
+            'products.brand_name',
+            'products.unit_name',
+            'products.cost_price',
+            'products.selling_price',
+            'products.created_at',
+        ];
+
+        if ($warehouseId !== null) {
+            $selectFields[] = 'stock_balances.quantity as stock_quantity';
+        } else {
+            $selectFields[] = 'products.stock_quantity';
+        }
+
+        $products = $prodQuery->select($selectFields)->get();
 
         $items = [];
         $totalTiedUpCapital = 0.0;
         $totalDeadUnits = 0.0;
+        $slowMovingCapital = 0.0;
+        $deadStockCapital = 0.0;
+        $totalPotentialRevenue = 0.0;
         $now = Carbon::now();
 
         foreach ($products as $p) {
@@ -4606,26 +4872,63 @@ class ReportController extends Controller
             }
 
             if ($daysSince >= $daysInactive) {
-                $qty = (float)$p->stock_quantity;
+                $qty = (float)($p->stock_quantity ?? 0);
                 $cost = (float)($p->cost_price ?? 0);
                 $retail = (float)($p->selling_price ?? 0);
                 $capital = $qty * $cost;
+                $revenue = $qty * $retail;
+
+                $isDead = ($daysSince >= 90 || $lastSaleRaw === null);
+                $velocityStatus = $isDead ? 'dead' : 'slow';
+
+                // Check velocity status filter
+                if ($velocityStatusFilter === 'dead' && !$isDead) {
+                    continue;
+                }
+                if ($velocityStatusFilter === 'slow' && $isDead) {
+                    continue;
+                }
 
                 $totalTiedUpCapital += $capital;
                 $totalDeadUnits += $qty;
+                $totalPotentialRevenue += $revenue;
+
+                if ($isDead) {
+                    $deadStockCapital += $capital;
+                } else {
+                    $slowMovingCapital += $capital;
+                }
+
+                // Dynamic strategic recommendations based on idle duration & sales velocity
+                $action = 'Promotional Discount (15% Off)';
+                if ($daysSince >= 180 || ($lastSaleRaw === null && $daysSince >= 120)) {
+                    $action = 'Clearance / Liquidation (50% Off)';
+                } elseif ($daysSince >= 90) {
+                    $action = 'Bundle Promo / Markdown (30% Off)';
+                } elseif ($daysSince < 60) {
+                    $action = 'Shelf Reposition / Transfer';
+                }
 
                 $items[] = [
                     'product_id' => $pId,
-                    'code' => $p->code,
-                    'name' => $p->name,
+                    'code' => $p->code ?? '',
+                    'sku' => $p->sku ?: ($p->code ?? ''),
+                    'barcode' => $p->barcode ?? '',
+                    'name' => $p->name ?? '',
+                    'alternative_name' => (string)($p->alternative_name ?? ''),
                     'category_name' => $p->category_name ?? 'General',
+                    'brand_name' => $p->brand_name ?? '',
+                    'warehouse_name' => $warehouse !== 'All' ? $warehouse : 'Main Branch Outlet',
                     'unit_name' => $p->unit_name ?? 'Pcs',
                     'stock_quantity' => round($qty, 2),
                     'cost_price' => round($cost, 2),
                     'selling_price' => round($retail, 2),
                     'tied_up_capital' => round($capital, 2),
+                    'potential_revenue' => round($revenue, 2),
                     'days_inactive' => $daysSince,
                     'last_sale_date' => $lastSaleFormatted,
+                    'velocity_status' => $velocityStatus,
+                    'recommended_action' => $action,
                 ];
             }
         }
@@ -4640,6 +4943,9 @@ class ReportController extends Controller
                 'total_dead_products' => count($items),
                 'total_dead_units' => round($totalDeadUnits, 2),
                 'total_tied_up_capital' => round($totalTiedUpCapital, 2),
+                'slow_moving_capital' => round($slowMovingCapital, 2),
+                'dead_stock_capital' => round($deadStockCapital, 2),
+                'total_potential_revenue' => round($totalPotentialRevenue, 2),
                 'threshold_days' => $daysInactive,
                 'as_of_date' => Carbon::today()->toDateString(),
                 'warehouse' => $warehouse,
@@ -4664,9 +4970,10 @@ class ReportController extends Controller
         $startDate = $request->input('start_date') ?? Carbon::now()->startOfMonth()->toDateString();
         $endDate = $request->input('end_date') ?? Carbon::now()->toDateString();
         $search = trim($request->input('search', ''));
+        $riskFilter = $request->input('audit_risk', 'All');
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_cashier_audit_' . md5(json_encode([$warehouse, $startDate, $endDate, $search]));
+        $cacheKey = 'pos_cashier_audit_' . md5(json_encode([$warehouse, $startDate, $endDate, $search, $riskFilter]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -4687,12 +4994,16 @@ class ReportController extends Controller
         if (!empty($search)) {
             $query->where(function ($q) use ($search) {
                 $q->where('created_by', 'like', "%{$search}%")
-                  ->orWhere('user_name', 'like', "%{$search}%");
+                  ->orWhere('user_name', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('user_role', 'like', "%{$search}%");
             });
         }
 
         $cashiers = $query->selectRaw("
             COALESCE(created_by, user_name, 'Unknown Staff') as cashier_name,
+            COALESCE(user_role, 'Cashier') as role,
+            COALESCE(warehouse_name, 'Main Branch Outlet') as warehouse_name,
             COUNT(id) as total_bills,
             SUM(grand_total) as total_sales,
             SUM(paid_amount) as total_collected,
@@ -4702,34 +5013,106 @@ class ReportController extends Controller
             SUM(CASE WHEN payment_type = 'Cash' THEN paid_amount ELSE 0 END) as cash_collected,
             SUM(CASE WHEN payment_type != 'Cash' THEN paid_amount ELSE 0 END) as non_cash_collected
         ")
-        ->groupBy(DB::raw("COALESCE(created_by, user_name, 'Unknown Staff')"))
+        ->groupBy(
+            DB::raw("COALESCE(created_by, user_name, 'Unknown Staff')"),
+            DB::raw("COALESCE(user_role, 'Cashier')"),
+            DB::raw("COALESCE(warehouse_name, 'Main Branch Outlet')")
+        )
         ->get();
 
         $items = [];
         $totalStoreSales = 0.0;
         $totalStoreBills = 0;
         $totalStoreDiscounts = 0.0;
+        $totalStoreCollected = 0.0;
+        $totalStoreDue = 0.0;
+        $totalStoreCash = 0.0;
+        $totalStoreNonCash = 0.0;
+        $totalDiscrepancy = 0.0;
 
+        $idx = 1;
         foreach ($cashiers as $c) {
             $sales = (float)$c->total_sales;
             $bills = (int)$c->total_bills;
+            $collected = (float)$c->total_collected;
+            $due = (float)$c->total_due;
             $discount = (float)$c->total_discount;
+            $cash = (float)$c->cash_collected;
+            $nonCash = (float)$c->non_cash_collected;
             $avgTicket = $bills > 0 ? round($sales / $bills, 2) : 0.0;
+            $netRevenue = $sales - $discount;
+            $discountRate = $sales > 0 ? round(($discount / $sales) * 100, 1) : 0.0;
+
+            // Find matching register
+            $reg = DB::table('cash_registers')
+                ->where('warehouse_name', $c->warehouse_name)
+                ->orderBy('id', 'desc')
+                ->first();
+
+            $expectedCash = $reg ? (float)($reg->expected_cash ?? 50000.0) : 50000.0;
+            $closingCash = $reg ? (float)($reg->closing_cash ?? 50000.0) : 50000.0;
+            $diff = $reg ? (float)($reg->cash_difference ?? 0.0) : 0.0;
+            $regName = $reg ? $reg->register_name : 'Register 01';
+
+            // Audit risk
+            $risk = 'healthy';
+            if ($diff < -100) {
+                $risk = 'critical';
+            } elseif ($discountRate > 10.0 || abs($diff) > 0) {
+                $risk = 'watch';
+            }
+
+            if ($riskFilter !== 'All' && $risk !== $riskFilter) {
+                continue;
+            }
 
             $totalStoreSales += $sales;
             $totalStoreBills += $bills;
             $totalStoreDiscounts += $discount;
+            $totalStoreCollected += $collected;
+            $totalStoreDue += $due;
+            $totalStoreCash += $cash;
+            $totalStoreNonCash += $nonCash;
+            $totalDiscrepancy += $diff;
+
+            // Recent transactions drilldown (up to 15)
+            $txs = DB::table('sales')
+                ->where('date', '>=', $startDate . ' 00:00:00')
+                ->where('date', '<=', $endDate . ' 23:59:59')
+                ->where(function($q) use ($c) {
+                    $q->where('created_by', $c->cashier_name)
+                      ->orWhere('user_name', $c->cashier_name);
+                })
+                ->where('warehouse_name', $c->warehouse_name)
+                ->orderBy('date', 'desc')
+                ->limit(15)
+                ->select([
+                    'id', 'reference_no', 'date', 'customer_name', 'payment_type',
+                    'grand_total', 'paid_amount', 'due_amount', 'discount'
+                ])
+                ->get();
 
             $items[] = [
+                'staff_code' => 'STF-' . str_pad($idx++, 3, '0', STR_PAD_LEFT),
                 'cashier_name' => $c->cashier_name,
+                'role' => $c->role,
+                'warehouse_name' => $c->warehouse_name,
+                'register_name' => $regName,
                 'total_bills' => $bills,
                 'total_sales' => round($sales, 2),
-                'total_collected' => round((float)$c->total_collected, 2),
-                'total_due' => round((float)$c->total_due, 2),
+                'total_collected' => round($collected, 2),
+                'total_due' => round($due, 2),
                 'total_discount' => round($discount, 2),
+                'net_revenue' => round($netRevenue, 2),
+                'discount_rate' => $discountRate,
                 'average_bill_value' => $avgTicket,
-                'cash_collected' => round((float)$c->cash_collected, 2),
-                'non_cash_collected' => round((float)$c->non_cash_collected, 2),
+                'cash_collected' => round($cash, 2),
+                'non_cash_collected' => round($nonCash, 2),
+                'expected_cash' => round($expectedCash, 2),
+                'counted_cash' => round($closingCash, 2),
+                'cash_difference' => round($diff, 2),
+                'audit_risk_status' => $risk,
+                'transactions' => $txs,
             ];
         }
 
@@ -4743,8 +5126,13 @@ class ReportController extends Controller
                 'total_cashiers' => count($items),
                 'total_store_bills' => $totalStoreBills,
                 'total_store_sales' => round($totalStoreSales, 2),
+                'total_collected' => round($totalStoreCollected, 2),
+                'total_due' => round($totalStoreDue, 2),
                 'total_store_discounts' => round($totalStoreDiscounts, 2),
+                'total_cash_collected' => round($totalStoreCash, 2),
+                'total_non_cash_collected' => round($totalStoreNonCash, 2),
                 'average_store_bill' => $totalStoreBills > 0 ? round($totalStoreSales / $totalStoreBills, 2) : 0.0,
+                'total_drawer_discrepancy' => round($totalDiscrepancy, 2),
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,

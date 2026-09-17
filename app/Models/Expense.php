@@ -17,6 +17,8 @@ class Expense extends Model
         'expense_category_name',
         'title',
         'amount',
+        'payment_method',
+        'payment_method_id',
         'date',
         'details',
         'created_by',
@@ -27,6 +29,7 @@ class Expense extends Model
 
     protected $casts = [
         'warehouse_id' => 'integer',
+        'payment_method_id' => 'integer',
         'user_id' => 'integer',
         'amount' => 'float',
     ];
@@ -34,5 +37,10 @@ class Expense extends Model
     public function category()
     {
         return $this->belongsTo(ExpenseCategory::class, 'expense_category_id');
+    }
+
+    public function paymentMethod()
+    {
+        return $this->belongsTo(PaymentMethod::class, 'payment_method_id');
     }
 }

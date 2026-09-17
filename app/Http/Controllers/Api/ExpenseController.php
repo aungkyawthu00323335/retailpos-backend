@@ -55,6 +55,10 @@ class ExpenseController extends Controller
             $query->where('expense_category_name', $request->input('category_name'));
         }
 
+        if ($request->filled('payment_method') && $request->input('payment_method') !== 'All') {
+            $query->where('payment_method', $request->input('payment_method'));
+        }
+
         if ($request->filled('date_from')) {
             $query->where('date', '>=', $request->input('date_from'));
         }
@@ -74,6 +78,7 @@ class ExpenseController extends Controller
                   ->orWhere('title', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
                   ->orWhere('expense_category_name', 'like', "%{$search}%")
+                  ->orWhere('payment_method', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
                   ->orWhere('user_name', 'like', "%{$search}%")
                   ->orWhere('user_role', 'like', "%{$search}%")
@@ -87,7 +92,7 @@ class ExpenseController extends Controller
         // High-performance sorting
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'created_by', 'user_name'];
+        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'payment_method', 'created_by', 'user_name'];
         if (in_array($sortBy, $allowedSorts, true)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
@@ -123,6 +128,8 @@ class ExpenseController extends Controller
             'expense_category_name' => 'required|string|max:255',
             'title' => 'required|string|max:255',
             'amount' => 'required|numeric|min:0.01',
+            'payment_method' => 'nullable|string|max:255',
+            'payment_method_id' => 'nullable|integer',
             'date' => 'required|string',
             'details' => 'nullable|string',
             'created_by' => 'nullable|string|max:255',
@@ -152,6 +159,8 @@ class ExpenseController extends Controller
             'expense_category_name' => $validated['expense_category_name'],
             'title' => $validated['title'],
             'amount' => (float)$validated['amount'],
+            'payment_method' => $validated['payment_method'] ?? 'Cash',
+            'payment_method_id' => $validated['payment_method_id'] ?? null,
             'date' => $txDate,
             'details' => $validated['details'] ?? null,
             'created_by' => $userName,
@@ -191,6 +200,8 @@ class ExpenseController extends Controller
             'expense_category_name' => 'sometimes|required|string|max:255',
             'title' => 'sometimes|required|string|max:255',
             'amount' => 'sometimes|required|numeric|min:0.01',
+            'payment_method' => 'sometimes|nullable|string|max:255',
+            'payment_method_id' => 'sometimes|nullable|integer',
             'date' => 'sometimes|required|string',
             'details' => 'nullable|string',
             'created_by' => 'sometimes|nullable|string|max:255',
