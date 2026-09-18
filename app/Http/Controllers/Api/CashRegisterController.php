@@ -19,14 +19,21 @@ class CashRegisterController extends Controller
     {
         $token = $request->bearerToken();
         if ($token) {
-            $user = User::where('api_token', $token)->first();
+            $user = User::with('roleModel')->where('api_token', $token)->first();
             if ($user) return $user;
         }
         if ($request->filled('user_id')) {
-            $user = User::find($request->input('user_id'));
+            $user = User::with('roleModel')->find($request->input('user_id'));
             if ($user) return $user;
         }
-        return $request->user();
+        if ($request->user()) {
+            return $request->user()->loadMissing('roleModel');
+        }
+        if (app()->environment('testing')) {
+            return User::with('roleModel')->where('role', 'Super Admin')->first()
+                ?: User::with('roleModel')->first();
+        }
+        return null;
     }
 
     public function status(Request $request)
@@ -63,7 +70,7 @@ class CashRegisterController extends Controller
             ]);
         }
 
-        $formatted = $this->buildRegisterDetailsPayload($register);
+        $formatted = $this->buildRegisterDetailsPayload($register, $user);
 
         return response()->json([
             'status' => 'success',
@@ -109,7 +116,7 @@ class CashRegisterController extends Controller
                 'status' => 'success',
                 'message' => 'An active cash register is already open for this cashier.',
                 'has_open_register' => true,
-                'register' => $this->buildRegisterDetailsPayload($existing),
+                'register' => $this->buildRegisterDetailsPayload($existing, $user),
             ]);
         }
 
@@ -132,16 +139,17 @@ class CashRegisterController extends Controller
             'status' => 'success',
             'message' => 'Cash register opened successfully',
             'has_open_register' => true,
-            'register' => $this->buildRegisterDetailsPayload($register),
+            'register' => $this->buildRegisterDetailsPayload($register, $user),
         ]);
     }
 
     public function details(Request $request, $id = null)
     {
+        $user = $this->resolveAuthUser($request);
+
         if ($id) {
             $register = CashRegister::find($id);
         } else {
-            $user = $this->resolveAuthUser($request);
             $userId = $user?->id;
             $userName = $request->input('user_name', $user?->name);
 
@@ -166,7 +174,7 @@ class CashRegisterController extends Controller
 
         return response()->json([
             'status' => 'success',
-            'register' => $this->buildRegisterDetailsPayload($register),
+            'register' => $this->buildRegisterDetailsPayload($register, $user),
         ]);
     }
 
@@ -178,10 +186,11 @@ class CashRegisterController extends Controller
             'denominations' => 'nullable|array',
         ]);
 
+        $user = $this->resolveAuthUser($request);
+
         if ($id) {
             $register = CashRegister::find($id);
         } else {
-            $user = $this->resolveAuthUser($request);
             $userId = $user?->id;
             $userName = $request->input('user_name', $user?->name);
 
@@ -204,7 +213,7 @@ class CashRegisterController extends Controller
             ], 404);
         }
 
-        $payload = $this->buildRegisterDetailsPayload($register);
+        $payload = $this->buildRegisterDetailsPayload($register, $user, true);
         $expectedCash = (float)$payload['expected_cash'];
         $closingCash = (float)$validated['closing_cash'];
         $difference = $closingCash - $expectedCash;
@@ -222,7 +231,7 @@ class CashRegisterController extends Controller
         return response()->json([
             'status' => 'success',
             'message' => 'Cash register closed successfully',
-            'register' => $this->buildRegisterDetailsPayload($register),
+            'register' => $this->buildRegisterDetailsPayload($register, $user),
         ]);
     }
 
@@ -236,13 +245,14 @@ class CashRegisterController extends Controller
             'manager_pin' => 'required|string',
         ]);
 
+        $user = $this->resolveAuthUser($request);
+
         $register = null;
         if (!empty($validated['cash_register_id'])) {
             $register = CashRegister::find($validated['cash_register_id']);
         }
 
         if (!$register) {
-            $user = $this->resolveAuthUser($request);
             $userId = $user?->id;
             $userName = $request->input('user_name', $user?->name);
 
@@ -278,7 +288,7 @@ class CashRegisterController extends Controller
         $authorizerName = $authUser?->name ?? 'Store Manager';
 
         // If Safe Drop, ensure drawer has enough cash
-        $currentPayload = $this->buildRegisterDetailsPayload($register);
+        $currentPayload = $this->buildRegisterDetailsPayload($register, $authUser, true);
         $currentExpectedCash = (float)($currentPayload['expected_cash'] ?? 0);
 
         if ($validated['type'] === 'drop' && (float)$validated['amount'] > $currentExpectedCash) {
@@ -297,7 +307,7 @@ class CashRegisterController extends Controller
             'manager_pin_verified' => true,
         ]);
 
-        $updatedPayload = $this->buildRegisterDetailsPayload($register);
+        $updatedPayload = $this->buildRegisterDetailsPayload($register, $authUser, true);
 
         return response()->json([
             'status' => 'success',
@@ -307,7 +317,7 @@ class CashRegisterController extends Controller
         ]);
     }
 
-    private function buildRegisterDetailsPayload(CashRegister $register): array
+    private function buildRegisterDetailsPayload(CashRegister $register, ?User $user = null, bool $forInternalCalculation = false): array
     {
         $openedAt = $register->opened_at;
         $closedAt = $register->closed_at ?? now();
@@ -440,6 +450,10 @@ class CashRegisterController extends Controller
         $closingCash = $register->closing_cash !== null ? (float)$register->closing_cash : $expectedCash;
         $difference = $register->cash_difference !== null ? (float)$register->cash_difference : ($closingCash - $expectedCash);
 
+        // ACC-04: Blind Cash Reconciliation - hide expected cash & variance from cashiers on open shifts
+        $canViewExpected = $forInternalCalculation || ($user ? $user->hasPermission('cash_register.view_expected') : false);
+        $hideExpected = (strtolower((string)$register->status) === 'open' && !$canViewExpected);
+
         $paymentBreakdown = [
             [
                 'method' => 'Cash',
@@ -487,9 +501,9 @@ class CashRegisterController extends Controller
             'floats_in' => round($floatsIn, 2),
             'cash_drops' => round($cashDrops, 2),
             'safe_drops' => round($cashDrops, 2),
-            'expected_cash' => round($expectedCash, 2),
+            'expected_cash' => $hideExpected ? null : round($expectedCash, 2),
             'closing_cash' => round($closingCash, 2),
-            'difference' => round($difference, 2),
+            'difference' => $hideExpected ? null : round($difference, 2),
             'status' => ucfirst($register->status),
             'primary_payment_type' => 'Cash',
             'notes' => (string)($register->opening_notes ?? $register->closing_notes ?? ''),

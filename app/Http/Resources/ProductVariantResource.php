@@ -9,6 +9,9 @@ class ProductVariantResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
+        $user = \App\Models\User::resolveFromRequest($request);
+        $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
+
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
@@ -29,7 +32,7 @@ class ProductVariantResource extends JsonResource
             'name' => $this->name,
             'sku' => $this->sku,
             'barcode' => $this->barcode,
-            'cost_price' => (float) $this->cost_price,
+            'cost_price' => $canViewCost ? (float) $this->cost_price : null,
             'selling_price' => (float) $this->selling_price,
             'retail_price' => (float) ($this->selling_price ?? 0.0),
             'retail_prices' => $this->retail_prices ?? ($this->selling_price ? [(float)$this->selling_price] : []),

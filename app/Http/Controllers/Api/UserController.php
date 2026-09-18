@@ -128,6 +128,25 @@ class UserController extends Controller
             }
         }
 
+        // SEC-03: Privilege escalation prevention - only Super Admin can create Super Admin accounts
+        $targetIsSuper = (strtolower(trim((string)$roleName)) === 'super admin');
+        if (!$targetIsSuper && $roleId) {
+            $assignedRole = Role::find($roleId);
+            if ($assignedRole && ($assignedRole->slug === 'super_admin' || strtolower($assignedRole->name) === 'super admin')) {
+                $targetIsSuper = true;
+            }
+        }
+
+        if ($targetIsSuper) {
+            $caller = User::resolveFromRequest($request);
+            if (!$caller || !$caller->isSuperAdmin()) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Unauthorized. Only Super Admin can create Super Admin accounts.',
+                ], 403);
+            }
+        }
+
         $outletIds = $validated['outlet_ids'] ?? [];
         $branchName = $validated['branch'] ?? null;
         if (empty($branchName) && !empty($outletIds)) {
@@ -208,6 +227,16 @@ class UserController extends Controller
             ], 404);
         }
 
+        $caller = User::resolveFromRequest($request);
+
+        // SEC-03: Only Super Admin can modify Super Admin accounts
+        if ($user->isSuperAdmin() && (!$caller || !$caller->isSuperAdmin())) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Only Super Admin can modify Super Admin accounts.',
+            ], 403);
+        }
+
         $validated = $request->validate([
             'user_id' => 'sometimes|nullable|string|max:50|unique:users,user_id,' . $id,
             'name' => 'sometimes|required|string|max:255',
@@ -234,6 +263,24 @@ class UserController extends Controller
             if ($matchedRole) {
                 $validated['role_id'] = $matchedRole->id;
             }
+        }
+
+        // SEC-03: Privilege escalation prevention - only Super Admin can assign Super Admin role
+        $elevatingToSuper = false;
+        if (isset($validated['role']) && strtolower(trim((string)$validated['role'])) === 'super admin') {
+            $elevatingToSuper = true;
+        }
+        if (isset($validated['role_id'])) {
+            $r = Role::find($validated['role_id']);
+            if ($r && ($r->slug === 'super_admin' || strtolower($r->name) === 'super admin')) {
+                $elevatingToSuper = true;
+            }
+        }
+        if ($elevatingToSuper && (!$caller || !$caller->isSuperAdmin())) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Only Super Admin can assign the Super Admin role.',
+            ], 403);
         }
 
         if (array_key_exists('outlet_ids', $validated)) {
@@ -283,7 +330,7 @@ class UserController extends Controller
     /**
      * Remove the specified user account.
      */
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
         $user = User::find($id);
 
@@ -294,11 +341,21 @@ class UserController extends Controller
             ], 404);
         }
 
-        if ($user->isSuperAdmin()) {
+        if ($user->isSuperAdmin() || ($user->roleModel && $user->roleModel->slug === 'super_admin')) {
             return response()->json([
                 'status' => 'error',
                 'message' => 'Super Admin user cannot be deleted.',
             ], 422);
+        }
+
+        $caller = User::resolveFromRequest($request);
+        if (!$caller || !$caller->isSuperAdmin()) {
+            if ($user->roleModel && ($user->roleModel->slug === 'store_manager' || strtolower((string)$user->role) === 'store manager')) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Unauthorized. Only Super Admin can delete Store Manager accounts.',
+                ], 403);
+            }
         }
 
         $user->outlets()->detach();

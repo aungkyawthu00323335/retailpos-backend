@@ -140,7 +140,12 @@ class ProductController extends Controller
         $search = trim((string)$request->input('search', ''));
         $category = (string)$request->input('category', '');
         $brand = (string)$request->input('brand', '');
-        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0'));
+
+        $user = \App\Models\User::resolveFromRequest($request);
+        $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
+        $costScope = $canViewCost ? 'with_cost' : 'masked_cost';
+
+        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0') . "|{$costScope}");
 
         if (!$request->boolean('force_refresh') && \Illuminate\Support\Facades\Cache::store('file')->has($cacheKey)) {
             $cached = \Illuminate\Support\Facades\Cache::store('file')->get($cacheKey);
@@ -161,10 +166,10 @@ class ProductController extends Controller
         $items    = $paginator->getCollection();
 
         // ── HTTP caching headers ───────────────────────────────────────────
-        // ETag: changes whenever total count, page, per_page or warehouse filter changes.
+        // ETag: changes whenever total count, page, per_page, warehouse filter or costScope changes.
         // Cache-Control: private (user-specific data), max-age matches the
         //   Flutter client's _pageCacheTtl so downstream caches stay in sync.
-        $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all')) . '"';
+        $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}") . '"';
 
         if ($request->header('If-None-Match') === $etag) {
             return response(null, 304)->header('ETag', $etag);
@@ -172,7 +177,7 @@ class ProductController extends Controller
 
         $responseData = [
             'status'     => 'success',
-            'data'       => ProductListResource::collection($items)->resolve(),
+            'data'       => ProductListResource::collection($items)->resolve($request),
             'pagination' => [
                 'current_page' => $page,
                 'per_page'     => $perPage,

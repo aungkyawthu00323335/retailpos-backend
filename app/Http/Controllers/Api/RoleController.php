@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Role;
+use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 
@@ -52,6 +53,16 @@ class RoleController extends Controller
             'permissions' => 'nullable|array',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
+
+        $caller = User::resolveFromRequest($request);
+        if (isset($validated['permissions']) && is_array($validated['permissions']) && in_array('*', $validated['permissions'], true)) {
+            if (!$caller || !$caller->isSuperAdmin()) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Unauthorized. Only Super Admin can create roles with wildcard permissions.',
+                ], 403);
+            }
+        }
 
         $slug = Str::slug($validated['name'], '_');
         $originalSlug = $slug;
@@ -112,6 +123,18 @@ class RoleController extends Controller
             ], 404);
         }
 
+        $caller = User::resolveFromRequest($request);
+
+        // SEC-03: Prevent non-super-admins from editing Super Admin role
+        if ($role->slug === 'super_admin' || strtolower($role->name) === 'super admin') {
+            if (!$caller || !$caller->isSuperAdmin()) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Unauthorized. Super Admin role cannot be modified by non-super-admin users.',
+                ], 403);
+            }
+        }
+
         $validated = $request->validate([
             'name' => 'sometimes|required|string|max:255',
             'description' => 'nullable|string',
@@ -119,6 +142,22 @@ class RoleController extends Controller
             'permissions' => 'nullable|array',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
+
+        if (isset($validated['name']) && strtolower(trim($validated['name'])) === 'super admin' && (!$caller || !$caller->isSuperAdmin())) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Cannot rename a role to Super Admin.',
+            ], 403);
+        }
+
+        if (isset($validated['permissions']) && is_array($validated['permissions']) && in_array('*', $validated['permissions'], true)) {
+            if (!$caller || !$caller->isSuperAdmin()) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Unauthorized. Only Super Admin can assign wildcard permissions.',
+                ], 403);
+            }
+        }
 
         $role->update($validated);
 
@@ -132,7 +171,7 @@ class RoleController extends Controller
     /**
      * Remove the specified role.
      */
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
         $role = Role::find($id);
 
@@ -141,6 +180,13 @@ class RoleController extends Controller
                 'status' => 'error',
                 'message' => 'Role not found',
             ], 404);
+        }
+
+        if ($role->slug === 'super_admin' || strtolower($role->name) === 'super admin') {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Super Admin role cannot be deleted.',
+            ], 403);
         }
 
         if ($role->is_default) {

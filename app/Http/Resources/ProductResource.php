@@ -9,6 +9,9 @@ class ProductResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
+        $user = \App\Models\User::resolveFromRequest($request);
+        $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
+
         $primaryImgUrl = (string)($this->image_url ?? '');
         if ($this->relationLoaded('primaryImage') && $this->primaryImage) {
             $primaryImgUrl = $this->primaryImage->url;
@@ -89,9 +92,9 @@ class ProductResource extends JsonResource
                 $this->relationLoaded('unitLinks'),
                 fn () => $serializedUnitLinks,
             ),
-            'cost_price' => (float) ($this->cost_price ?: $this->purchase_price),
+            'cost_price' => $canViewCost ? (float) ($this->cost_price ?: $this->purchase_price) : null,
             'selling_price' => (float) ($this->selling_price ?: $this->retail_price),
-            'purchase_price' => (float) ($this->purchase_price ?: $this->cost_price),
+            'purchase_price' => $canViewCost ? (float) ($this->purchase_price ?: $this->cost_price) : null,
             'retail_price' => (float) ($this->retail_price ?: $this->selling_price),
             'retail_prices' => $this->retail_prices ?? (($this->retail_price || $this->selling_price) ? [(float)($this->retail_price ?: $this->selling_price)] : []),
             'selling_prices' => $this->retail_prices ?? (($this->retail_price || $this->selling_price) ? [(float)($this->retail_price ?: $this->selling_price)] : []),
