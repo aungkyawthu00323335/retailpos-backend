@@ -3403,13 +3403,13 @@ class ReportController extends Controller
 
         // 2. Returns & Expenses for matching dates
         $returnsAgg = DB::table('sale_returns')
-            ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(paid_amount) as cash_refunds")
+            ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(CASE WHEN LOWER(COALESCE(refund_tender, payment_type, 'cash')) LIKE '%cash%' THEN paid_amount ELSE 0 END) as cash_refunds")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
             ->get()
             ->keyBy(function($r) { return $r->ret_date . '_' . $r->w_id; });
 
         $expensesAgg = DB::table('expenses')
-            ->selectRaw("SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, SUM(amount) as total_expenses")
+            ->selectRaw("SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, SUM(amount) as total_expenses, SUM(CASE WHEN LOWER(COALESCE(payment_method, 'cash')) = 'cash' THEN amount ELSE 0 END) as cash_expenses")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
             ->get()
             ->keyBy(function($e) { return $e->exp_date . '_' . $e->w_id; });
@@ -3439,12 +3439,14 @@ class ReportController extends Controller
             $cardSales = (float)$s->card_sales;
             $digitalSales = (float)$s->digital_sales;
 
-            $refunds = $ret ? (float)$ret->cash_refunds : 0.0;
-            $expenses = $exp ? (float)$exp->total_expenses : 0.0;
+            $totalRefunds = $ret ? (float)$ret->total_returns : 0.0;
+            $cashRefunds = $ret ? (float)$ret->cash_refunds : 0.0;
+            $totalExpenses = $exp ? (float)$exp->total_expenses : 0.0;
+            $cashExpenses = $exp ? (float)$exp->cash_expenses : 0.0;
 
             // Opening Cash Float ($500 base standard)
             $openingCash = 500.00;
-            $expectedCash = max(0.0, $openingCash + $cashSales - $refunds - $expenses);
+            $expectedCash = max(0.0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
             $closingCash = $expectedCash; // Actual counted cash
             $variance = round($closingCash - $expectedCash, 2);
 
@@ -3520,8 +3522,11 @@ class ReportController extends Controller
                 'cash_sales' => round($cashSales, 2),
                 'card_sales' => round($cardSales, 2),
                 'digital_sales' => round($digitalSales, 2),
-                'total_refunds' => round($refunds, 2),
-                'total_expenses' => round($expenses, 2),
+                'total_refunds' => round($totalRefunds, 2),
+                'cash_refunds' => round($cashRefunds, 2),
+                'total_expenses' => round($totalExpenses, 2),
+                'cash_expenses' => round($cashExpenses, 2),
+                'digital_expenses' => round($totalExpenses - $cashExpenses, 2),
                 'expected_cash' => round($expectedCash, 2),
                 'closing_cash' => round($closingCash, 2),
                 'difference' => $variance,

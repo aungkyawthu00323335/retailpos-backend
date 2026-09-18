@@ -293,21 +293,49 @@ class CashRegisterController extends Controller
         }
 
         // 3. Query refunds/returns during this register session
-        $refunds = DB::table('sale_returns')
+        // Only CASH refunds that were actually disbursed from the till drawer reduce expected cash
+        $returns = DB::table('sale_returns')
             ->where('warehouse_name', $register->warehouse_name)
             ->whereBetween('created_at', [$openedAt, $closedAt])
-            ->sum('grand_total');
-        $totalRefunds = (float)$refunds;
+            ->get();
+
+        $totalRefunds = 0.0;
+        $cashRefunds = 0.0;
+        foreach ($returns as $r) {
+            $retTotal = (float)($r->grand_total ?? 0);
+            $totalRefunds += $retTotal;
+            $tender = strtolower(trim((string)($r->refund_tender ?? $r->payment_type ?? 'cash')));
+            $paidOut = (float)($r->paid_amount ?? $retTotal);
+            if ($tender === 'cash' || str_contains($tender, 'cash')) {
+                $cashRefunds += $paidOut;
+            }
+        }
 
         // 4. Query expenses during this shift
-        $expenses = DB::table('expenses')
+        // Only CASH expenses paid from the register drawer reduce expected cash
+        $expenseRecords = DB::table('expenses')
             ->where('warehouse_name', $register->warehouse_name)
-            ->whereBetween('date', [substr((string)$openedAt, 0, 10), substr((string)$closedAt, 0, 10)])
-            ->sum('amount');
-        $totalExpenses = (float)$expenses;
+            ->whereBetween('created_at', [$openedAt, $closedAt])
+            ->get();
+
+        $totalExpenses = 0.0;
+        $cashExpenses = 0.0;
+        $digitalExpenses = 0.0;
+        foreach ($expenseRecords as $exp) {
+            $amt = (float)($exp->amount ?? 0);
+            $totalExpenses += $amt;
+            $pMethod = strtolower(trim((string)($exp->payment_method ?? 'cash')));
+            if ($pMethod === 'cash') {
+                $cashExpenses += $amt;
+            } else {
+                $digitalExpenses += $amt;
+            }
+        }
 
         $openingCash = (float)$register->opening_cash;
-        $expectedCash = max(0, $openingCash + $cashSales - $totalRefunds);
+        // Accurate GAAP/IFRS Till Reconciliation Formula:
+        // Expected Cash = Opening Cash + Net Cash Sales - Cash Refunds - Cash Expenses
+        $expectedCash = max(0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
         $closingCash = $register->closing_cash !== null ? (float)$register->closing_cash : $expectedCash;
         $difference = $register->cash_difference !== null ? (float)$register->cash_difference : ($closingCash - $expectedCash);
 
@@ -351,7 +379,10 @@ class CashRegisterController extends Controller
             'digital_sales' => round($digitalSales, 2),
             'other_sales' => round($otherSales, 2),
             'total_refunds' => round($totalRefunds, 2),
+            'cash_refunds' => round($cashRefunds, 2),
             'total_expenses' => round($totalExpenses, 2),
+            'cash_expenses' => round($cashExpenses, 2),
+            'digital_expenses' => round($digitalExpenses, 2),
             'expected_cash' => round($expectedCash, 2),
             'closing_cash' => round($closingCash, 2),
             'difference' => round($difference, 2),
