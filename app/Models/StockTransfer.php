@@ -23,6 +23,9 @@ class StockTransfer extends Model
         'status', // Sent, Pending, Completed
         'notes',
         'created_by',
+        'received_by',
+        'received_at',
+        'receiving_notes',
         'user_id',
         'user_name',
         'user_role',
@@ -35,6 +38,7 @@ class StockTransfer extends Model
         'items_count' => 'integer',
         'total_quantity' => 'float',
         'shipping_charge' => 'float',
+        'received_at' => 'datetime',
     ];
 
     public function items()

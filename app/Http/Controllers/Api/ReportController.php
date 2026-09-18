@@ -5381,14 +5381,41 @@ class ReportController extends Controller
             ->where('tax_amount', '>', 0)
             ->orderBy('date', 'desc')
             ->limit(50)
-            ->get();
+            ->get()
+            ->map(function ($row) {
+                return [
+                    'id'             => $row->id,
+                    'reference_no'   => $row->reference_no,
+                    'date'           => $row->date,
+                    'customer_name'  => $row->customer_name ?? 'Walk-in Customer',
+                    'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
+                    'tax_rate'       => (float)($row->tax_rate ?? 0),
+                    'tax_amount'     => (float)($row->tax_amount ?? 0),
+                    'subtotal'       => (float)($row->subtotal ?? 0),
+                    'discount'       => (float)($row->discount ?? 0),
+                    'grand_total'    => (float)($row->grand_total ?? 0),
+                ];
+            });
 
         $taxablePurchasesList = (clone $purchQuery)
             ->select('id', 'reference_no', 'date', 'supplier_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'discount', 'grand_total')
             ->where('tax_amount', '>', 0)
             ->orderBy('date', 'desc')
             ->limit(50)
-            ->get();
+            ->get()
+            ->map(function ($row) {
+                return [
+                    'id'             => $row->id,
+                    'reference_no'   => $row->reference_no,
+                    'date'           => $row->date,
+                    'supplier_name'  => $row->supplier_name ?? 'Default Supplier',
+                    'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
+                    'tax_rate'       => (float)($row->tax_rate ?? 0),
+                    'tax_amount'     => (float)($row->tax_amount ?? 0),
+                    'discount'       => (float)($row->discount ?? 0),
+                    'grand_total'    => (float)($row->grand_total ?? 0),
+                ];
+            });
 
         return response()->json([
             'status' => 'success',

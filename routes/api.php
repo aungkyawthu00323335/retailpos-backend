@@ -74,6 +74,7 @@ Route::apiResource('products', ProductController::class);
 Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateCode']);
 Route::apiResource('adjustments', AdjustmentController::class);
 Route::get('transfers/generate-code', [TransferController::class, 'generateCode']);
+Route::post('transfers/{id}/receive', [TransferController::class, 'receiveTransfer']);
 Route::apiResource('transfers', TransferController::class);
 
 // Purchases & Purchase Returns
@@ -147,6 +148,13 @@ Route::get('reports/product-margins', [ReportController::class, 'productMarginsR
 Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport']);
 Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport']);
 Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport']);
+
+// Cash Register Till & Shift Management
+Route::get('cash-register/status', [CashRegisterController::class, 'status']);
+Route::post('cash-register/open', [CashRegisterController::class, 'open']);
+Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'details']);
+Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
+Route::post('cash-register/transaction', [CashRegisterController::class, 'recordTransaction']);
 
 // General Settings & Multi-Currency
 Route::get('settings', [SettingController::class, 'getSettings']);

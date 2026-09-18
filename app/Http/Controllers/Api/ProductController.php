@@ -58,8 +58,11 @@ class ProductController extends Controller
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
-                'stockBalances' => function ($q) {
+                'stockBalances' => function ($q) use ($warehouseId) {
                     $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
                 },
             ]);
 

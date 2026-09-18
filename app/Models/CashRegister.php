@@ -52,4 +52,9 @@ class CashRegister extends Model
     {
         return $this->hasMany(Sale::class, 'cash_register_id');
     }
+
+    public function transactions()
+    {
+        return $this->hasMany(CashRegisterTransaction::class, 'cash_register_id');
+    }
 }

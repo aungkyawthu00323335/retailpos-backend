@@ -145,8 +145,8 @@ class TransferController extends Controller
 
         // ── T3: Available Stock Validation ────────────────────────────────────
         // Before creating the transfer, verify every item has sufficient stock
-        // in the source warehouse. Prevents sending more than what is in stock.
-        if ($transferStatus === 'Completed' && $fromWarehouseId) {
+        // in the source warehouse for both Completed and Sent (In-Transit) status.
+        if (in_array($transferStatus, ['Completed', 'Sent']) && $fromWarehouseId) {
             $insufficientItems = [];
             foreach ($validated['items'] as $item) {
                 $productId = $item['product_id'] ?? null;
@@ -157,10 +157,16 @@ class TransferController extends Controller
                     : ($qty * max($convRate, 1));
 
                 if ($productId && $baseQty > 0) {
-                    $stockBalance = DB::table('product_warehouse')
+                    $stockBalance = DB::table('stock_balances')
                         ->where('product_id', $productId)
                         ->where('warehouse_id', $fromWarehouseId)
                         ->value('quantity');
+                    if ($stockBalance === null) {
+                        $stockBalance = DB::table('product_warehouse')
+                            ->where('product_id', $productId)
+                            ->where('warehouse_id', $fromWarehouseId)
+                            ->value('quantity');
+                    }
                     $available = (float)($stockBalance ?? 0);
                     if ($available < $baseQty) {
                         $insufficientItems[] = sprintf(
@@ -226,7 +232,7 @@ class TransferController extends Controller
                     ? (float)$item['base_unit_cost']
                     : ($convRate > 0 ? $unitCost / $convRate : $unitCost);
 
-                StockTransferItem::create([
+                $createdItem = StockTransferItem::create([
                     'stock_transfer_id'  => $transfer->id,
                     'product_id'         => $item['product_id'] ?? null,
                     'product_variant_id' => $item['product_variant_id'] ?? null,
@@ -243,8 +249,8 @@ class TransferController extends Controller
                     'subtotal'           => (float)($item['subtotal'] ?? ($qty * $unitCost)),
                 ]);
 
-                // Physically execute stock movement if transfer is Completed
-                if ($transferStatus === 'Completed' && $baseQty > 0 && $fromWarehouseId && $toWarehouseId) {
+                // Physically execute stock movement if Completed or Sent
+                if (in_array($transferStatus, ['Completed', 'Sent']) && $baseQty > 0 && $fromWarehouseId) {
                     $productId = $item['product_id'] ?? null;
                     $variantId = !empty($item['product_variant_id']) ? (int)$item['product_variant_id'] : null;
                     $product   = $productId
@@ -259,14 +265,7 @@ class TransferController extends Controller
                             (string)$transfer->id, 'Transferred to ' . $validated['to_warehouse']
                         );
 
-                        // 2. Add stock to destination warehouse
-                        $unitService->applyStock(
-                            $product, $toWarehouseId, $variantId, $baseQty,
-                            'in', 'stock_transfer_in', 'stock_transfer',
-                            (string)$transfer->id, 'Transferred from ' . $validated['from_warehouse']
-                        );
-
-                        // 3. Deplete FIFO batch from source warehouse (carry real cost)
+                        // 2. Deplete FIFO batch from source warehouse (carry real cost)
                         $totalLossCost       = $fifoService->depleteForAdjustment(
                             warehouseId:  (int)$fromWarehouseId,
                             productId:    (int)$product->id,
@@ -280,18 +279,28 @@ class TransferController extends Controller
                             $transferredUnitCost = $baseCost;
                         }
 
-                        // 4. Record replenishment batch in destination warehouse
-                        $fifoService->recordBatch(
-                            warehouseId:     (int)$toWarehouseId,
-                            productId:       (int)$product->id,
-                            variantId:       $variantId,
-                            baseQuantity:    (float)$baseQty,
-                            baseUnitCost:    (float)$transferredUnitCost,
-                            sourceType:      'stock_transfer',
-                            sourceReference: (string)$transfer->reference_no,
-                            receivedDate:    (string)$transfer->date,
-                            notes:           'Transfer replenishment from ' . $validated['from_warehouse']
-                        );
+                        $createdItem->update(['base_unit_cost' => $transferredUnitCost]);
+
+                        // 3. If Completed immediately (single-step), add stock & batch to destination warehouse
+                        if ($transferStatus === 'Completed' && $toWarehouseId) {
+                            $unitService->applyStock(
+                                $product, $toWarehouseId, $variantId, $baseQty,
+                                'in', 'stock_transfer_in', 'stock_transfer',
+                                (string)$transfer->id, 'Transferred from ' . $validated['from_warehouse']
+                            );
+
+                            $fifoService->recordBatch(
+                                warehouseId:     (int)$toWarehouseId,
+                                productId:       (int)$product->id,
+                                variantId:       $variantId,
+                                baseQuantity:    (float)$baseQty,
+                                baseUnitCost:    (float)$transferredUnitCost,
+                                sourceType:      'stock_transfer',
+                                sourceReference: (string)$transfer->reference_no,
+                                receivedDate:    (string)$transfer->date,
+                                notes:           'Transfer replenishment from ' . $validated['from_warehouse']
+                            );
+                        }
                     }
                 }
             }
@@ -560,6 +569,25 @@ class TransferController extends Controller
                         }
                     }
                 }
+            } elseif ($transfer->status === 'Sent') {
+                // Was in-transit (source stock was deducted upon dispatch), revert source deduction
+                $unitService = app(\App\Services\ProductUnitConversionService::class);
+                $fromWarehouseId = $unitService->warehouseId($transfer->from_warehouse_id, $transfer->from_warehouse);
+                foreach ($transfer->items as $item) {
+                    $baseQty = (float)($item->base_quantity ?? ($item->quantity * ($item->conversion_rate ?? 1.0)));
+                    if ($baseQty > 0 && $fromWarehouseId) {
+                        $product = $item->product_id
+                            ? Product::find($item->product_id)
+                            : Product::where('code', $item->product_code)->first();
+                        if ($product) {
+                            $unitService->applyStock(
+                                $product, $fromWarehouseId, $item->product_variant_id, $baseQty,
+                                'in', 'stock_transfer_reversal_in', 'stock_transfer_reversal',
+                                (string)$transfer->id, 'Cancelled in-transit transfer to ' . $transfer->to_warehouse
+                            );
+                        }
+                    }
+                }
             }
 
             $transfer->items()->delete();
@@ -567,6 +595,98 @@ class TransferController extends Controller
 
             DB::commit();
             return response()->json(['status' => 'success', 'message' => 'Transfer deleted successfully and stock restored']);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Confirm and receive an In-Transit (Sent) transfer at the destination branch.
+     * Physically replenishes inventory and logs FIFO receipt layer.
+     */
+    public function receiveTransfer(Request $request, $id)
+    {
+        $transfer = StockTransfer::with('items')->find($id);
+        if (!$transfer) {
+            return response()->json(['status' => 'error', 'message' => 'Transfer not found'], 404);
+        }
+
+        if ($transfer->status === 'Completed') {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Transfer is already marked as Completed.',
+            ], 422);
+        }
+
+        if ($transfer->status !== 'Sent') {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Only In-Transit (Sent) transfers can be received into destination inventory.',
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'received_by'     => 'nullable|string|max:255',
+            'receiving_notes' => 'nullable|string|max:500',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $unitService   = app(\App\Services\ProductUnitConversionService::class);
+            $fifoService   = app(\App\Services\FifoInventoryService::class);
+            $toWarehouseId = $unitService->warehouseId($transfer->to_warehouse_id, $transfer->to_warehouse);
+
+            foreach ($transfer->items as $item) {
+                $baseQty   = (float)($item->base_quantity ?? ($item->quantity * ($item->conversion_rate ?? 1.0)));
+                $baseCost  = (float)($item->base_unit_cost ?? ($item->unit_cost ?? 0));
+                $variantId = !empty($item->product_variant_id) ? (int)$item->product_variant_id : null;
+
+                if ($baseQty > 0 && $toWarehouseId) {
+                    $product = $item->product_id
+                        ? Product::find($item->product_id)
+                        : Product::where('code', $item->product_code)->first();
+
+                    if ($product) {
+                        // 1. Add stock to destination warehouse
+                        $unitService->applyStock(
+                            $product, $toWarehouseId, $variantId, $baseQty,
+                            'in', 'stock_transfer_in', 'stock_transfer',
+                            (string)$transfer->id, 'Transfer received from ' . $transfer->from_warehouse
+                        );
+
+                        // 2. Record FIFO replenishment batch in destination warehouse
+                        $fifoService->recordBatch(
+                            warehouseId:     (int)$toWarehouseId,
+                            productId:       (int)$product->id,
+                            variantId:       $variantId,
+                            baseQuantity:    (float)$baseQty,
+                            baseUnitCost:    (float)$baseCost,
+                            sourceType:      'stock_transfer',
+                            sourceReference: (string)$transfer->reference_no,
+                            receivedDate:    now()->toDateTimeString(),
+                            notes:           'Transfer replenishment from ' . $transfer->from_warehouse . (!empty($validated['receiving_notes']) ? ' (' . $validated['receiving_notes'] . ')' : '')
+                        );
+                    }
+                }
+            }
+
+            $receiverName = $validated['received_by'] ?? ($request->user()?->name ?? 'Branch Manager');
+
+            $transfer->update([
+                'status'          => 'Completed',
+                'received_by'     => $receiverName,
+                'received_at'     => now(),
+                'receiving_notes' => $validated['receiving_notes'] ?? null,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Stock transfer received and verified successfully. Goods added to destination inventory.',
+                'data'    => $transfer->fresh()->load('items'),
+            ]);
         } catch (\Throwable $e) {
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);

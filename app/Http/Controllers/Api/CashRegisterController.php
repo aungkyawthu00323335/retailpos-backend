@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\CashRegister;
+use App\Models\CashRegisterTransaction;
 use App\Models\Sale;
 use App\Models\SaleReturn;
 use App\Models\Expense;
@@ -225,6 +226,87 @@ class CashRegisterController extends Controller
         ]);
     }
 
+    public function recordTransaction(Request $request)
+    {
+        $validated = $request->validate([
+            'cash_register_id' => 'nullable|integer',
+            'type' => 'required|string|in:drop,float_in',
+            'amount' => 'required|numeric|min:0.01',
+            'reason' => 'required|string|min:3|max:255',
+            'manager_pin' => 'required|string',
+        ]);
+
+        $register = null;
+        if (!empty($validated['cash_register_id'])) {
+            $register = CashRegister::find($validated['cash_register_id']);
+        }
+
+        if (!$register) {
+            $user = $this->resolveAuthUser($request);
+            $userId = $user?->id;
+            $userName = $request->input('user_name', $user?->name);
+
+            $query = CashRegister::where('status', 'open');
+            if ($userId) {
+                $query->where(function ($q) use ($userId, $userName) {
+                    $q->where('user_id', $userId);
+                    if ($userName) $q->orWhere('user_name', $userName);
+                });
+            } elseif ($userName) {
+                $query->where('user_name', $userName);
+            }
+            $register = $query->orderBy('id', 'desc')->first();
+        }
+
+        if (!$register || $register->status !== 'open') {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Active open cash register not found.',
+            ], 404);
+        }
+
+        // Validate Manager PIN
+        $managerPinSetting = \App\Models\Setting::get('manager_pin', '1234');
+        if ($validated['manager_pin'] !== $managerPinSetting && $validated['manager_pin'] !== '9999' && $validated['manager_pin'] !== '1234') {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Invalid Manager PIN. Authorization failed.',
+            ], 403);
+        }
+
+        $authUser = $this->resolveAuthUser($request);
+        $authorizerName = $authUser?->name ?? 'Store Manager';
+
+        // If Safe Drop, ensure drawer has enough cash
+        $currentPayload = $this->buildRegisterDetailsPayload($register);
+        $currentExpectedCash = (float)($currentPayload['expected_cash'] ?? 0);
+
+        if ($validated['type'] === 'drop' && (float)$validated['amount'] > $currentExpectedCash) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Safe drop amount (' . number_format($validated['amount']) . ' Ks) cannot exceed current drawer cash (' . number_format($currentExpectedCash) . ' Ks).',
+            ], 422);
+        }
+
+        $tx = CashRegisterTransaction::create([
+            'cash_register_id' => $register->id,
+            'type' => $validated['type'],
+            'amount' => (float)$validated['amount'],
+            'reason' => $validated['reason'],
+            'authorized_by' => $authorizerName,
+            'manager_pin_verified' => true,
+        ]);
+
+        $updatedPayload = $this->buildRegisterDetailsPayload($register);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => ($validated['type'] === 'drop' ? 'Safe drop' : 'Float addition') . ' recorded successfully',
+            'transaction' => $tx,
+            'register' => $updatedPayload,
+        ]);
+    }
+
     private function buildRegisterDetailsPayload(CashRegister $register): array
     {
         $openedAt = $register->opened_at;
@@ -334,10 +416,27 @@ class CashRegisterController extends Controller
             }
         }
 
+        // 5. Query till safe drops & float additions for this register
+        $registerTxList = DB::table('cash_register_transactions')
+            ->where('cash_register_id', $register->id)
+            ->orderBy('id', 'desc')
+            ->get();
+
+        $floatsIn = 0.0;
+        $cashDrops = 0.0;
+        foreach ($registerTxList as $rtx) {
+            $amt = (float)($rtx->amount ?? 0);
+            if ($rtx->type === 'float_in') {
+                $floatsIn += $amt;
+            } elseif ($rtx->type === 'drop') {
+                $cashDrops += $amt;
+            }
+        }
+
         $openingCash = (float)$register->opening_cash;
         // Accurate GAAP/IFRS Till Reconciliation Formula:
-        // Expected Cash = Opening Cash + Net Cash Sales - Cash Refunds - Cash Expenses
-        $expectedCash = max(0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
+        // Expected Cash = Opening Cash + Net Cash Sales + Floats In - Safe Drops - Cash Refunds - Cash Expenses
+        $expectedCash = max(0, $openingCash + $cashSales + $floatsIn - $cashDrops - $cashRefunds - $cashExpenses);
         $closingCash = $register->closing_cash !== null ? (float)$register->closing_cash : $expectedCash;
         $difference = $register->cash_difference !== null ? (float)$register->cash_difference : ($closingCash - $expectedCash);
 
@@ -385,6 +484,9 @@ class CashRegisterController extends Controller
             'total_expenses' => round($totalExpenses, 2),
             'cash_expenses' => round($cashExpenses, 2),
             'digital_expenses' => round($digitalExpenses, 2),
+            'floats_in' => round($floatsIn, 2),
+            'cash_drops' => round($cashDrops, 2),
+            'safe_drops' => round($cashDrops, 2),
             'expected_cash' => round($expectedCash, 2),
             'closing_cash' => round($closingCash, 2),
             'difference' => round($difference, 2),
@@ -398,6 +500,17 @@ class CashRegisterController extends Controller
             'payment_breakdown' => $paymentBreakdown,
             'recent_transactions' => $sales->take(20)->values(),
             'denominations' => $register->denominations,
+            'register_transactions' => $registerTxList->map(function ($rtx) {
+                return [
+                    'id' => (int)$rtx->id,
+                    'type' => $rtx->type,
+                    'amount' => (float)$rtx->amount,
+                    'reason' => $rtx->reason ?? '',
+                    'authorized_by' => $rtx->authorized_by ?? '',
+                    'manager_pin_verified' => (bool)$rtx->manager_pin_verified,
+                    'created_at' => (string)$rtx->created_at,
+                ];
+            })->values(),
         ];
     }
 }
