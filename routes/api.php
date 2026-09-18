@@ -89,6 +89,7 @@ Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close'
 
 // Sales, POS Checkout & Sales Returns
 Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
+Route::post('sales/{id}/void', [SaleController::class, 'voidSale']);
 Route::apiResource('sales', SaleController::class);
 Route::apiResource('sale-returns', SaleReturnController::class);
 
@@ -145,6 +146,7 @@ Route::get('reports/stock-ledger', [ReportController::class, 'stockLedgerReport'
 Route::get('reports/product-margins', [ReportController::class, 'productMarginsReport']);
 Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport']);
 Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport']);
+Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport']);
 
 // General Settings & Multi-Currency
 Route::get('settings', [SettingController::class, 'getSettings']);

@@ -43,7 +43,7 @@ class ReportController extends Controller
         $yesterday = Carbon::yesterday()->toDateString();
 
         // 1. Base query scopes
-        $salesQuery = Sale::query();
+        $salesQuery = Sale::query()->where('status', '!=', 'Voided');
         $purchQuery = Purchase::query();
         $expQuery = Expense::query();
 
@@ -257,6 +257,7 @@ class ReportController extends Controller
             $topProductsRaw = DB::table('sale_items')
                 ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
                 ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                ->where('sales.status', '!=', 'Voided')
                 ->when($warehouse !== 'All' && !empty($warehouse), function ($q) use ($warehouse) {
                     $q->where('sales.warehouse_name', $warehouse);
                 })
@@ -1958,7 +1959,7 @@ class ReportController extends Controller
         }
 
         // 1. Sales Query Scope
-        $salesQuery = DB::table('sales');
+        $salesQuery = DB::table('sales')->where('status', '!=', 'Voided');
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $salesQuery->where('warehouse_name', $warehouse);
         }
@@ -5268,5 +5269,157 @@ class ReportController extends Controller
         } catch (\Throwable $e) {}
 
         return response()->json($responsePayload);
+    }
+
+    /**
+     * Commercial Tax / VAT Input vs Output Reconciliation Report (ကုန်သွယ်လုပ်ငန်းခွန် အစီရင်ခံစာ)
+     * Reconciles Output Tax (Sales) against Input Tax (Purchases), returns, and computes Net Tax Payable.
+     */
+    public function commercialTaxReport(Request $request)
+    {
+        $warehouse = $request->query('warehouse', $request->query('warehouse_name', 'All'));
+        $startDate = $request->query('start_date', $request->query('from_date', ''));
+        $endDate = $request->query('end_date', $request->query('to_date', ''));
+        $month = $request->query('month', '');
+
+        if (!empty($month)) {
+            $startDate = Carbon::parse($month . '-01')->startOfMonth()->toDateString();
+            $endDate = Carbon::parse($month . '-01')->endOfMonth()->toDateString();
+        } elseif (empty($startDate) || empty($endDate)) {
+            $startDate = Carbon::now()->startOfMonth()->toDateString();
+            $endDate = Carbon::now()->endOfMonth()->toDateString();
+        }
+
+        // 1. Output Tax from Sales (collected from customers)
+        $salesQuery = DB::table('sales')->where('status', '!=', 'Voided');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesQuery->where('warehouse_name', $warehouse);
+        }
+        $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
+
+        $salesAgg = (clone $salesQuery)
+            ->selectRaw("
+                COUNT(id) as total_sales_count,
+                COALESCE(SUM(subtotal), 0) as gross_sales,
+                COALESCE(SUM(discount), 0) as total_sales_discount,
+                COALESCE(SUM(subtotal - discount), 0) as taxable_sales,
+                COALESCE(SUM(tax_amount), 0) as output_tax_collected,
+                COALESCE(SUM(grand_total), 0) as total_sales_with_tax
+            ")
+            ->first();
+
+        // 2. Output Tax adjustment from Sale Returns (tax refunded to customers)
+        $srQuery = DB::table('sale_returns')->where('status', '!=', 'Cancelled');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $srQuery->where('warehouse_name', $warehouse);
+        }
+        $srQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
+
+        $srAgg = (clone $srQuery)
+            ->selectRaw("
+                COUNT(id) as total_returns_count,
+                COALESCE(SUM(subtotal - discount), 0) as returned_taxable_amount,
+                COALESCE(SUM(tax_amount), 0) as output_tax_refunded,
+                COALESCE(SUM(grand_total), 0) as total_returned_with_tax
+            ")
+            ->first();
+
+        // 3. Input Tax from Purchases (tax paid to suppliers)
+        $purchQuery = DB::table('purchases')->where('status', '!=', 'Cancelled');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $purchQuery->where('warehouse_name', $warehouse);
+        }
+        $purchQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
+
+        $purchAgg = (clone $purchQuery)
+            ->selectRaw("
+                COUNT(id) as total_purchases_count,
+                COALESCE(SUM(grand_total - tax_amount), 0) as gross_purchases,
+                COALESCE(SUM(discount), 0) as total_purchases_discount,
+                COALESCE(SUM(grand_total - tax_amount), 0) as taxable_purchases,
+                COALESCE(SUM(tax_amount), 0) as input_tax_paid,
+                COALESCE(SUM(grand_total), 0) as total_purchases_with_tax
+            ")
+            ->first();
+
+        // 4. Input Tax adjustment from Purchase Returns (tax recovered from suppliers)
+        $prQuery = DB::table('purchase_returns')->where('status', '!=', 'Cancelled');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $prQuery->where('warehouse_name', $warehouse);
+        }
+        $prQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
+
+        $prAgg = (clone $prQuery)
+            ->selectRaw("
+                COUNT(id) as total_pr_count,
+                COALESCE(SUM(subtotal - discount), 0) as pr_taxable_amount,
+                COALESCE(SUM(tax_amount), 0) as input_tax_recovered,
+                COALESCE(SUM(grand_total), 0) as total_pr_with_tax
+            ")
+            ->first();
+
+        // 5. Calculations
+        $grossOutputTax = (float)($salesAgg->output_tax_collected ?? 0);
+        $refundedOutputTax = (float)($srAgg->output_tax_refunded ?? 0);
+        $netOutputTax = max(0.0, $grossOutputTax - $refundedOutputTax);
+
+        $grossInputTax = (float)($purchAgg->input_tax_paid ?? 0);
+        $recoveredInputTax = (float)($prAgg->input_tax_recovered ?? 0);
+        $netInputTax = max(0.0, $grossInputTax - $recoveredInputTax);
+
+        $netTaxPayable = 0.0;
+        $taxCreditForward = 0.0;
+        if ($netOutputTax >= $netInputTax) {
+            $netTaxPayable = round($netOutputTax - $netInputTax, 2);
+        } else {
+            $taxCreditForward = round($netInputTax - $netOutputTax, 2);
+        }
+
+        // Recent Invoices with Tax Breakdown (last 50)
+        $taxableSalesList = (clone $salesQuery)
+            ->select('id', 'reference_no', 'date', 'customer_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'subtotal', 'discount', 'grand_total')
+            ->where('tax_amount', '>', 0)
+            ->orderBy('date', 'desc')
+            ->limit(50)
+            ->get();
+
+        $taxablePurchasesList = (clone $purchQuery)
+            ->select('id', 'reference_no', 'date', 'supplier_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'discount', 'grand_total')
+            ->where('tax_amount', '>', 0)
+            ->orderBy('date', 'desc')
+            ->limit(50)
+            ->get();
+
+        return response()->json([
+            'status' => 'success',
+            'period' => [
+                'start_date' => $startDate,
+                'end_date'   => $endDate,
+                'warehouse'  => $warehouse,
+            ],
+            'output_tax' => [
+                'gross_sales_tax'      => round($grossOutputTax, 2),
+                'returns_tax_refund'   => round($refundedOutputTax, 2),
+                'net_output_tax'       => round($netOutputTax, 2),
+                'taxable_sales_amount' => round((float)($salesAgg->taxable_sales ?? 0) - (float)($srAgg->returned_taxable_amount ?? 0), 2),
+                'sales_count'          => (int)($salesAgg->total_sales_count ?? 0),
+            ],
+            'input_tax' => [
+                'gross_purchases_tax'      => round($grossInputTax, 2),
+                'returns_tax_recovered'    => round($recoveredInputTax, 2),
+                'net_input_tax'            => round($netInputTax, 2),
+                'taxable_purchases_amount' => round((float)($purchAgg->taxable_purchases ?? 0) - (float)($prAgg->pr_taxable_amount ?? 0), 2),
+                'purchases_count'          => (int)($purchAgg->total_purchases_count ?? 0),
+            ],
+            'tax_reconciliation' => [
+                'net_output_tax'         => round($netOutputTax, 2),
+                'net_input_tax'          => round($netInputTax, 2),
+                'net_tax_payable'        => $netTaxPayable,
+                'tax_credit_forward'     => $taxCreditForward,
+                'tax_status'             => $netTaxPayable > 0 ? 'Tax Payable (ပေးဆောင်ရန်)' : ($taxCreditForward > 0 ? 'Tax Credit (ပိုလျှံ/ရရန်)' : 'Balanced (ညီမျှ)'),
+            ],
+            'sales_tax_records'     => $taxableSalesList,
+            'purchases_tax_records' => $taxablePurchasesList,
+        ]);
     }
 }

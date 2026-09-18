@@ -20,6 +20,8 @@ class Sale extends Model
         'tax_rate',
         'tax_amount',
         'discount',
+        'redeemed_points',
+        'points_discount',
         'shipping',
         'subtotal',
         'grand_total',
@@ -36,6 +38,9 @@ class Sale extends Model
         'user_name',
         'user_role',
         'total_cogs',
+        'void_reason',
+        'voided_by',
+        'voided_at',
     ];
 
     protected $casts = [
@@ -43,6 +48,8 @@ class Sale extends Model
         'tax_rate' => 'float',
         'tax_amount' => 'float',
         'discount' => 'float',
+        'redeemed_points' => 'integer',
+        'points_discount' => 'float',
         'shipping' => 'float',
         'subtotal' => 'float',
         'grand_total' => 'float',
@@ -52,6 +59,7 @@ class Sale extends Model
         'change_amount' => 'float',
         'pos_flag' => 'boolean',
         'cash_register_id' => 'integer',
+        'voided_at' => 'datetime',
     ];
 
     public function items()
