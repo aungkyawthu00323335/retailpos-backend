@@ -104,37 +104,38 @@ class QuotationController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'customer_id' => 'nullable|integer',
-            'customer_name' => 'required|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'warehouse_name' => 'required|string|max:255',
-            'user_id' => 'nullable|integer',
-            'user_name' => 'nullable|string|max:255',
-            'user_role' => 'nullable|string|max:255',
-            'date' => 'required|string',
-            'tax_rate' => 'nullable|numeric|min:0',
-            'tax_amount' => 'nullable|numeric|min:0',
-            'discount' => 'nullable|numeric|min:0',
-            'shipping' => 'nullable|numeric|min:0',
-            'grand_total' => 'required|numeric|min:0',
-            'status' => 'nullable|string|in:Sent,Pending,Ordered,Expired',
-            'notes' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'items' => 'required|array|min:1',
-            'items.*.product_id' => 'nullable|integer',
+            'customer_id'        => 'nullable|integer',
+            'customer_name'      => 'required|string|max:255',
+            'warehouse_id'       => 'nullable|integer',
+            'warehouse_name'     => 'required|string|max:255',
+            'user_id'            => 'nullable|integer',
+            'user_name'          => 'nullable|string|max:255',
+            'user_role'          => 'nullable|string|max:255',
+            'date'               => 'required|string',
+            'expiry_date'        => 'nullable|date',
+            'tax_rate'           => 'nullable|numeric|min:0',
+            'tax_amount'         => 'nullable|numeric|min:0',
+            'discount'           => 'nullable|numeric|min:0',
+            'shipping'           => 'nullable|numeric|min:0',
+            'grand_total'        => 'required|numeric|min:0',
+            'status'             => 'nullable|string|in:Sent,Pending,Ordered,Expired',
+            'notes'              => 'nullable|string',
+            'created_by'         => 'nullable|string|max:255',
+            'items'              => 'required|array|min:1',
+            'items.*.product_id'         => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
-            'items.*.unit_id' => 'nullable|integer',
-            'items.*.unit_name' => 'nullable|string|max:100',
-            'items.*.conversion_rate' => 'nullable|numeric|min:0',
-            'items.*.base_unit_price' => 'nullable|numeric|min:0',
-            'items.*.base_quantity' => 'nullable|numeric|min:0',
-            'items.*.product_code' => 'required|string',
-            'items.*.product_name' => 'required|string',
-            'items.*.unit_price' => 'required|numeric|min:0',
-            'items.*.quantity' => 'required|numeric|min:0.01',
-            'items.*.tax' => 'nullable|numeric|min:0',
-            'items.*.discount' => 'nullable|numeric|min:0',
-            'items.*.subtotal' => 'required|numeric|min:0',
+            'items.*.unit_id'            => 'nullable|integer',
+            'items.*.unit_name'          => 'nullable|string|max:100',
+            'items.*.conversion_rate'    => 'nullable|numeric|min:0',
+            'items.*.base_unit_price'    => 'nullable|numeric|min:0',
+            'items.*.base_quantity'      => 'nullable|numeric|min:0',
+            'items.*.product_code'       => 'required|string',
+            'items.*.product_name'       => 'required|string',
+            'items.*.unit_price'         => 'required|numeric|min:0',
+            'items.*.quantity'           => 'required|numeric|min:0.01',
+            'items.*.tax'                => 'nullable|numeric|min:0',
+            'items.*.discount'           => 'nullable|numeric|min:0',
+            'items.*.subtotal'           => 'required|numeric|min:0',
         ]);
 
         DB::beginTransaction();
@@ -142,7 +143,7 @@ class QuotationController extends Controller
             $refNo = $request->input('reference_no');
             if (empty($refNo)) {
                 $prefix = Setting::get('quotation_prefix', 'QUO_');
-                $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
+                $refNo  = $prefix . date('Ymd') . '-' . rand(1000, 9999);
             }
 
             $creator = $validated['created_by'] ?? ($validated['user_name'] ?? 'Sales Staff');
@@ -152,25 +153,34 @@ class QuotationController extends Controller
                 $txDate .= ' ' . now()->format('H:i:s');
             }
 
+            // Determine status — if expiry_date is in the past, set to Expired automatically
+            $expiryDate  = $validated['expiry_date'] ?? null;
+            $autoStatus  = $validated['status'] ?? 'Sent';
+            if ($expiryDate && \Carbon\Carbon::parse($expiryDate)->isPast()) {
+                $autoStatus = 'Expired';
+            }
+
             $quotation = Quotation::create([
                 'reference_no' => $refNo,
-                'customer_id' => $validated['customer_id'] ?? null,
-                'customer_name' => $validated['customer_name'],
+                'customer_id'  => $validated['customer_id'] ?? null,
+                'customer_name'=> $validated['customer_name'],
                 'warehouse_id' => $validated['warehouse_id'] ?? null,
-                'warehouse_name' => $validated['warehouse_name'],
-                'date' => $txDate,
-                'tax_rate' => (float)($validated['tax_rate'] ?? 0),
-                'tax_amount' => (float)($validated['tax_amount'] ?? 0),
-                'discount' => (float)($validated['discount'] ?? 0),
-                'shipping' => (float)($validated['shipping'] ?? 0),
-                'grand_total' => (float)$validated['grand_total'],
-                'status' => $validated['status'] ?? 'Sent',
-                'notes' => $validated['notes'] ?? null,
-                'created_by' => $creator,
-                'user_id' => $validated['user_id'] ?? null,
-                'user_name' => $validated['user_name'] ?? null,
-                'user_role' => $validated['user_role'] ?? null,
+                'warehouse_name'=> $validated['warehouse_name'],
+                'date'         => $txDate,
+                'expiry_date'  => $expiryDate,
+                'tax_rate'     => (float)($validated['tax_rate'] ?? 0),
+                'tax_amount'   => (float)($validated['tax_amount'] ?? 0),
+                'discount'     => (float)($validated['discount'] ?? 0),
+                'shipping'     => (float)($validated['shipping'] ?? 0),
+                'grand_total'  => (float)$validated['grand_total'],
+                'status'       => $autoStatus,
+                'notes'        => $validated['notes'] ?? null,
+                'created_by'   => $creator,
+                'user_id'      => $validated['user_id'] ?? null,
+                'user_name'    => $validated['user_name'] ?? null,
+                'user_role'    => $validated['user_role'] ?? null,
             ]);
+
 
             $itemsData = [];
             $now = now();
@@ -241,56 +251,66 @@ class QuotationController extends Controller
         }
 
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:255',
-            'customer_id' => 'nullable|integer',
-            'customer_name' => 'required|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'warehouse_name' => 'required|string|max:255',
-            'user_id' => 'nullable|integer',
-            'user_name' => 'nullable|string|max:255',
-            'user_role' => 'nullable|string|max:255',
-            'date' => 'required|string',
-            'tax_rate' => 'nullable|numeric|min:0',
-            'tax_amount' => 'nullable|numeric|min:0',
-            'discount' => 'nullable|numeric|min:0',
-            'shipping' => 'nullable|numeric|min:0',
-            'grand_total' => 'required|numeric|min:0',
-            'status' => 'nullable|string|in:Sent,Pending,Ordered,Expired',
-            'notes' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'items' => 'required|array|min:1',
-            'items.*.product_id' => 'nullable|integer',
+            'reference_no'               => 'nullable|string|max:255',
+            'customer_id'                => 'nullable|integer',
+            'customer_name'              => 'required|string|max:255',
+            'warehouse_id'               => 'nullable|integer',
+            'warehouse_name'             => 'required|string|max:255',
+            'user_id'                    => 'nullable|integer',
+            'user_name'                  => 'nullable|string|max:255',
+            'user_role'                  => 'nullable|string|max:255',
+            'date'                       => 'required|string',
+            'expiry_date'                => 'nullable|date',
+            'tax_rate'                   => 'nullable|numeric|min:0',
+            'tax_amount'                 => 'nullable|numeric|min:0',
+            'discount'                   => 'nullable|numeric|min:0',
+            'shipping'                   => 'nullable|numeric|min:0',
+            'grand_total'                => 'required|numeric|min:0',
+            'status'                     => 'nullable|string|in:Sent,Pending,Ordered,Expired',
+            'notes'                      => 'nullable|string',
+            'created_by'                 => 'nullable|string|max:255',
+            'items'                      => 'required|array|min:1',
+            'items.*.product_id'         => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
-            'items.*.unit_id' => 'nullable|integer',
-            'items.*.unit_name' => 'nullable|string|max:100',
-            'items.*.conversion_rate' => 'nullable|numeric|min:0',
-            'items.*.base_unit_price' => 'nullable|numeric|min:0',
-            'items.*.base_quantity' => 'nullable|numeric|min:0',
-            'items.*.product_code' => 'required|string',
-            'items.*.product_name' => 'required|string',
-            'items.*.unit_price' => 'required|numeric|min:0',
-            'items.*.quantity' => 'required|numeric|min:0.01',
-            'items.*.tax' => 'nullable|numeric|min:0',
-            'items.*.discount' => 'nullable|numeric|min:0',
-            'items.*.subtotal' => 'required|numeric|min:0',
+            'items.*.unit_id'            => 'nullable|integer',
+            'items.*.unit_name'          => 'nullable|string|max:100',
+            'items.*.conversion_rate'    => 'nullable|numeric|min:0',
+            'items.*.base_unit_price'    => 'nullable|numeric|min:0',
+            'items.*.base_quantity'      => 'nullable|numeric|min:0',
+            'items.*.product_code'       => 'required|string',
+            'items.*.product_name'       => 'required|string',
+            'items.*.unit_price'         => 'required|numeric|min:0',
+            'items.*.quantity'           => 'required|numeric|min:0.01',
+            'items.*.tax'                => 'nullable|numeric|min:0',
+            'items.*.discount'           => 'nullable|numeric|min:0',
+            'items.*.subtotal'           => 'required|numeric|min:0',
         ]);
 
         DB::beginTransaction();
         try {
+            $expiryDate = $validated['expiry_date'] ?? $quotation->expiry_date;
+            $newStatus  = $validated['status'] ?? $quotation->status;
+            // Auto-expire if expiry_date is in the past (and not already Ordered)
+            if ($expiryDate && $newStatus !== 'Ordered' && \Carbon\Carbon::parse($expiryDate)->isPast()) {
+                $newStatus = 'Expired';
+            }
+
             $updateData = [
-                'customer_id' => $validated['customer_id'] ?? null,
+                'customer_id'   => $validated['customer_id'] ?? null,
                 'customer_name' => $validated['customer_name'],
-                'warehouse_id' => $validated['warehouse_id'] ?? $quotation->warehouse_id,
-                'warehouse_name' => $validated['warehouse_name'],
-                'date' => $validated['date'],
-                'tax_rate' => (float)($validated['tax_rate'] ?? 0),
-                'tax_amount' => (float)($validated['tax_amount'] ?? 0),
-                'discount' => (float)($validated['discount'] ?? 0),
-                'shipping' => (float)($validated['shipping'] ?? 0),
-                'grand_total' => (float)$validated['grand_total'],
-                'status' => $validated['status'] ?? $quotation->status,
-                'notes' => $validated['notes'] ?? null,
+                'warehouse_id'  => $validated['warehouse_id'] ?? $quotation->warehouse_id,
+                'warehouse_name'=> $validated['warehouse_name'],
+                'date'          => $validated['date'],
+                'expiry_date'   => $expiryDate,
+                'tax_rate'      => (float)($validated['tax_rate'] ?? 0),
+                'tax_amount'    => (float)($validated['tax_amount'] ?? 0),
+                'discount'      => (float)($validated['discount'] ?? 0),
+                'shipping'      => (float)($validated['shipping'] ?? 0),
+                'grand_total'   => (float)$validated['grand_total'],
+                'status'        => $newStatus,
+                'notes'         => $validated['notes'] ?? null,
             ];
+
 
             if (!empty($validated['reference_no'])) {
                 $updateData['reference_no'] = $validated['reference_no'];
@@ -387,6 +407,12 @@ class QuotationController extends Controller
 
     /**
      * Convert the specified quotation into a completed sale, and mark quotation as Ordered.
+     *
+     * Accounting integrity:
+     * 1. Duplicate guard — status === 'Ordered' → 422 (prevents double-conversion fraud)
+     * 2. FIFO depletion per item  — accurate COGS tracking in P&L
+     * 3. SalePayment record       — Cash Register and payment reports are correct
+     * 4. Cash Register increment  — Cash payment increments open till balance
      */
     public function convertToSale(Request $request, $id)
     {
@@ -395,14 +421,24 @@ class QuotationController extends Controller
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
 
+        // ── Q1: Duplicate Convert Guard ───────────────────────────────────────
+        // Prevent the same quotation from being converted to a Sale more than once.
+        if ($quotation->status === 'Ordered') {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'This quotation has already been converted to a sale and cannot be converted again.',
+            ], 422);
+        }
+
         DB::beginTransaction();
         try {
-            $prefix = Setting::get('sale_prefix', 'SA_');
-            $refNo = $prefix . rand(1000000, 9999999);
+            $prefix     = Setting::get('sale_prefix', 'SA_');
+            $refNo      = $prefix . rand(1000000, 9999999);
+            $paymentType = $request->input('payment_type', 'Cash');
 
-            $grandTotal = (float)$quotation->grand_total;
-            $paidAmount = (float)($request->input('paid_amount', $grandTotal));
-            $dueAmount = max(0, $grandTotal - $paidAmount);
+            $grandTotal    = (float)$quotation->grand_total;
+            $paidAmount    = (float)($request->input('paid_amount', $grandTotal));
+            $dueAmount     = max(0, $grandTotal - $paidAmount);
             $paymentStatus = $paidAmount >= $grandTotal ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid');
 
             $subtotal = 0;
@@ -411,62 +447,63 @@ class QuotationController extends Controller
             }
 
             $sale = Sale::create([
-                'reference_no' => $refNo,
-                'customer_id' => $quotation->customer_id,
-                'customer_name' => $quotation->customer_name,
-                'warehouse_id' => $quotation->warehouse_id,
+                'reference_no'   => $refNo,
+                'customer_id'    => $quotation->customer_id,
+                'customer_name'  => $quotation->customer_name,
+                'warehouse_id'   => $quotation->warehouse_id,
                 'warehouse_name' => $quotation->warehouse_name,
-                'date' => date('Y-m-d H:i:s'),
-                'status' => 'Completed',
-                'tax_rate' => (float)$quotation->tax_rate,
-                'tax_amount' => (float)$quotation->tax_amount,
-                'discount' => (float)$quotation->discount,
-                'shipping' => (float)$quotation->shipping,
-                'subtotal' => $subtotal > 0 ? $subtotal : $grandTotal,
-                'grand_total' => $grandTotal,
-                'paid_amount' => $paidAmount,
-                'due_amount' => $dueAmount,
-                'change_amount' => 0,
+                'date'           => date('Y-m-d H:i:s'),
+                'status'         => 'Completed',
+                'tax_rate'       => (float)$quotation->tax_rate,
+                'tax_amount'     => (float)$quotation->tax_amount,
+                'discount'       => (float)$quotation->discount,
+                'shipping'       => (float)$quotation->shipping,
+                'subtotal'       => $subtotal > 0 ? $subtotal : $grandTotal,
+                'grand_total'    => $grandTotal,
+                'paid_amount'    => $paidAmount,
+                'due_amount'     => $dueAmount,
+                'change_amount'  => 0,
                 'payment_status' => $paymentStatus,
-                'payment_type' => $request->input('payment_type', 'Cash'),
-                'notes' => 'Converted from Quotation: ' . $quotation->reference_no . ($quotation->notes ? ' | ' . $quotation->notes : ''),
-                'created_by' => $request->input('created_by', $quotation->user_name ?? $quotation->created_by ?? 'Sales Staff'),
+                'payment_type'   => $paymentType,
+                'notes'          => 'Converted from Quotation: ' . $quotation->reference_no . ($quotation->notes ? ' | ' . $quotation->notes : ''),
+                'created_by'     => $request->input('created_by', $quotation->user_name ?? $quotation->created_by ?? 'Sales Staff'),
             ]);
 
             $unitService = app(ProductUnitConversionService::class);
+            $fifoService = app(\App\Services\FifoInventoryService::class);
             $warehouseId = $unitService->warehouseId($quotation->warehouse_id, $sale->warehouse_name);
 
             foreach ($quotation->items as $item) {
                 $convRate = (float)($item->conversion_rate ?? 1.0);
                 if ($convRate <= 0) $convRate = 1.0;
-                $qty = (float)$item->quantity;
+                $qty      = (float)$item->quantity;
                 $unitPrice = (float)$item->unit_price;
-                $baseQty = $item->base_quantity !== null && (float)$item->base_quantity > 0 
-                    ? (float)$item->base_quantity 
+                $baseQty  = $item->base_quantity !== null && (float)$item->base_quantity > 0
+                    ? (float)$item->base_quantity
                     : ($qty * $convRate);
-                $basePrice = $item->base_unit_price !== null && (float)$item->base_unit_price > 0 
-                    ? (float)$item->base_unit_price 
+                $basePrice = $item->base_unit_price !== null && (float)$item->base_unit_price > 0
+                    ? (float)$item->base_unit_price
                     : ($unitPrice / $convRate);
 
-                SaleItem::create([
-                    'sale_id' => $sale->id,
-                    'product_id' => $item->product_id,
-                    'product_variant_id' => $item->product_variant_id,
-                    'unit_id' => $item->unit_id,
-                    'unit_name' => $item->unit_name ?? 'pcs',
-                    'conversion_rate' => $convRate,
-                    'base_quantity' => $baseQty,
-                    'base_unit_price' => $basePrice,
-                    'product_code' => $item->product_code,
-                    'product_name' => $item->product_name,
-                    'unit_price' => $unitPrice,
-                    'quantity' => $qty,
-                    'tax' => (float)$item->tax,
-                    'discount' => (float)$item->discount,
-                    'subtotal' => (float)$item->subtotal,
+                $saleItem = SaleItem::create([
+                    'sale_id'           => $sale->id,
+                    'product_id'        => $item->product_id,
+                    'product_variant_id'=> $item->product_variant_id,
+                    'unit_id'           => $item->unit_id,
+                    'unit_name'         => $item->unit_name ?? 'pcs',
+                    'conversion_rate'   => $convRate,
+                    'base_quantity'     => $baseQty,
+                    'base_unit_price'   => $basePrice,
+                    'product_code'      => $item->product_code,
+                    'product_name'      => $item->product_name,
+                    'unit_price'        => $unitPrice,
+                    'quantity'          => $qty,
+                    'tax'               => (float)$item->tax,
+                    'discount'          => (float)$item->discount,
+                    'subtotal'          => (float)$item->subtotal,
                 ]);
 
-                // Reduce inventory stock for completed sale
+                // Reduce inventory stock + FIFO tracking for completed sale
                 if ($item->product_id) {
                     $product = Product::find($item->product_id);
                     if ($product) {
@@ -481,20 +518,64 @@ class QuotationController extends Controller
                             (string)$sale->id,
                             'Converted from Quotation ' . $quotation->reference_no
                         );
+
+                        // ── Q1: FIFO Cost Depletion ───────────────────────────────────
+                        // Consume FIFO cost batches oldest-first so COGS is correctly
+                        // calculated in the P&L. Without this, Gross Profit is overstated.
+                        if ($warehouseId && $baseQty > 0) {
+                            try {
+                                $fifoService->depleteFifo(
+                                    warehouseId:   (int)$warehouseId,
+                                    productId:     (int)$product->id,
+                                    variantId:     $item->product_variant_id,
+                                    neededBaseQty: (float)$baseQty,
+                                    saleId:        (int)$sale->id,
+                                    saleItemId:    (int)$saleItem->id,
+                                    saleDate:      $sale->date,
+                                    fallbackCost:  (float)($product->cost_price ?? $product->purchase_price ?? 0)
+                                );
+                            } catch (\Throwable $fifoEx) {
+                                \Illuminate\Support\Facades\Log::warning('FIFO depletion on quotation convert failed: ' . $fifoEx->getMessage());
+                            }
+                        }
                     }
                 }
             }
 
-            // Mark quotation status as Ordered
+            // ── Q1: Record Sale Payment ───────────────────────────────────────
+            // Creates a SalePayment row so payment reports and Cash Register are correct.
+            if ($paidAmount > 0) {
+                \App\Models\SalePayment::create([
+                    'sale_id'       => $sale->id,
+                    'payment_type'  => $paymentType,
+                    'amount'        => $paidAmount,
+                    'change_amount' => 0,
+                    'reference'     => 'Quotation conversion: ' . $quotation->reference_no,
+                    'date'          => date('Y-m-d H:i:s'),
+                ]);
+
+                // Increment Cash Register for Cash payments only
+                if (strtolower(trim($paymentType)) === 'cash' && $warehouseId) {
+                    $register = \App\Models\CashRegister::where('status', 'open')
+                        ->where('warehouse_id', $warehouseId)
+                        ->latest()
+                        ->first();
+                    if ($register) {
+                        $register->increment('expected_cash', $paidAmount);
+                    }
+                }
+            }
+
+            // Mark quotation as Ordered (prevents future re-conversion)
             $quotation->update(['status' => 'Ordered']);
 
             DB::commit();
 
             return response()->json([
-                'status' => 'success',
+                'status'  => 'success',
                 'message' => 'Quotation successfully converted to Sale ' . $sale->reference_no,
-                'data' => [
-                    'sale' => $sale->load('items'),
+                'data'    => [
+                    'sale'      => $sale->load('items'),
                     'quotation' => $quotation->fresh('items'),
                 ],
             ], 201);

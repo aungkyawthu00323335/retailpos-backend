@@ -3,9 +3,11 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\CashRegister;
 use App\Models\Expense;
 use App\Models\Setting;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class ExpenseController extends Controller
 {
@@ -89,6 +91,10 @@ class ExpenseController extends Controller
         // Aggregate total spend for filtered result
         $totalAmount = (clone $query)->sum('amount');
 
+        // ── Cash vs Non-Cash Breakdown ────────────────────────────────────────
+        $cashTotal    = (clone $query)->where('payment_method', 'Cash')->sum('amount');
+        $digitalTotal = (clone $query)->whereIn('payment_method', ['KBZPay', 'WavePay', 'Bank Transfer'])->sum('amount');
+
         // High-performance sorting
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
@@ -99,21 +105,23 @@ class ExpenseController extends Controller
             $query->orderBy('id', 'desc');
         }
 
-        $perPage = max(1, min(100, (int)$request->input('per_page', 25)));
+        $perPage  = max(1, min(100, (int)$request->input('per_page', 25)));
         $expenses = $query->paginate($perPage);
 
         return response()->json([
             'status' => 'success',
-            'data' => $expenses->items(),
+            'data'   => $expenses->items(),
             'summary' => [
-                'total_amount' => (float)$totalAmount,
-                'total_records' => $expenses->total(),
+                'total_amount'   => (float)$totalAmount,
+                'cash_total'     => (float)$cashTotal,
+                'digital_total'  => (float)$digitalTotal,
+                'total_records'  => $expenses->total(),
             ],
             'pagination' => [
                 'current_page' => $expenses->currentPage(),
-                'per_page' => $expenses->perPage(),
-                'total' => $expenses->total(),
-                'last_page' => $expenses->lastPage(),
+                'per_page'     => $expenses->perPage(),
+                'total'        => $expenses->total(),
+                'last_page'    => $expenses->lastPage(),
             ],
         ]);
     }
@@ -121,59 +129,80 @@ class ExpenseController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:255',
-            'warehouse_id' => 'nullable|integer',
-            'warehouse_name' => 'required|string|max:255',
-            'expense_category_id' => 'nullable|integer',
+            'reference_no'          => 'nullable|string|max:255',
+            'warehouse_id'          => 'nullable|integer',
+            'warehouse_name'        => 'required|string|max:255',
+            'expense_category_id'   => 'nullable|integer',
             'expense_category_name' => 'required|string|max:255',
-            'title' => 'required|string|max:255',
-            'amount' => 'required|numeric|min:0.01',
-            'payment_method' => 'nullable|string|max:255',
-            'payment_method_id' => 'nullable|integer',
-            'date' => 'required|string',
-            'details' => 'nullable|string',
-            'created_by' => 'nullable|string|max:255',
-            'user_name' => 'nullable|string|max:255',
-            'user_role' => 'nullable|string|max:255',
-            'user_id' => 'nullable|integer',
+            'title'                 => 'required|string|max:255',
+            'amount'                => 'required|numeric|min:0.01',
+            'payment_method'        => 'nullable|string|max:255',
+            'payment_method_id'     => 'nullable|integer',
+            'date'                  => 'required|string',
+            'details'               => 'nullable|string',
+            'created_by'            => 'nullable|string|max:255',
+            'user_name'             => 'nullable|string|max:255',
+            'user_role'             => 'nullable|string|max:255',
+            'user_id'               => 'nullable|integer',
         ]);
 
         $refNo = !empty($validated['reference_no']) ? trim($validated['reference_no']) : null;
         if (empty($refNo)) {
             $prefix = Setting::get('expense_prefix', 'EXP_');
-            $refNo = $prefix . date('Ymd') . '-' . rand(1000, 9999);
+            $refNo  = $prefix . date('Ymd') . '-' . rand(1000, 9999);
         }
 
         $userName = $validated['user_name'] ?? ($validated['created_by'] ?? ($request->user()?->name ?? 'Admin User'));
+        $amount   = (float)$validated['amount'];
+        $paymentMethod = strtolower(trim($validated['payment_method'] ?? 'Cash'));
 
         $txDate = trim($validated['date']);
         if (!str_contains($txDate, ':')) {
             $txDate .= ' ' . now()->format('H:i:s');
         }
 
-        $expense = Expense::create([
-            'reference_no' => $refNo,
-            'warehouse_id' => $validated['warehouse_id'] ?? null,
-            'warehouse_name' => $validated['warehouse_name'],
-            'expense_category_id' => $validated['expense_category_id'] ?? null,
-            'expense_category_name' => $validated['expense_category_name'],
-            'title' => $validated['title'],
-            'amount' => (float)$validated['amount'],
-            'payment_method' => $validated['payment_method'] ?? 'Cash',
-            'payment_method_id' => $validated['payment_method_id'] ?? null,
-            'date' => $txDate,
-            'details' => $validated['details'] ?? null,
-            'created_by' => $userName,
-            'user_name' => $userName,
-            'user_role' => $validated['user_role'] ?? ($request->user()?->role ?? 'Super Admin'),
-            'user_id' => $validated['user_id'] ?? $request->user()?->id,
-        ]);
+        DB::beginTransaction();
+        try {
+            $expense = Expense::create([
+                'reference_no'          => $refNo,
+                'warehouse_id'          => $validated['warehouse_id'] ?? null,
+                'warehouse_name'        => $validated['warehouse_name'],
+                'expense_category_id'   => $validated['expense_category_id'] ?? null,
+                'expense_category_name' => $validated['expense_category_name'],
+                'title'                 => $validated['title'],
+                'amount'                => $amount,
+                'payment_method'        => $validated['payment_method'] ?? 'Cash',
+                'payment_method_id'     => $validated['payment_method_id'] ?? null,
+                'date'                  => $txDate,
+                'details'               => $validated['details'] ?? null,
+                'created_by'            => $userName,
+                'user_name'             => $userName,
+                'user_role'             => $validated['user_role'] ?? ($request->user()?->role ?? 'Super Admin'),
+                'user_id'               => $validated['user_id'] ?? $request->user()?->id,
+            ]);
 
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Expense created successfully',
-            'data' => $expense,
-        ], 201);
+            // ── E1: Cash Register Deduction ───────────────────────────────────
+            // Only Cash expenses reduce the till. KBZPay / WavePay / Bank Transfer
+            // go through external payment channels and must NOT touch the cash drawer.
+            if ($paymentMethod === 'cash') {
+                $this->deductFromCashRegister(
+                    warehouseName: $validated['warehouse_name'],
+                    warehouseId:   $validated['warehouse_id'] ?? null,
+                    amount:        $amount
+                );
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Expense created successfully',
+                'data'    => $expense,
+            ], 201);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
     }
 
     public function show($id)
@@ -193,21 +222,21 @@ class ExpenseController extends Controller
         }
 
         $validated = $request->validate([
-            'reference_no' => 'sometimes|nullable|string|max:255',
-            'warehouse_id' => 'sometimes|nullable|integer',
-            'warehouse_name' => 'sometimes|required|string|max:255',
-            'expense_category_id' => 'nullable|integer',
+            'reference_no'          => 'sometimes|nullable|string|max:255',
+            'warehouse_id'          => 'sometimes|nullable|integer',
+            'warehouse_name'        => 'sometimes|required|string|max:255',
+            'expense_category_id'   => 'nullable|integer',
             'expense_category_name' => 'sometimes|required|string|max:255',
-            'title' => 'sometimes|required|string|max:255',
-            'amount' => 'sometimes|required|numeric|min:0.01',
-            'payment_method' => 'sometimes|nullable|string|max:255',
-            'payment_method_id' => 'sometimes|nullable|integer',
-            'date' => 'sometimes|required|string',
-            'details' => 'nullable|string',
-            'created_by' => 'sometimes|nullable|string|max:255',
-            'user_name' => 'sometimes|nullable|string|max:255',
-            'user_role' => 'sometimes|nullable|string|max:255',
-            'user_id' => 'sometimes|nullable|integer',
+            'title'                 => 'sometimes|required|string|max:255',
+            'amount'                => 'sometimes|required|numeric|min:0.01',
+            'payment_method'        => 'sometimes|nullable|string|max:255',
+            'payment_method_id'     => 'sometimes|nullable|integer',
+            'date'                  => 'sometimes|required|string',
+            'details'               => 'nullable|string',
+            'created_by'            => 'sometimes|nullable|string|max:255',
+            'user_name'             => 'sometimes|nullable|string|max:255',
+            'user_role'             => 'sometimes|nullable|string|max:255',
+            'user_id'               => 'sometimes|nullable|integer',
         ]);
 
         if (isset($validated['user_name']) && empty($validated['created_by'])) {
@@ -216,13 +245,39 @@ class ExpenseController extends Controller
             $validated['user_name'] = $validated['created_by'];
         }
 
-        $expense->update($validated);
+        DB::beginTransaction();
+        try {
+            $oldAmount        = (float)$expense->amount;
+            $oldPaymentMethod = strtolower(trim((string)$expense->payment_method));
+            $newAmount        = isset($validated['amount']) ? (float)$validated['amount'] : $oldAmount;
+            $newPaymentMethod = strtolower(trim($validated['payment_method'] ?? $expense->payment_method ?? 'cash'));
+            $warehouseName    = $validated['warehouse_name'] ?? $expense->warehouse_name;
+            $warehouseId      = $validated['warehouse_id'] ?? $expense->warehouse_id;
 
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Expense updated successfully',
-            'data' => $expense,
-        ]);
+            // ── E2: Cash Register Reversal on Update ─────────────────────────
+            // Restore original Cash impact, then apply new one.
+            if ($oldPaymentMethod === 'cash') {
+                // Restore old cash back to register
+                $this->addToCashRegister($warehouseName, $warehouseId, $oldAmount);
+            }
+            if ($newPaymentMethod === 'cash') {
+                // Deduct new cash amount from register
+                $this->deductFromCashRegister($warehouseName, $warehouseId, $newAmount);
+            }
+
+            $expense->update($validated);
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Expense updated successfully',
+                'data'    => $expense,
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
     }
 
     public function destroy($id)
@@ -231,7 +286,75 @@ class ExpenseController extends Controller
         if (!$expense) {
             return response()->json(['status' => 'error', 'message' => 'Expense not found'], 404);
         }
-        $expense->delete();
-        return response()->json(['status' => 'success', 'message' => 'Expense deleted']);
+
+        DB::beginTransaction();
+        try {
+            $amount        = (float)$expense->amount;
+            $paymentMethod = strtolower(trim((string)$expense->payment_method));
+
+            // ── E2: Cash Register Reversal on Delete ─────────────────────────
+            // If this was a Cash expense, restore the money back to the open register.
+            if ($paymentMethod === 'cash') {
+                $this->addToCashRegister($expense->warehouse_name, $expense->warehouse_id, $amount);
+            }
+
+            $expense->delete();
+
+            DB::commit();
+
+            return response()->json(['status' => 'success', 'message' => 'Expense deleted']);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    // ── Private Helpers: Cash Register ───────────────────────────────────────
+
+    /**
+     * Deduct an amount from the open cash register for a given warehouse.
+     * Used when a Cash expense is created.
+     */
+    private function deductFromCashRegister(?string $warehouseName, ?int $warehouseId, float $amount): void
+    {
+        $register = $this->findOpenRegister($warehouseName, $warehouseId);
+        if ($register) {
+            $register->decrement('expected_cash', $amount);
+            if ($register->closing_cash !== null) {
+                $register->decrement('closing_cash', $amount);
+            }
+        }
+    }
+
+    /**
+     * Restore an amount to the open cash register for a given warehouse.
+     * Used when a Cash expense is updated or deleted.
+     */
+    private function addToCashRegister(?string $warehouseName, ?int $warehouseId, float $amount): void
+    {
+        $register = $this->findOpenRegister($warehouseName, $warehouseId);
+        if ($register) {
+            $register->increment('expected_cash', $amount);
+            if ($register->closing_cash !== null) {
+                $register->increment('closing_cash', $amount);
+            }
+        }
+    }
+
+    /**
+     * Find the latest open cash register for the given warehouse.
+     */
+    private function findOpenRegister(?string $warehouseName, ?int $warehouseId): ?CashRegister
+    {
+        return CashRegister::where('status', 'open')
+            ->where(function ($q) use ($warehouseName, $warehouseId) {
+                if ($warehouseId) {
+                    $q->where('warehouse_id', $warehouseId);
+                } elseif ($warehouseName) {
+                    $q->where('warehouse_name', $warehouseName);
+                }
+            })
+            ->latest()
+            ->first();
     }
 }
