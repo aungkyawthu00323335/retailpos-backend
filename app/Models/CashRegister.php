@@ -25,6 +25,7 @@ class CashRegister extends Model
         'closed_at',
         'opening_notes',
         'closing_notes',
+        'denominations',
     ];
 
     protected $casts = [
@@ -34,6 +35,7 @@ class CashRegister extends Model
         'cash_difference' => 'float',
         'opened_at' => 'datetime',
         'closed_at' => 'datetime',
+        'denominations' => 'array',
     ];
 
     public function user()

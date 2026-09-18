@@ -174,6 +174,7 @@ class CashRegisterController extends Controller
         $validated = $request->validate([
             'closing_cash' => 'required|numeric|min:0',
             'closing_notes' => 'nullable|string',
+            'denominations' => 'nullable|array',
         ]);
 
         if ($id) {
@@ -214,6 +215,7 @@ class CashRegisterController extends Controller
             'status' => 'closed',
             'closed_at' => now(),
             'closing_notes' => $validated['closing_notes'] ?? null,
+            'denominations' => $validated['denominations'] ?? null,
         ]);
 
         return response()->json([
@@ -395,6 +397,7 @@ class CashRegisterController extends Controller
             'user_role' => 'Lead Cashier',
             'payment_breakdown' => $paymentBreakdown,
             'recent_transactions' => $sales->take(20)->values(),
+            'denominations' => $register->denominations,
         ];
     }
 }
