@@ -3127,13 +3127,13 @@ class ReportController extends Controller
 
         // 2. Aggregate Returns & Expenses for matching dates
         $returnsAgg = DB::table('sale_returns')
-            ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(paid_amount) as cash_refunds")
+            ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(CASE WHEN LOWER(COALESCE(refund_tender, payment_type, 'cash')) LIKE '%cash%' THEN paid_amount ELSE 0 END) as cash_refunds")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
             ->get()
             ->keyBy(function($r) { return $r->ret_date . '_' . $r->w_id; });
 
         $expensesAgg = DB::table('expenses')
-            ->selectRaw("SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, SUM(amount) as total_expenses")
+            ->selectRaw("SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, SUM(amount) as total_expenses, SUM(CASE WHEN LOWER(COALESCE(payment_method, 'cash')) = 'cash' THEN amount ELSE 0 END) as cash_expenses")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
             ->get()
             ->keyBy(function($e) { return $e->exp_date . '_' . $e->w_id; });
@@ -3198,7 +3198,7 @@ class ReportController extends Controller
             $cardSales = (float)$s->card_sales;
             $digitalSales = (float)$s->digital_sales;
             $cashRefunds = $ret ? (float)$ret->cash_refunds : 0.0;
-            $cashPayouts = 0.0;
+            $cashPayouts = $exp ? (float)($exp->cash_expenses ?? 0.0) : 0.0;
             $expectedCash = max(0.0, $openingCash + $cashSales - $cashRefunds - $cashPayouts);
             $closingCash = ($regSession && $regSession->closing_cash !== null) ? (float)$regSession->closing_cash : $expectedCash;
             $actualCash = $closingCash;
@@ -3984,7 +3984,19 @@ class ReportController extends Controller
                 ];
             });
 
-        $totalInflows = $salesCashReceived;
+        $prQuery = DB::table('purchase_returns');
+        if (!empty($startDate)) {
+            $prQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
+        }
+        if (!empty($endDate)) {
+            $prQuery->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $prQuery->where('warehouse_name', $warehouse);
+        }
+        $supplierRefundsReceived = (float)$prQuery->sum('paid_amount');
+
+        $totalInflows = $salesCashReceived + $supplierRefundsReceived;
 
         // 2. Cash Outflows: Purchases Paid + Expenses Paid + Sale Return Refunds Paid
         $purchQuery = DB::table('purchases');
@@ -4045,6 +4057,11 @@ class ReportController extends Controller
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"))
             ->pluck('inflow', 'day_date');
 
+        $dailySupplierRefunds = (clone $prQuery)
+            ->selectRaw("SUBSTRING(date, 1, 10) as day_date, SUM(paid_amount) as inflow")
+            ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"))
+            ->pluck('inflow', 'day_date');
+
         $dailyPurch = (clone $purchQuery)
             ->selectRaw("SUBSTRING(date, 1, 10) as day_date, SUM(paid_amount) as outflow")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"))
@@ -4062,6 +4079,7 @@ class ReportController extends Controller
 
         $allDates = array_unique(array_merge(
             $dailyInflows->keys()->all(),
+            $dailySupplierRefunds->keys()->all(),
             $dailyPurch->keys()->all(),
             $dailyExp->keys()->all(),
             $dailyRefunds->keys()->all()
@@ -4071,7 +4089,7 @@ class ReportController extends Controller
         $timeline = [];
         $runningBalance = 0.0;
         foreach ($allDates as $d) {
-            $in = (float)($dailyInflows[$d] ?? 0.0);
+            $in = (float)($dailyInflows[$d] ?? 0.0) + (float)($dailySupplierRefunds[$d] ?? 0.0);
             $out = (float)($dailyPurch[$d] ?? 0.0) + (float)($dailyExp[$d] ?? 0.0) + (float)($dailyRefunds[$d] ?? 0.0);
             $net = $in - $out;
             $runningBalance += $net;
@@ -4169,8 +4187,30 @@ class ReportController extends Controller
             ])
             ->get();
 
+        $purchRetTxns = (clone $prQuery)
+            ->where('paid_amount', '>', 0)
+            ->select([
+                'id',
+                'reference_no',
+                'date',
+                DB::raw("'purchase_return' as type"),
+                DB::raw("'Operating Inflow (Supplier Refund)' as type_label"),
+                DB::raw("'Operating' as activity"),
+                DB::raw("COALESCE(supplier_name, 'Supplier') as party_name"),
+                'warehouse_name',
+                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
+                'paid_amount as amount_in',
+                DB::raw('0 as amount_out'),
+                DB::raw("COALESCE(created_by, 'Super Admin') as created_by"),
+                DB::raw("'Super Admin' as user_role"),
+                DB::raw("COALESCE(status, 'Completed') as status"),
+                DB::raw("COALESCE(notes, '') as notes"),
+            ])
+            ->get();
+
         $mergedTxns = collect([])
             ->concat($salesTxns)
+            ->concat($purchRetTxns)
             ->concat($purchTxns)
             ->concat($expTxns)
             ->concat($retTxns)
@@ -4214,6 +4254,7 @@ class ReportController extends Controller
                 'total_outflow' => round($totalOutflows, 2),
                 'net_cash_flow' => round($netCashFlow, 2),
                 'sales_cash_received' => round($salesCashReceived, 2),
+                'supplier_refunds_received' => round($supplierRefundsReceived, 2),
                 'purchases_cash_paid' => round($purchCashPaid, 2),
                 'operating_expenses_paid' => round($totalExpenses, 2),
                 'refunds_paid' => round($refundsPaid, 2),
@@ -4392,7 +4433,82 @@ class ReportController extends Controller
             'stock_transfers.date as date',
         ]);
 
-        $unionQuery = $salesMovements->unionAll($purchMovements)->unionAll($adjMovements)->unionAll($transMovements);
+        // E. Sale Return Movements (Stock In to Warehouse)
+        $saleRetMvQuery = DB::table('stock_movements')
+            ->join('sale_returns', function ($join) {
+                $join->on('stock_movements.reference_id', '=', 'sale_returns.id')
+                     ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(sale_returns.id AS CHAR)'));
+            })
+            ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
+            ->where('stock_movements.movement_type', 'sale_return')
+            ->where('sale_returns.date', '>=', $fromDateTime)
+            ->where('sale_returns.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $saleRetMvQuery->where('sale_returns.warehouse_name', $warehouse);
+        }
+        $saleRetMovements = $saleRetMvQuery->select([
+            'sale_returns.id as source_id',
+            'sale_returns.reference_no as reference_no',
+            DB::raw("'sale_return' as movement_type"),
+            DB::raw("'Return In' as type_label"),
+            'stock_movements.product_id',
+            'products.name as product_name',
+            'products.code as product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+            'products.category_name',
+            'sale_returns.warehouse_name',
+            DB::raw('COALESCE(sale_returns.warehouse_id, 1) as warehouse_id'),
+            'stock_movements.quantity_in as quantity_in',
+            DB::raw('0 as quantity_out'),
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(products.cost_price, products.purchase_price, 0) as unit_cost'),
+            'sale_returns.created_by',
+            'sale_returns.created_by as user_name',
+            DB::raw("'' as user_role"),
+            'sale_returns.date as date',
+        ]);
+
+        // F. Purchase Return Movements (Stock Out from Warehouse)
+        $purchRetMvQuery = DB::table('stock_movements')
+            ->join('purchase_returns', function ($join) {
+                $join->on('stock_movements.reference_id', '=', 'purchase_returns.id')
+                     ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(purchase_returns.id AS CHAR)'));
+            })
+            ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
+            ->where('stock_movements.movement_type', 'purchase_return')
+            ->where('purchase_returns.date', '>=', $fromDateTime)
+            ->where('purchase_returns.date', '<=', $toDateTime);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $purchRetMvQuery->where('purchase_returns.warehouse_name', $warehouse);
+        }
+        $purchRetMovements = $purchRetMvQuery->select([
+            'purchase_returns.id as source_id',
+            'purchase_returns.reference_no as reference_no',
+            DB::raw("'purchase_return' as movement_type"),
+            DB::raw("'Return Out' as type_label"),
+            'stock_movements.product_id',
+            'products.name as product_name',
+            'products.code as product_code',
+            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+            'products.category_name',
+            'purchase_returns.warehouse_name',
+            DB::raw('COALESCE(purchase_returns.warehouse_id, 1) as warehouse_id'),
+            DB::raw('0 as quantity_in'),
+            'stock_movements.quantity_out as quantity_out',
+            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+            DB::raw('COALESCE(products.cost_price, products.purchase_price, 0) as unit_cost'),
+            'purchase_returns.created_by',
+            'purchase_returns.created_by as user_name',
+            DB::raw("'' as user_role"),
+            'purchase_returns.date as date',
+        ]);
+
+        $unionQuery = $salesMovements
+            ->unionAll($purchMovements)
+            ->unionAll($adjMovements)
+            ->unionAll($transMovements)
+            ->unionAll($saleRetMovements)
+            ->unionAll($purchRetMovements);
         $movementsSub = DB::query()->fromSub($unionQuery, 'mv');
 
         if (!empty($category) && $category !== 'All') {
@@ -4408,6 +4524,8 @@ class ReportController extends Controller
                 $movementsSub->whereIn('movement_type', ['adjustment_in', 'adjustment_out']);
             } elseif ($movementType === 'transfer' || $movementType === 'transfers') {
                 $movementsSub->where('movement_type', 'transfer');
+            } elseif ($movementType === 'return' || $movementType === 'returns' || $movementType === 'sale_return' || $movementType === 'sale_returns') {
+                $movementsSub->whereIn('movement_type', ['sale_return', 'purchase_return']);
             } else {
                 $movementsSub->where('movement_type', $movementType);
             }
