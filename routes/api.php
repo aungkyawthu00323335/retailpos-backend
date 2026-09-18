@@ -90,7 +90,7 @@ Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close'
 
 // Sales, POS Checkout & Sales Returns
 Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
-Route::post('sales/{id}/void', [SaleController::class, 'voidSale']);
+Route::post('sales/{id}/void', [SaleController::class, 'voidSale'])->middleware('permission:sales.void');
 Route::apiResource('sales', SaleController::class);
 Route::apiResource('sale-returns', SaleReturnController::class);
 
@@ -120,12 +120,13 @@ Route::apiResource('supplier-categories', SupplierCategoryController::class);
 
 // Users & RBAC Roles
 Route::get('users/generate-id', [UserController::class, 'generateUserId']);
-Route::apiResource('users', UserController::class);
-Route::apiResource('roles', RoleController::class);
+Route::apiResource('users', UserController::class)->middleware('permission:users.view,users.create,users.update,users.delete');
+Route::apiResource('roles', RoleController::class)->middleware('permission:roles.view,roles.create,roles.update,roles.delete');
 
 // Reports & Executive Analytics (InfyPOS Reports Suite)
+Route::get('reports/profit-loss', [ReportController::class, 'profitLoss'])->middleware('permission:reports.profit_loss,reports.view');
+Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport'])->middleware('permission:reports.commercial_tax,reports.view');
 Route::get('reports/dashboard-summary', [ReportController::class, 'dashboardSummary']);
-Route::get('reports/profit-loss', [ReportController::class, 'profitLoss']);
 Route::get('reports/stock', [ReportController::class, 'stockReport']);
 Route::get('reports/stock/export', [ReportController::class, 'exportStock']);
 Route::get('reports/stock/{id}/details', [ReportController::class, 'stockProductDetails']);
@@ -147,7 +148,6 @@ Route::get('reports/stock-ledger', [ReportController::class, 'stockLedgerReport'
 Route::get('reports/product-margins', [ReportController::class, 'productMarginsReport']);
 Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport']);
 Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport']);
-Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport']);
 
 // Cash Register Till & Shift Management
 Route::get('cash-register/status', [CashRegisterController::class, 'status']);
@@ -157,6 +157,6 @@ Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close'
 Route::post('cash-register/transaction', [CashRegisterController::class, 'recordTransaction']);
 
 // General Settings & Multi-Currency
-Route::get('settings', [SettingController::class, 'getSettings']);
-Route::post('settings', [SettingController::class, 'updateSettings']);
+Route::get('settings', [SettingController::class, 'getSettings'])->middleware('permission:general_settings.view');
+Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update');
 Route::apiResource('currencies', CurrencyController::class);
