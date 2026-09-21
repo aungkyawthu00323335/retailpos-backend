@@ -11,27 +11,24 @@ use Illuminate\Support\Facades\DB;
 class ExpenseController extends Controller
 {
     /**
-     * Generate next numeric expense code (numbers only).
+     * Generate next expense reference code (e.g. EXP_1234567).
      */
     public function generateCode()
     {
+        $prefix = Setting::get('expense_prefix', 'EXP_');
         $expenses = Expense::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
-        $maxNum = 100000;
-        foreach ($expenses as $exp) {
-            $digits = preg_replace('/\D/', '', (string)$exp->reference_no);
-            if (!empty($digits)) {
-                $val = (int)$digits;
-                if ($val >= 100000 && $val < 999999999 && $val > $maxNum) {
-                    $maxNum = $val;
-                }
-            }
-        }
-        $nextCode = (string)($maxNum + 1);
+        $existingCodes = $expenses->pluck('reference_no')->filter()->toArray();
+
+        do {
+            $num = rand(1000000, 9999999);
+            $candidate = $prefix . $num;
+        } while (in_array($candidate, $existingCodes) || Expense::where('reference_no', $candidate)->exists());
 
         return response()->json([
             'status' => 'success',
-            'data' => [
-                'code' => $nextCode,
+            'data'   => [
+                'code'         => $candidate,
+                'reference_no' => $candidate,
             ],
         ]);
     }
