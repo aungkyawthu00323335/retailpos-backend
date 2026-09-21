@@ -39,7 +39,15 @@ class TransferController extends Controller
 
     public function index(Request $request)
     {
-        $query = StockTransfer::with('items');
+        $query = StockTransfer::select([
+            'id', 'reference_no', 'from_warehouse_id', 'from_warehouse',
+            'to_warehouse_id', 'to_warehouse', 'date', 'transfer_time',
+            'items_count', 'total_quantity', 'shipping_charge', 'status',
+            'notes', 'created_by', 'user_id', 'user_name', 'user_role',
+            'created_at', 'updated_at'
+        ])->with([
+            'items:id,stock_transfer_id,product_id,product_variant_id,product_code,product_name,variant_name,unit_id,unit_name,conversion_rate,quantity,base_quantity,unit_cost,base_unit_cost,subtotal'
+        ]);
 
         if ($request->filled('from_warehouse') && $request->input('from_warehouse') !== 'All') {
             $query->where('from_warehouse', $request->input('from_warehouse'));
@@ -80,7 +88,8 @@ class TransferController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $items = $query->orderBy('id', 'desc')->get();
+            $limit = min((int)$request->input('limit', 200), 500);
+            $items = $query->orderBy('id', 'desc')->take($limit)->get();
             return response()->json([
                 'status'     => 'success',
                 'data'       => $items,
