@@ -8,6 +8,7 @@ use App\Models\Product;
 use App\Models\Setting;
 use App\Models\StockTransfer;
 use App\Models\StockTransferItem;
+use App\Models\ProductVariant;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
@@ -46,7 +47,8 @@ class TransferController extends Controller
             'notes', 'created_by', 'user_id', 'user_name', 'user_role',
             'created_at', 'updated_at'
         ])->with([
-            'items:id,stock_transfer_id,product_id,product_variant_id,product_code,product_name,variant_name,unit_id,unit_name,conversion_rate,quantity,base_quantity,unit_cost,base_unit_cost,subtotal'
+            'user:id,name,role',
+            'items.variant.values',
         ]);
 
         if ($request->filled('from_warehouse') && $request->input('from_warehouse') !== 'All') {
@@ -119,7 +121,7 @@ class TransferController extends Controller
 
     public function show($id)
     {
-        $transfer = StockTransfer::with('items')->find($id);
+        $transfer = StockTransfer::with(['items.variant.values', 'user:id,name,role'])->find($id);
         if (!$transfer) {
             return response()->json(['status' => 'error', 'message' => 'Transfer not found'], 404);
         }
@@ -315,7 +317,7 @@ class TransferController extends Controller
                     'product_variant_id' => $item['product_variant_id'] ?? null,
                     'product_code'       => $item['product_code'],
                     'product_name'       => $item['product_name'],
-                    'variant_name'       => $item['variant_name'] ?? null,
+                    'variant_name'       => $this->resolveVariantName($item),
                     'unit_id'            => $item['unit_id'] ?? null,
                     'unit_name'          => $item['unit_name'] ?? 'Pcs',
                     'conversion_rate'    => $convRate,
@@ -635,7 +637,7 @@ class TransferController extends Controller
                     'product_variant_id' => $item['product_variant_id'] ?? null,
                     'product_code'       => $item['product_code'],
                     'product_name'       => $item['product_name'],
-                    'variant_name'       => $item['variant_name'] ?? null,
+                    'variant_name'       => $this->resolveVariantName($item),
                     'unit_id'            => $item['unit_id'] ?? null,
                     'unit_name'          => $item['unit_name'] ?? 'Pcs',
                     'conversion_rate'    => $convRate,
@@ -866,4 +868,52 @@ class TransferController extends Controller
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
         }
     }
+
+    /**
+     * Resolve rich variation name with attribute type and values.
+     * E.g. "Cyan (Color: Cyan, Size: 44)" or "Size: 32, Color: Red"
+     */
+    protected function resolveVariantName(array $item): ?string
+    {
+        $vName = isset($item['variant_name']) ? trim((string)$item['variant_name']) : '';
+        $pvId  = $item['product_variant_id'] ?? null;
+
+        if (!empty($pvId)) {
+            $pv = ProductVariant::with('values')->find($pvId);
+            if ($pv) {
+                $valParts = [];
+                if (!empty($pv->values)) {
+                    foreach ($pv->values as $val) {
+                        $an = trim($val->attribute_name ?? '');
+                        $av = trim($val->attribute_value ?? '');
+                        if (!empty($an) && !empty($av)) {
+                            $valParts[] = "$an: $av";
+                        } elseif (!empty($av)) {
+                            $valParts[] = $av;
+                        }
+                    }
+                }
+                $attrStr = implode(', ', $valParts);
+                $pvName  = trim($pv->name ?? '');
+
+                if ($vName !== '') {
+                    if (!empty($attrStr) && !str_contains($vName, ':')) {
+                        return "$vName ($attrStr)";
+                    }
+                    return $vName;
+                }
+
+                if (!empty($pvName) && !empty($attrStr) && !str_contains($pvName, ':')) {
+                    return "$pvName ($attrStr)";
+                } elseif (!empty($attrStr)) {
+                    return $attrStr;
+                } elseif (!empty($pvName)) {
+                    return $pvName;
+                }
+            }
+        }
+
+        return $vName !== '' ? $vName : null;
+    }
 }
+
