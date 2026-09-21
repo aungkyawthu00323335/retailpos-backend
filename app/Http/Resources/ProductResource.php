@@ -157,6 +157,7 @@ class ProductResource extends JsonResource
             'status' => $this->status ?? ($this->is_active ? 'Active' : 'Inactive'),
             'is_active' => (bool) $this->is_active,
             'added_by' => $this->added_by,
+            'total_dependencies' => (int)($this->total_dependencies ?? 0),
             'created_at' => $this->created_at?->toIso8601String(),
             'updated_at' => $this->updated_at?->toIso8601String(),
         ];

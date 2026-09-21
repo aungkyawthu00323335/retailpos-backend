@@ -4977,7 +4977,8 @@ class ReportController extends Controller
         $slowMovingCapital = 0.0;
         $deadStockCapital = 0.0;
         $totalPotentialRevenue = 0.0;
-        $now = Carbon::now();
+        $nowTs = time();
+        $nowDate = date('Y-m-d');
 
         foreach ($products as $p) {
             $pId = $p->id;
@@ -4987,12 +4988,14 @@ class ReportController extends Controller
             $lastSaleFormatted = 'Never Sold';
 
             if ($lastSaleRaw) {
-                $lastCarbon = Carbon::parse(substr($lastSaleRaw, 0, 10));
-                $daysSince = (int)$lastCarbon->diffInDays($now, false);
-                $lastSaleFormatted = substr($lastSaleRaw, 0, 10);
+                $lastDateStr = substr($lastSaleRaw, 0, 10);
+                $lastSaleFormatted = $lastDateStr;
+                $lastTs = strtotime($lastDateStr);
+                $daysSince = $lastTs ? (int) max(0, floor(($nowTs - $lastTs) / 86400)) : 999;
             } else {
-                $createDate = Carbon::parse(substr($p->created_at ?? now(), 0, 10));
-                $daysSince = (int)$createDate->diffInDays($now, false);
+                $createDateStr = substr($p->created_at ?: $nowDate, 0, 10);
+                $createTs = strtotime($createDateStr);
+                $daysSince = $createTs ? (int) max(0, floor(($nowTs - $createTs) / 86400)) : 999;
             }
 
             if ($daysSince >= $daysInactive) {
@@ -5214,7 +5217,22 @@ class ReportController extends Controller
                     'id', 'reference_no', 'date', 'customer_name', 'payment_type',
                     'grand_total', 'paid_amount', 'due_amount', 'discount'
                 ])
-                ->get();
+                ->get()
+                ->map(function ($t) {
+                    return [
+                        'id' => (int)$t->id,
+                        'reference_no' => (string)($t->reference_no ?? ''),
+                        'date' => (string)($t->date ?? ''),
+                        'customer_name' => (string)($t->customer_name ?? 'Walk-in Customer'),
+                        'payment_type' => (string)($t->payment_type ?? 'Cash'),
+                        'grand_total' => (float)($t->grand_total ?? 0.0),
+                        'paid_amount' => (float)($t->paid_amount ?? 0.0),
+                        'due_amount' => (float)($t->due_amount ?? 0.0),
+                        'discount' => (float)($t->discount ?? 0.0),
+                    ];
+                })
+                ->values()
+                ->all();
 
             $items[] = [
                 'staff_code' => 'STF-' . str_pad($idx++, 3, '0', STR_PAD_LEFT),

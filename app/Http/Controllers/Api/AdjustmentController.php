@@ -13,6 +13,7 @@ use App\Models\Outlet;
 use App\Models\Setting;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -48,7 +49,8 @@ class AdjustmentController extends Controller
     {
         $query = StockAdjustment::with([
             'user:id,name,role',
-            'items'
+            'items.variant.values',
+            'items.product',
         ]);
 
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
@@ -107,7 +109,33 @@ class AdjustmentController extends Controller
             $sortBy = 'id';
         }
 
-        $perPage = min(max((int)$request->input('per_page', 25), 1), 100);
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $adjustments = $query->orderBy($sortBy, $sortOrder)->get();
+            $data = $adjustments->map(function ($adj) {
+                if ($adj->user) {
+                    $adj->created_by = $adj->user->name;
+                    if (!empty($adj->user->role)) {
+                        $adj->user_role = $adj->user->role;
+                    }
+                }
+                $this->enrichAdjustmentItems($adj);
+                return $adj;
+            });
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $data,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => $adjustments->count(),
+                    'total' => $adjustments->count(),
+                    'last_page' => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(max((int)$request->input('per_page', 25), 1), 1000);
         $adjustments = $query->orderBy($sortBy, $sortOrder)->paginate($perPage);
 
         $data = collect($adjustments->items())->map(function ($adj) {
@@ -117,6 +145,7 @@ class AdjustmentController extends Controller
                     $adj->user_role = $adj->user->role;
                 }
             }
+            $this->enrichAdjustmentItems($adj);
             return $adj;
         });
 
@@ -135,7 +164,7 @@ class AdjustmentController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:255',
+            'reference_no' => 'nullable|string|max:255|unique:stock_adjustments,reference_no',
             'warehouse_id' => 'nullable|integer',
             'warehouse_name' => 'required|string|max:255',
             'date' => 'required|string',
@@ -162,10 +191,64 @@ class AdjustmentController extends Controller
             'items.*.subtotal' => 'nullable|numeric|min:0',
         ]);
 
+        $warehouseId = $this->resolveWarehouseId($validated['warehouse_id'] ?? null, $validated['warehouse_name']);
+
+        // Senior Accounting Validation: Verify total subtraction deductions per product & variant against warehouse balance
+        $subtractionsByItem = [];
+        foreach ($validated['items'] as $item) {
+            $itemType = $item['type'] ?? $validated['type'];
+            if ($itemType === 'Subtraction') {
+                $pid = $item['product_id'] ?? null;
+                if (!$pid && !empty($item['product_code'])) {
+                    $p = Product::where('code', $item['product_code'])->orWhere('sku', $item['product_code'])->first();
+                    $pid = $p?->id;
+                }
+                $vid = $item['product_variant_id'] ?? null;
+                $key = ($pid ?? 'p0') . '_' . ($vid ? "var_{$vid}" : 'single');
+                $cRate = isset($item['conversion_rate']) ? (float)$item['conversion_rate'] : 1.0;
+                $qty = (float)$item['quantity'];
+                $baseQty = isset($item['base_quantity']) ? (float)$item['base_quantity'] : ($qty * ($cRate > 0 ? $cRate : 1.0));
+
+                if (!isset($subtractionsByItem[$key])) {
+                    $subtractionsByItem[$key] = [
+                        'product_id' => $pid,
+                        'variant_id' => $vid,
+                        'product_name' => $item['product_name'] ?? 'Product',
+                        'total_base_qty' => 0.0,
+                    ];
+                }
+                $subtractionsByItem[$key]['total_base_qty'] += $baseQty;
+            }
+        }
+
+        foreach ($subtractionsByItem as $sub) {
+            $pid = $sub['product_id'];
+            $vid = $sub['variant_id'];
+            $needed = $sub['total_base_qty'];
+
+            if ($pid) {
+                $balQuery = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $pid);
+                if ($vid && $vid > 0) {
+                    $balQuery->where('product_variant_id', $vid);
+                } else {
+                    $balQuery->whereNull('product_variant_id');
+                }
+                $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+
+                if ($needed > $curBal + 0.0001) {
+                    $pName = $sub['product_name'];
+                    $outletObj = Outlet::find($warehouseId);
+                    $outletName = $outletObj ? $outletObj->name : $validated['warehouse_name'];
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => "လက်ကျန်စတော့ထက် ပိုမိုနုတ်၍မရပါ: {$outletName} တွင် '{$pName}' စုစုပေါင်း လက်ကျန် {$curBal} သာရှိသော်လည်း စုစုပေါင်း {$needed} နုတ်ရန် တောင်းဆိုထားပါသည်။",
+                    ], 422);
+                }
+            }
+        }
+
         DB::beginTransaction();
         try {
-            $warehouseId = $this->resolveWarehouseId($validated['warehouse_id'] ?? null, $validated['warehouse_name']);
-
             $prefix = Setting::get('adjustment_prefix', 'AD_');
             $refNo = !empty($validated['reference_no']) 
                 ? $validated['reference_no'] 
@@ -232,13 +315,16 @@ class AdjustmentController extends Controller
                     $resolvedProductId = $prod?->id;
                 }
 
+                $resolvedVariantId = $itemData['product_variant_id'] ?? null;
+                $variantName = $this->resolveVariantDisplayName($itemData['variant_name'] ?? null, $resolvedVariantId);
+
                 $adjItem = StockAdjustmentItem::create([
                     'stock_adjustment_id' => $adjustment->id,
                     'product_id' => $resolvedProductId,
-                    'product_variant_id' => $itemData['product_variant_id'] ?? null,
+                    'product_variant_id' => $resolvedVariantId,
                     'product_code' => $itemData['product_code'],
                     'product_name' => $itemData['product_name'],
-                    'variant_name' => $itemData['variant_name'] ?? null,
+                    'variant_name' => $variantName,
                     'unit_id' => $itemData['unit_id'] ?? null,
                     'unit_name' => $itemData['unit_name'] ?? 'Pcs',
                     'conversion_rate' => $conversionRate,
@@ -306,7 +392,12 @@ class AdjustmentController extends Controller
 
     public function show($id)
     {
-        $adjustment = StockAdjustment::with(['user:id,name,role', 'items'])->find($id);
+        $adjustment = StockAdjustment::with([
+            'user:id,name,role',
+            'items.variant.values',
+            'items.product',
+        ])->find($id);
+
         if (!$adjustment) {
             return response()->json(['status' => 'error', 'message' => 'Adjustment not found'], 404);
         }
@@ -316,6 +407,8 @@ class AdjustmentController extends Controller
                 $adjustment->user_role = $adjustment->user->role;
             }
         }
+        $this->enrichAdjustmentItems($adjustment);
+
         return response()->json(['status' => 'success', 'data' => $adjustment]);
     }
 
@@ -327,6 +420,7 @@ class AdjustmentController extends Controller
         }
 
         $validated = $request->validate([
+            'reference_no' => ['nullable', 'string', 'max:255', Rule::unique('stock_adjustments', 'reference_no')->ignore($id)],
             'warehouse_id' => 'nullable|integer',
             'warehouse_name' => 'required|string|max:255',
             'date' => 'required|string',
@@ -372,6 +466,57 @@ class AdjustmentController extends Controller
             }
             $adjustment->items()->delete();
 
+            // 2. Senior Accounting Validation: Verify total subtraction deductions against restored balance
+            $subtractionsByItem = [];
+            foreach ($validated['items'] as $item) {
+                $itemType = $item['type'] ?? ($validated['type'] ?? $adjustment->type);
+                if ($itemType === 'Subtraction') {
+                    $pid = $item['product_id'] ?? null;
+                    if (!$pid && !empty($item['product_code'])) {
+                        $p = Product::where('code', $item['product_code'])->orWhere('sku', $item['product_code'])->first();
+                        $pid = $p?->id;
+                    }
+                    $vid = $item['product_variant_id'] ?? null;
+                    $key = ($pid ?? 'p0') . '_' . ($vid ? "var_{$vid}" : 'single');
+                    $cRate = isset($item['conversion_rate']) ? (float)$item['conversion_rate'] : 1.0;
+                    $qty = (float)$item['quantity'];
+                    $baseQty = isset($item['base_quantity']) ? (float)$item['base_quantity'] : ($qty * ($cRate > 0 ? $cRate : 1.0));
+
+                    if (!isset($subtractionsByItem[$key])) {
+                        $subtractionsByItem[$key] = [
+                            'product_id' => $pid,
+                            'variant_id' => $vid,
+                            'product_name' => $item['product_name'] ?? 'Product',
+                            'total_base_qty' => 0.0,
+                        ];
+                    }
+                    $subtractionsByItem[$key]['total_base_qty'] += $baseQty;
+                }
+            }
+
+            foreach ($subtractionsByItem as $sub) {
+                $pid = $sub['product_id'];
+                $vid = $sub['variant_id'];
+                $needed = $sub['total_base_qty'];
+
+                if ($pid) {
+                    $balQuery = StockBalance::where('warehouse_id', $newWarehouseId)->where('product_id', $pid);
+                    if ($vid && $vid > 0) {
+                        $balQuery->where('product_variant_id', $vid);
+                    } else {
+                        $balQuery->whereNull('product_variant_id');
+                    }
+                    $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+
+                    if ($needed > $curBal + 0.0001) {
+                        $pName = $sub['product_name'];
+                        $outletObj = Outlet::find($newWarehouseId);
+                        $outletName = $outletObj ? $outletObj->name : $validated['warehouse_name'];
+                        throw new \Exception("လက်ကျန်စတော့ထက် ပိုမိုနုတ်၍မရပါ: {$outletName} တွင် '{$pName}' စုစုပေါင်း လက်ကျန် {$curBal} သာရှိသော်လည်း စုစုပေါင်း {$needed} နုတ်ရန် တောင်းဆိုထားပါသည်။");
+                    }
+                }
+            }
+
             $totalQty = 0;
             foreach ($validated['items'] as $item) {
                 $totalQty += (float)$item['quantity'];
@@ -386,6 +531,9 @@ class AdjustmentController extends Controller
                 'type' => $validated['type'] ?? $adjustment->type,
                 'notes' => $validated['notes'] ?? $adjustment->notes,
             ];
+            if (!empty($validated['reference_no'])) {
+                $updateData['reference_no'] = $validated['reference_no'];
+            }
             if (isset($validated['user_name'])) {
                 $updateData['user_name'] = $validated['user_name'];
                 $updateData['created_by'] = $validated['user_name'];
@@ -410,13 +558,16 @@ class AdjustmentController extends Controller
                 $baseCost = isset($itemData['base_unit_cost']) ? (float)$itemData['base_unit_cost'] : ($conversionRate > 0 ? $unitCost / $conversionRate : $unitCost);
                 $subtotal = isset($itemData['subtotal']) ? (float)$itemData['subtotal'] : ($quantity * $unitCost);
 
+                $resolvedVariantId = $itemData['product_variant_id'] ?? null;
+                $variantName = $this->resolveVariantDisplayName($itemData['variant_name'] ?? null, $resolvedVariantId);
+
                 $adjItem = StockAdjustmentItem::create([
                     'stock_adjustment_id' => $adjustment->id,
                     'product_id' => $itemData['product_id'] ?? null,
-                    'product_variant_id' => $itemData['product_variant_id'] ?? null,
+                    'product_variant_id' => $resolvedVariantId,
                     'product_code' => $itemData['product_code'],
                     'product_name' => $itemData['product_name'],
-                    'variant_name' => $itemData['variant_name'] ?? null,
+                    'variant_name' => $variantName,
                     'unit_id' => $itemData['unit_id'] ?? null,
                     'unit_name' => $itemData['unit_name'] ?? 'Pcs',
                     'conversion_rate' => $conversionRate,
@@ -577,6 +728,13 @@ class AdjustmentController extends Controller
         if ($isAddition) {
             $balance->increment('quantity', $effectiveQty);
         } else {
+            if (!$isRollback && (float)$balance->quantity < $effectiveQty - 0.0001) {
+                $avail = (float)$balance->quantity;
+                $prodName = $prod->name;
+                $outletObj = Outlet::find($warehouseId);
+                $outletName = $outletObj ? $outletObj->name : "Warehouse #$warehouseId";
+                throw new \Exception("လက်ကျန်စတော့ထက် ပိုမိုနုတ်၍မရပါ: {$outletName} တွင် '{$prodName}' လက်ကျန် {$avail} သာရှိသော်လည်း {$effectiveQty} နုတ်ရန် ကြိုးစားနေပါသည်။ Accounting rules strictly prohibit negative outlet inventory balances.");
+            }
             $balance->decrement('quantity', $effectiveQty);
         }
         $balance->refresh();
@@ -618,6 +776,90 @@ class AdjustmentController extends Controller
                 'note' => $notes ?: "Stock Adjustment ($adjustmentRef)",
                 'created_at' => now(),
             ]);
+        }
+    }
+
+    /**
+     * Resolves human-readable variation display string (e.g., 'Size: 32, Color: Red')
+     */
+    private function resolveVariantDisplayName(?string $providedName, ?int $variantId): ?string
+    {
+        $name = trim($providedName ?? '');
+        if (!empty($name) && str_contains($name, ':')) {
+            return $name;
+        }
+
+        if (!empty($variantId) && $variantId > 0) {
+            $pv = ProductVariant::with('values')->find($variantId);
+            if ($pv && $pv->relationLoaded('values') && $pv->values->isNotEmpty()) {
+                $parts = [];
+                foreach ($pv->values as $val) {
+                    $an = trim($val->attribute_name ?? '');
+                    $av = trim($val->attribute_value ?? '');
+                    if (!empty($an) && !empty($av)) {
+                        $parts[] = "{$an}: {$av}";
+                    } elseif (!empty($av)) {
+                        $parts[] = $av;
+                    }
+                }
+                if (!empty($parts)) {
+                    return implode(', ', $parts);
+                }
+            }
+            if ($pv && !empty($pv->name)) {
+                return $pv->name;
+            }
+        }
+
+        return !empty($name) ? $name : null;
+    }
+
+    /**
+     * Enriches adjustment items with accurate product info, variation name, and attribute display
+     */
+    private function enrichAdjustmentItems($adj): void
+    {
+        if (!$adj || !$adj->relationLoaded('items') || !$adj->items) {
+            return;
+        }
+
+        foreach ($adj->items as $item) {
+            // 1. Ensure product name
+            if (empty($item->product_name) && $item->product) {
+                $item->product_name = $item->product->name;
+            }
+
+            // 2. Ensure product code (fallback to variant SKU/barcode or product code/sku)
+            if (empty($item->product_code)) {
+                if ($item->variant && (!empty($item->variant->sku) || !empty($item->variant->barcode))) {
+                    $item->product_code = !empty($item->variant->sku) ? $item->variant->sku : $item->variant->barcode;
+                } elseif ($item->product) {
+                    $item->product_code = !empty($item->product->code) ? $item->product->code : ($item->product->sku ?? '');
+                }
+            }
+
+            // 3. Enrich variation type and name
+            if ($item->variant) {
+                if ($item->variant->relationLoaded('values') && $item->variant->values && $item->variant->values->isNotEmpty()) {
+                    $parts = [];
+                    foreach ($item->variant->values as $val) {
+                        $attrName = trim($val->attribute_name ?? '');
+                        $attrVal = trim($val->attribute_value ?? '');
+                        if (!empty($attrName) && !empty($attrVal)) {
+                            $parts[] = "{$attrName}: {$attrVal}";
+                        } elseif (!empty($attrVal)) {
+                            $parts[] = $attrVal;
+                        } elseif (!empty($attrName)) {
+                            $parts[] = $attrName;
+                        }
+                    }
+                    if (!empty($parts)) {
+                        $item->variant_name = implode(', ', $parts);
+                    }
+                } elseif (empty($item->variant_name) && !empty($item->variant->name)) {
+                    $item->variant_name = $item->variant->name;
+                }
+            }
         }
     }
 }

@@ -74,6 +74,10 @@ class Product extends Model
         'is_active' => 'boolean',
     ];
 
+    protected $appends = [
+        'total_dependencies',
+    ];
+
     protected static function booted()
     {
         static::creating(function ($product) {
@@ -150,4 +154,34 @@ class Product extends Model
     {
         return $this->belongsTo(ProductUnit::class, 'base_unit_id');
     }
+
+    public function saleItems()
+    {
+        return $this->hasMany(SaleItem::class, 'product_id');
+    }
+
+    public function purchaseItems()
+    {
+        return $this->hasMany(PurchaseItem::class, 'product_id');
+    }
+
+    public function stockAdjustmentItems()
+    {
+        return $this->hasMany(StockAdjustmentItem::class, 'product_id');
+    }
+
+    public function stockTransferItems()
+    {
+        return $this->hasMany(StockTransferItem::class, 'product_id');
+    }
+
+    public function getTotalDependenciesAttribute(): int
+    {
+        return (int) (
+            ($this->sale_items_count ?? $this->saleItems()->count()) +
+            ($this->purchase_items_count ?? $this->purchaseItems()->count()) +
+            ($this->stock_adjustment_items_count ?? $this->stockAdjustmentItems()->count())
+        );
+    }
 }
+

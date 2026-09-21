@@ -10,7 +10,7 @@ class BrandController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Brand::query();
+        $query = Brand::withCount('products');
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
@@ -27,6 +27,23 @@ class BrandController extends Controller
         return response()->json([
             'status' => 'success',
             'data' => $brands,
+        ]);
+    }
+
+    public function toggleStatus($id)
+    {
+        $brand = Brand::find($id);
+        if (!$brand) {
+            return response()->json(['status' => 'error', 'message' => 'Brand not found'], 404);
+        }
+
+        $brand->status = ($brand->status === 'Active') ? 'Inactive' : 'Active';
+        $brand->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Brand status toggled successfully',
+            'data' => $brand,
         ]);
     }
 
@@ -57,7 +74,7 @@ class BrandController extends Controller
 
     public function show($id)
     {
-        $brand = Brand::find($id);
+        $brand = Brand::withCount('products')->find($id);
         if (!$brand) {
             return response()->json(['status' => 'error', 'message' => 'Brand not found'], 404);
         }
@@ -90,10 +107,18 @@ class BrandController extends Controller
 
     public function destroy($id)
     {
-        $brand = Brand::find($id);
+        $brand = Brand::withCount('products')->find($id);
         if (!$brand) {
             return response()->json(['status' => 'error', 'message' => 'Brand not found'], 404);
         }
+
+        if ($brand->products_count > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete brand '{$brand->name}' because it contains {$brand->products_count} active product(s). Please reassign or delete these products first to preserve accounting and inventory integrity.",
+            ], 422);
+        }
+
         $brand->delete();
         return response()->json(['status' => 'success', 'message' => 'Brand deleted successfully']);
     }

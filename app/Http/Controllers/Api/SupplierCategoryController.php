@@ -30,14 +30,17 @@ class SupplierCategoryController extends Controller
 
         $categories = $query->orderBy('id', 'asc')->get();
 
-        // Calculate mapped supplier counts per category in 1 single fast query
-        $supplierCounts = Supplier::selectRaw('category, count(*) as count')
+        // Calculate mapped supplier counts and total AP balance due per category in 1 single fast query
+        $supplierStats = Supplier::selectRaw('category, count(*) as count, coalesce(sum(balance_due), 0) as total_due')
             ->whereNotNull('category')
             ->groupBy('category')
-            ->pluck('count', 'category');
+            ->get()
+            ->keyBy('category');
 
-        $mapped = $categories->map(function ($cat) use ($supplierCounts) {
-            $cat->suppliers_count = (int)($supplierCounts[$cat->name] ?? 0);
+        $mapped = $categories->map(function ($cat) use ($supplierStats) {
+            $stat = $supplierStats->get($cat->name);
+            $cat->suppliers_count = $stat ? (int)$stat->count : 0;
+            $cat->total_due = $stat ? (float)$stat->total_due : 0.00;
             return $cat;
         });
 
@@ -46,12 +49,15 @@ class SupplierCategoryController extends Controller
             SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active_categories
         ")->first();
 
+        $totalApDue = (float) Supplier::sum('balance_due');
+
         return response()->json([
             'status' => 'success',
             'summary' => [
                 'total_categories' => (int)($summaryData->total_categories ?? 0),
                 'active_categories' => (int)($summaryData->active_categories ?? 0),
                 'total_suppliers' => Supplier::count(),
+                'total_ap_due' => $totalApDue,
             ],
             'data' => $mapped,
         ]);
@@ -77,6 +83,7 @@ class SupplierCategoryController extends Controller
         ]);
 
         $category->suppliers_count = 0;
+        $category->total_due = 0.00;
 
         return response()->json([
             'status' => 'success',
@@ -99,7 +106,11 @@ class SupplierCategoryController extends Controller
             ], 404);
         }
 
-        $category->suppliers_count = Supplier::where('category', $category->name)->count();
+        $supplierStat = Supplier::where('category', $category->name)
+            ->selectRaw('count(*) as count, coalesce(sum(balance_due), 0) as total_due')
+            ->first();
+        $category->suppliers_count = (int)($supplierStat->count ?? 0);
+        $category->total_due = (float)($supplierStat->total_due ?? 0.00);
 
         return response()->json([
             'status' => 'success',
@@ -136,7 +147,11 @@ class SupplierCategoryController extends Controller
             Supplier::where('category', $oldName)->update(['category' => $validated['name']]);
         }
 
-        $category->suppliers_count = Supplier::where('category', $category->name)->count();
+        $supplierStat = Supplier::where('category', $category->name)
+            ->selectRaw('count(*) as count, coalesce(sum(balance_due), 0) as total_due')
+            ->first();
+        $category->suppliers_count = (int)($supplierStat->count ?? 0);
+        $category->total_due = (float)($supplierStat->total_due ?? 0.00);
 
         return response()->json([
             'status' => 'success',
@@ -146,7 +161,39 @@ class SupplierCategoryController extends Controller
     }
 
     /**
+     * Toggle the active status of a supplier category.
+     */
+    public function toggleStatus($id)
+    {
+        $category = SupplierCategory::find($id);
+
+        if (!$category) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Supplier category not found',
+            ], 404);
+        }
+
+        $newStatus = ($category->status === 'Active') ? 'Inactive' : 'Active';
+        $category->status = $newStatus;
+        $category->save();
+
+        $supplierStat = Supplier::where('category', $category->name)
+            ->selectRaw('count(*) as count, coalesce(sum(balance_due), 0) as total_due')
+            ->first();
+        $category->suppliers_count = (int)($supplierStat->count ?? 0);
+        $category->total_due = (float)($supplierStat->total_due ?? 0.00);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => "Supplier category marked as {$newStatus}",
+            'data' => $category,
+        ]);
+    }
+
+    /**
      * Remove the specified supplier category.
+     * Senior Accountant Safeguard: Protects against orphaned vendor classifications and AP ledger corruption.
      */
     public function destroy($id)
     {
@@ -157,6 +204,17 @@ class SupplierCategoryController extends Controller
                 'status' => 'error',
                 'message' => 'Supplier category not found',
             ], 404);
+        }
+
+        $supplierCount = Supplier::where('category', $category->name)->count();
+        $totalDue = (float) Supplier::where('category', $category->name)->sum('balance_due');
+
+        if ($supplierCount > 0 || $totalDue > 0) {
+            $dueStr = number_format($totalDue, 2);
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete supplier category '{$category->name}'. It is currently assigned to {$supplierCount} supplier(s) with an outstanding Accounts Payable liability of \${$dueStr}. Please reassign suppliers or settle outstanding liabilities before deletion.",
+            ], 422);
         }
 
         $category->delete();

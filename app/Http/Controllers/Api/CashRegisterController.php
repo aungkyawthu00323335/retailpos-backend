@@ -181,7 +181,7 @@ class CashRegisterController extends Controller
     public function close(Request $request, $id = null)
     {
         $validated = $request->validate([
-            'closing_cash' => 'required|numeric|min:0',
+            'closing_cash' => 'nullable|numeric|min:0',
             'closing_notes' => 'nullable|string',
             'denominations' => 'nullable|array',
         ]);
@@ -215,7 +215,7 @@ class CashRegisterController extends Controller
 
         $payload = $this->buildRegisterDetailsPayload($register, $user, true);
         $expectedCash = (float)$payload['expected_cash'];
-        $closingCash = (float)$validated['closing_cash'];
+        $closingCash = isset($validated['closing_cash']) ? (float)$validated['closing_cash'] : $expectedCash;
         $difference = $closingCash - $expectedCash;
 
         $register->update([
@@ -329,7 +329,10 @@ class CashRegisterController extends Controller
                   ->orWhere(function ($sub) use ($register, $openedAt, $closedAt) {
                       $sub->whereNull('cash_register_id')
                           ->where('warehouse_name', $register->warehouse_name)
-                          ->whereBetween('date', [$openedAt, $closedAt]);
+                          ->where(function ($dq) use ($openedAt, $closedAt) {
+                              $dq->whereBetween('created_at', [$openedAt, $closedAt])
+                                 ->orWhereBetween('date', [substr((string)$openedAt, 0, 10), substr((string)$closedAt, 0, 10)]);
+                          });
                       if ($register->user_id) {
                           $sub->where('user_id', $register->user_id);
                       }
@@ -342,6 +345,8 @@ class CashRegisterController extends Controller
         $cashSales = 0.0;
         $cardSales = 0.0;
         $digitalSales = 0.0;
+        $chequeSales = 0.0;
+        $bankTransferSales = 0.0;
         $otherSales = 0.0;
         $txCount = $sales->count();
 
@@ -360,9 +365,13 @@ class CashRegisterController extends Controller
                 if ($pType === 'cash') {
                     // Net cash retained in till drawer = amount collected minus change given back to customer
                     $cashSales += max(0, $amount - $change);
+                } elseif (in_array($pType, ['cheque', 'check'])) {
+                    $chequeSales += $amount;
+                } elseif (in_array($pType, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) {
+                    $bankTransferSales += $amount;
                 } elseif (in_array($pType, ['card', 'credit card', 'pos card', 'visa', 'mastercard'])) {
                     $cardSales += $amount;
-                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer'])) {
+                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet'])) {
                     $digitalSales += $amount;
                 } else {
                     $otherSales += $amount;
@@ -376,9 +385,13 @@ class CashRegisterController extends Controller
                 $paid = (float)$s->paid_amount;
                 if ($pType === 'cash') {
                     $cashSales += $paid;
+                } elseif (in_array($pType, ['cheque', 'check'])) {
+                    $chequeSales += $paid;
+                } elseif (in_array($pType, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) {
+                    $bankTransferSales += $paid;
                 } elseif (in_array($pType, ['card', 'credit card', 'pos card', 'visa', 'mastercard'])) {
                     $cardSales += $paid;
-                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer'])) {
+                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet'])) {
                     $digitalSales += $paid;
                 } else {
                     $otherSales += $paid;
@@ -461,21 +474,35 @@ class CashRegisterController extends Controller
                 'count' => $sales->filter(fn($s) => strtolower($s->payment_type) === 'cash')->count(),
             ],
             [
+                'method' => 'Cheque',
+                'amount' => round($chequeSales, 2),
+                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['cheque', 'check']))->count(),
+            ],
+            [
+                'method' => 'Bank Transfer',
+                'amount' => round($bankTransferSales, 2),
+                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['bank transfer', 'bank_transfer', 'wire', 'bank']))->count(),
+            ],
+            [
                 'method' => 'Card',
                 'amount' => round($cardSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['card', 'credit card', 'pos card']))->count(),
+                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['card', 'credit card', 'pos card', 'visa', 'mastercard']))->count(),
             ],
             [
                 'method' => 'Digital / Mobile',
                 'amount' => round($digitalSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer']))->count(),
+                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet']))->count(),
             ],
             [
-                'method' => 'Other / Split',
+                'method' => 'Other',
                 'amount' => round($otherSales, 2),
-                'count' => $sales->filter(fn($s) => !in_array(strtolower($s->payment_type), ['cash', 'card', 'credit card', 'pos card', 'kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer']))->count(),
+                'count' => $sales->filter(fn($s) => !in_array(strtolower($s->payment_type), ['cash', 'cheque', 'check', 'bank transfer', 'bank_transfer', 'wire', 'bank', 'card', 'credit card', 'pos card', 'visa', 'mastercard', 'kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet']))->count(),
             ],
         ];
+
+        $totalCollections = round($cashSales + $cardSales + $digitalSales + $chequeSales + $bankTransferSales + $otherSales, 2);
+        // Ultimate POS Standard: Total Payment in Register Summary is Gross Inflow (Cash In Hand + Total Collections)
+        $totalPayment = round($openingCash + $totalCollections, 2);
 
         return [
             'id' => (int)$register->id,
@@ -490,9 +517,13 @@ class CashRegisterController extends Controller
             'opening_cash' => $openingCash,
             'total_sales' => round($totalSales, 2),
             'cash_sales' => round($cashSales, 2),
+            'cheque_sales' => round($chequeSales, 2),
+            'bank_transfer_sales' => round($bankTransferSales, 2),
             'card_sales' => round($cardSales, 2),
             'digital_sales' => round($digitalSales, 2),
             'other_sales' => round($otherSales, 2),
+            'total_collections' => $totalCollections,
+            'total_payment' => $totalPayment,
             'total_refunds' => round($totalRefunds, 2),
             'cash_refunds' => round($cashRefunds, 2),
             'total_expenses' => round($totalExpenses, 2),
@@ -507,6 +538,7 @@ class CashRegisterController extends Controller
             'status' => ucfirst($register->status),
             'primary_payment_type' => 'Cash',
             'notes' => (string)($register->opening_notes ?? $register->closing_notes ?? ''),
+            'closing_notes' => (string)($register->closing_notes ?? ''),
             'created_by' => $register->user_name ?? 'Super Admin',
             'cashier_name' => $register->user_name ?? 'Super Admin',
             'user_name' => $register->user_name ?? 'Super Admin',

@@ -9,33 +9,30 @@ use App\Models\Setting;
 use App\Models\StockTransfer;
 use App\Models\StockTransferItem;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
 
 class TransferController extends Controller
 {
     /**
-     * Generate next numeric transfer reference code (numbers only).
+     * Generate next transfer reference code (e.g. TR_1234567).
      */
     public function generateCode()
     {
+        $prefix = Setting::get('transfer_prefix', 'TR_');
         $transfers = StockTransfer::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
-        $maxNum = 100000;
-        foreach ($transfers as $trf) {
-            $digits = preg_replace('/\D/', '', (string)$trf->reference_no);
-            if (!empty($digits)) {
-                $val = (int)$digits;
-                if ($val >= 100000 && $val < 999999999 && $val > $maxNum) {
-                    $maxNum = $val;
-                }
-            }
-        }
-        $nextCode = (string)($maxNum + 1);
+        $existingCodes = $transfers->pluck('reference_no')->filter()->toArray();
+
+        do {
+            $num = rand(1000000, 9999999);
+            $candidate = $prefix . $num;
+        } while (in_array($candidate, $existingCodes) || StockTransfer::where('reference_no', $candidate)->exists());
 
         return response()->json([
             'status' => 'success',
             'data'   => [
-                'code'         => $nextCode,
-                'reference_no' => $nextCode,
+                'code'         => $candidate,
+                'reference_no' => $candidate,
             ],
         ]);
     }
@@ -81,7 +78,23 @@ class TransferController extends Controller
             });
         }
 
-        $transfers = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $items = $query->orderBy('id', 'desc')->get();
+            return response()->json([
+                'status'     => 'success',
+                'data'       => $items,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page'     => $items->count(),
+                    'total'        => $items->count(),
+                    'last_page'    => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(1000, max(1, (int)$request->input('per_page', 25)));
+        $transfers = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
             'status'     => 'success',
@@ -107,7 +120,7 @@ class TransferController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no'               => 'nullable|string|max:255',
+            'reference_no'               => 'nullable|string|max:255|unique:stock_transfers,reference_no',
             'from_warehouse_id'          => 'nullable|integer',
             'from_warehouse'             => 'required|string|max:255',
             'to_warehouse_id'            => 'nullable|integer',
@@ -143,41 +156,81 @@ class TransferController extends Controller
         $toWarehouseId   = $unitService->warehouseId($validated['to_warehouse_id'] ?? null, $validated['to_warehouse']);
         $transferStatus  = $validated['status'] ?? 'Completed';
 
-        // ── T3: Available Stock Validation ────────────────────────────────────
-        // Before creating the transfer, verify every item has sufficient stock
-        // in the source warehouse for both Completed and Sent (In-Transit) status.
+        // ── T3: Cumulative Multi-Unit Available Stock Validation ──────────────
+        // Before creating the transfer, verify that the cumulative base quantity
+        // across ALL packaging unit lines for each product/variant does not exceed
+        // available stock in the source warehouse.
         if (in_array($transferStatus, ['Completed', 'Sent']) && $fromWarehouseId) {
-            $insufficientItems = [];
+            $cumulativeNeeded = [];
+            $itemInfo = [];
+
             foreach ($validated['items'] as $item) {
                 $productId = $item['product_id'] ?? null;
+                if (!$productId && !empty($item['product_code'])) {
+                    $prod = Product::where('code', $item['product_code'])->first();
+                    $productId = $prod?->id;
+                }
+                $variantId = !empty($item['product_variant_id']) ? (int)$item['product_variant_id'] : null;
                 $convRate  = (float)($item['conversion_rate'] ?? 1.0);
                 $qty       = (float)$item['quantity'];
                 $baseQty   = isset($item['base_quantity']) && (float)$item['base_quantity'] > 0
                     ? (float)$item['base_quantity']
-                    : ($qty * max($convRate, 1));
+                    : ($qty * max($convRate, 0.0001));
 
-                if ($productId && $baseQty > 0) {
-                    $stockBalance = DB::table('stock_balances')
+                $key = ($productId ?: $item['product_code']) . '_' . ($variantId ?? '0');
+                if (!isset($cumulativeNeeded[$key])) {
+                    $cumulativeNeeded[$key] = 0.0;
+                    $itemInfo[$key] = [
+                        'product_id'   => $productId,
+                        'variant_id'   => $variantId,
+                        'product_name' => $item['product_name'] ?? ($item['product_code'] ?? 'Product'),
+                    ];
+                }
+                $cumulativeNeeded[$key] += $baseQty;
+            }
+
+            $insufficientItems = [];
+            foreach ($cumulativeNeeded as $key => $neededBaseQty) {
+                $info = $itemInfo[$key];
+                $productId = $info['product_id'];
+                $variantId = $info['variant_id'];
+
+                if ($productId && $neededBaseQty > 0) {
+                    $query = DB::table('stock_balances')
                         ->where('product_id', $productId)
-                        ->where('warehouse_id', $fromWarehouseId)
-                        ->value('quantity');
+                        ->where('warehouse_id', $fromWarehouseId);
+                    if ($variantId !== null) {
+                        $query->where('product_variant_id', $variantId);
+                    } else {
+                        $query->whereNull('product_variant_id');
+                    }
+                    $stockBalance = $query->value('quantity');
+
                     if ($stockBalance === null) {
                         $stockBalance = DB::table('product_warehouse')
                             ->where('product_id', $productId)
                             ->where('warehouse_id', $fromWarehouseId)
                             ->value('quantity');
                     }
+
+                    if ($stockBalance === null) {
+                        $hasBalances = DB::table('stock_balances')->where('product_id', $productId)->exists();
+                        $prod = Product::find($productId);
+                        $stockBalance = (!$hasBalances && $variantId === null && $prod) ? $prod->stock_quantity : 0;
+                    }
+
                     $available = (float)($stockBalance ?? 0);
-                    if ($available < $baseQty) {
+                    if ($available < ($neededBaseQty - 0.0001)) {
                         $insufficientItems[] = sprintf(
-                            '%s: Need %.4f, Available %.4f',
-                            $item['product_name'],
-                            $baseQty,
+                            '%s: Total Base Needed %.4f, Available %.4f',
+                            $info['product_name'],
+                            $neededBaseQty,
                             $available
                         );
                     }
                 }
             }
+
             if (!empty($insufficientItems)) {
                 return response()->json([
                     'status'  => 'error',
@@ -188,9 +241,10 @@ class TransferController extends Controller
 
         DB::beginTransaction();
         try {
+            $prefix   = Setting::get('transfer_prefix', 'TR_');
             $refNo    = !empty($validated['reference_no'])
                 ? $validated['reference_no']
-                : (date('Ymd') . rand(1000, 9999));
+                : ($prefix . rand(1000000, 9999999));
             $totalQty = 0;
 
             foreach ($validated['items'] as $item) {
@@ -201,6 +255,20 @@ class TransferController extends Controller
             if (!str_contains($txDate, ':')) {
                 $txDate .= ' ' . now()->format('H:i:s');
             }
+
+            $authUserName = $request->user()?->name;
+            $authUserRole = $request->user()?->role;
+            $authUserId   = $request->user()?->id;
+
+            $effectiveUserName = !empty($validated['user_name'])
+                ? $validated['user_name']
+                : (!empty($validated['created_by']) ? $validated['created_by'] : ($authUserName ?? 'Admin User'));
+            $effectiveUserRole = !empty($validated['user_role'])
+                ? $validated['user_role']
+                : ($authUserRole ?? 'Super Admin');
+            $effectiveUserId = !empty($validated['user_id'])
+                ? $validated['user_id']
+                : $authUserId;
 
             $transfer = StockTransfer::create([
                 'reference_no'     => $refNo,
@@ -215,10 +283,10 @@ class TransferController extends Controller
                 'shipping_charge'  => (float)($validated['shipping_charge'] ?? 0),
                 'status'           => $transferStatus,
                 'notes'            => $validated['notes'] ?? null,
-                'created_by'       => $validated['created_by'] ?? ($validated['user_name'] ?? 'Admin User'),
-                'user_id'          => $validated['user_id'] ?? null,
-                'user_name'        => $validated['user_name'] ?? null,
-                'user_role'        => $validated['user_role'] ?? 'Super Admin',
+                'created_by'       => $effectiveUserName,
+                'user_id'          => $effectiveUserId,
+                'user_name'        => $effectiveUserName,
+                'user_role'        => $effectiveUserRole,
             ]);
 
             foreach ($validated['items'] as $item) {
@@ -349,6 +417,7 @@ class TransferController extends Controller
         }
 
         $validated = $request->validate([
+            'reference_no'               => ['nullable', 'string', 'max:255', Rule::unique('stock_transfers', 'reference_no')->ignore($id)],
             'from_warehouse_id'          => 'nullable|integer',
             'from_warehouse'             => 'required|string|max:255',
             'to_warehouse_id'            => 'nullable|integer',
@@ -417,6 +486,87 @@ class TransferController extends Controller
                 }
             }
 
+            // ── T3: Available Cumulative Stock Validation ─────────────────────
+            if (in_array($newStatus, ['Completed', 'Sent']) && $fromWarehouseId) {
+                $cumulativeNeeded = [];
+                $itemInfo = [];
+
+                foreach ($validated['items'] as $item) {
+                    $productId = $item['product_id'] ?? null;
+                    if (!$productId && !empty($item['product_code'])) {
+                        $prod = Product::where('code', $item['product_code'])->first();
+                        $productId = $prod?->id;
+                    }
+                    $variantId = !empty($item['product_variant_id']) ? (int)$item['product_variant_id'] : null;
+                    $convRate  = (float)($item['conversion_rate'] ?? 1.0);
+                    $qty       = (float)$item['quantity'];
+                    $baseQty   = isset($item['base_quantity']) && (float)$item['base_quantity'] > 0
+                        ? (float)$item['base_quantity']
+                        : ($qty * max($convRate, 0.0001));
+
+                    $key = ($productId ?: $item['product_code']) . '_' . ($variantId ?? '0');
+                    if (!isset($cumulativeNeeded[$key])) {
+                        $cumulativeNeeded[$key] = 0.0;
+                        $itemInfo[$key] = [
+                            'product_id'   => $productId,
+                            'variant_id'   => $variantId,
+                            'product_name' => $item['product_name'] ?? ($item['product_code'] ?? 'Product'),
+                        ];
+                    }
+                    $cumulativeNeeded[$key] += $baseQty;
+                }
+
+                $insufficientItems = [];
+                foreach ($cumulativeNeeded as $key => $neededBaseQty) {
+                    $info = $itemInfo[$key];
+                    $productId = $info['product_id'];
+                    $variantId = $info['variant_id'];
+
+                    if ($productId && $neededBaseQty > 0) {
+                        $query = DB::table('stock_balances')
+                            ->where('product_id', $productId)
+                            ->where('warehouse_id', $fromWarehouseId);
+                        if ($variantId !== null) {
+                            $query->where('product_variant_id', $variantId);
+                        } else {
+                            $query->whereNull('product_variant_id');
+                        }
+                        $stockBalance = $query->value('quantity');
+
+                        if ($stockBalance === null) {
+                            $stockBalance = DB::table('product_warehouse')
+                                ->where('product_id', $productId)
+                                ->where('warehouse_id', $fromWarehouseId)
+                                ->value('quantity');
+                        }
+
+                        if ($stockBalance === null) {
+                            $hasBalances = DB::table('stock_balances')->where('product_id', $productId)->exists();
+                            $prod = Product::find($productId);
+                            $stockBalance = (!$hasBalances && $variantId === null && $prod) ? $prod->stock_quantity : 0;
+                        }
+
+                        $available = (float)($stockBalance ?? 0);
+                        if ($available < ($neededBaseQty - 0.0001)) {
+                            $insufficientItems[] = sprintf(
+                                '%s: Total Base Needed %.4f, Available %.4f',
+                                $info['product_name'],
+                                $neededBaseQty,
+                                $available
+                            );
+                        }
+                    }
+                }
+
+                if (!empty($insufficientItems)) {
+                    DB::rollBack();
+                    return response()->json([
+                        'status'  => 'error',
+                        'message' => 'Insufficient stock in source warehouse for: ' . implode('; ', $insufficientItems),
+                    ], 422);
+                }
+            }
+
             // Remove old items; update header
             $transfer->items()->delete();
 
@@ -425,7 +575,22 @@ class TransferController extends Controller
                 $totalQty += (float)$item['quantity'];
             }
 
+            $authUserName = $request->user()?->name;
+            $authUserRole = $request->user()?->role;
+            $authUserId   = $request->user()?->id;
+
+            $effectiveUserName = !empty($validated['user_name'])
+                ? $validated['user_name']
+                : (!empty($validated['created_by']) ? $validated['created_by'] : ($transfer->user_name ?? ($transfer->created_by ?? ($authUserName ?? 'Admin User'))));
+            $effectiveUserRole = !empty($validated['user_role'])
+                ? $validated['user_role']
+                : ($transfer->user_role ?? ($authUserRole ?? 'Super Admin'));
+            $effectiveUserId = !empty($validated['user_id'])
+                ? $validated['user_id']
+                : ($transfer->user_id ?? $authUserId);
+
             $transfer->update([
+                'reference_no'      => $validated['reference_no'] ?? $transfer->reference_no,
                 'from_warehouse_id' => $fromWarehouseId ?? $transfer->from_warehouse_id,
                 'from_warehouse'    => $validated['from_warehouse'],
                 'to_warehouse_id'   => $toWarehouseId ?? $transfer->to_warehouse_id,
@@ -437,10 +602,10 @@ class TransferController extends Controller
                 'shipping_charge'   => (float)($validated['shipping_charge'] ?? 0),
                 'status'            => $newStatus,
                 'notes'             => $validated['notes'] ?? $transfer->notes,
-                'created_by'        => $validated['created_by'] ?? $transfer->created_by,
-                'user_id'           => $validated['user_id'] ?? $transfer->user_id,
-                'user_name'         => $validated['user_name'] ?? $transfer->user_name,
-                'user_role'         => $validated['user_role'] ?? $transfer->user_role,
+                'created_by'        => $effectiveUserName,
+                'user_id'           => $effectiveUserId,
+                'user_name'         => $effectiveUserName,
+                'user_role'         => $effectiveUserRole,
             ]);
 
             // Re-apply new items + stock movements

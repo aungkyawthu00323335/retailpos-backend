@@ -323,8 +323,8 @@ class RetailSeeder extends Seeder
 
         // 10. Store Settings
         $settings = [
-            'company_name' => 'Infy Retail POS',
-            'company_email' => 'contact@infypos.com',
+            'company_name' => 'အလင်းသစ် (Ah Linn Thit)',
+            'company_email' => 'contact@ahlinnthit.com',
             'company_phone' => '+95 9 1234 5678',
             'company_address' => 'No. 124, Merchant Road, Yangon, Myanmar',
             'default_currency' => 'USD',
@@ -332,8 +332,10 @@ class RetailSeeder extends Seeder
             'currency_position' => 'Prefix',
             'default_warehouse' => 'Main Warehouse Branch',
             'default_customer' => 'Walk-in Customer',
-            'receipt_header' => 'Welcome to Infy Retail POS!',
+            'receipt_header' => 'Welcome to အလင်းသစ် (Ah Linn Thit)!',
             'receipt_footer' => 'Thank you for shopping with us! Please come again.',
+            'footer' => 'All rights reserved by အလင်းသစ် (Ah Linn Thit)',
+            'developed_by' => 'Ah Linn Thit',
             'tax_rate' => '5',
             'barcode_symbology' => 'CODE128',
             'receipt_width' => '80mm',

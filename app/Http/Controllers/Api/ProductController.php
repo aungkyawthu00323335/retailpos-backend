@@ -543,12 +543,61 @@ class ProductController extends Controller
         ]);
     }
 
+    public function toggleStatus(Request $request, $id)
+    {
+        $product = Product::find($id);
+
+        if (!$product) {
+            return response()->json([
+                'success' => false,
+                'status' => 'error',
+                'message' => 'Product not found',
+            ], 404);
+        }
+
+        $newStatus = ($product->status === 'Active' || $product->is_active) ? 'Inactive' : 'Active';
+        $product->status = $newStatus;
+        $product->is_active = ($newStatus === 'Active');
+        $product->save();
+
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
+
+        return response()->json([
+            'success' => true,
+            'status' => 'success',
+            'message' => "Product marked as {$newStatus}",
+            'data' => [
+                'id' => $product->id,
+                'status' => $newStatus,
+                'is_active' => $product->is_active,
+            ],
+        ]);
+    }
+
     public function destroy($id)
     {
         $product = Product::find($id);
 
         if (!$product) {
             return response()->json(['success' => false, 'status' => 'error', 'message' => 'Product not found'], 404);
+        }
+
+        // 🔒 Senior Accountant Safeguard: Protect inventory capital and audit trails
+        $stockQty = (float)($product->stock_quantity ?? 0);
+        $totalDependencies = (int)$product->total_dependencies;
+
+        if ($stockQty > 0 || $totalDependencies > 0) {
+            return response()->json([
+                'success' => false,
+                'status' => 'error',
+                'message' => 'Product cannot be deleted because it has active inventory on hand or is linked to historical sales/purchases/adjustments. Internal accounting controls require preserving inventory ledger history. Please deactivate the product instead.',
+                'data' => [
+                    'stock_quantity' => $stockQty,
+                    'total_dependencies' => $totalDependencies,
+                ],
+            ], 422);
         }
 
         $product->delete();

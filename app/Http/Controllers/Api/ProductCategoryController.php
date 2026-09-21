@@ -10,7 +10,7 @@ class ProductCategoryController extends Controller
 {
     public function index()
     {
-        $categories = ProductCategory::orderBy('id', 'desc')->get();
+        $categories = ProductCategory::withCount('products')->orderBy('id', 'desc')->get();
 
         return response()->json([
             'status' => 'success',
@@ -84,13 +84,20 @@ class ProductCategoryController extends Controller
 
     public function destroy($id)
     {
-        $category = ProductCategory::find($id);
+        $category = ProductCategory::withCount('products')->find($id);
 
         if (!$category) {
             return response()->json([
                 'status' => 'error',
                 'message' => 'Product category not found',
             ], 404);
+        }
+
+        if ($category->products_count > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete category '{$category->name}' because it contains {$category->products_count} active product(s). Please reassign or delete these products first.",
+            ], 422);
         }
 
         $category->delete();

@@ -44,7 +44,8 @@ class UserController extends Controller
      */
     public function index(Request $request)
     {
-        $query = User::with(['roleModel', 'outlets']);
+        $query = User::with(['roleModel', 'outlets'])
+            ->withCount(['sales', 'purchases', 'expenses', 'cashRegisters', 'stockAdjustments']);
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -69,6 +70,13 @@ class UserController extends Controller
         $users = $query->orderBy('id', 'asc')->get()->map(function ($u) {
             $u->is_super_admin = $u->isSuperAdmin();
             $u->outlet_ids = $u->outlets->pluck('id')->toArray();
+            $u->total_dependencies = (int) (
+                ($u->sales_count ?? 0) +
+                ($u->purchases_count ?? 0) +
+                ($u->expenses_count ?? 0) +
+                ($u->cash_registers_count ?? 0) +
+                ($u->stock_adjustments_count ?? 0)
+            );
             return $u;
         });
 
@@ -77,6 +85,8 @@ class UserController extends Controller
             'summary' => [
                 'total_users' => $users->count(),
                 'active_users' => $users->where('status', 'Active')->count(),
+                'super_admins' => $users->filter(fn($u) => $u->is_super_admin)->count(),
+                'cashiers' => $users->filter(fn($u) => str_contains(strtolower($u->role), 'cashier'))->count(),
             ],
             'data' => $users,
         ]);
@@ -195,7 +205,9 @@ class UserController extends Controller
      */
     public function show($id)
     {
-        $user = User::with(['roleModel', 'outlets'])->find($id);
+        $user = User::with(['roleModel', 'outlets'])
+            ->withCount(['sales', 'purchases', 'expenses', 'cashRegisters', 'stockAdjustments'])
+            ->find($id);
 
         if (!$user) {
             return response()->json([
@@ -206,6 +218,13 @@ class UserController extends Controller
 
         $user->is_super_admin = $user->isSuperAdmin();
         $user->outlet_ids = $user->outlets->pluck('id')->toArray();
+        $user->total_dependencies = (int) (
+            ($user->sales_count ?? 0) +
+            ($user->purchases_count ?? 0) +
+            ($user->expenses_count ?? 0) +
+            ($user->cash_registers_count ?? 0) +
+            ($user->stock_adjustments_count ?? 0)
+        );
 
         return response()->json([
             'status' => 'success',
@@ -328,7 +347,51 @@ class UserController extends Controller
     }
 
     /**
+     * Toggle the active status of a user account.
+     */
+    public function toggleStatus(Request $request, $id)
+    {
+        $user = User::find($id);
+
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'User account not found',
+            ], 404);
+        }
+
+        // Prevent deactivating the only active Super Admin
+        if ($user->isSuperAdmin() && $user->status === 'Active') {
+            $activeSuperAdmins = User::where('role', 'Super Admin')
+                ->orWhereHas('roleModel', fn($q) => $q->where('slug', 'super_admin'))
+                ->where('status', 'Active')
+                ->count();
+            if ($activeSuperAdmins <= 1) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Cannot deactivate the primary Super Admin account. At least one active Super Admin is required.',
+                ], 422);
+            }
+        }
+
+        $newStatus = ($user->status === 'Active') ? 'Inactive' : 'Active';
+        $user->status = $newStatus;
+        $user->save();
+
+        $user->load(['roleModel', 'outlets']);
+        $user->is_super_admin = $user->isSuperAdmin();
+        $user->outlet_ids = $user->outlets->pluck('id')->toArray();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => "Staff member '{$user->name}' marked as {$newStatus}",
+            'data' => $user,
+        ]);
+    }
+
+    /**
      * Remove the specified user account.
+     * Senior Accountant Safeguard: Protects against orphaned financial journals and broken audit trails.
      */
     public function destroy(Request $request, $id)
     {
@@ -356,6 +419,21 @@ class UserController extends Controller
                     'message' => 'Unauthorized. Only Super Admin can delete Store Manager accounts.',
                 ], 403);
             }
+        }
+
+        // Senior Accountant Safeguard: Check operational & financial dependencies
+        $salesCount = \App\Models\Sale::where('user_id', $user->id)->count();
+        $purchasesCount = \App\Models\Purchase::where('user_id', $user->id)->count();
+        $expensesCount = \App\Models\Expense::where('user_id', $user->id)->count();
+        $registersCount = \App\Models\CashRegister::where('user_id', $user->id)->count();
+        $adjustmentsCount = \App\Models\StockAdjustment::where('user_id', $user->id)->count();
+        $totalDependencies = $salesCount + $purchasesCount + $expensesCount + $registersCount + $adjustmentsCount;
+
+        if ($totalDependencies > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete staff account '{$user->name}'. This user has {$totalDependencies} linked operational & financial record(s) ({$salesCount} sales, {$purchasesCount} purchases, {$expensesCount} expenses, {$registersCount} cash shifts). Please deactivate the user account instead to preserve financial audit trails and ledger integrity.",
+            ], 422);
         }
 
         $user->outlets()->detach();

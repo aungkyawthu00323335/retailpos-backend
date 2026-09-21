@@ -58,7 +58,23 @@ class PurchaseReturnController extends Controller
             });
         }
 
-        $returns = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $returns = $query->orderBy('id', 'desc')->get();
+            return response()->json([
+                'status' => 'success',
+                'data'   => $returns,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page'     => $returns->count(),
+                    'total'        => $returns->count(),
+                    'last_page'    => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(max((int)$request->input('per_page', 25), 1), 1000);
+        $returns = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
             'status' => 'success',

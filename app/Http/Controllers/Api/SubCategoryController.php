@@ -14,7 +14,7 @@ class SubCategoryController extends Controller
      */
     public function index(Request $request)
     {
-        $query = SubCategory::query();
+        $query = SubCategory::withCount('products');
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
@@ -46,6 +46,26 @@ class SubCategoryController extends Controller
         return response()->json([
             'status' => 'success',
             'data' => $items,
+        ]);
+    }
+
+    /**
+     * Toggle the status of the specified sub category.
+     */
+    public function toggleStatus($id)
+    {
+        $subCategory = SubCategory::find($id);
+        if (!$subCategory) {
+            return response()->json(['status' => 'error', 'message' => 'Sub category not found'], 404);
+        }
+
+        $subCategory->status = ($subCategory->status === 'Active') ? 'Inactive' : 'Active';
+        $subCategory->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Sub category status toggled successfully',
+            'data' => $subCategory,
         ]);
     }
 
@@ -82,7 +102,7 @@ class SubCategoryController extends Controller
      */
     public function show($id)
     {
-        $subCategory = SubCategory::find($id);
+        $subCategory = SubCategory::withCount('products')->find($id);
 
         if (!$subCategory) {
             return response()->json(['status' => 'error', 'message' => 'Sub category not found'], 404);
@@ -127,10 +147,17 @@ class SubCategoryController extends Controller
      */
     public function destroy($id)
     {
-        $subCategory = SubCategory::find($id);
+        $subCategory = SubCategory::withCount('products')->find($id);
 
         if (!$subCategory) {
             return response()->json(['status' => 'error', 'message' => 'Sub category not found'], 404);
+        }
+
+        if ($subCategory->products_count > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete sub category '{$subCategory->name}' because it contains {$subCategory->products_count} active product(s). Please reassign or delete these products first to preserve accounting and inventory integrity.",
+            ], 422);
         }
 
         $subCategory->delete();

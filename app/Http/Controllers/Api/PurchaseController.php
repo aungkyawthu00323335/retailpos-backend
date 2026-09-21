@@ -25,10 +25,17 @@ class PurchaseController extends Controller
                 'payment_status', 'payment_type', 'notes',
                 'created_by', 'user_id', 'user_name', 'user_role',
                 'created_at', 'updated_at',
-            ])
-            ->with([
-                'items:id,purchase_id,product_id,product_variant_id,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal',
             ]);
+
+        $relations = [
+            'supplier:id,name',
+        ];
+
+        if (!$request->boolean('no_items', false)) {
+            $relations[] = 'items:id,purchase_id,product_id,product_variant_id,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal';
+        }
+
+        $query->with($relations);
 
         if ($request->filled('supplier_id')) {
             $query->where('supplier_id', $request->input('supplier_id'));
@@ -71,7 +78,23 @@ class PurchaseController extends Controller
             });
         }
 
-        $purchases = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $purchases = $query->orderBy('id', 'desc')->get();
+            return response()->json([
+                'status' => 'success',
+                'data' => $purchases,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => $purchases->count(),
+                    'total' => $purchases->count(),
+                    'last_page' => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(1000, max(1, (int)$request->input('per_page', 500)));
+        $purchases = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
             'status' => 'success',

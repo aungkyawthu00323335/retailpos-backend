@@ -70,7 +70,15 @@ class ExpenseController extends Controller
         }
 
         if ($request->filled('created_by') && $request->input('created_by') !== 'All') {
-            $query->where('created_by', $request->input('created_by'));
+            $filterUser = $request->input('created_by');
+            $query->where(function ($q) use ($filterUser) {
+                $q->where('created_by', $filterUser)
+                  ->orWhere('user_name', $filterUser);
+            });
+        }
+
+        if ($request->filled('user_role') && $request->input('user_role') !== 'All') {
+            $query->where('user_role', $request->input('user_role'));
         }
 
         if ($request->filled('search')) {
@@ -105,7 +113,28 @@ class ExpenseController extends Controller
             $query->orderBy('id', 'desc');
         }
 
-        $perPage  = max(1, min(100, (int)$request->input('per_page', 25)));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $items = $query->get();
+            return response()->json([
+                'status' => 'success',
+                'data'   => $items,
+                'summary' => [
+                    'total_amount'   => (float)$totalAmount,
+                    'cash_total'     => (float)$cashTotal,
+                    'digital_total'  => (float)$digitalTotal,
+                    'total_records'  => $items->count(),
+                ],
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page'     => $items->count(),
+                    'total'        => $items->count(),
+                    'last_page'    => 1,
+                ],
+            ]);
+        }
+
+        $perPage  = max(1, min(1000, (int)$request->input('per_page', 25)));
         $expenses = $query->paginate($perPage);
 
         return response()->json([

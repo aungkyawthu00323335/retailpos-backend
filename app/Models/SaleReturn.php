@@ -33,6 +33,9 @@ class SaleReturn extends Model
         'refund_tender',      // New: how refund is given (Cash, KBZPay, Store Credit, etc.)
         'items_payload',
         'created_by',
+        'user_id',
+        'user_name',
+        'user_role',
     ];
 
     protected $casts = [
@@ -45,6 +48,7 @@ class SaleReturn extends Model
         'paid_amount'  => 'float',
         'due_amount'   => 'float',
         'warehouse_id' => 'integer',
+        'user_id'      => 'integer',
     ];
 
     protected $appends = ['items'];

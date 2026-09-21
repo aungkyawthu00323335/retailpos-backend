@@ -142,7 +142,32 @@ class CustomerGroupController extends Controller
     }
 
     /**
-     * Remove the specified customer group.
+     * Toggle active/inactive status of the customer group.
+     */
+    public function toggleStatus($id)
+    {
+        $group = CustomerGroup::find($id);
+
+        if (!$group) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Customer group not found',
+            ], 404);
+        }
+
+        $group->status = ($group->status === 'Active') ? 'Inactive' : 'Active';
+        $group->save();
+        $group->members_count = Customer::where('tier', $group->name)->count();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Customer group status updated to ' . $group->status,
+            'data' => $group,
+        ]);
+    }
+
+    /**
+     * Remove the specified customer group with Senior Accountant safeguards.
      */
     public function destroy($id)
     {
@@ -153,6 +178,16 @@ class CustomerGroupController extends Controller
                 'status' => 'error',
                 'message' => 'Customer group not found',
             ], 404);
+        }
+
+        $membersCount = Customer::where('tier', $group->name)->count();
+
+        if ($membersCount > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Cannot delete customer group "' . $group->name . '" because it currently has ' . $membersCount . ' active registered customer member(s). Deleting this group would create orphaned customer membership tiers and break POS discount automation. Please reassign the customers or deactivate the group instead.',
+                'members_count' => $membersCount,
+            ], 422);
         }
 
         $group->delete();

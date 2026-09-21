@@ -14,7 +14,7 @@ class SupplierController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Supplier::query();
+        $query = Supplier::withCount(['purchases']);
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -176,9 +176,9 @@ class SupplierController extends Controller
     }
 
     /**
-     * Remove the specified supplier.
+     * Toggle active/inactive status of the supplier.
      */
-    public function destroy($id)
+    public function toggleStatus($id)
     {
         $supplier = Supplier::find($id);
 
@@ -187,6 +187,44 @@ class SupplierController extends Controller
                 'status' => 'error',
                 'message' => 'Supplier not found',
             ], 404);
+        }
+
+        $supplier->status = ($supplier->status === 'Active') ? 'Inactive' : 'Active';
+        $supplier->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Supplier status updated to ' . $supplier->status,
+            'data' => $supplier,
+        ]);
+    }
+
+    /**
+     * Remove the specified supplier with Senior Accountant safeguards.
+     */
+    public function destroy($id)
+    {
+        $supplier = Supplier::withCount(['purchases', 'purchaseReturns'])->find($id);
+
+        if (!$supplier) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Supplier not found',
+            ], 404);
+        }
+
+        $purchasesCount = (int)($supplier->purchases_count ?? 0);
+        $returnsCount = (int)($supplier->purchase_returns_count ?? 0);
+        $balanceDue = (float)($supplier->balance_due ?? 0.0);
+
+        if ($purchasesCount > 0 || $returnsCount > 0 || $balanceDue > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Cannot delete supplier because they have ' . $purchasesCount . ' active purchase invoice(s), ' . $returnsCount . ' return(s), or outstanding Accounts Payable due debt ($' . number_format($balanceDue, 2) . '). This is protected by accounting safeguards to prevent ledger corruption. Please deactivate the supplier instead.',
+                'purchases_count' => $purchasesCount,
+                'purchase_returns_count' => $returnsCount,
+                'balance_due' => $balanceDue,
+            ], 422);
         }
 
         $supplier->delete();

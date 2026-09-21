@@ -48,12 +48,30 @@ class SaleReturnController extends Controller
                   ->orWhere('sale_reference_no', 'like', "%{$search}%")
                   ->orWhere('customer_name', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
                   ->orWhere('return_reason', 'like', "%{$search}%")
                   ->orWhere('notes', 'like', "%{$search}%");
             });
         }
 
-        $returns = $query->orderBy('id', 'desc')->paginate((int)$request->input('per_page', 25));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $returns = $query->orderBy('id', 'desc')->get();
+            return response()->json([
+                'status' => 'success',
+                'data'   => $returns,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page'     => $returns->count(),
+                    'total'        => $returns->count(),
+                    'last_page'    => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(max((int)$request->input('per_page', 25), 1), 1000);
+        $returns = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
             'status' => 'success',
@@ -108,6 +126,9 @@ class SaleReturnController extends Controller
             'refund_tender'    => 'nullable|string|max:100',
             'items'            => 'nullable|array',
             'created_by'       => 'nullable|string|max:255',
+            'user_id'          => 'nullable|integer',
+            'user_name'        => 'nullable|string|max:255',
+            'user_role'        => 'nullable|string|max:100',
         ]);
 
         // ── Business Rule: Duplicate Return Check ─────────────────────────────
@@ -162,7 +183,10 @@ class SaleReturnController extends Controller
 
         DB::beginTransaction();
         try {
-            $itemsPayload = !empty($validated['items']) ? json_encode($validated['items']) : null;
+            $userId    = $validated['user_id'] ?? ($request->user()?->id);
+            $userName  = !empty($validated['user_name']) ? $validated['user_name'] : ($request->user()?->name ?? 'Super Admin');
+            $userRole  = !empty($validated['user_role']) ? $validated['user_role'] : ($request->user()?->role ?? 'Super Admin');
+            $createdBy = !empty($validated['created_by']) ? $validated['created_by'] : ($userName . ' (' . $userRole . ')');
 
             $return = SaleReturn::create([
                 'reference_no'     => $refNo,
@@ -187,7 +211,10 @@ class SaleReturnController extends Controller
                 'return_reason'    => $validated['return_reason'] ?? null,
                 'refund_tender'    => $refundTender,
                 'items_payload'    => $itemsPayload,
-                'created_by'       => $validated['created_by'] ?? 'Cashier',
+                'created_by'       => $createdBy,
+                'user_id'          => $userId,
+                'user_name'        => $userName,
+                'user_role'        => $userRole,
             ]);
 
             // ── Stock Replenishment ───────────────────────────────────────────
@@ -321,6 +348,10 @@ class SaleReturnController extends Controller
             'return_reason'    => 'nullable|string|max:255',
             'refund_tender'    => 'nullable|string|max:100',
             'items'            => 'nullable|array',
+            'created_by'       => 'nullable|string|max:255',
+            'user_id'          => 'nullable|integer',
+            'user_name'        => 'nullable|string|max:255',
+            'user_role'        => 'nullable|string|max:100',
         ]);
 
         if (isset($validated['grand_total'])) {

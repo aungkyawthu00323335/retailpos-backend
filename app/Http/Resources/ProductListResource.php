@@ -146,6 +146,7 @@ class ProductListResource extends JsonResource
             'status' => $this->status ?? ($this->is_active ? 'Active' : 'Inactive'),
             'is_active' => (bool)$this->is_active,
             'added_by' => $this->added_by,
+            'total_dependencies' => (int)($this->total_dependencies ?? 0),
         ];
     }
 }

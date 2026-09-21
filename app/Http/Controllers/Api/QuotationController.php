@@ -53,6 +53,26 @@ class QuotationController extends Controller
             });
         }
 
+        // Filter: Created By / Staff
+        if ($request->filled('created_by') && $request->input('created_by') !== 'All') {
+            $filterUser = $request->input('created_by');
+            $query->where(function ($q) use ($filterUser) {
+                $q->where('created_by', $filterUser)
+                  ->orWhere('user_name', $filterUser);
+            });
+        }
+        if ($request->filled('user_role') && $request->input('user_role') !== 'All') {
+            $query->where('user_role', $request->input('user_role'));
+        }
+
+        // Filter: Date Range
+        if ($request->filled('date_from')) {
+            $query->whereDate('date', '>=', $request->input('date_from'));
+        }
+        if ($request->filled('date_to')) {
+            $query->whereDate('date', '<=', $request->input('date_to'));
+        }
+
         // Sorting
         $allowedSortCols = [
             'id' => 'id',
@@ -75,7 +95,23 @@ class QuotationController extends Controller
         $sortBy = $allowedSortCols[$sortByInput] ?? 'id';
         $sortOrder = strtolower((string)$request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
 
-        $perPage = (int)$request->input('per_page', 25);
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $items = $query->orderBy($sortBy, $sortOrder)->get();
+            return response()->json([
+                'status' => 'success',
+                'data' => $items,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => $items->count(),
+                    'total' => $items->count(),
+                    'last_page' => 1,
+                ],
+            ])
+            ->header('Cache-Control', 'private, max-age=60');
+        }
+
+        $perPage = min(1000, max(1, (int)$request->input('per_page', 25)));
         $page = (int)$request->input('page', 1);
 
         $quotations = $query->orderBy($sortBy, $sortOrder)->paginate($perPage, ['*'], 'page', $page);
@@ -146,7 +182,11 @@ class QuotationController extends Controller
                 $refNo  = $prefix . date('Ymd') . '-' . rand(1000, 9999);
             }
 
-            $creator = $validated['created_by'] ?? ($validated['user_name'] ?? 'Sales Staff');
+            $user = $request->user();
+            $userId = $validated['user_id'] ?? $user?->id;
+            $userName = $validated['user_name'] ?? $user?->name;
+            $userRole = $validated['user_role'] ?? $user?->role ?? 'Sales Staff';
+            $creator = $validated['created_by'] ?? ($userName ?: ($user?->name ?: 'Sales Staff'));
 
             $txDate = trim($validated['date']);
             if (!str_contains($txDate, ':')) {
@@ -176,9 +216,9 @@ class QuotationController extends Controller
                 'status'       => $autoStatus,
                 'notes'        => $validated['notes'] ?? null,
                 'created_by'   => $creator,
-                'user_id'      => $validated['user_id'] ?? null,
-                'user_name'    => $validated['user_name'] ?? null,
-                'user_role'    => $validated['user_role'] ?? null,
+                'user_id'      => $userId,
+                'user_name'    => $userName,
+                'user_role'    => $userRole,
             ]);
 
 
@@ -312,20 +352,29 @@ class QuotationController extends Controller
             ];
 
 
+            $user = $request->user();
             if (!empty($validated['reference_no'])) {
                 $updateData['reference_no'] = $validated['reference_no'];
             }
             if (!empty($validated['created_by'])) {
                 $updateData['created_by'] = $validated['created_by'];
+            } elseif (empty($quotation->created_by) && $user?->name) {
+                $updateData['created_by'] = $user->name;
             }
             if (!empty($validated['user_id'])) {
                 $updateData['user_id'] = $validated['user_id'];
+            } elseif (empty($quotation->user_id) && $user?->id) {
+                $updateData['user_id'] = $user->id;
             }
             if (!empty($validated['user_name'])) {
                 $updateData['user_name'] = $validated['user_name'];
+            } elseif (empty($quotation->user_name) && $user?->name) {
+                $updateData['user_name'] = $user->name;
             }
             if (!empty($validated['user_role'])) {
                 $updateData['user_role'] = $validated['user_role'];
+            } elseif (empty($quotation->user_role) && $user?->role) {
+                $updateData['user_role'] = $user->role;
             }
 
             $quotation->update($updateData);

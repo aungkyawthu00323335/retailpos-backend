@@ -22,6 +22,7 @@ class Quotation extends Model
         'shipping',
         'grand_total',
         'status', // Sent, Pending, Ordered, Expired
+        'expiry_date',
         'notes',
         'created_by',
         'user_id',
@@ -32,6 +33,7 @@ class Quotation extends Model
     protected $casts = [
         'warehouse_id' => 'integer',
         'user_id' => 'integer',
+        'expiry_date' => 'date',
         'tax_rate' => 'float',
         'tax_amount' => 'float',
         'discount' => 'float',

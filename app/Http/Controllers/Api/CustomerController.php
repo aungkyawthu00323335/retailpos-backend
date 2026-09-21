@@ -13,7 +13,7 @@ class CustomerController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Customer::query();
+        $query = Customer::withCount(['sales']);
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -168,9 +168,9 @@ class CustomerController extends Controller
     }
 
     /**
-     * Remove the specified customer.
+     * Toggle active/inactive status of the customer.
      */
-    public function destroy($id)
+    public function toggleStatus($id)
     {
         $customer = Customer::find($id);
 
@@ -179,6 +179,46 @@ class CustomerController extends Controller
                 'status' => 'error',
                 'message' => 'Customer not found',
             ], 404);
+        }
+
+        $customer->status = ($customer->status === 'Active') ? 'Inactive' : 'Active';
+        $customer->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Customer status updated to ' . $customer->status,
+            'data' => $customer,
+        ]);
+    }
+
+    /**
+     * Remove the specified customer with Senior Accountant safeguards.
+     */
+    public function destroy($id)
+    {
+        $customer = Customer::withCount(['sales', 'saleReturns', 'quotations'])->find($id);
+
+        if (!$customer) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Customer not found',
+            ], 404);
+        }
+
+        $salesCount = (int)($customer->sales_count ?? 0);
+        $returnsCount = (int)($customer->sale_returns_count ?? 0);
+        $quotationsCount = (int)($customer->quotations_count ?? 0);
+        $totalDue = (float)($customer->sales()->sum('due_amount') ?? 0.0);
+
+        if ($salesCount > 0 || $returnsCount > 0 || $quotationsCount > 0 || $totalDue > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Cannot delete customer because they have ' . $salesCount . ' active sales invoice(s), ' . $returnsCount . ' return(s), ' . $quotationsCount . ' quotation(s), or outstanding Accounts Receivable due debt ($' . number_format($totalDue, 2) . '). This is protected by accounting safeguards to prevent ledger corruption. Please deactivate the customer instead.',
+                'sales_count' => $salesCount,
+                'sale_returns_count' => $returnsCount,
+                'quotations_count' => $quotationsCount,
+                'total_due' => $totalDue,
+            ], 422);
         }
 
         $customer->delete();

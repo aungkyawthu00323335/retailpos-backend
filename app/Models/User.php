@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Http\Request;
 use Illuminate\Notifications\Notifiable;
@@ -32,6 +33,11 @@ class User extends Authenticatable
         'remember_token',
     ];
 
+    protected $appends = [
+        'total_dependencies',
+        'sales_count',
+    ];
+
     protected function casts(): array
     {
         return [
@@ -48,6 +54,51 @@ class User extends Authenticatable
     public function outlets(): BelongsToMany
     {
         return $this->belongsToMany(Outlet::class, 'outlet_user');
+    }
+
+    public function sales(): HasMany
+    {
+        return $this->hasMany(Sale::class, 'user_id');
+    }
+
+    public function purchases(): HasMany
+    {
+        return $this->hasMany(Purchase::class, 'user_id');
+    }
+
+    public function expenses(): HasMany
+    {
+        return $this->hasMany(Expense::class, 'user_id');
+    }
+
+    public function cashRegisters(): HasMany
+    {
+        return $this->hasMany(CashRegister::class, 'user_id');
+    }
+
+    public function stockAdjustments(): HasMany
+    {
+        return $this->hasMany(StockAdjustment::class, 'user_id');
+    }
+
+    public function getSalesCountAttribute(): int
+    {
+        if (array_key_exists('sales_count', $this->attributes)) {
+            return (int) $this->attributes['sales_count'];
+        }
+        return $this->sales()->count();
+    }
+
+    public function getTotalDependenciesAttribute(): int
+    {
+        if (array_key_exists('total_dependencies', $this->attributes)) {
+            return (int) $this->attributes['total_dependencies'];
+        }
+        return $this->sales()->count() +
+            $this->purchases()->count() +
+            $this->expenses()->count() +
+            $this->cashRegisters()->count() +
+            $this->stockAdjustments()->count();
     }
 
     public function isSuperAdmin(): bool

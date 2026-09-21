@@ -48,14 +48,20 @@ Route::apiResource('outlets', OutletController::class);
 Route::patch('outlets/{id}/toggle-status', [OutletController::class, 'toggleStatus']);
 
 // Brands
+Route::patch('brands/{id}/toggle-status', [BrandController::class, 'toggleStatus']);
 Route::apiResource('brands', BrandController::class);
 
 // Product Categories, Sub Categories, Variations & Units
 Route::apiResource('product-categories', ProductCategoryController::class);
+Route::patch('sub-categories/{id}/toggle-status', [SubCategoryController::class, 'toggleStatus']);
 Route::apiResource('sub-categories', SubCategoryController::class);
+Route::patch('product-units/{id}/toggle-status', [ProductUnitController::class, 'toggleStatus']);
 Route::apiResource('product-units', ProductUnitController::class);
+Route::patch('sale-units/{id}/toggle-status', [SaleUnitController::class, 'toggleStatus']);
 Route::apiResource('sale-units', SaleUnitController::class);
+Route::patch('purchase-units/{id}/toggle-status', [PurchaseUnitController::class, 'toggleStatus']);
 Route::apiResource('purchase-units', PurchaseUnitController::class);
+Route::patch('variations/{id}/toggle-status', [VariationController::class, 'toggleStatus']);
 Route::apiResource('variations', VariationController::class);
 
 // Products & Barcode
@@ -67,6 +73,7 @@ Route::get('products/template', [ProductController::class, 'downloadTemplate']);
 Route::get('products/export', [ProductController::class, 'export']);
 Route::post('products/bulk-import', [ProductController::class, 'bulkImport']);
 Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
+Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
 Route::apiResource('products', ProductController::class);
 
@@ -108,18 +115,23 @@ Route::patch('payment-methods/{id}/toggle-status', [PaymentMethodController::cla
 Route::apiResource('payment-methods', PaymentMethodController::class);
 
 // Customers & Customer Groups (CRM)
+Route::patch('customers/{id}/toggle-status', [CustomerController::class, 'toggleStatus']);
 Route::apiResource('customers', CustomerController::class);
+Route::patch('customer-groups/{id}/toggle-status', [CustomerGroupController::class, 'toggleStatus']);
 Route::apiResource('customer-groups', CustomerGroupController::class);
 
 // Suppliers & Supplier Categories
 Route::get('suppliers/template', [SupplierController::class, 'downloadTemplate']);
 Route::get('suppliers/export', [SupplierController::class, 'export']);
 Route::post('suppliers/bulk-import', [SupplierController::class, 'bulkImport']);
+Route::patch('suppliers/{id}/toggle-status', [SupplierController::class, 'toggleStatus']);
 Route::apiResource('suppliers', SupplierController::class);
+Route::patch('supplier-categories/{id}/toggle-status', [SupplierCategoryController::class, 'toggleStatus']);
 Route::apiResource('supplier-categories', SupplierCategoryController::class);
 
 // Users & RBAC Roles
 Route::get('users/generate-id', [UserController::class, 'generateUserId']);
+Route::patch('users/{id}/toggle-status', [UserController::class, 'toggleStatus']);
 Route::apiResource('users', UserController::class)->middleware('permission:users.view,users.create,users.update,users.delete');
 Route::apiResource('roles', RoleController::class)->middleware('permission:roles.view,roles.create,roles.update,roles.delete');
 
@@ -159,4 +171,5 @@ Route::post('cash-register/transaction', [CashRegisterController::class, 'record
 // General Settings & Multi-Currency
 Route::get('settings', [SettingController::class, 'getSettings'])->middleware('permission:general_settings.view');
 Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update');
+Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault']);
 Route::apiResource('currencies', CurrencyController::class);

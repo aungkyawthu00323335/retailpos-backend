@@ -23,6 +23,7 @@ class DatabaseSeeder extends Seeder
             SaleSeeder::class,
             AdjustmentSeeder::class,
             ClothingStoreSeeder::class,
+            QuotationSeeder::class,
         ]);
     }
 }

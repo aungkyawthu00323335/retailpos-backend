@@ -49,6 +49,15 @@ class VariationController extends Controller
 
         $variations = $query->get();
 
+        $productCounts = \App\Models\ProductVariantValue::join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+            ->select('product_variant_values.attribute_name', \DB::raw('COUNT(DISTINCT product_variants.product_id) as count'))
+            ->groupBy('product_variant_values.attribute_name')
+            ->pluck('count', 'attribute_name');
+
+        foreach ($variations as $v) {
+            $v->products_count = (int)($productCounts[$v->name] ?? 0);
+        }
+
         return response()->json([
             'status' => 'success',
             'data' => $variations,
@@ -237,6 +246,26 @@ class VariationController extends Controller
     }
 
     /**
+     * Toggle the status of the specified variation.
+     */
+    public function toggleStatus($id)
+    {
+        $variation = Variation::find($id);
+        if (!$variation) {
+            return response()->json(['status' => 'error', 'message' => 'Variation not found'], 404);
+        }
+
+        $variation->status = ($variation->status === 'Active') ? 'Inactive' : 'Active';
+        $variation->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Variation status toggled successfully',
+            'data' => $variation,
+        ]);
+    }
+
+    /**
      * Remove the specified variation.
      */
     public function destroy($id)
@@ -245,6 +274,14 @@ class VariationController extends Controller
 
         if (!$variation) {
             return response()->json(['status' => 'error', 'message' => 'Variation not found'], 404);
+        }
+
+        $linkedCount = \App\Models\ProductVariantValue::where('attribute_name', $variation->name)->count();
+        if ($linkedCount > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => "Cannot delete variation '{$variation->name}' because it is currently assigned to active product variant(s). Please reassign or remove these variants first to preserve accounting and inventory integrity.",
+            ], 422);
         }
 
         $variation->delete();

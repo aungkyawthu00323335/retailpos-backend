@@ -10,6 +10,7 @@ use App\Models\Product;
 use App\Services\ProductUnitConversionService;
 use App\Models\Customer;
 use App\Models\Setting;
+use App\Models\StockBalance;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -27,19 +28,20 @@ class SaleController extends Controller
             'void_reason', 'voided_by', 'voided_at'
         ]);
 
-        if ($includeFull) {
-            $query->with([
-                'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,unit_price,quantity,tax,discount,subtotal',
-                'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
-                'customer:id,name',
-            ]);
-        } else {
-            $query->with([
-                'items:id,sale_id,product_id,product_code,product_name,unit_name,unit_price,quantity,subtotal',
-                'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
-                'customer:id,name',
-            ]);
+        $relations = [
+            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
+            'customer:id,name',
+        ];
+
+        if (!$request->boolean('no_items', false)) {
+            if ($includeFull) {
+                $relations[] = 'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,unit_price,quantity,tax,discount,subtotal';
+            } else {
+                $relations[] = 'items:id,sale_id,product_id,product_code,product_name,unit_name,unit_price,quantity,subtotal';
+            }
         }
+
+        $query->with($relations);
 
         if ($request->filled('customer_id')) {
             $query->where('customer_id', $request->input('customer_id'));
@@ -61,11 +63,32 @@ class SaleController extends Controller
             $search = trim($request->input('search'));
             $query->where(function ($q) use ($search) {
                 $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('customer_name', 'like', "%{$search}%");
+                  ->orWhere('customer_name', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhereHas('items', function ($itemQuery) use ($search) {
+                      $itemQuery->where('product_name', 'like', "%{$search}%")
+                                ->orWhere('product_code', 'like', "%{$search}%");
+                  });
             });
         }
 
-        $perPage = min(500, max(1, (int)$request->input('per_page', 25)));
+        $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        if ($isAll) {
+            $sales = $query->orderBy('id', 'desc')->get();
+            return response()->json([
+                'status' => 'success',
+                'data' => $sales,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => $sales->count(),
+                    'total' => $sales->count(),
+                    'last_page' => 1,
+                ],
+            ]);
+        }
+
+        $perPage = min(1000, max(1, (int)$request->input('per_page', 500)));
         $sales = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
@@ -83,7 +106,7 @@ class SaleController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no' => 'nullable|string|max:100',
+            'reference_no' => 'nullable|string|max:100|unique:sales,reference_no',
             'customer_id' => 'nullable|integer',
             'customer_name' => 'required|string|max:255',
             'warehouse_name' => 'required|string|max:255',
@@ -99,8 +122,10 @@ class SaleController extends Controller
             'subtotal' => 'required|numeric|min:0',
             'grand_total' => 'required|numeric|min:0',
             'paid_amount' => 'nullable|numeric|min:0',
+            'due_amount' => 'nullable|numeric|min:0',
             'received_amount' => 'nullable|numeric|min:0',
             'change_amount' => 'nullable|numeric|min:0',
+            'payment_status' => 'nullable|string|in:Paid,Unpaid,Partial',
             'payment_type' => 'nullable|string',
             'notes' => 'nullable|string',
             'pos_flag' => 'nullable|boolean',
@@ -137,21 +162,46 @@ class SaleController extends Controller
             $prefix = !empty($validated['pos_flag'])
                 ? Setting::get('pos_prefix', Setting::get('sale_prefix', 'SA_'))
                 : Setting::get('sale_prefix', 'SA_');
-            $refNo = !empty($validated['reference_no'])
-                ? $validated['reference_no']
-                : ($prefix . rand(1000000, 9999999));
+            if (!empty($validated['reference_no'])) {
+                $refNo = $validated['reference_no'];
+            } else {
+                do {
+                    $refNo = $prefix . rand(1000000, 9999999);
+                } while (Sale::where('reference_no', $refNo)->exists());
+            }
             $grandTotal = (float)$validated['grand_total'];
-            $paidAmount = (float)($validated['paid_amount'] ?? $grandTotal);
-            $dueAmount = max(0, $grandTotal - $paidAmount);
+            $explicitStatus = $validated['payment_status'] ?? null;
+            if ($explicitStatus === 'Unpaid') {
+                $paidAmount = 0.0;
+                $dueAmount = $grandTotal;
+                $paymentStatus = 'Unpaid';
+            } elseif ($explicitStatus === 'Partial') {
+                $paidAmount = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : round($grandTotal * 0.5, 2);
+                if ($paidAmount > $grandTotal) {
+                    $paidAmount = $grandTotal;
+                }
+                $dueAmount = max(0, $grandTotal - $paidAmount);
+                $paymentStatus = $dueAmount <= 0 ? 'Paid' : 'Partial';
+            } elseif ($explicitStatus === 'Paid') {
+                $paidAmount = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $grandTotal;
+                if ($paidAmount < $grandTotal && $grandTotal > 0) {
+                    $paidAmount = $grandTotal;
+                }
+                $dueAmount = 0.0;
+                $paymentStatus = 'Paid';
+            } else {
+                $paidAmount = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $grandTotal;
+                $dueAmount = max(0, $grandTotal - $paidAmount);
+                if ($paidAmount >= $grandTotal && $grandTotal > 0) {
+                    $paymentStatus = 'Paid';
+                } elseif ($paidAmount > 0) {
+                    $paymentStatus = 'Partial';
+                } else {
+                    $paymentStatus = 'Unpaid';
+                }
+            }
             $received = (float)($validated['received_amount'] ?? $paidAmount);
             $change = (float)($validated['change_amount'] ?? max(0, $received - $grandTotal));
-
-            $paymentStatus = 'Unpaid';
-            if ($paidAmount >= $grandTotal && $grandTotal > 0) {
-                $paymentStatus = 'Paid';
-            } elseif ($paidAmount > 0) {
-                $paymentStatus = 'Partial';
-            }
 
             $txDate = trim($validated['date']);
             if (!str_contains($txDate, ':')) {
@@ -258,6 +308,77 @@ class SaleController extends Controller
 
             $productsById = $productsMap->keyBy('id');
             $productsByCode = $productsMap->keyBy('code');
+
+            // Upfront aggregate stock pre-check across all cart items for each product/variant in the specified warehouse
+            if (($sale->status) === 'Completed') {
+                $requiredStockByItem = [];
+                foreach ($validated['items'] as $item) {
+                    $product = (!empty($item['product_id']) && isset($productsById[$item['product_id']]))
+                        ? $productsById[$item['product_id']]
+                        : ($productsByCode[$item['product_code']] ?? null);
+
+                    if (!$product) continue;
+
+                    $variantId = !empty($item['product_variant_id']) ? (int)$item['product_variant_id'] : null;
+                    $convRate = (float)($item['conversion_rate'] ?? 0);
+                    if ($convRate <= 0) {
+                        $linkedUnit = $unitService->resolve(
+                            $product,
+                            'sale',
+                            isset($item['unit_id']) ? (int)$item['unit_id'] : null,
+                            $item['unit_name'] ?? null,
+                            $variantId
+                        );
+                        $convRate = (float)($linkedUnit['conversion_rate'] ?? 1);
+                    }
+                    $baseQty = (float)$item['quantity'] * ($convRate > 0 ? $convRate : 1.0);
+                    $key = $product->id . '_' . ($variantId ?? '0');
+                    if (!isset($requiredStockByItem[$key])) {
+                        $requiredStockByItem[$key] = [
+                            'product' => $product,
+                            'variant_id' => $variantId,
+                            'total_base_qty' => 0.0,
+                        ];
+                    }
+                    $requiredStockByItem[$key]['total_base_qty'] += $baseQty;
+                }
+
+                foreach ($requiredStockByItem as $req) {
+                    $prod = $req['product'];
+                    $varId = $req['variant_id'];
+                    $totalBaseNeeded = $req['total_base_qty'];
+
+                    $stockQuery = StockBalance::where('warehouse_id', $warehouseId)
+                        ->where('product_id', $prod->id);
+                    if ($varId === null) {
+                        $stockQuery->whereNull('product_variant_id');
+                    } else {
+                        $stockQuery->where('product_variant_id', $varId);
+                    }
+                    $balance = $stockQuery->value('quantity');
+                    $available = $balance !== null ? (float)$balance : 0.0;
+
+                    // If no StockBalance record exists at all, check if legacy product has stock_quantity
+                    if ($balance === null) {
+                        $hasBalances = StockBalance::where('product_id', $prod->id)->exists();
+                        if (!$hasBalances && $varId === null) {
+                            $available = (float)$prod->stock_quantity;
+                        }
+                    }
+
+                    if ($totalBaseNeeded > $available + 0.0001) {
+                        $varName = '';
+                        if ($varId && $prod->relationLoaded('variants')) {
+                            $vObj = $prod->variants->firstWhere('id', $varId);
+                            if ($vObj) {
+                                $varName = " ({$vObj->name})";
+                            }
+                        }
+                        $whName = $validated['warehouse_name'] ?? 'Selected Warehouse';
+                        throw new \RuntimeException("Insufficient stock for '{$prod->name}{$varName}' in '{$whName}'. Total requested: {$totalBaseNeeded}, Available: {$available}.");
+                    }
+                }
+            }
 
             $fifoService = app(\App\Services\FifoInventoryService::class);
             $totalSaleCogs = 0.0;
@@ -433,13 +554,21 @@ class SaleController extends Controller
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
-            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+            $statusCode = 500;
+            if (str_contains($e->getMessage(), 'Insufficient stock') ||
+                str_contains($e->getMessage(), 'Stock') ||
+                str_contains($e->getMessage(), 'stock') ||
+                str_contains($e->getMessage(), 'warehouse')) {
+                $statusCode = 422;
+            }
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], $statusCode);
         }
     }
 
     public function show($id)
     {
-        $sale = Sale::with(['items', 'payments', 'customer'])->find($id);
+        $sale = Sale::with(['items', 'payments', 'customer'])->find($id)
+            ?? Sale::with(['items', 'payments', 'customer'])->where('reference_no', $id)->first();
         if (!$sale) {
             return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
         }
@@ -494,7 +623,13 @@ class SaleController extends Controller
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
-            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+            $statusCode = 500;
+            if (str_contains($e->getMessage(), 'Insufficient stock') ||
+                str_contains($e->getMessage(), 'Stock') ||
+                str_contains($e->getMessage(), 'warehouse')) {
+                $statusCode = 422;
+            }
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], $statusCode);
         }
     }
 
@@ -506,6 +641,7 @@ class SaleController extends Controller
         }
 
         $validated = $request->validate([
+            'reference_no' => 'nullable|string|max:100|unique:sales,reference_no,' . $sale->id,
             'customer_name' => 'nullable|string|max:255',
             'warehouse_name' => 'nullable|string|max:255',
             'date' => 'nullable|string',
