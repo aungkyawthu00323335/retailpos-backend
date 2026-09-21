@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\CashRegister;
 use App\Models\Expense;
 use App\Models\Setting;
 use Illuminate\Http\Request;
@@ -210,16 +209,9 @@ class ExpenseController extends Controller
                 'user_id'               => $validated['user_id'] ?? $request->user()?->id,
             ]);
 
-            // ── E1: Cash Register Deduction ───────────────────────────────────
-            // Only Cash expenses reduce the till. KBZPay / WavePay / Bank Transfer
-            // go through external payment channels and must NOT touch the cash drawer.
-            if ($paymentMethod === 'cash') {
-                $this->deductFromCashRegister(
-                    warehouseName: $validated['warehouse_name'],
-                    warehouseId:   $validated['warehouse_id'] ?? null,
-                    amount:        $amount
-                );
-            }
+            // Store operating expense created independently of POS till cash drawer
+            // (Cash Register tracks POS till shift sales/drawers, whereas general expenses
+            // are maintained in the general ledger/petty cash).
 
             DB::commit();
 
@@ -276,24 +268,6 @@ class ExpenseController extends Controller
 
         DB::beginTransaction();
         try {
-            $oldAmount        = (float)$expense->amount;
-            $oldPaymentMethod = strtolower(trim((string)$expense->payment_method));
-            $newAmount        = isset($validated['amount']) ? (float)$validated['amount'] : $oldAmount;
-            $newPaymentMethod = strtolower(trim($validated['payment_method'] ?? $expense->payment_method ?? 'cash'));
-            $warehouseName    = $validated['warehouse_name'] ?? $expense->warehouse_name;
-            $warehouseId      = $validated['warehouse_id'] ?? $expense->warehouse_id;
-
-            // ── E2: Cash Register Reversal on Update ─────────────────────────
-            // Restore original Cash impact, then apply new one.
-            if ($oldPaymentMethod === 'cash') {
-                // Restore old cash back to register
-                $this->addToCashRegister($warehouseName, $warehouseId, $oldAmount);
-            }
-            if ($newPaymentMethod === 'cash') {
-                // Deduct new cash amount from register
-                $this->deductFromCashRegister($warehouseName, $warehouseId, $newAmount);
-            }
-
             $expense->update($validated);
 
             DB::commit();
@@ -318,15 +292,6 @@ class ExpenseController extends Controller
 
         DB::beginTransaction();
         try {
-            $amount        = (float)$expense->amount;
-            $paymentMethod = strtolower(trim((string)$expense->payment_method));
-
-            // ── E2: Cash Register Reversal on Delete ─────────────────────────
-            // If this was a Cash expense, restore the money back to the open register.
-            if ($paymentMethod === 'cash') {
-                $this->addToCashRegister($expense->warehouse_name, $expense->warehouse_id, $amount);
-            }
-
             $expense->delete();
 
             DB::commit();
@@ -336,54 +301,5 @@ class ExpenseController extends Controller
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
         }
-    }
-
-    // ── Private Helpers: Cash Register ───────────────────────────────────────
-
-    /**
-     * Deduct an amount from the open cash register for a given warehouse.
-     * Used when a Cash expense is created.
-     */
-    private function deductFromCashRegister(?string $warehouseName, ?int $warehouseId, float $amount): void
-    {
-        $register = $this->findOpenRegister($warehouseName, $warehouseId);
-        if ($register) {
-            $register->decrement('expected_cash', $amount);
-            if ($register->closing_cash !== null) {
-                $register->decrement('closing_cash', $amount);
-            }
-        }
-    }
-
-    /**
-     * Restore an amount to the open cash register for a given warehouse.
-     * Used when a Cash expense is updated or deleted.
-     */
-    private function addToCashRegister(?string $warehouseName, ?int $warehouseId, float $amount): void
-    {
-        $register = $this->findOpenRegister($warehouseName, $warehouseId);
-        if ($register) {
-            $register->increment('expected_cash', $amount);
-            if ($register->closing_cash !== null) {
-                $register->increment('closing_cash', $amount);
-            }
-        }
-    }
-
-    /**
-     * Find the latest open cash register for the given warehouse.
-     */
-    private function findOpenRegister(?string $warehouseName, ?int $warehouseId): ?CashRegister
-    {
-        return CashRegister::where('status', 'open')
-            ->where(function ($q) use ($warehouseName, $warehouseId) {
-                if ($warehouseId) {
-                    $q->where('warehouse_id', $warehouseId);
-                } elseif ($warehouseName) {
-                    $q->where('warehouse_name', $warehouseName);
-                }
-            })
-            ->latest()
-            ->first();
     }
 }
