@@ -47,10 +47,13 @@ class AdjustmentController extends Controller
 
     public function index(Request $request)
     {
-        $query = StockAdjustment::with([
+        $query = StockAdjustment::select([
+            'id', 'reference_no', 'warehouse_id', 'warehouse_name', 'date',
+            'total_products', 'total_quantity', 'type', 'notes',
+            'user_id', 'user_name', 'created_by', 'user_role', 'created_at', 'updated_at'
+        ])->with([
             'user:id,name,role',
-            'items.variant.values',
-            'items.product',
+            'items:id,stock_adjustment_id,product_id,product_variant_id,product_code,product_name,variant_name,unit_id,unit_name,conversion_rate,quantity,base_quantity,type,unit_cost,base_unit_cost,subtotal',
         ]);
 
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
@@ -119,7 +122,6 @@ class AdjustmentController extends Controller
                         $adj->user_role = $adj->user->role;
                     }
                 }
-                $this->enrichAdjustmentItems($adj);
                 return $adj;
             });
 
@@ -145,7 +147,6 @@ class AdjustmentController extends Controller
                     $adj->user_role = $adj->user->role;
                 }
             }
-            $this->enrichAdjustmentItems($adj);
             return $adj;
         });
 
