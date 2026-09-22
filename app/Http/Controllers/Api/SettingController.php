@@ -42,6 +42,7 @@ class SettingController extends Controller
             'default_currency' => 'USD',
             'currency_symbol' => '$',
             'currency_position' => 'Prefix',
+            'default_language' => 'my',
             'receipt_header' => 'Welcome to အလင်းသစ် (Ah Linn Thit)!',
             'tax_rate' => '5',
             'tax_type' => 'percentage',
