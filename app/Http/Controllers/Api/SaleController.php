@@ -667,6 +667,86 @@ class SaleController extends Controller
         }
     }
 
+    public function deletePayment(Request $request, $saleId, $paymentId = null)
+    {
+        if ($paymentId === null) {
+            $payment = SalePayment::find($saleId);
+            if (!$payment) {
+                return response()->json(['status' => 'error', 'message' => 'Payment transaction not found'], 404);
+            }
+            $sale = Sale::find($payment->sale_id);
+        } else {
+            $sale = Sale::find($saleId) ?? Sale::where('reference_no', $saleId)->first();
+            if (!$sale) {
+                return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
+            }
+            $payment = SalePayment::where('sale_id', $sale->id)
+                ->where(function ($q) use ($paymentId) {
+                    $q->where('id', $paymentId)->orWhere('reference_no', $paymentId);
+                })->first() ?? SalePayment::find($paymentId);
+        }
+
+        if (!$payment) {
+            return response()->json(['status' => 'error', 'message' => 'Payment record not found for this sale'], 404);
+        }
+
+        if (!$sale) {
+            $sale = Sale::find($payment->sale_id);
+        }
+
+        if (!$sale) {
+            return response()->json(['status' => 'error', 'message' => 'Associated sale not found'], 404);
+        }
+
+        DB::beginTransaction();
+        try {
+            $payment->delete();
+
+            // Recalculate based on remaining active payments
+            $remainingPayments = SalePayment::where('sale_id', $sale->id)->get();
+            $newPaid = (float)$remainingPayments->sum('amount');
+            $newDue = max(0, (float)$sale->grand_total - $newPaid);
+
+            if ($newPaid <= 0.001) {
+                $newStatus = 'Unpaid';
+            } elseif ($newDue <= 0.001) {
+                $newStatus = 'Paid';
+            } else {
+                $newStatus = 'Partial';
+            }
+
+            $uniqueTypes = $remainingPayments->pluck('payment_type')->filter()->unique();
+            if ($uniqueTypes->count() > 1) {
+                $newPaymentType = 'Split Payment';
+            } elseif ($uniqueTypes->count() === 1) {
+                $newPaymentType = $uniqueTypes->first();
+            } else {
+                $newPaymentType = 'Cash';
+            }
+
+            $sale->update([
+                'paid_amount' => $newPaid,
+                'due_amount' => $newDue,
+                'payment_status' => $newStatus,
+                'payment_type' => $newPaymentType,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Payment deleted successfully. Due balance updated.',
+                'data' => $sale->load(['items', 'payments', 'customer']),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to delete payment: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
     public function update(Request $request, $id)
     {
         $sale = Sale::find($id) ?? Sale::where('reference_no', $id)->first();

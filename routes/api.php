@@ -97,6 +97,8 @@ Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close'
 
 // Sales, POS Checkout & Sales Returns
 Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
+Route::delete('sales/{saleId}/payments/{paymentId}', [SaleController::class, 'deletePayment']);
+Route::delete('sales/payments/{paymentId}', [SaleController::class, 'deletePayment']);
 Route::post('sales/{id}/void', [SaleController::class, 'voidSale'])->middleware('permission:sales.void');
 Route::apiResource('sales', SaleController::class);
 Route::apiResource('sale-returns', SaleReturnController::class);
