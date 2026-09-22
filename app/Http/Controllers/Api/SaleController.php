@@ -29,7 +29,7 @@ class SaleController extends Controller
         ]);
 
         $relations = [
-            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount',
+            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount,notes',
             'customer:id,name',
         ];
 
