@@ -563,43 +563,97 @@ class SaleController extends Controller
         }
 
         $validated = $request->validate([
-            'amount' => 'required|numeric|min:0.01',
-            'payment_type' => 'required|string',
+            'amount' => 'required_without:payments|nullable|numeric|min:0.01',
+            'payment_type' => 'required_without:payments|nullable|string',
             'payment_date' => 'nullable|string',
             'notes' => 'nullable|string',
+            'payments' => 'nullable|array|min:1',
+            'payments.*.amount' => 'required|numeric|min:0.01',
+            'payments.*.payment_type' => 'required|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount' => 'nullable|numeric|min:0',
+            'payments.*.payment_date' => 'nullable|string',
+            'payments.*.notes' => 'nullable|string',
         ]);
 
-        $payingAmount = (float)$validated['amount'];
-        $newPaid = $sale->paid_amount + $payingAmount;
-        $newDue = max(0, $sale->grand_total - $newPaid);
-        $newStatus = $newDue <= 0 ? 'Paid' : 'Partial';
+        $createdBy = $request->user()?->name ?? 'Cashier';
 
         DB::beginTransaction();
         try {
-            $payment = SalePayment::create([
-                'sale_id' => $sale->id,
-                'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
-                'payment_date' => $validated['payment_date'] ?? date('Y-m-d H:i:s'),
-                'payment_type' => $validated['payment_type'],
-                'amount' => $payingAmount,
-                'received_amount' => $payingAmount,
-                'change_amount' => 0,
-                'notes' => $validated['notes'] ?? null,
-                'created_by' => 'Cashier',
-            ]);
+            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                $paymentsList = $validated['payments'];
+                $totalPaying = 0.0;
+                foreach ($paymentsList as $idx => $p) {
+                    $pAmt = (float)($p['amount'] ?? 0);
+                    if ($pAmt <= 0) continue;
+                    $totalPaying += $pAmt;
+                    SalePayment::create([
+                        'sale_id' => $sale->id,
+                        'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999) . '-' . ($idx + 1),
+                        'payment_date' => $p['payment_date'] ?? ($validated['payment_date'] ?? date('Y-m-d H:i:s')),
+                        'payment_type' => $p['payment_type'] ?? 'Cash',
+                        'amount' => $pAmt,
+                        'received_amount' => (float)($p['received_amount'] ?? $pAmt),
+                        'change_amount' => (float)($p['change_amount'] ?? 0),
+                        'notes' => $p['notes'] ?? ($validated['notes'] ?? 'Additional split payment'),
+                        'created_by' => $createdBy,
+                    ]);
+                }
 
-            $sale->update([
-                'paid_amount' => $newPaid,
-                'due_amount' => $newDue,
-                'payment_status' => $newStatus,
-            ]);
+                $newPaid = $sale->paid_amount + $totalPaying;
+                $newDue = max(0, $sale->grand_total - $newPaid);
+                $newStatus = $newDue <= 0 ? 'Paid' : 'Partial';
+
+                $newPaymentType = $sale->payment_type;
+                if (count($paymentsList) > 1 || $sale->payment_type === 'Split Payment') {
+                    $newPaymentType = 'Split Payment';
+                } elseif ($sale->paid_amount <= 0 && !empty($paymentsList[0]['payment_type'])) {
+                    $newPaymentType = $paymentsList[0]['payment_type'];
+                }
+
+                $sale->update([
+                    'paid_amount' => $newPaid,
+                    'due_amount' => $newDue,
+                    'payment_status' => $newStatus,
+                    'payment_type' => $newPaymentType,
+                ]);
+            } else {
+                $payingAmount = (float)$validated['amount'];
+                $newPaid = $sale->paid_amount + $payingAmount;
+                $newDue = max(0, $sale->grand_total - $newPaid);
+                $newStatus = $newDue <= 0 ? 'Paid' : 'Partial';
+
+                $newPaymentType = $sale->payment_type;
+                if ($sale->payment_type && $sale->payment_type !== $validated['payment_type'] && $sale->paid_amount > 0) {
+                    $newPaymentType = 'Split Payment';
+                }
+
+                SalePayment::create([
+                    'sale_id' => $sale->id,
+                    'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
+                    'payment_date' => $validated['payment_date'] ?? date('Y-m-d H:i:s'),
+                    'payment_type' => $validated['payment_type'],
+                    'amount' => $payingAmount,
+                    'received_amount' => $payingAmount,
+                    'change_amount' => 0,
+                    'notes' => $validated['notes'] ?? null,
+                    'created_by' => $createdBy,
+                ]);
+
+                $sale->update([
+                    'paid_amount' => $newPaid,
+                    'due_amount' => $newDue,
+                    'payment_status' => $newStatus,
+                    'payment_type' => $newPaymentType,
+                ]);
+            }
 
             DB::commit();
 
             return response()->json([
                 'status' => 'success',
                 'message' => 'Payment added successfully',
-                'data' => $sale->load(['items', 'payments']),
+                'data' => $sale->load(['items', 'payments', 'customer']),
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
