@@ -293,14 +293,12 @@ class SaleReturnController extends Controller
                 }
             }
 
-            // ── Loyalty Points & Total Spent Reversal ────────────────────────
+            // ── Customer Total Spent Reversal (Points decommissioned) ─────────
             if ($return->status === 'Completed' && !empty($validated['customer_id'])) {
                 $cust = \App\Models\Customer::find($validated['customer_id']);
                 if ($cust) {
-                    $lostPoints = (int) floor($grandTotal / 1000);
                     $cust->update([
                         'total_spent'   => max(0, (float)$cust->total_spent - $grandTotal),
-                        'reward_points' => max(0, (int)$cust->reward_points - $lostPoints),
                     ]);
                 }
             }

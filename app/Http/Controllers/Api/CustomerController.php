@@ -52,7 +52,7 @@ class CustomerController extends Controller
         $summaryData = Customer::selectRaw("
             COUNT(*) as total_customers,
             SUM(CASE WHEN tier IN ('VIP Platinum', 'Gold VIP') THEN 1 ELSE 0 END) as vip_members,
-            COALESCE(SUM(reward_points), 0) as total_points,
+            0 as total_points,
             SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active_customers
         ")->first();
 

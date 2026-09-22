@@ -272,8 +272,8 @@ class SaleController extends Controller
                 'tax_rate' => (float)($validated['tax_rate'] ?? 0),
                 'tax_amount' => (float)($validated['tax_amount'] ?? 0),
                 'discount' => (float)($validated['discount'] ?? 0),
-                'redeemed_points' => (int)($validated['redeemed_points'] ?? 0),
-                'points_discount' => (float)($validated['points_discount'] ?? 0),
+                'redeemed_points' => 0,
+                'points_discount' => 0.0,
                 'shipping' => (float)($validated['shipping'] ?? 0),
                 'subtotal' => (float)$validated['subtotal'],
                 'grand_total' => $grandTotal,
@@ -508,34 +508,14 @@ class SaleController extends Controller
                 ]);
             }
 
-            // Accumulate customer loyalty points, total spend, and visit count
+            // Update customer total spend and visit count (Customer Group/Tier remains manual; Points decommissioned)
             if ($sale->status === 'Completed' && !empty($validated['customer_id'])) {
                 $cust = Customer::find($validated['customer_id']);
                 if ($cust) {
-                    $earnedPoints = (int) floor($grandTotal / 1000);
-                    $redeemedPoints = (int)($validated['redeemed_points'] ?? 0);
-
-                    if ($redeemedPoints > 0 && (int)$cust->reward_points < $redeemedPoints) {
-                        throw new \RuntimeException("Insufficient loyalty points. Customer has {$cust->reward_points} points, but {$redeemedPoints} were requested for redemption.");
-                    }
-
                     $newTotalSpent = (float)$cust->total_spent + $grandTotal;
-                    $tier = $cust->tier ?? 'Standard';
-                    if ($newTotalSpent >= 1000000) {
-                        $tier = 'VIP';
-                    } elseif ($newTotalSpent >= 500000) {
-                        $tier = 'Gold';
-                    } elseif ($newTotalSpent >= 200000) {
-                        $tier = 'Silver';
-                    }
-
-                    $netPoints = max(0, (int)$cust->reward_points - $redeemedPoints + $earnedPoints);
-
                     $cust->update([
                         'total_spent' => $newTotalSpent,
                         'total_visits' => (int)$cust->total_visits + 1,
-                        'reward_points' => $netPoints,
-                        'tier' => $tier,
                     ]);
                 }
             }
@@ -775,30 +755,14 @@ class SaleController extends Controller
             // 2. Reverse FIFO cost layers and replenish batch quantities
             app(\App\Services\FifoInventoryService::class)->reverseSaleFifo($sale);
 
-            // 3. Revert customer loyalty points, total spend, and visits
+            // 3. Revert customer total spend and visits (Customer Group/Tier remains manual; Points decommissioned)
             if ($sale->customer_id) {
                 $cust = Customer::find($sale->customer_id);
                 if ($cust) {
-                    $earnedPoints = (int) floor((float)$sale->grand_total / 1000);
                     $newTotalSpent = max(0, (float)$cust->total_spent - (float)$sale->grand_total);
-                    $tier = 'Standard';
-                    if ($newTotalSpent >= 1000000) {
-                        $tier = 'VIP';
-                    } elseif ($newTotalSpent >= 500000) {
-                        $tier = 'Gold';
-                    } elseif ($newTotalSpent >= 200000) {
-                        $tier = 'Silver';
-                    }
-
-                    // Restore any redeemed points
-                    $redeemedPoints = (int)($sale->redeemed_points ?? 0);
-                    $newPoints = max(0, (int)$cust->reward_points - $earnedPoints + $redeemedPoints);
-
                     $cust->update([
                         'total_spent'   => $newTotalSpent,
                         'total_visits'  => max(0, (int)$cust->total_visits - 1),
-                        'reward_points' => $newPoints,
-                        'tier'          => $tier,
                     ]);
                 }
             }
