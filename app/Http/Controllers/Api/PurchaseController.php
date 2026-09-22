@@ -32,7 +32,10 @@ class PurchaseController extends Controller
         ];
 
         if (!$request->boolean('no_items', false)) {
-            $relations[] = 'items:id,purchase_id,product_id,product_variant_id,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal';
+            $relations[] = 'items:id,purchase_id,product_id,product_variant_id,variant_name,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal';
+            $relations[] = 'items.variant.values';
+            $relations[] = 'items.variant.attributeValues';
+            $relations[] = 'items.product';
         }
 
         $query->with($relations);
@@ -134,6 +137,7 @@ class PurchaseController extends Controller
             'items'                     => 'required|array|min:1',
             'items.*.product_id'        => 'nullable|integer',
             'items.*.product_variant_id'=> 'nullable|integer',
+            'items.*.variant_name'      => 'nullable|string',
             'items.*.unit_id'           => 'nullable|integer',
             'items.*.unit_name'         => 'nullable|string|max:100',
             'items.*.conversion_rate'   => 'nullable|numeric|gt:0',
@@ -266,6 +270,7 @@ class PurchaseController extends Controller
                     'purchase_id' => $purchase->id,
                     'product_id' => $product?->id,
                     'product_variant_id' => $variantId,
+                    'variant_name' => $item['variant_name'] ?? null,
                     'unit_id' => $linkedUnit['unit_id'],
                     'unit_name' => $linkedUnit['unit_name'],
                     'conversion_rate' => $linkedUnit['conversion_rate'],
@@ -318,7 +323,7 @@ class PurchaseController extends Controller
             return response()->json([
                 'status' => 'success',
                 'message' => 'Purchase order created successfully',
-                'data' => $purchase->load('items'),
+                'data' => $purchase->load(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'supplier']),
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -367,13 +372,13 @@ class PurchaseController extends Controller
         return response()->json([
             'status' => 'success',
             'message' => 'Purchase updated successfully',
-            'data' => $purchase->load('items'),
+            'data' => $purchase->load(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'supplier']),
         ]);
     }
 
     public function show($id)
     {
-        $purchase = Purchase::with(['items', 'supplier'])->where('reference_no', (string)$id)->first() ?? Purchase::with(['items', 'supplier'])->find($id);
+        $purchase = Purchase::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'supplier'])->where('reference_no', (string)$id)->first() ?? Purchase::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'supplier'])->find($id);
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }

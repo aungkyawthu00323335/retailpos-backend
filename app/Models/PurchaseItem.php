@@ -18,6 +18,7 @@ class PurchaseItem extends Model
         'conversion_rate',
         'product_code',
         'product_name',
+        'variant_name',
         'unit_cost',
         'base_unit_cost',
         'quantity',
@@ -41,5 +42,15 @@ class PurchaseItem extends Model
     public function purchase()
     {
         return $this->belongsTo(Purchase::class, 'purchase_id');
+    }
+
+    public function product()
+    {
+        return $this->belongsTo(Product::class, 'product_id');
+    }
+
+    public function variant()
+    {
+        return $this->belongsTo(ProductVariant::class, 'product_variant_id');
     }
 }

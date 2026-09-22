@@ -44,6 +44,11 @@ class ProductVariant extends Model
         return $this->hasMany(ProductVariantValue::class);
     }
 
+    public function attributeValues()
+    {
+        return $this->hasMany(ProductVariantValue::class);
+    }
+
     public function stockBalances()
     {
         return $this->hasMany(StockBalance::class, 'product_variant_id');
