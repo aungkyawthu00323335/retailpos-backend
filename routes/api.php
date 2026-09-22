@@ -115,6 +115,9 @@ Route::patch('payment-methods/{id}/toggle-status', [PaymentMethodController::cla
 Route::apiResource('payment-methods', PaymentMethodController::class);
 
 // Customers & Customer Groups (CRM)
+Route::get('customers/template', [CustomerController::class, 'downloadTemplate']);
+Route::get('customers/export', [CustomerController::class, 'export']);
+Route::post('customers/bulk-import', [CustomerController::class, 'bulkImport']);
 Route::patch('customers/{id}/toggle-status', [CustomerController::class, 'toggleStatus']);
 Route::apiResource('customers', CustomerController::class);
 Route::patch('customer-groups/{id}/toggle-status', [CustomerGroupController::class, 'toggleStatus']);
