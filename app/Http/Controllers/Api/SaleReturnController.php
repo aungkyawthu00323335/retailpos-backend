@@ -181,6 +181,9 @@ class SaleReturnController extends Controller
         $fifoService = app(\App\Services\FifoInventoryService::class);
         $warehouseId = $unitService->warehouseId(null, $validated['warehouse_name'] ?? null);
 
+        // Build items payload
+        $itemsPayload = !empty($validated['items']) ? json_encode($validated['items']) : null;
+
         DB::beginTransaction();
         try {
             $userId    = $validated['user_id'] ?? ($request->user()?->id);
