@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\ProductUnitController;
 use App\Http\Controllers\Api\SaleUnitController;
 use App\Http\Controllers\Api\PurchaseUnitController;
 use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\ProductExcelController;
 use App\Http\Controllers\Api\AdjustmentController;
 use App\Http\Controllers\Api\TransferController;
 use App\Http\Controllers\Api\PurchaseController;
@@ -72,6 +73,10 @@ Route::post('products/generate-barcode', [ProductController::class, 'generateBar
 Route::get('products/template', [ProductController::class, 'downloadTemplate']);
 Route::get('products/export', [ProductController::class, 'export']);
 Route::post('products/bulk-import', [ProductController::class, 'bulkImport']);
+Route::get('products/excel-template', [ProductExcelController::class, 'downloadTemplate']);
+Route::get('products/excel-export', [ProductExcelController::class, 'exportProducts']);
+Route::post('products/excel-import', [ProductExcelController::class, 'importNewProducts']);
+Route::post('products/price-change-import', [ProductExcelController::class, 'importPriceChanges']);
 Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
 Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
