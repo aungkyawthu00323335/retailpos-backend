@@ -2115,14 +2115,64 @@ class ReportController extends Controller
     public function profitLoss(Request $request)
     {
         $warehouse = $request->query('warehouse_name', $request->query('warehouse', 'All'));
+        $dateFilter = $request->query('date_filter');
         $startDate = $request->query('start_date', $request->query('from_date', ''));
         $endDate = $request->query('end_date', $request->query('to_date', ''));
         $statusFilter = $request->query('status', 'All');
         $search = trim($request->query('search', ''));
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
 
-        $cacheKey = "pos_profit_loss_v2_" . md5(json_encode([
-            $warehouse, $startDate, $endDate, $statusFilter, $search
+        // 1. Unified Period Presets Parsing (Aligned with Admin Dashboard)
+        if (!empty($dateFilter)) {
+            switch ($dateFilter) {
+                case 'today':
+                    $startDate = Carbon::today()->toDateString();
+                    $endDate = Carbon::today()->toDateString();
+                    break;
+                case 'yesterday':
+                    $startDate = Carbon::yesterday()->toDateString();
+                    $endDate = Carbon::yesterday()->toDateString();
+                    break;
+                case 'last_7_days':
+                    $startDate = Carbon::today()->subDays(6)->toDateString();
+                    $endDate = Carbon::today()->toDateString();
+                    break;
+                case 'this_month':
+                    $startDate = Carbon::today()->startOfMonth()->toDateString();
+                    $endDate = Carbon::today()->toDateString();
+                    break;
+                case 'last_month':
+                    $startDate = Carbon::today()->subMonth()->startOfMonth()->toDateString();
+                    $endDate = Carbon::today()->subMonth()->endOfMonth()->toDateString();
+                    break;
+                case 'this_year':
+                    $startDate = Carbon::today()->startOfYear()->toDateString();
+                    $endDate = Carbon::today()->toDateString();
+                    break;
+                case 'all':
+                    $startDate = null;
+                    $endDate = null;
+                    break;
+                case 'custom':
+                    // Respect provided start_date & end_date
+                    break;
+            }
+        } else {
+            if (!empty($startDate) && !empty($endDate)) {
+                $dateFilter = 'custom';
+            } else {
+                $dateFilter = 'all';
+            }
+        }
+
+        if (!empty($startDate) && !empty($endDate) && $startDate > $endDate) {
+            $temp = $startDate;
+            $startDate = $endDate;
+            $endDate = $temp;
+        }
+
+        $cacheKey = "pos_profit_loss_v3_" . md5(json_encode([
+            $warehouse, $dateFilter, $startDate, $endDate, $statusFilter, $search
         ]));
 
         if (!$forceRefresh) {
@@ -2134,18 +2184,24 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
+        // B-tree Index-friendly Date Scoping helper (preserves index range seek)
+        $applyDateScope = function ($query, $column = 'date') use ($startDate, $endDate) {
+            if (!empty($startDate) && !empty($endDate)) {
+                $query->where($column, '>=', $startDate)
+                      ->where($column, '<=', $endDate . ' 23:59:59');
+            } elseif (!empty($startDate)) {
+                $query->where($column, '>=', $startDate);
+            } elseif (!empty($endDate)) {
+                $query->where($column, '<=', $endDate . ' 23:59:59');
+            }
+        };
+
         // 1. Sales Query Scope
         $salesQuery = DB::table('sales')->where('status', '!=', 'Voided');
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $salesQuery->where('warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($salesQuery, 'date');
 
         $salesSummary = (clone $salesQuery)
             ->selectRaw("
@@ -2161,30 +2217,21 @@ class ReportController extends Controller
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $returnsQuery->where('warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $returnsQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $returnsQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $returnsQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($returnsQuery, 'date');
         $saleReturns = (float)$returnsQuery->sum('grand_total');
 
         $grossSales = (float)($salesSummary->gross_sales ?? 0);
         $netSales = max(0.0, $grossSales - $saleReturns);
 
         // 3. Purchases & Purchase Returns Query Scope
-        $purchQuery = DB::table('purchases');
+        $purchQuery = DB::table('purchases')->where(function ($q) {
+            $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+        });
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $purchQuery->where('warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $purchQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $purchQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $purchQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($purchQuery, 'date');
+
         $purchSummary = (clone $purchQuery)
             ->selectRaw("
                 COUNT(id) as total_purchases_count,
@@ -2197,13 +2244,7 @@ class ReportController extends Controller
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $prQuery->where('warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $prQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $prQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $prQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($prQuery, 'date');
         $purchaseReturns = (float)$prQuery->sum('grand_total');
         $netPurchases = max(0.0, $grossPurchases - $purchaseReturns);
 
@@ -2211,18 +2252,14 @@ class ReportController extends Controller
         $cogsQuery = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
             ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
+            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+            ->where('sales.status', '!=', 'Voided');
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $cogsQuery->where('sales.warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $cogsQuery->whereRaw("SUBSTRING(sales.date, 1, 10) >= ? AND SUBSTRING(sales.date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $cogsQuery->whereRaw("SUBSTRING(sales.date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $cogsQuery->whereRaw("SUBSTRING(sales.date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($cogsQuery, 'sales.date');
+
         $cogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0)';
         $cogs = (float)$cogsQuery->selectRaw("{$cogsExpr} as total_cogs")->value('total_cogs');
 
@@ -2234,13 +2271,7 @@ class ReportController extends Controller
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $expQuery->where('warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $expQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $expQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $expQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($expQuery, 'date');
         $totalExpenses = (float)$expQuery->sum('amount');
 
         // 5b. Inventory Shrinkage / Wastage Loss (Damages & Expiries)
@@ -2250,18 +2281,10 @@ class ReportController extends Controller
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $lossQuery->where('stock_adjustments.warehouse_name', $warehouse);
         }
-        if (!empty($startDate) && !empty($endDate)) {
-            $lossQuery->whereRaw("SUBSTRING(stock_adjustments.date, 1, 10) >= ? AND SUBSTRING(stock_adjustments.date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $lossQuery->whereRaw("SUBSTRING(stock_adjustments.date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $lossQuery->whereRaw("SUBSTRING(stock_adjustments.date, 1, 10) <= ?", [$endDate]);
-        }
+        $applyDateScope($lossQuery, 'stock_adjustments.date');
         $inventoryLoss = (float)$lossQuery->sum('stock_adjustment_items.subtotal');
 
-        // Bug Fix: Include inventory shrinkage/wastage loss in Net Profit calculation
-        // Standard retail accounting: Net Profit = Gross Profit - Operating Expenses - Inventory Loss
-        // Previously $inventoryLoss was calculated and returned in response but NOT subtracted from Net Profit
+        // Standard GAAP / Retail Accounting: Net Profit = Gross Profit - Operating Expenses - Inventory Loss
         $netProfit = round($grossProfit - $totalExpenses - $inventoryLoss, 2);
         $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 2) : 0.0;
 
@@ -2280,7 +2303,7 @@ class ReportController extends Controller
             })
             ->all();
 
-        // 7. Monthly Period Ledger Breakdown
+        // 7. Monthly Period Ledger Breakdown (Properly scoped with warehouse & dates!)
         $salesMonthly = (clone $salesQuery)
             ->selectRaw("
                 SUBSTRING(date, 1, 7) as month_period,
@@ -2292,22 +2315,37 @@ class ReportController extends Controller
             ->orderByDesc(DB::raw("SUBSTRING(date, 1, 7)"))
             ->get();
 
-        $returnsMonthly = DB::table('sale_returns')
+        $returnsMonthlyQuery = DB::table('sale_returns');
+        $expensesMonthlyQuery = DB::table('expenses');
+        $cogsMonthlyQuery = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+            ->where('sales.status', '!=', 'Voided');
+
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $returnsMonthlyQuery->where('warehouse_name', $warehouse);
+            $expensesMonthlyQuery->where('warehouse_name', $warehouse);
+            $cogsMonthlyQuery->where('sales.warehouse_name', $warehouse);
+        }
+
+        $applyDateScope($returnsMonthlyQuery, 'date');
+        $applyDateScope($expensesMonthlyQuery, 'date');
+        $applyDateScope($cogsMonthlyQuery, 'sales.date');
+
+        $returnsMonthly = $returnsMonthlyQuery
             ->selectRaw("SUBSTRING(date, 1, 7) as month_period, COALESCE(warehouse_name, 'Main Branch Outlet') as w_name, SUM(grand_total) as returns_total")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 7)"), 'warehouse_name')
             ->get()
             ->keyBy(function($r) { return $r->month_period . '_' . $r->w_name; });
 
-        $expensesMonthly = DB::table('expenses')
+        $expensesMonthly = $expensesMonthlyQuery
             ->selectRaw("SUBSTRING(date, 1, 7) as month_period, COALESCE(warehouse_name, 'Main Branch Outlet') as w_name, SUM(amount) as expenses_total")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 7)"), 'warehouse_name')
             ->get()
             ->keyBy(function($e) { return $e->month_period . '_' . $e->w_name; });
 
-        $cogsMonthly = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+        $cogsMonthly = $cogsMonthlyQuery
             ->selectRaw("SUBSTRING(sales.date, 1, 7) as month_period, COALESCE(sales.warehouse_name, 'Main Branch Outlet') as w_name, {$cogsExpr} as cogs_total")
             ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 7)"), 'sales.warehouse_name')
             ->get()
@@ -2372,7 +2410,11 @@ class ReportController extends Controller
             ];
         }
 
+        $ordersCount = (int)($salesSummary->total_orders ?? 0);
         $summary = [
+            'date_filter' => $dateFilter,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
             'total_gross_sales' => round($grossSales, 2),
             'total_sales_return' => round($saleReturns, 2),
             'total_net_sales' => round($netSales, 2),
@@ -2387,7 +2429,8 @@ class ReportController extends Controller
             'total_net_profit' => round($netProfit, 2),
             'net_margin_percentage' => $netMarginPct,
             'total_periods' => count($periods),
-            'total_orders' => (int)($salesSummary->total_orders ?? 0),
+            'total_orders' => $ordersCount,
+            'average_order_value' => $ordersCount > 0 ? round($netSales / $ordersCount, 2) : 0.0,
         ];
 
         // Backwards-compatible payload matching RetailPosTest & Flutter models
