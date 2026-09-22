@@ -18,6 +18,7 @@ class SaleItem extends Model
         'conversion_rate',
         'product_code',
         'product_name',
+        'variant_name',
         'unit_price',
         'base_unit_price',
         'quantity',

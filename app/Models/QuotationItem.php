@@ -18,6 +18,7 @@ class QuotationItem extends Model
         'conversion_rate',
         'product_code',
         'product_name',
+        'variant_name',
         'unit_price',
         'base_unit_price',
         'quantity',
@@ -44,5 +45,15 @@ class QuotationItem extends Model
     public function quotation()
     {
         return $this->belongsTo(Quotation::class, 'quotation_id');
+    }
+
+    public function product()
+    {
+        return $this->belongsTo(Product::class, 'product_id');
+    }
+
+    public function variant()
+    {
+        return $this->belongsTo(ProductVariant::class, 'product_variant_id');
     }
 }

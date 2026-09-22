@@ -20,7 +20,7 @@ class QuotationController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Quotation::with(['items', 'customer']);
+        $query = Quotation::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']);
 
         // Filter: Warehouse / Outlet
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
@@ -167,6 +167,7 @@ class QuotationController extends Controller
             'items.*.base_quantity'      => 'nullable|numeric|min:0',
             'items.*.product_code'       => 'required|string',
             'items.*.product_name'       => 'required|string',
+            'items.*.variant_name'       => 'nullable|string',
             'items.*.unit_price'         => 'required|numeric|min:0',
             'items.*.quantity'           => 'required|numeric|min:0.01',
             'items.*.tax'                => 'nullable|numeric|min:0',
@@ -241,6 +242,7 @@ class QuotationController extends Controller
                     'conversion_rate' => $convRate,
                     'product_code' => $item['product_code'],
                     'product_name' => $item['product_name'],
+                    'variant_name' => $item['variant_name'] ?? null,
                     'unit_price' => $unitPrice,
                     'base_unit_price' => $basePrice,
                     'quantity' => $qty,
@@ -260,7 +262,7 @@ class QuotationController extends Controller
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation created successfully',
-                'data' => $quotation->load(['items', 'customer']),
+                'data' => $quotation->load(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']),
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -273,7 +275,7 @@ class QuotationController extends Controller
      */
     public function show($id)
     {
-        $quotation = Quotation::with(['items', 'customer'])->find($id);
+        $quotation = Quotation::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer'])->find($id);
         if (!$quotation) {
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
@@ -319,6 +321,7 @@ class QuotationController extends Controller
             'items.*.base_quantity'      => 'nullable|numeric|min:0',
             'items.*.product_code'       => 'required|string',
             'items.*.product_name'       => 'required|string',
+            'items.*.variant_name'       => 'nullable|string',
             'items.*.unit_price'         => 'required|numeric|min:0',
             'items.*.quantity'           => 'required|numeric|min:0.01',
             'items.*.tax'                => 'nullable|numeric|min:0',
@@ -401,6 +404,7 @@ class QuotationController extends Controller
                     'conversion_rate' => $convRate,
                     'product_code' => $item['product_code'],
                     'product_name' => $item['product_name'],
+                    'variant_name' => $item['variant_name'] ?? null,
                     'unit_price' => $unitPrice,
                     'base_unit_price' => $basePrice,
                     'quantity' => $qty,
@@ -420,7 +424,7 @@ class QuotationController extends Controller
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation updated successfully',
-                'data' => $quotation->fresh(['items', 'customer']),
+                'data' => $quotation->fresh(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']),
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -545,6 +549,7 @@ class QuotationController extends Controller
                     'base_unit_price'   => $basePrice,
                     'product_code'      => $item->product_code,
                     'product_name'      => $item->product_name,
+                    'variant_name'      => $item->variant_name,
                     'unit_price'        => $unitPrice,
                     'quantity'          => $qty,
                     'tax'               => (float)$item->tax,
