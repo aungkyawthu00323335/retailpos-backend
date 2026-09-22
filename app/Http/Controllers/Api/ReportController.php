@@ -29,7 +29,67 @@ class ReportController extends Controller
         $year = (int)$request->query('year', Carbon::now()->year);
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
 
-        $cacheKey = "pos_dashboard_summary_" . md5($warehouse . '_' . $year);
+        $dateFilter = strtolower(trim((string)$request->query('date_filter', 'this_month')));
+        $startDate = $request->query('start_date');
+        $endDate = $request->query('end_date');
+
+        // Resolve standard presets if start_date/end_date not provided explicitly
+        switch ($dateFilter) {
+            case 'today':
+                $startDate = Carbon::today()->toDateString();
+                $endDate = Carbon::today()->toDateString();
+                break;
+            case 'yesterday':
+                $startDate = Carbon::yesterday()->toDateString();
+                $endDate = Carbon::yesterday()->toDateString();
+                break;
+            case 'last_7_days':
+            case '7_days':
+                $startDate = Carbon::today()->subDays(6)->toDateString();
+                $endDate = Carbon::today()->toDateString();
+                break;
+            case 'this_month':
+                $startDate = Carbon::today()->startOfMonth()->toDateString();
+                $endDate = Carbon::today()->toDateString();
+                break;
+            case 'last_month':
+                $startDate = Carbon::today()->subMonth()->startOfMonth()->toDateString();
+                $endDate = Carbon::today()->subMonth()->endOfMonth()->toDateString();
+                break;
+            case 'this_year':
+                $startDate = Carbon::today()->startOfYear()->toDateString();
+                $endDate = Carbon::today()->toDateString();
+                break;
+            case 'all':
+                $startDate = null;
+                $endDate = null;
+                break;
+            case 'custom':
+                if (empty($startDate)) {
+                    $startDate = Carbon::today()->startOfMonth()->toDateString();
+                }
+                if (empty($endDate)) {
+                    $endDate = Carbon::today()->toDateString();
+                }
+                break;
+            default:
+                if (!empty($startDate) && !empty($endDate)) {
+                    $dateFilter = 'custom';
+                } else {
+                    $dateFilter = 'this_month';
+                    $startDate = Carbon::today()->startOfMonth()->toDateString();
+                    $endDate = Carbon::today()->toDateString();
+                }
+                break;
+        }
+
+        if (!empty($startDate) && !empty($endDate) && $startDate > $endDate) {
+            $temp = $startDate;
+            $startDate = $endDate;
+            $endDate = $temp;
+        }
+
+        $cacheKey = "pos_dashboard_" . md5($warehouse . '_' . $dateFilter . '_' . ($startDate ?? 'all') . '_' . ($endDate ?? 'all') . '_' . $year);
         if (!$forceRefresh) {
             try {
                 $cachedData = Cache::get($cacheKey);
@@ -41,65 +101,95 @@ class ReportController extends Controller
 
         $today = Carbon::today()->toDateString();
         $yesterday = Carbon::yesterday()->toDateString();
-
-        // 1. Base query scopes
-        $salesQuery = Sale::query()->where('status', '!=', 'Voided');
-        $purchQuery = Purchase::query();
-        $expQuery = Expense::query();
-
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where('warehouse_name', $warehouse);
-            $purchQuery->where('warehouse_name', $warehouse);
-            $expQuery->where('warehouse_name', $warehouse);
-        }
-
-        // 2. Single-Pass Consolidated Sales Aggregation with Substring/Timestamp Matching
         $todayPrefix = $today . '%';
         $yesterdayPrefix = $yesterday . '%';
 
-        $salesAgg = (clone $salesQuery)
-            ->selectRaw('
-                COALESCE(SUM(grand_total), 0) as total_sales,
-                COALESCE(SUM(due_amount), 0) as customer_due,
-                COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as today_sales,
-                COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN 1 ELSE 0 END), 0) as today_sales_count,
-                COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
-            ', [$todayPrefix, $today, $todayPrefix, $today, $yesterdayPrefix, $yesterday])
-            ->first();
+        // Date scoping helper (preserves index range seek)
+        $applyDateScope = function ($query, $column = 'date') use ($startDate, $endDate) {
+            if (!empty($startDate) && !empty($endDate)) {
+                $query->where($column, '>=', $startDate)
+                      ->where($column, '<=', $endDate . ' 23:59:59');
+            }
+        };
 
-        $totalSales = (float)($salesAgg->total_sales ?? 0);
-        $customerDue = (float)($salesAgg->customer_due ?? 0);
-        $todaySales = (float)($salesAgg->today_sales ?? 0);
-        $todaySalesCount = (int)($salesAgg->today_sales_count ?? 0);
-        $yesterdaySales = (float)($salesAgg->yesterday_sales ?? 0);
+        // 1. Base query scopes
+        $salesBaseQuery = DB::table('sales')->where('status', '!=', 'Voided');
+        $purchBaseQuery = DB::table('purchases')->where(function ($q) {
+            $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+        });
+        $expBaseQuery = DB::table('expenses');
 
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesBaseQuery->where('warehouse_name', $warehouse);
+            $purchBaseQuery->where('warehouse_name', $warehouse);
+            $expBaseQuery->where('warehouse_name', $warehouse);
+        }
+
+        // 2. Single-Pass Consolidated Period Sales Aggregation
+        $periodSalesQuery = clone $salesBaseQuery;
+        $applyDateScope($periodSalesQuery, 'date');
+        $periodSalesAgg = $periodSalesQuery->selectRaw('
+            COALESCE(SUM(grand_total), 0) as total_sales,
+            COALESCE(SUM(paid_amount), 0) as paid_amount,
+            COALESCE(SUM(due_amount), 0) as due_amount,
+            COUNT(*) as orders_count
+        ')->first();
+
+        $totalSales = (float)($periodSalesAgg->total_sales ?? 0);
+        $periodPaid = (float)($periodSalesAgg->paid_amount ?? 0);
+        $periodDue = (float)($periodSalesAgg->due_amount ?? 0);
+        $ordersCount = (int)($periodSalesAgg->orders_count ?? 0);
+
+        // Real-time Pulse Metrics (Today vs Yesterday)
+        $pulseSalesAgg = (clone $salesBaseQuery)->selectRaw('
+            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as today_sales,
+            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN 1 ELSE 0 END), 0) as today_sales_count,
+            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
+        ', [$todayPrefix, $today, $todayPrefix, $today, $yesterdayPrefix, $yesterday])->first();
+
+        $todaySales = (float)($pulseSalesAgg->today_sales ?? 0);
+        $todaySalesCount = (int)($pulseSalesAgg->today_sales_count ?? 0);
+        $yesterdaySales = (float)($pulseSalesAgg->yesterday_sales ?? 0);
         $salesGrowthPct = $yesterdaySales > 0
             ? round((($todaySales - $yesterdaySales) / $yesterdaySales) * 100, 1)
             : ($todaySales > 0 ? 100.0 : 0.0);
 
+        // Sales Returns in matching period
         $totalSaleReturns = 0.0;
         try {
             $srQuery = DB::table('sale_returns');
             if ($warehouse !== 'All' && !empty($warehouse)) {
                 $srQuery->where('warehouse_name', $warehouse);
             }
+            $applyDateScope($srQuery, 'date');
+            $srQuery->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+            });
             $totalSaleReturns = (float)$srQuery->sum('grand_total');
         } catch (\Throwable $e) {}
 
         $netSales = max(0.0, $totalSales - $totalSaleReturns);
+        $averageOrderValue = $ordersCount > 0 ? round($netSales / $ordersCount, 2) : 0.0;
+        $cashRatioPct = $totalSales > 0 ? round(($periodPaid / $totalSales) * 100, 1) : 0.0;
 
-        // 3. Single-Pass Consolidated Purchases Aggregation
-        $purchAgg = (clone $purchQuery)
-            ->selectRaw('
-                COALESCE(SUM(grand_total), 0) as total_purchases,
-                COALESCE(SUM(due_amount), 0) as supplier_due,
-                COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as today_purchases
-            ', [$todayPrefix, $today])
-            ->first();
+        // 3. Single-Pass Consolidated Purchases Aggregation in Period
+        $periodPurchQuery = clone $purchBaseQuery;
+        $applyDateScope($periodPurchQuery, 'date');
+        $periodPurchAgg = $periodPurchQuery->selectRaw('
+            COALESCE(SUM(grand_total), 0) as total_purchases,
+            COALESCE(SUM(paid_amount), 0) as paid_amount,
+            COALESCE(SUM(due_amount), 0) as due_amount,
+            COUNT(*) as purchases_count
+        ')->first();
 
-        $totalPurchases = (float)($purchAgg->total_purchases ?? 0);
-        $supplierDue = (float)($purchAgg->supplier_due ?? 0);
-        $todayPurchases = (float)($purchAgg->today_purchases ?? 0);
+        $totalPurchases = (float)($periodPurchAgg->total_purchases ?? 0);
+        $periodPurchDue = (float)($periodPurchAgg->due_amount ?? 0);
+
+        $todayPurchases = (float)(clone $purchBaseQuery)
+            ->where(function ($q) use ($todayPrefix, $today) {
+                $q->where('date', 'LIKE', $todayPrefix)->orWhere('date', $today);
+            })
+            ->sum('grand_total');
 
         $totalPurchaseReturns = 0.0;
         try {
@@ -107,46 +197,46 @@ class ReportController extends Controller
             if ($warehouse !== 'All' && !empty($warehouse)) {
                 $prQuery->where('warehouse_name', $warehouse);
             }
+            $applyDateScope($prQuery, 'date');
             $totalPurchaseReturns = (float)$prQuery->sum('grand_total');
         } catch (\Throwable $e) {}
 
         $netPurchases = max(0.0, $totalPurchases - $totalPurchaseReturns);
 
-        // 4. Single-Pass Consolidated Expenses Aggregation
-        $expAgg = (clone $expQuery)
-            ->selectRaw('
-                COALESCE(SUM(amount), 0) as total_expenses,
-                COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN amount ELSE 0 END), 0) as today_expenses
-            ', [$todayPrefix, $today])
-            ->first();
+        // 4. Single-Pass Consolidated Expenses Aggregation in Period
+        $periodExpQuery = clone $expBaseQuery;
+        $applyDateScope($periodExpQuery, 'date');
+        $totalExpenses = (float)$periodExpQuery->sum('amount');
 
-        $totalExpenses = (float)($expAgg->total_expenses ?? 0);
-        $todayExpenses = (float)($expAgg->today_expenses ?? 0);
+        $todayExpenses = (float)(clone $expBaseQuery)
+            ->where(function ($q) use ($todayPrefix, $today) {
+                $q->where('date', 'LIKE', $todayPrefix)->orWhere('date', $today);
+            })
+            ->sum('amount');
 
-        // 5. Cost of Goods Sold (COGS) & GAAP/IFRS Operational Net Profit Calculation
-        $cogsQuery = DB::table('sale_items')
+        // 5. Cost of Goods Sold (COGS) & GAAP/IFRS Operational Profitability
+        $cogsBaseQuery = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
             ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
+            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+            ->where('sales.status', '!=', 'Voided');
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $cogsQuery->where('sales.warehouse_name', $warehouse);
+            $cogsBaseQuery->where('sales.warehouse_name', $warehouse);
         }
 
         $cogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0) as total_cogs';
 
-        $totalCogs = (float)(clone $cogsQuery)
-            ->selectRaw($cogsExpr)
-            ->value('total_cogs');
+        $periodCogsQuery = clone $cogsBaseQuery;
+        $applyDateScope($periodCogsQuery, 'sales.date');
+        $totalCogs = (float)$periodCogsQuery->selectRaw($cogsExpr)->value('total_cogs');
 
-        $todayCogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0) as today_cogs';
-
-        $todayCogs = (float)(clone $cogsQuery)
+        $todayCogs = (float)(clone $cogsBaseQuery)
             ->where(function ($q) use ($todayPrefix, $today) {
                 $q->where('sales.date', 'LIKE', $todayPrefix)->orWhere('sales.date', $today);
             })
-            ->selectRaw($todayCogsExpr)
-            ->value('today_cogs');
+            ->selectRaw($cogsExpr)
+            ->value('total_cogs');
 
         $grossProfit = round($netSales - $totalCogs, 2);
         $netProfit = round($grossProfit - $totalExpenses, 2);
@@ -154,7 +244,44 @@ class ReportController extends Controller
         $todayGrossProfit = round($todaySales - $todayCogs, 2);
         $todayProfit = round($todayGrossProfit - $todayExpenses, 2);
 
-        // 6. Monthly 12-Month Trends for Selected Year
+        // 6. Balance Sheet Health Snapshots (Current as of today)
+        $customerDue = (float) DB::table('sales')
+            ->where('status', '!=', 'Voided')
+            ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
+            ->sum('due_amount');
+
+        $supplierDue = (float) DB::table('purchases')
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+            })
+            ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
+            ->sum('due_amount');
+
+        // Total Inventory Stock Asset Valuation at Cost Price
+        $singleValuation = (float) DB::table('products')
+            ->whereNull('deleted_at')
+            ->where(function ($q) {
+                $q->where('has_variants', false)->orWhereNull('has_variants');
+            })
+            ->where('stock_quantity', '>', 0)
+            ->selectRaw('COALESCE(SUM(stock_quantity * COALESCE(NULLIF(cost_price, 0), NULLIF(purchase_price, 0), 0)), 0) as val')
+            ->value('val');
+
+        $variantValuation = 0.0;
+        try {
+            $variantValuation = (float) DB::table('stock_balances')
+                ->join('products', 'stock_balances.product_id', '=', 'products.id')
+                ->leftJoin('product_variants', 'stock_balances.product_variant_id', '=', 'product_variants.id')
+                ->whereNull('products.deleted_at')
+                ->where('products.has_variants', true)
+                ->where('stock_balances.quantity', '>', 0)
+                ->selectRaw('COALESCE(SUM(stock_balances.quantity * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)), 0) as val')
+                ->value('val');
+        } catch (\Throwable $e) {}
+
+        $inventoryValuationCost = round($singleValuation + $variantValuation, 2);
+
+        // 7. Monthly 12-Month Trends for Selected Year (Annual Graphic)
         $monthlySales = array_fill(0, 12, 0.0);
         $monthlyPurchases = array_fill(0, 12, 0.0);
         $monthlyExpenses = array_fill(0, 12, 0.0);
@@ -165,7 +292,7 @@ class ReportController extends Controller
         $monthGroup = $isSqlite ? DB::raw("CAST(strftime('%m', date) AS integer)") : DB::raw('MONTH(date)');
 
         // Group sales by month
-        $salesByMonth = (clone $salesQuery)
+        $salesByMonth = (clone $salesBaseQuery)
             ->whereYear('date', $year)
             ->select($monthExpr, DB::raw('SUM(grand_total) as total'))
             ->groupBy($monthGroup)
@@ -179,7 +306,7 @@ class ReportController extends Controller
         }
 
         // Group purchases by month
-        $purchasesByMonth = (clone $purchQuery)
+        $purchasesByMonth = (clone $purchBaseQuery)
             ->whereYear('date', $year)
             ->select($monthExpr, DB::raw('SUM(grand_total) as total'))
             ->groupBy($monthGroup)
@@ -193,7 +320,7 @@ class ReportController extends Controller
         }
 
         // Group expenses by month
-        $expensesByMonth = (clone $expQuery)
+        $expensesByMonth = (clone $expBaseQuery)
             ->whereYear('date', $year)
             ->select($monthExpr, DB::raw('SUM(amount) as total'))
             ->groupBy($monthGroup)
@@ -207,12 +334,10 @@ class ReportController extends Controller
         }
 
         // Group COGS by month for true operational monthly profitability
-        // Bug Fix: Use FIFO snapshot (sale_items.total_cogs) first — same expression as overall COGS above ($cogsExpr)
-        // Previously used static cost_price × qty which ignored actual FIFO depletion cost layers
         $monthSalesExpr = $isSqlite ? DB::raw("CAST(strftime('%m', sales.date) AS integer) as m") : DB::raw('MONTH(sales.date) as m');
         $monthSalesGroup = $isSqlite ? DB::raw("CAST(strftime('%m', sales.date) AS integer)") : DB::raw('MONTH(sales.date)');
 
-        $cogsByMonth = (clone $cogsQuery)
+        $cogsByMonth = (clone $cogsBaseQuery)
             ->whereYear('sales.date', $year)
             ->select($monthSalesExpr, DB::raw($cogsExpr))
             ->groupBy($monthSalesGroup)
@@ -226,13 +351,14 @@ class ReportController extends Controller
             }
         }
 
-        // Calculate true monthly net profit: Monthly Sales - Monthly COGS - Monthly Expenses
         for ($i = 0; $i < 12; $i++) {
             $monthlyProfit[$i] = round($monthlySales[$i] - $monthlyCogs[$i] - $monthlyExpenses[$i], 2);
         }
 
-        // 5. Payment Methods Tender Mix
-        $rawPaymentMethods = (clone $salesQuery)
+        // 8. Payment Methods Tender Mix in Period
+        $rawPaymentMethodsQuery = (clone $salesBaseQuery);
+        $applyDateScope($rawPaymentMethodsQuery, 'date');
+        $rawPaymentMethods = $rawPaymentMethodsQuery
             ->select('payment_type', DB::raw('COUNT(*) as count'), DB::raw('SUM(grand_total) as amount'))
             ->groupBy('payment_type')
             ->orderByDesc('amount')
@@ -251,16 +377,19 @@ class ReportController extends Controller
             ];
         }
 
-        // 6. Real Top Selling Products (Single SQL JOIN without N+1)
+        // 9. Real Top Selling Products in Period
         $topProducts = [];
         try {
-            $topProductsRaw = DB::table('sale_items')
+            $topProductsQuery = DB::table('sale_items')
                 ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
                 ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
                 ->where('sales.status', '!=', 'Voided')
                 ->when($warehouse !== 'All' && !empty($warehouse), function ($q) use ($warehouse) {
                     $q->where('sales.warehouse_name', $warehouse);
-                })
+                });
+            $applyDateScope($topProductsQuery, 'sales.date');
+
+            $topProductsRaw = $topProductsQuery
                 ->select(
                     'sale_items.product_id',
                     'sale_items.product_name',
@@ -326,8 +455,42 @@ class ReportController extends Controller
             });
         }
 
-        // 7. Recent Sales Transactions (Latest 10 Transactions)
-        $recentSales = (clone $salesQuery)
+        // 10. Top Category Sales Share in Period
+        $categorySales = [];
+        try {
+            $catQuery = DB::table('sale_items')
+                ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                ->where('sales.status', '!=', 'Voided')
+                ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('sales.warehouse_name', $warehouse));
+            $applyDateScope($catQuery, 'sales.date');
+
+            $catResults = $catQuery
+                ->select(
+                    DB::raw("COALESCE(NULLIF(products.category_name, ''), 'General') as category_name"),
+                    DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales'),
+                    DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_qty'),
+                    DB::raw('COUNT(DISTINCT sale_items.sale_id) as orders_count')
+                )
+                ->groupBy('category_name')
+                ->orderByDesc('total_sales')
+                ->limit(8)
+                ->get();
+
+            foreach ($catResults as $cr) {
+                $amt = (float)$cr->total_sales;
+                $categorySales[] = [
+                    'category_name' => $cr->category_name,
+                    'amount' => $amt,
+                    'quantity' => (float)$cr->total_qty,
+                    'orders_count' => (int)$cr->orders_count,
+                    'percentage' => $totalSales > 0 ? round(($amt / $totalSales) * 100, 1) : 0.0,
+                ];
+            }
+        } catch (\Throwable $e) {}
+
+        // 11. Recent Sales Transactions (Latest 10)
+        $recentSales = (clone $salesBaseQuery)
             ->orderBy('id', 'desc')
             ->limit(10)
             ->get()
@@ -347,7 +510,7 @@ class ReportController extends Controller
                 ];
             });
 
-        // 8. Low Stock & Out of Stock Products (Single Products + Product Variants - Optimized selective columns)
+        // 12. Low Stock & Out of Stock Products
         $singleLowStock = Product::where(function ($q) {
                 $q->where('has_variants', false)->orWhereNull('has_variants');
             })
@@ -459,14 +622,13 @@ class ReportController extends Controller
                 });
         } catch (\Throwable $e) {}
 
-        // Combine both single & variation alerts, sort by stock ASC (out of stock first, then lowest stock)
         $allLowStock = $singleLowStock->concat($variantLowStock)
             ->sortBy('stock_quantity')
             ->values();
 
         $lowStockProducts = $allLowStock->take(10)->values();
 
-        // 9. Operational & Inventory Metrics (Single Consolidated SQL Query)
+        // 13. Operational & Inventory Metrics
         $inventoryAgg = DB::table('products')
             ->whereNull('deleted_at')
             ->where(function ($q) {
@@ -477,7 +639,7 @@ class ReportController extends Controller
 
         $totalProducts = (int)($inventoryAgg->total_products ?? 0);
         $singleInStock = (float)($inventoryAgg->total_stock ?? 0);
-        
+
         $totalVariants = 0;
         try {
             $totalVariants = DB::table('product_variants')
@@ -507,19 +669,33 @@ class ReportController extends Controller
         $responsePayload = [
             'status' => 'success',
             'data' => [
+                'date_filter' => $dateFilter,
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+
                 'total_sales' => $totalSales,
                 'total_sale_returns' => $totalSaleReturns,
                 'net_sales' => $netSales,
+                'orders_count' => $ordersCount,
+                'average_order_value' => $averageOrderValue,
+                'paid_amount' => $periodPaid,
+                'cash_collected' => $periodPaid,
+                'cash_ratio_pct' => $cashRatioPct,
+                'period_due' => $periodDue,
+
                 'total_purchases' => $totalPurchases,
                 'total_purchase_returns' => $totalPurchaseReturns,
                 'net_purchases' => $netPurchases,
+
                 'total_expenses' => $totalExpenses,
                 'cogs' => $totalCogs,
                 'gross_profit' => $grossProfit,
                 'net_profit' => $netProfit,
                 'profit_margin_pct' => $profitMarginPct,
+
                 'customer_due' => $customerDue,
                 'supplier_due' => $supplierDue,
+                'inventory_valuation_cost' => $inventoryValuationCost,
 
                 'today_sales' => $todaySales,
                 'today_sales_count' => $todaySalesCount,
@@ -550,9 +726,9 @@ class ReportController extends Controller
 
                 'payment_methods' => $paymentMethods,
                 'top_products' => $topProducts,
+                'top_categories' => $categorySales,
                 'recent_sales' => $recentSales,
                 'low_stock_products' => $lowStockProducts,
-                'top_categories' => [],
             ],
         ];
 
