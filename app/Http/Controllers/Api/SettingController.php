@@ -91,6 +91,12 @@ class SettingController extends Controller
 
         foreach ($data as $key => $value) {
             $strVal = is_array($value) ? json_encode($value) : (string)$value;
+
+            // If default_language changed, validate and normalize supported language codes ('my', 'en')
+            if ($key === 'default_language') {
+                $strVal = in_array(strtolower($strVal), ['my', 'en'], true) ? strtolower($strVal) : 'my';
+            }
+
             Setting::updateOrCreate(
                 ['key' => $key],
                 ['value' => $strVal]
