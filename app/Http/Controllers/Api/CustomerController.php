@@ -20,6 +20,7 @@ class CustomerController extends Controller
             $search = $request->input('search');
             $query->where(function ($q) use ($search) {
                 $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('customer_id', 'like', "%{$search}%")
                   ->orWhere('phone', 'like', "%{$search}%")
                   ->orWhere('email', 'like', "%{$search}%")
                   ->orWhere('tier', 'like', "%{$search}%");
@@ -36,7 +37,7 @@ class CustomerController extends Controller
 
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'name', 'phone', 'email', 'tier', 'reward_points', 'total_spent', 'total_visits', 'status'];
+        $allowedSorts = ['id', 'customer_id', 'name', 'phone', 'email', 'tier', 'reward_points', 'total_spent', 'total_visits', 'status'];
         if (in_array($sortBy, $allowedSorts)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
@@ -75,11 +76,44 @@ class CustomerController extends Controller
     }
 
     /**
+     * Generate the next sequential unique Customer ID (e.g. CUST-052).
+     */
+    public function generateCustomerId(Request $request)
+    {
+        $existing = Customer::whereNotNull('customer_id')->pluck('customer_id');
+        $maxNum = (int)(Customer::max('id') ?? 0);
+
+        foreach ($existing as $cid) {
+            if (preg_match('/(?:CUST-)?([0-9]+)$/i', (string)$cid, $matches)) {
+                $n = (int)$matches[1];
+                if ($n > $maxNum) {
+                    $maxNum = $n;
+                }
+            }
+        }
+
+        $nextNum = $maxNum + 1;
+        $candidateId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+        while (Customer::where('customer_id', $candidateId)->exists()) {
+            $nextNum++;
+            $candidateId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'customer_id' => $candidateId,
+            ],
+        ]);
+    }
+
+    /**
      * Store a newly created customer.
      */
     public function store(Request $request)
     {
         $validated = $request->validate([
+            'customer_id' => 'nullable|string|max:50|unique:customers,customer_id',
             'name' => 'required|string|max:255',
             'phone' => 'nullable|string|max:50',
             'email' => 'nullable|email|max:255',
@@ -92,7 +126,26 @@ class CustomerController extends Controller
             'notes' => 'nullable|string',
         ]);
 
+        $customerId = !empty($validated['customer_id']) ? trim($validated['customer_id']) : null;
+        if (empty($customerId)) {
+            $existing = Customer::whereNotNull('customer_id')->pluck('customer_id');
+            $maxNum = (int)(Customer::max('id') ?? 0);
+            foreach ($existing as $cid) {
+                if (preg_match('/(?:CUST-)?([0-9]+)$/i', (string)$cid, $matches)) {
+                    $n = (int)$matches[1];
+                    if ($n > $maxNum) $maxNum = $n;
+                }
+            }
+            $nextNum = $maxNum + 1;
+            $customerId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+            while (Customer::where('customer_id', $customerId)->exists()) {
+                $nextNum++;
+                $customerId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+            }
+        }
+
         $customer = Customer::create([
+            'customer_id' => $customerId,
             'name' => $validated['name'],
             'phone' => $validated['phone'] ?? null,
             'email' => $validated['email'] ?? null,
@@ -147,6 +200,7 @@ class CustomerController extends Controller
         }
 
         $validated = $request->validate([
+            'customer_id' => 'sometimes|nullable|string|max:50|unique:customers,customer_id,' . $id,
             'name' => 'sometimes|required|string|max:255',
             'phone' => 'nullable|string|max:50',
             'email' => 'nullable|email|max:255',
