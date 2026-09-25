@@ -4974,11 +4974,16 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
-        $cogsExpr = 'COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))';
+        $cogsExpr = 'COALESCE(
+            NULLIF(sale_items.total_cogs, 0),
+            NULLIF(sale_items.base_unit_cost, 0) * COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1),
+            COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)
+        )';
 
         $query = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
             ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
             ->whereNotIn('sales.status', ['Voided', 'Cancelled']);
 
         if (!empty($startDate) && !empty($endDate)) {
@@ -5016,15 +5021,21 @@ class ReportController extends Controller
 
         $rawItems = $query->selectRaw("
             sale_items.product_id,
-            COALESCE(sale_items.product_code, products.code, 'N/A') as code,
-            COALESCE(sale_items.product_name, products.name, 'Unnamed Product') as name,
+            COALESCE(products.code, sale_items.product_code, 'N/A') as code,
+            COALESCE(products.name, sale_items.product_name, 'Unnamed Product') as name,
             COALESCE(products.alternative_name, '') as alternative_name,
             COALESCE(products.category_name, 'General') as category_name,
             SUM(sale_items.quantity) as units_sold,
             SUM(sale_items.subtotal) as gross_revenue,
             SUM({$cogsExpr}) as total_cogs
         ")
-        ->groupBy('sale_items.product_id', 'sale_items.product_code', 'sale_items.product_name', 'products.code', 'products.name', 'products.alternative_name', 'products.category_name')
+        ->groupBy(
+            'sale_items.product_id',
+            DB::raw("COALESCE(products.code, sale_items.product_code, 'N/A')"),
+            DB::raw("COALESCE(products.name, sale_items.product_name, 'Unnamed Product')"),
+            DB::raw("COALESCE(products.alternative_name, '')"),
+            DB::raw("COALESCE(products.category_name, 'General')")
+        )
         ->get();
 
         $totalRevenue = 0.0;
