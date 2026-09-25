@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Schema;
 use App\Models\Sale;
 use App\Models\Purchase;
 use App\Models\Expense;
@@ -3597,9 +3598,256 @@ class ReportController extends Controller
             }
         }
 
-        // 1. Group completed sales by Date, Warehouse, and Cashier/User to form POS Register Sessions
-        $salesQuery = DB::table('sales')
+        $accountedSaleIds = [];
+        $items = [];
+
+        // 1. Process Real Cash Registers if table exists
+        if (Schema::hasTable('cash_registers')) {
+            $regQuery = DB::table('cash_registers');
+            if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
+                $regQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
+                    if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
+                    if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
+                });
+            }
+            if ($cashier !== 'All' && !empty($cashier)) {
+                $regQuery->where(function ($q) use ($cashier) {
+                    $q->where('user_name', 'like', "%{$cashier}%");
+                });
+            }
+            if (!empty($startDate) && !empty($endDate)) {
+                $regQuery->whereRaw("SUBSTRING(opened_at, 1, 10) >= ? AND SUBSTRING(opened_at, 1, 10) <= ?", [$startDate, $endDate]);
+            } elseif (!empty($startDate)) {
+                $regQuery->whereRaw("SUBSTRING(opened_at, 1, 10) >= ?", [$startDate]);
+            } elseif (!empty($endDate)) {
+                $regQuery->whereRaw("SUBSTRING(opened_at, 1, 10) <= ?", [$endDate]);
+            }
+
+            $realRegs = $regQuery->orderByDesc('id')->get();
+            $realRegIds = $realRegs->pluck('id')->all();
+
+            // Pre-fetch transactions (float_in, drop)
+            $regTxAgg = [];
+            if (Schema::hasTable('cash_register_transactions') && !empty($realRegIds)) {
+                $txRows = DB::table('cash_register_transactions')->whereIn('cash_register_id', $realRegIds)->get();
+                foreach ($txRows as $tx) {
+                    $rid = (int)$tx->cash_register_id;
+                    if (!isset($regTxAgg[$rid])) $regTxAgg[$rid] = ['float_in' => 0.0, 'drop' => 0.0];
+                    if ($tx->type === 'float_in') $regTxAgg[$rid]['float_in'] += (float)$tx->amount;
+                    elseif ($tx->type === 'drop' || $tx->type === 'safe_drop') $regTxAgg[$rid]['drop'] += (float)$tx->amount;
+                }
+            }
+
+            foreach ($realRegs as $r) {
+                $openedAt = $r->opened_at;
+                $closedAt = $r->closed_at ?: now();
+
+                // Query sales explicitly linked or within shift bounds
+                $shiftSalesQuery = DB::table('sales')
+                    ->whereNotIn(DB::raw("LOWER(COALESCE(status, 'completed'))"), ['voided', 'cancelled', 'draft'])
+                    ->where(function ($q) use ($r, $openedAt, $closedAt) {
+                        $q->where('cash_register_id', $r->id)
+                          ->orWhere(function ($sub) use ($r, $openedAt, $closedAt) {
+                              $sub->whereNull('cash_register_id')
+                                  ->where('warehouse_name', $r->warehouse_name)
+                                  ->whereBetween('created_at', [$openedAt, $closedAt]);
+                              if ($r->user_id) $sub->where('user_id', $r->user_id);
+                          });
+                    });
+
+                $shiftSales = $shiftSalesQuery->get();
+                foreach ($shiftSales as $ss) {
+                    $accountedSaleIds[$ss->id] = true;
+                }
+
+                $txCount = $shiftSales->count();
+                $salesTotal = (float)$shiftSales->sum('grand_total');
+                $saleIds = $shiftSales->pluck('id')->all();
+
+                $cashSales = 0.0;
+                $cardSales = 0.0;
+                $digitalSales = 0.0;
+                $cashCount = 0;
+                $cardCount = 0;
+                $digitalCount = 0;
+
+                if (!empty($saleIds)) {
+                    $spList = Schema::hasTable('sale_payments')
+                        ? DB::table('sale_payments')->whereIn('sale_id', $saleIds)->get()
+                        : collect([]);
+                    if ($spList->isNotEmpty()) {
+                        foreach ($spList as $sp) {
+                            $pt = strtolower(trim((string)$sp->payment_type));
+                            $amt = (float)$sp->amount;
+                            $chg = (float)($sp->change_amount ?? 0);
+                            if ($pt === 'cash') {
+                                $cashSales += max(0, $amt - $chg);
+                                $cashCount++;
+                            } elseif (in_array($pt, ['card', 'pos card', 'credit card', 'visa', 'mastercard'])) {
+                                $cardSales += $amt;
+                                $cardCount++;
+                            } else {
+                                $digitalSales += $amt;
+                                $digitalCount++;
+                            }
+                        }
+                    } else {
+                        foreach ($shiftSales as $s) {
+                            $pt = strtolower(trim((string)$s->payment_type));
+                            $paid = (float)$s->paid_amount;
+                            if ($pt === 'cash') {
+                                $cashSales += $paid;
+                                $cashCount++;
+                            } elseif (in_array($pt, ['card', 'pos card', 'credit card', 'visa', 'mastercard'])) {
+                                $cardSales += $paid;
+                                $cardCount++;
+                            } else {
+                                $digitalSales += $paid;
+                                $digitalCount++;
+                            }
+                        }
+                    }
+                }
+
+                // Floats in & Cash Drops
+                $floatsIn = (float)($regTxAgg[$r->id]['float_in'] ?? 0.0);
+                $cashDrops = (float)($regTxAgg[$r->id]['drop'] ?? 0.0);
+
+                // Shift Expenses & Refunds
+                $shiftExpenses = Schema::hasTable('expenses')
+                    ? DB::table('expenses')
+                        ->where('warehouse_name', $r->warehouse_name)
+                        ->whereBetween('created_at', [$openedAt, $closedAt])
+                        ->get()
+                    : collect([]);
+                $totalExpenses = (float)$shiftExpenses->sum('amount');
+                $cashExpenses = 0.0;
+                foreach ($shiftExpenses as $exp) {
+                    if (strtolower(trim((string)($exp->payment_method ?? 'cash'))) === 'cash') {
+                        $cashExpenses += (float)$exp->amount;
+                    }
+                }
+
+                $shiftReturns = Schema::hasTable('sale_returns')
+                    ? DB::table('sale_returns')
+                        ->where('warehouse_name', $r->warehouse_name)
+                        ->whereBetween('created_at', [$openedAt, $closedAt])
+                        ->get()
+                    : collect([]);
+                $totalRefunds = (float)$shiftReturns->sum('grand_total');
+                $cashRefunds = 0.0;
+                foreach ($shiftReturns as $ret) {
+                    $tender = strtolower(trim((string)($ret->refund_tender ?? $ret->payment_type ?? 'cash')));
+                    if (str_contains($tender, 'cash')) {
+                        $cashRefunds += (float)($ret->paid_amount ?? $ret->grand_total);
+                    }
+                }
+
+                $openingCash = (float)$r->opening_cash;
+                $status = ucfirst(strtolower((string)($r->status ?: 'Closed')));
+
+                if (strtolower($status) === 'closed' && $r->expected_cash !== null) {
+                    $expectedCash = (float)$r->expected_cash;
+                    $closingCash = (float)($r->closing_cash ?? $expectedCash);
+                    $variance = $r->cash_difference !== null ? (float)$r->cash_difference : round($closingCash - $expectedCash, 2);
+                } else {
+                    $expectedCash = max(0.0, $openingCash + $cashSales + $floatsIn - $cashDrops - $cashRefunds - $cashExpenses);
+                    $closingCash = $r->closing_cash !== null ? (float)$r->closing_cash : $expectedCash;
+                    $variance = $r->cash_difference !== null ? (float)$r->cash_difference : round($closingCash - $expectedCash, 2);
+                }
+
+                // Primary payment type
+                $primaryPayment = 'Cash';
+                if ($digitalSales > $cashSales && $digitalSales > $cardSales) $primaryPayment = 'KBZPay';
+                elseif ($cardSales > $cashSales) $primaryPayment = 'Card';
+                elseif ($cashSales > 0 && ($digitalSales > 0 || $cardSales > 0)) $primaryPayment = 'Split Payment';
+
+                $sessionDate = substr((string)$r->opened_at, 0, 10);
+                $cashierName = trim(explode('(', (string)($r->user_name ?: 'Super Admin'))[0]) ?: 'Super Admin';
+                $refNo = $r->reference_no ?: ('REG-' . str_replace('-', '', $sessionDate) . '-' . str_pad($r->id, 4, '0', STR_PAD_LEFT));
+                $registerName = $r->register_name ?: 'Register 01';
+
+                // Filters
+                if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($registerName, $registerFilter) !== 0) continue;
+                if ($statusFilter !== 'All' && !empty($statusFilter)) {
+                    $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
+                    $normStatus = strtolower($status) === 'active' ? 'open' : strtolower($status);
+                    if ($normFilter !== $normStatus) continue;
+                }
+                if ($paymentTypeFilter !== 'All' && !empty($paymentTypeFilter) && strcasecmp($primaryPayment, $paymentTypeFilter) !== 0) continue;
+
+                if (!empty($search)) {
+                    $q = strtolower($search);
+                    $m = str_contains(strtolower($refNo), $q) || str_contains(strtolower($registerName), $q) || str_contains(strtolower((string)$r->warehouse_name), $q) || str_contains(strtolower($cashierName), $q) || str_contains($sessionDate, $q);
+                    if (!$m) continue;
+                }
+
+                $userRole = (stripos($cashierName, 'admin') !== false) ? 'Super Admin' : ((stripos($cashierName, 'manager') !== false) ? 'Branch Manager' : 'Lead Cashier');
+
+                $items[] = [
+                    'id' => (int)$r->id,
+                    'reference_no' => $refNo,
+                    'register_id' => $registerName,
+                    'warehouse_id' => (int)($r->warehouse_id ?? 1),
+                    'warehouse_name' => $r->warehouse_name ?: 'Main Branch Outlet',
+                    'date' => $sessionDate,
+                    'opened_at' => (string)$r->opened_at,
+                    'closed_at' => $status === 'Open' ? '' : (string)($r->closed_at ?: ''),
+                    'total_transactions' => $txCount,
+                    'opening_cash' => round($openingCash, 2),
+                    'total_sales' => round($salesTotal, 2),
+                    'cash_sales' => round($cashSales, 2),
+                    'card_sales' => round($cardSales, 2),
+                    'digital_sales' => round($digitalSales, 2),
+                    'total_refunds' => round($totalRefunds, 2),
+                    'cash_refunds' => round($cashRefunds, 2),
+                    'total_expenses' => round($totalExpenses, 2),
+                    'cash_expenses' => round($cashExpenses, 2),
+                    'digital_expenses' => round($totalExpenses - $cashExpenses, 2),
+                    'floats_in' => round($floatsIn, 2),
+                    'cash_drops' => round($cashDrops, 2),
+                    'expected_cash' => round($expectedCash, 2),
+                    'closing_cash' => round($closingCash, 2),
+                    'difference' => round($variance, 2),
+                    'status' => $status,
+                    'primary_payment_type' => $primaryPayment,
+                    'notes' => $r->closing_notes ?: ($r->opening_notes ?: 'Shift verified and audited.'),
+                    'created_by' => $cashierName,
+                    'cashier_name' => $cashierName,
+                    'user_name' => $cashierName,
+                    'user_role' => $userRole,
+                    'payment_breakdown' => [
+                        ['method' => 'Cash', 'amount' => round($cashSales, 2), 'count' => $cashCount],
+                        ['method' => 'Card', 'amount' => round($cardSales, 2), 'count' => $cardCount],
+                        ['method' => 'Digital', 'amount' => round($digitalSales, 2), 'count' => $digitalCount],
+                    ],
+                ];
+            }
+        }
+
+        // 2. Process Legacy Sales (Not linked to any real cash register)
+        $legacySalesQuery = DB::table('sales')
             ->whereNotIn(DB::raw("LOWER(COALESCE(status, 'completed'))"), ['voided', 'cancelled', 'draft'])
+            ->whereNotIn('id', array_keys($accountedSaleIds));
+
+        if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
+            $legacySalesQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
+                if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
+                if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
+            });
+        }
+        if ($cashier !== 'All' && !empty($cashier)) {
+            $legacySalesQuery->where('created_by', 'like', "%{$cashier}%");
+        }
+        if (!empty($startDate) && !empty($endDate)) {
+            $legacySalesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
+        } elseif (!empty($startDate)) {
+            $legacySalesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
+        } elseif (!empty($endDate)) {
+            $legacySalesQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
+        }
+
+        $legacyGroups = $legacySalesQuery
             ->selectRaw("
                 SUBSTRING(date, 1, 10) as session_date,
                 MIN(date) as opened_at_raw,
@@ -3609,137 +3857,94 @@ class ReportController extends Controller
                 COALESCE(created_by, 'Super Admin') as cashier_name,
                 COUNT(id) as tx_count,
                 COALESCE(SUM(grand_total), 0) as total_sales,
-                COALESCE(SUM(paid_amount), 0) as paid_amount,
                 COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, 'Cash')) = 'cash' THEN paid_amount ELSE 0 END), 0) as cash_sales,
                 COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as card_sales,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer', 'bank_transfer', 'cheque', 'check') THEN paid_amount ELSE 0 END), 0) as digital_sales,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, 'Cash')) = 'cash' THEN 1 ELSE 0 END), 0) as cash_count,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END), 0) as card_count,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer', 'bank_transfer', 'cheque', 'check') THEN 1 ELSE 0 END), 0) as digital_count
-            ");
-
-        if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
-            $salesQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
-                if ($targetWarehouseId !== null) {
-                    $q->where('warehouse_id', $targetWarehouseId);
-                }
-                if ($targetWarehouseName !== null) {
-                    $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
-                }
-            });
-        }
-
-        if ($cashier !== 'All' && !empty($cashier)) {
-            $salesQuery->where(function($q) use ($cashier) {
-                $q->where('created_by', 'like', "%{$cashier}%");
-            });
-        }
-
-        if (!empty($startDate) && !empty($endDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
-        } elseif (!empty($startDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ?", [$startDate]);
-        } elseif (!empty($endDate)) {
-            $salesQuery->whereRaw("SUBSTRING(date, 1, 10) <= ?", [$endDate]);
-        }
-
-        $sessionGroups = $salesQuery
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) NOT IN ('cash', 'card', 'pos card', 'credit card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as digital_sales
+            ")
             ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id', 'warehouse_name', 'created_by')
             ->orderByDesc(DB::raw("SUBSTRING(date, 1, 10)"))
             ->get();
 
-        // 1b. Multi-tender split payment resolution from sale_payments if available
-        $splitTenderMap = collect();
-        if (Schema::hasTable('sale_payments')) {
-            $spQuery = DB::table('sale_payments')
-                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
-                ->whereNotIn(DB::raw("LOWER(COALESCE(sales.status, 'completed'))"), ['voided', 'cancelled', 'draft'])
-                ->selectRaw("
-                    SUBSTRING(sales.date, 1, 10) as session_date,
-                    COALESCE(sales.warehouse_id, 1) as w_id,
-                    COALESCE(sales.created_by, 'Super Admin') as cashier_name,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, 'cash')) = 'cash' THEN sale_payments.amount ELSE 0 END) as sp_cash,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN sale_payments.amount ELSE 0 END) as sp_card,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) NOT IN ('cash', 'card', 'pos card', 'credit card', 'visa', 'mastercard') THEN sale_payments.amount ELSE 0 END) as sp_digital,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, 'cash')) = 'cash' THEN 1 ELSE 0 END) as sp_cash_cnt,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END) as sp_card_cnt,
-                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) NOT IN ('cash', 'card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END) as sp_digital_cnt
-                ");
-            if (!empty($startDate) && !empty($endDate)) {
-                $spQuery->whereRaw("SUBSTRING(sales.date, 1, 10) >= ? AND SUBSTRING(sales.date, 1, 10) <= ?", [$startDate, $endDate]);
+        $seq = count($items) + 1;
+        foreach ($legacyGroups as $lg) {
+            $sDate = $lg->session_date;
+            $cName = trim(explode('(', (string)($lg->cashier_name ?: 'Super Admin'))[0]) ?: 'Super Admin';
+            $refNo = 'REG-' . str_replace('-', '', $sDate) . '-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+            $regName = 'Register ' . str_pad(($seq % 3) + 1, 2, '0', STR_PAD_LEFT);
+
+            if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($regName, $registerFilter) !== 0) continue;
+            if ($statusFilter !== 'All' && !empty($statusFilter)) {
+                $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
+                if ($normFilter !== 'closed') continue;
             }
-            $splitTenderMap = $spQuery
-                ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), 'sales.warehouse_id', 'sales.created_by')
-                ->get()
-                ->keyBy(function ($row) {
-                    return $row->session_date . '_' . $row->w_id . '_' . $row->cashier_name;
-                });
+
+            $cSales = (float)$lg->cash_sales;
+            $cdSales = (float)$lg->card_sales;
+            $dgSales = (float)$lg->digital_sales;
+            $totSales = (float)$lg->total_sales;
+
+            $prim = 'Cash';
+            if ($dgSales > $cSales && $dgSales > $cdSales) $prim = 'KBZPay';
+            elseif ($cdSales > $cSales) $prim = 'Card';
+            elseif ($cSales > 0 && ($dgSales > 0 || $cdSales > 0)) $prim = 'Split Payment';
+
+            if ($paymentTypeFilter !== 'All' && !empty($paymentTypeFilter) && strcasecmp($prim, $paymentTypeFilter) !== 0) continue;
+
+            if (!empty($search)) {
+                $q = strtolower($search);
+                $m = str_contains(strtolower($refNo), $q) || str_contains(strtolower($regName), $q) || str_contains(strtolower((string)$lg->w_name), $q) || str_contains(strtolower($cName), $q) || str_contains($sDate, $q);
+                if (!$m) continue;
+            }
+
+            $openCash = 500.00;
+            $expCash = max(0.0, $openCash + $cSales);
+            $closeCash = $expCash;
+            $var = 0.00;
+
+            $items[] = [
+                'id' => $seq++,
+                'reference_no' => $refNo,
+                'register_id' => $regName,
+                'warehouse_id' => (int)$lg->w_id,
+                'warehouse_name' => $lg->w_name,
+                'date' => $sDate,
+                'opened_at' => (string)$lg->opened_at_raw,
+                'closed_at' => (string)$lg->closed_at_raw,
+                'total_transactions' => (int)$lg->tx_count,
+                'opening_cash' => $openCash,
+                'total_sales' => round($totSales, 2),
+                'cash_sales' => round($cSales, 2),
+                'card_sales' => round($cdSales, 2),
+                'digital_sales' => round($dgSales, 2),
+                'total_refunds' => 0.0,
+                'cash_refunds' => 0.0,
+                'total_expenses' => 0.0,
+                'cash_expenses' => 0.0,
+                'digital_expenses' => 0.0,
+                'floats_in' => 0.0,
+                'cash_drops' => 0.0,
+                'expected_cash' => round($expCash, 2),
+                'closing_cash' => round($closeCash, 2),
+                'difference' => $var,
+                'status' => 'Closed',
+                'primary_payment_type' => $prim,
+                'notes' => 'Legacy POS shift historical balance.',
+                'created_by' => $cName,
+                'cashier_name' => $cName,
+                'user_name' => $cName,
+                'user_role' => 'Lead Cashier',
+                'payment_breakdown' => [
+                    ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count],
+                ],
+            ];
         }
 
-        // 2. Returns & Expenses for matching dates
-        $returnsAgg = DB::table('sale_returns')
-            ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(CASE WHEN LOWER(COALESCE(refund_tender, payment_type, 'cash')) LIKE '%cash%' THEN paid_amount ELSE 0 END) as cash_refunds")
-            ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
-            ->get()
-            ->keyBy(function($r) { return $r->ret_date . '_' . $r->w_id; });
+        // Sort all items by opened_at descending
+        usort($items, function ($a, $b) {
+            return strcmp($b['opened_at'] ?? $b['date'], $a['opened_at'] ?? $a['date']);
+        });
 
-        $expensesAgg = DB::table('expenses')
-            ->selectRaw("SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, SUM(amount) as total_expenses, SUM(CASE WHEN LOWER(COALESCE(payment_method, 'cash')) = 'cash' THEN amount ELSE 0 END) as cash_expenses")
-            ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id')
-            ->get()
-            ->keyBy(function($e) { return $e->exp_date . '_' . $e->w_id; });
-
-        // 2b. Real cash_registers and cash_register_transactions lookup
-        $realRegistersByUserKey = [];
-        $realRegistersByDateWh = [];
-        $regTxAgg = [];
-        if (Schema::hasTable('cash_registers')) {
-            $regQuery = DB::table('cash_registers');
-            if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
-                $regQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
-                    if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
-                    if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
-                });
-            }
-            if (!empty($startDate) && !empty($endDate)) {
-                $regQuery->whereRaw("SUBSTRING(opened_at, 1, 10) >= ? AND SUBSTRING(opened_at, 1, 10) <= ?", [$startDate, $endDate]);
-            }
-            $realRegs = $regQuery->orderByDesc('id')->get();
-            foreach ($realRegs as $rr) {
-                $rDate = substr((string)$rr->opened_at, 0, 10);
-                $rWId = (int)($rr->warehouse_id ?? 1);
-                $rUser = strtolower(trim(explode('(', (string)($rr->user_name ?: 'Super Admin'))[0]));
-                $uKey = $rDate . '_' . $rWId . '_' . $rUser;
-                $dwKey = $rDate . '_' . $rWId;
-                if (!isset($realRegistersByUserKey[$uKey])) {
-                    $realRegistersByUserKey[$uKey] = $rr;
-                }
-                if (!isset($realRegistersByDateWh[$dwKey])) {
-                    $realRegistersByDateWh[$dwKey] = $rr;
-                }
-            }
-
-            if (Schema::hasTable('cash_register_transactions') && $realRegs->isNotEmpty()) {
-                $regIds = $realRegs->pluck('id')->all();
-                $txRows = DB::table('cash_register_transactions')
-                    ->whereIn('cash_register_id', $regIds)
-                    ->get();
-                foreach ($txRows as $tx) {
-                    $rid = (int)$tx->cash_register_id;
-                    if (!isset($regTxAgg[$rid])) {
-                        $regTxAgg[$rid] = ['float_in' => 0.0, 'drop' => 0.0];
-                    }
-                    if ($tx->type === 'float_in') {
-                        $regTxAgg[$rid]['float_in'] += (float)$tx->amount;
-                    } elseif ($tx->type === 'drop' || $tx->type === 'safe_drop') {
-                        $regTxAgg[$rid]['drop'] += (float)$tx->amount;
-                    }
-                }
-            }
-        }
-
-        // 3. Assemble Sessions
-        $items = [];
+        // Calculate summary
         $totalShiftSales = 0.0;
         $totalOpeningCash = 0.0;
         $totalCashSales = 0.0;
@@ -3754,190 +3959,24 @@ class ReportController extends Controller
         $closedSessionsCount = 0;
         $discrepancySessionsCount = 0;
 
-        $idSeq = 1;
-        foreach ($sessionGroups as $s) {
-            $sessionDate = $s->session_date;
-            $wId = (int)$s->w_id;
-            $wName = $s->w_name;
-            $cashierName = trim(explode('(', (string)($s->cashier_name ?: 'Super Admin'))[0]);
-            if (empty($cashierName)) {
-                $cashierName = 'Super Admin';
-            }
-            $key = $sessionDate . '_' . $wId;
-            $spKey = $sessionDate . '_' . $wId . '_' . $s->cashier_name;
+        foreach ($items as $item) {
+            $totalShiftSales += (float)$item['total_sales'];
+            $totalOpeningCash += (float)$item['opening_cash'];
+            $totalCashSales += (float)$item['cash_sales'];
+            $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
+            $totalRefundsSum += (float)$item['total_refunds'];
+            $totalExpensesSum += (float)$item['total_expenses'];
+            $totalExpectedCash += (float)$item['expected_cash'];
+            $totalClosingCash += (float)$item['closing_cash'];
+            $totalVariance += (float)$item['difference'];
+            $totalTxSum += (int)$item['total_transactions'];
 
-            $ret = $returnsAgg->get($key);
-            $exp = $expensesAgg->get($key);
-            $sp = $splitTenderMap->get($spKey);
-
-            $salesTotal = (float)$s->total_sales;
-            $cashSales = $sp ? (float)$sp->sp_cash : (float)$s->cash_sales;
-            $cardSales = $sp ? (float)$sp->sp_card : (float)$s->card_sales;
-            $digitalSales = $sp ? (float)$sp->sp_digital : (float)$s->digital_sales;
-            $cashCount = $sp ? (int)$sp->sp_cash_cnt : (int)$s->cash_count;
-            $cardCount = $sp ? (int)$sp->sp_card_cnt : (int)$s->card_count;
-            $digitalCount = $sp ? (int)$sp->sp_digital_cnt : (int)$s->digital_count;
-
-            // Ensure tender breakdown reconciles with paid_amount if sale_payments only had partial records
-            if (($cashSales + $cardSales + $digitalSales) == 0 && $salesTotal > 0) {
-                $cashSales = (float)$s->cash_sales;
-                $cardSales = (float)$s->card_sales;
-                $digitalSales = (float)$s->digital_sales;
-            }
-
-            $totalRefunds = $ret ? (float)$ret->total_returns : 0.0;
-            $cashRefunds = $ret ? (float)$ret->cash_refunds : 0.0;
-            $totalExpenses = $exp ? (float)$exp->total_expenses : 0.0;
-            $cashExpenses = $exp ? (float)$exp->cash_expenses : 0.0;
-
-            // Match against real cash_registers session if available
-            $uKey = $sessionDate . '_' . $wId . '_' . strtolower($cashierName);
-            $regSession = $realRegistersByUserKey[$uKey] ?? ($realRegistersByDateWh[$key] ?? null);
-
-            $floatsIn = 0.0;
-            $cashDrops = 0.0;
-            if ($regSession) {
-                $openingCash = (float)$regSession->opening_cash;
-                $rId = (int)$regSession->id;
-                $floatsIn = (float)($regTxAgg[$rId]['float_in'] ?? 0.0);
-                $cashDrops = (float)($regTxAgg[$rId]['drop'] ?? 0.0);
-                $expectedCash = max(0.0, $openingCash + $cashSales + $floatsIn - $cashDrops - $cashRefunds - $cashExpenses);
-                $closingCash = $regSession->closing_cash !== null ? (float)$regSession->closing_cash : $expectedCash;
-                $variance = $regSession->cash_difference !== null
-                    ? (float)$regSession->cash_difference
-                    : round($closingCash - $expectedCash, 2);
-                $status = ucfirst(strtolower((string)($regSession->status ?: 'Closed')));
-            } else {
-                // Standard Opening Cash Float ($500 base standard)
-                $openingCash = 500.00;
-                $expectedCash = max(0.0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
-                $closingCash = $expectedCash;
-                $variance = round($closingCash - $expectedCash, 2);
-                $status = 'Closed';
-            }
-
-            $cleanDate = str_replace('-', '', $sessionDate);
-            $regIndex = ($idSeq % 3) + 1;
-            $registerId = ($regSession && !empty($regSession->register_name))
-                ? $regSession->register_name
-                : ('Register ' . str_pad($regIndex, 2, '0', STR_PAD_LEFT));
-            $refNo = ($regSession && !empty($regSession->reference_no))
-                ? $regSession->reference_no
-                : ('REG-' . $cleanDate . '-' . str_pad($idSeq, 3, '0', STR_PAD_LEFT));
-
-            // Register filter
-            if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($registerId, $registerFilter) !== 0) {
-                continue;
-            }
-
-            // Status filter (handle 'Active'/'Open' synonymously)
-            if ($statusFilter !== 'All' && !empty($statusFilter)) {
-                $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
-                $normStatus = strtolower($status) === 'active' ? 'open' : strtolower($status);
-                if ($normFilter !== $normStatus) {
-                    continue;
-                }
-            }
-
-            // Primary Payment Type
-            $primaryPayment = 'Cash';
-            if ($digitalSales > $cashSales && $digitalSales > $cardSales) {
-                $primaryPayment = 'KBZPay';
-            } elseif ($cardSales > $cashSales) {
-                $primaryPayment = 'Card';
-            } elseif ($cashSales > 0 && ($digitalSales > 0 || $cardSales > 0)) {
-                $primaryPayment = 'Split Payment';
-            }
-
-            if ($paymentTypeFilter !== 'All' && !empty($paymentTypeFilter) && strcasecmp($primaryPayment, $paymentTypeFilter) !== 0) {
-                continue;
-            }
-
-            // Text search
-            if (!empty($search)) {
-                $q = strtolower($search);
-                $matches = str_contains(strtolower($refNo), $q) ||
-                           str_contains(strtolower($registerId), $q) ||
-                           str_contains(strtolower($wName), $q) ||
-                           str_contains(strtolower($cashierName), $q) ||
-                           str_contains($sessionDate, $q);
-                if (!$matches) continue;
-            }
-
-            $userRole = 'Lead Cashier';
-            if (stripos($cashierName, 'admin') !== false) {
-                $userRole = 'Super Admin';
-            } elseif (stripos($cashierName, 'manager') !== false) {
-                $userRole = 'Branch Manager';
-            }
-
-            $openedAtTime = !empty($s->opened_at_raw) && strlen($s->opened_at_raw) >= 19 ? substr($s->opened_at_raw, 11, 8) : '08:30:00';
-            $closedAtTime = !empty($s->closed_at_raw) && strlen($s->closed_at_raw) >= 19 ? substr($s->closed_at_raw, 11, 8) : '17:00:00';
-
-            $paymentBreakdown = [
-                ['method' => 'Cash', 'amount' => round($cashSales, 2), 'count' => $cashCount],
-                ['method' => 'Card (Visa/MC)', 'amount' => round($cardSales, 2), 'count' => $cardCount],
-                ['method' => 'Mobile Money (KBZPay)', 'amount' => round($digitalSales, 2), 'count' => $digitalCount],
-            ];
-
-            $shiftNotes = ($regSession && !empty($regSession->closing_notes))
-                ? $regSession->closing_notes
-                : (($regSession && !empty($regSession->opening_notes))
-                    ? $regSession->opening_notes
-                    : 'Drawer shift verified and counted with supervisor confirmation.');
-
-            $item = [
-                'id' => $idSeq++,
-                'reference_no' => $refNo,
-                'register_id' => $registerId,
-                'warehouse_id' => $wId,
-                'warehouse_name' => $wName,
-                'date' => $sessionDate,
-                'opened_at' => ($regSession && !empty($regSession->opened_at)) ? (string)$regSession->opened_at : ($sessionDate . ' ' . $openedAtTime),
-                'closed_at' => ($regSession && !empty($regSession->closed_at)) ? (string)$regSession->closed_at : ($status === 'Open' ? '' : ($sessionDate . ' ' . $closedAtTime)),
-                'total_transactions' => (int)$s->tx_count,
-                'opening_cash' => round($openingCash, 2),
-                'total_sales' => round($salesTotal, 2),
-                'cash_sales' => round($cashSales, 2),
-                'card_sales' => round($cardSales, 2),
-                'digital_sales' => round($digitalSales, 2),
-                'total_refunds' => round($totalRefunds, 2),
-                'cash_refunds' => round($cashRefunds, 2),
-                'total_expenses' => round($totalExpenses, 2),
-                'cash_expenses' => round($cashExpenses, 2),
-                'digital_expenses' => round($totalExpenses - $cashExpenses, 2),
-                'floats_in' => round($floatsIn, 2),
-                'cash_drops' => round($cashDrops, 2),
-                'expected_cash' => round($expectedCash, 2),
-                'closing_cash' => round($closingCash, 2),
-                'difference' => round($variance, 2),
-                'status' => $status,
-                'primary_payment_type' => $primaryPayment,
-                'notes' => $shiftNotes,
-                'created_by' => $cashierName,
-                'cashier_name' => $cashierName,
-                'user_name' => $cashierName,
-                'user_role' => $userRole,
-                'payment_breakdown' => $paymentBreakdown,
-            ];
-
-            $items[] = $item;
-            $totalShiftSales += $salesTotal;
-            $totalOpeningCash += $openingCash;
-            $totalCashSales += $cashSales;
-            $totalNonCashSales += ($cardSales + $digitalSales);
-            $totalRefundsSum += $totalRefunds;
-            $totalExpensesSum += $totalExpenses;
-            $totalExpectedCash += $expectedCash;
-            $totalClosingCash += $closingCash;
-            $totalVariance += $variance;
-            $totalTxSum += (int)$s->tx_count;
-            if (strtolower($status) === 'open' || strtolower($status) === 'active') {
+            if (strtolower($item['status']) === 'open' || strtolower($item['status']) === 'active') {
                 $openSessionsCount++;
             } else {
                 $closedSessionsCount++;
             }
-            if (abs($variance) > 0.009) {
+            if (abs((float)$item['difference']) > 0.009) {
                 $discrepancySessionsCount++;
             }
         }
@@ -3961,6 +4000,7 @@ class ReportController extends Controller
                 'discrepancy_sessions' => $discrepancySessionsCount,
             ],
             'data' => $items,
+            'sessions' => $items,
             'pagination' => [
                 'current_page' => 1,
                 'per_page' => max(1, count($items)),
