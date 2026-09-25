@@ -3578,8 +3578,28 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
-        // 1. Group sales by Date, Warehouse, and Cashier/User to form POS Register Sessions
+        // Resolve polymorphic warehouse filter (ID or Name)
+        $targetWarehouseId = null;
+        $targetWarehouseName = null;
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            if (is_numeric($warehouse)) {
+                $targetWarehouseId = (int)$warehouse;
+                $outletObj = DB::table('outlets')->where('id', $targetWarehouseId)->first()
+                    ?? (Schema::hasTable('warehouses') ? DB::table('warehouses')->where('id', $targetWarehouseId)->first() : null);
+                $targetWarehouseName = $outletObj ? $outletObj->name : (string)$warehouse;
+            } else {
+                $targetWarehouseName = (string)$warehouse;
+                $outletObj = DB::table('outlets')->whereRaw('LOWER(name) = ?', [strtolower($targetWarehouseName)])->first()
+                    ?? (Schema::hasTable('warehouses') ? DB::table('warehouses')->whereRaw('LOWER(name) = ?', [strtolower($targetWarehouseName)])->first() : null);
+                if ($outletObj) {
+                    $targetWarehouseId = (int)$outletObj->id;
+                }
+            }
+        }
+
+        // 1. Group completed sales by Date, Warehouse, and Cashier/User to form POS Register Sessions
         $salesQuery = DB::table('sales')
+            ->whereNotIn(DB::raw("LOWER(COALESCE(status, 'completed'))"), ['voided', 'cancelled', 'draft'])
             ->selectRaw("
                 SUBSTRING(date, 1, 10) as session_date,
                 MIN(date) as opened_at_raw,
@@ -3591,15 +3611,22 @@ class ReportController extends Controller
                 COALESCE(SUM(grand_total), 0) as total_sales,
                 COALESCE(SUM(paid_amount), 0) as paid_amount,
                 COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, 'Cash')) = 'cash' THEN paid_amount ELSE 0 END), 0) as cash_sales,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as card_sales,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'mobile money', 'digital', 'bank transfer') THEN paid_amount ELSE 0 END), 0) as digital_sales,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as card_sales,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer', 'bank_transfer', 'cheque', 'check') THEN paid_amount ELSE 0 END), 0) as digital_sales,
                 COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, 'Cash')) = 'cash' THEN 1 ELSE 0 END), 0) as cash_count,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'visa', 'mastercard') THEN 1 ELSE 0 END), 0) as card_count,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'mobile money', 'digital', 'bank transfer') THEN 1 ELSE 0 END), 0) as digital_count
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END), 0) as card_count,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'bank transfer', 'bank_transfer', 'cheque', 'check') THEN 1 ELSE 0 END), 0) as digital_count
             ");
 
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where('warehouse_name', $warehouse);
+        if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
+            $salesQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
+                if ($targetWarehouseId !== null) {
+                    $q->where('warehouse_id', $targetWarehouseId);
+                }
+                if ($targetWarehouseName !== null) {
+                    $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
+                }
+            });
         }
 
         if ($cashier !== 'All' && !empty($cashier)) {
@@ -3621,6 +3648,34 @@ class ReportController extends Controller
             ->orderByDesc(DB::raw("SUBSTRING(date, 1, 10)"))
             ->get();
 
+        // 1b. Multi-tender split payment resolution from sale_payments if available
+        $splitTenderMap = collect();
+        if (Schema::hasTable('sale_payments')) {
+            $spQuery = DB::table('sale_payments')
+                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
+                ->whereNotIn(DB::raw("LOWER(COALESCE(sales.status, 'completed'))"), ['voided', 'cancelled', 'draft'])
+                ->selectRaw("
+                    SUBSTRING(sales.date, 1, 10) as session_date,
+                    COALESCE(sales.warehouse_id, 1) as w_id,
+                    COALESCE(sales.created_by, 'Super Admin') as cashier_name,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, 'cash')) = 'cash' THEN sale_payments.amount ELSE 0 END) as sp_cash,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN sale_payments.amount ELSE 0 END) as sp_card,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) NOT IN ('cash', 'card', 'pos card', 'credit card', 'visa', 'mastercard') THEN sale_payments.amount ELSE 0 END) as sp_digital,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, 'cash')) = 'cash' THEN 1 ELSE 0 END) as sp_cash_cnt,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END) as sp_card_cnt,
+                    SUM(CASE WHEN LOWER(COALESCE(sale_payments.payment_method, '')) NOT IN ('cash', 'card', 'pos card', 'credit card', 'visa', 'mastercard') THEN 1 ELSE 0 END) as sp_digital_cnt
+                ");
+            if (!empty($startDate) && !empty($endDate)) {
+                $spQuery->whereRaw("SUBSTRING(sales.date, 1, 10) >= ? AND SUBSTRING(sales.date, 1, 10) <= ?", [$startDate, $endDate]);
+            }
+            $splitTenderMap = $spQuery
+                ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), 'sales.warehouse_id', 'sales.created_by')
+                ->get()
+                ->keyBy(function ($row) {
+                    return $row->session_date . '_' . $row->w_id . '_' . $row->cashier_name;
+                });
+        }
+
         // 2. Returns & Expenses for matching dates
         $returnsAgg = DB::table('sale_returns')
             ->selectRaw("SUBSTRING(date, 1, 10) as ret_date, COALESCE(warehouse_id, 1) as w_id, SUM(grand_total) as total_returns, SUM(CASE WHEN LOWER(COALESCE(refund_tender, payment_type, 'cash')) LIKE '%cash%' THEN paid_amount ELSE 0 END) as cash_refunds")
@@ -3634,11 +3689,70 @@ class ReportController extends Controller
             ->get()
             ->keyBy(function($e) { return $e->exp_date . '_' . $e->w_id; });
 
+        // 2b. Real cash_registers and cash_register_transactions lookup
+        $realRegistersByUserKey = [];
+        $realRegistersByDateWh = [];
+        $regTxAgg = [];
+        if (Schema::hasTable('cash_registers')) {
+            $regQuery = DB::table('cash_registers');
+            if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
+                $regQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
+                    if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
+                    if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
+                });
+            }
+            if (!empty($startDate) && !empty($endDate)) {
+                $regQuery->whereRaw("SUBSTRING(opened_at, 1, 10) >= ? AND SUBSTRING(opened_at, 1, 10) <= ?", [$startDate, $endDate]);
+            }
+            $realRegs = $regQuery->orderByDesc('id')->get();
+            foreach ($realRegs as $rr) {
+                $rDate = substr((string)$rr->opened_at, 0, 10);
+                $rWId = (int)($rr->warehouse_id ?? 1);
+                $rUser = strtolower(trim(explode('(', (string)($rr->user_name ?: 'Super Admin'))[0]));
+                $uKey = $rDate . '_' . $rWId . '_' . $rUser;
+                $dwKey = $rDate . '_' . $rWId;
+                if (!isset($realRegistersByUserKey[$uKey])) {
+                    $realRegistersByUserKey[$uKey] = $rr;
+                }
+                if (!isset($realRegistersByDateWh[$dwKey])) {
+                    $realRegistersByDateWh[$dwKey] = $rr;
+                }
+            }
+
+            if (Schema::hasTable('cash_register_transactions') && $realRegs->isNotEmpty()) {
+                $regIds = $realRegs->pluck('id')->all();
+                $txRows = DB::table('cash_register_transactions')
+                    ->whereIn('cash_register_id', $regIds)
+                    ->get();
+                foreach ($txRows as $tx) {
+                    $rid = (int)$tx->cash_register_id;
+                    if (!isset($regTxAgg[$rid])) {
+                        $regTxAgg[$rid] = ['float_in' => 0.0, 'drop' => 0.0];
+                    }
+                    if ($tx->type === 'float_in') {
+                        $regTxAgg[$rid]['float_in'] += (float)$tx->amount;
+                    } elseif ($tx->type === 'drop' || $tx->type === 'safe_drop') {
+                        $regTxAgg[$rid]['drop'] += (float)$tx->amount;
+                    }
+                }
+            }
+        }
+
         // 3. Assemble Sessions
         $items = [];
         $totalShiftSales = 0.0;
+        $totalOpeningCash = 0.0;
+        $totalCashSales = 0.0;
+        $totalNonCashSales = 0.0;
+        $totalRefundsSum = 0.0;
+        $totalExpensesSum = 0.0;
+        $totalExpectedCash = 0.0;
         $totalClosingCash = 0.0;
         $totalVariance = 0.0;
+        $totalTxSum = 0;
+        $openSessionsCount = 0;
+        $closedSessionsCount = 0;
+        $discrepancySessionsCount = 0;
 
         $idSeq = 1;
         foreach ($sessionGroups as $s) {
@@ -3650,40 +3764,79 @@ class ReportController extends Controller
                 $cashierName = 'Super Admin';
             }
             $key = $sessionDate . '_' . $wId;
+            $spKey = $sessionDate . '_' . $wId . '_' . $s->cashier_name;
 
             $ret = $returnsAgg->get($key);
             $exp = $expensesAgg->get($key);
+            $sp = $splitTenderMap->get($spKey);
 
             $salesTotal = (float)$s->total_sales;
-            $cashSales = (float)$s->cash_sales;
-            $cardSales = (float)$s->card_sales;
-            $digitalSales = (float)$s->digital_sales;
+            $cashSales = $sp ? (float)$sp->sp_cash : (float)$s->cash_sales;
+            $cardSales = $sp ? (float)$sp->sp_card : (float)$s->card_sales;
+            $digitalSales = $sp ? (float)$sp->sp_digital : (float)$s->digital_sales;
+            $cashCount = $sp ? (int)$sp->sp_cash_cnt : (int)$s->cash_count;
+            $cardCount = $sp ? (int)$sp->sp_card_cnt : (int)$s->card_count;
+            $digitalCount = $sp ? (int)$sp->sp_digital_cnt : (int)$s->digital_count;
+
+            // Ensure tender breakdown reconciles with paid_amount if sale_payments only had partial records
+            if (($cashSales + $cardSales + $digitalSales) == 0 && $salesTotal > 0) {
+                $cashSales = (float)$s->cash_sales;
+                $cardSales = (float)$s->card_sales;
+                $digitalSales = (float)$s->digital_sales;
+            }
 
             $totalRefunds = $ret ? (float)$ret->total_returns : 0.0;
             $cashRefunds = $ret ? (float)$ret->cash_refunds : 0.0;
             $totalExpenses = $exp ? (float)$exp->total_expenses : 0.0;
             $cashExpenses = $exp ? (float)$exp->cash_expenses : 0.0;
 
-            // Opening Cash Float ($500 base standard)
-            $openingCash = 500.00;
-            $expectedCash = max(0.0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
-            $closingCash = $expectedCash; // Actual counted cash
-            $variance = round($closingCash - $expectedCash, 2);
+            // Match against real cash_registers session if available
+            $uKey = $sessionDate . '_' . $wId . '_' . strtolower($cashierName);
+            $regSession = $realRegistersByUserKey[$uKey] ?? ($realRegistersByDateWh[$key] ?? null);
+
+            $floatsIn = 0.0;
+            $cashDrops = 0.0;
+            if ($regSession) {
+                $openingCash = (float)$regSession->opening_cash;
+                $rId = (int)$regSession->id;
+                $floatsIn = (float)($regTxAgg[$rId]['float_in'] ?? 0.0);
+                $cashDrops = (float)($regTxAgg[$rId]['drop'] ?? 0.0);
+                $expectedCash = max(0.0, $openingCash + $cashSales + $floatsIn - $cashDrops - $cashRefunds - $cashExpenses);
+                $closingCash = $regSession->closing_cash !== null ? (float)$regSession->closing_cash : $expectedCash;
+                $variance = $regSession->cash_difference !== null
+                    ? (float)$regSession->cash_difference
+                    : round($closingCash - $expectedCash, 2);
+                $status = ucfirst(strtolower((string)($regSession->status ?: 'Closed')));
+            } else {
+                // Standard Opening Cash Float ($500 base standard)
+                $openingCash = 500.00;
+                $expectedCash = max(0.0, $openingCash + $cashSales - $cashRefunds - $cashExpenses);
+                $closingCash = $expectedCash;
+                $variance = round($closingCash - $expectedCash, 2);
+                $status = 'Closed';
+            }
 
             $cleanDate = str_replace('-', '', $sessionDate);
             $regIndex = ($idSeq % 3) + 1;
-            $registerId = 'Register ' . str_pad($regIndex, 2, '0', STR_PAD_LEFT);
-            $refNo = 'REG-' . $cleanDate . '-' . str_pad($idSeq, 3, '0', STR_PAD_LEFT);
+            $registerId = ($regSession && !empty($regSession->register_name))
+                ? $regSession->register_name
+                : ('Register ' . str_pad($regIndex, 2, '0', STR_PAD_LEFT));
+            $refNo = ($regSession && !empty($regSession->reference_no))
+                ? $regSession->reference_no
+                : ('REG-' . $cleanDate . '-' . str_pad($idSeq, 3, '0', STR_PAD_LEFT));
 
             // Register filter
             if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($registerId, $registerFilter) !== 0) {
                 continue;
             }
 
-            // Status
-            $status = 'Closed';
-            if ($statusFilter !== 'All' && !empty($statusFilter) && strcasecmp($status, $statusFilter) !== 0) {
-                continue;
+            // Status filter (handle 'Active'/'Open' synonymously)
+            if ($statusFilter !== 'All' && !empty($statusFilter)) {
+                $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
+                $normStatus = strtolower($status) === 'active' ? 'open' : strtolower($status);
+                if ($normFilter !== $normStatus) {
+                    continue;
+                }
             }
 
             // Primary Payment Type
@@ -3722,10 +3875,16 @@ class ReportController extends Controller
             $closedAtTime = !empty($s->closed_at_raw) && strlen($s->closed_at_raw) >= 19 ? substr($s->closed_at_raw, 11, 8) : '17:00:00';
 
             $paymentBreakdown = [
-                ['method' => 'Cash', 'amount' => round($cashSales, 2), 'count' => (int)$s->cash_count],
-                ['method' => 'Card (Visa/MC)', 'amount' => round($cardSales, 2), 'count' => (int)$s->card_count],
-                ['method' => 'Mobile Money (KBZPay)', 'amount' => round($digitalSales, 2), 'count' => (int)$s->digital_count],
+                ['method' => 'Cash', 'amount' => round($cashSales, 2), 'count' => $cashCount],
+                ['method' => 'Card (Visa/MC)', 'amount' => round($cardSales, 2), 'count' => $cardCount],
+                ['method' => 'Mobile Money (KBZPay)', 'amount' => round($digitalSales, 2), 'count' => $digitalCount],
             ];
+
+            $shiftNotes = ($regSession && !empty($regSession->closing_notes))
+                ? $regSession->closing_notes
+                : (($regSession && !empty($regSession->opening_notes))
+                    ? $regSession->opening_notes
+                    : 'Drawer shift verified and counted with supervisor confirmation.');
 
             $item = [
                 'id' => $idSeq++,
@@ -3734,10 +3893,10 @@ class ReportController extends Controller
                 'warehouse_id' => $wId,
                 'warehouse_name' => $wName,
                 'date' => $sessionDate,
-                'opened_at' => $sessionDate . ' ' . $openedAtTime,
-                'closed_at' => $sessionDate . ' ' . $closedAtTime,
+                'opened_at' => ($regSession && !empty($regSession->opened_at)) ? (string)$regSession->opened_at : ($sessionDate . ' ' . $openedAtTime),
+                'closed_at' => ($regSession && !empty($regSession->closed_at)) ? (string)$regSession->closed_at : ($status === 'Open' ? '' : ($sessionDate . ' ' . $closedAtTime)),
                 'total_transactions' => (int)$s->tx_count,
-                'opening_cash' => $openingCash,
+                'opening_cash' => round($openingCash, 2),
                 'total_sales' => round($salesTotal, 2),
                 'cash_sales' => round($cashSales, 2),
                 'card_sales' => round($cardSales, 2),
@@ -3747,12 +3906,14 @@ class ReportController extends Controller
                 'total_expenses' => round($totalExpenses, 2),
                 'cash_expenses' => round($cashExpenses, 2),
                 'digital_expenses' => round($totalExpenses - $cashExpenses, 2),
+                'floats_in' => round($floatsIn, 2),
+                'cash_drops' => round($cashDrops, 2),
                 'expected_cash' => round($expectedCash, 2),
                 'closing_cash' => round($closingCash, 2),
-                'difference' => $variance,
+                'difference' => round($variance, 2),
                 'status' => $status,
                 'primary_payment_type' => $primaryPayment,
-                'notes' => 'Drawer shift verified and counted with supervisor confirmation.',
+                'notes' => $shiftNotes,
                 'created_by' => $cashierName,
                 'cashier_name' => $cashierName,
                 'user_name' => $cashierName,
@@ -3762,17 +3923,42 @@ class ReportController extends Controller
 
             $items[] = $item;
             $totalShiftSales += $salesTotal;
+            $totalOpeningCash += $openingCash;
+            $totalCashSales += $cashSales;
+            $totalNonCashSales += ($cardSales + $digitalSales);
+            $totalRefundsSum += $totalRefunds;
+            $totalExpensesSum += $totalExpenses;
+            $totalExpectedCash += $expectedCash;
             $totalClosingCash += $closingCash;
             $totalVariance += $variance;
+            $totalTxSum += (int)$s->tx_count;
+            if (strtolower($status) === 'open' || strtolower($status) === 'active') {
+                $openSessionsCount++;
+            } else {
+                $closedSessionsCount++;
+            }
+            if (abs($variance) > 0.009) {
+                $discrepancySessionsCount++;
+            }
         }
 
         $responsePayload = [
             'status' => 'success',
             'summary' => [
                 'total_sessions' => count($items),
+                'open_sessions' => $openSessionsCount,
+                'closed_sessions' => $closedSessionsCount,
+                'total_transactions' => $totalTxSum,
+                'total_opening_cash' => round($totalOpeningCash, 2),
                 'total_shift_sales' => round($totalShiftSales, 2),
+                'total_cash_sales' => round($totalCashSales, 2),
+                'total_non_cash_sales' => round($totalNonCashSales, 2),
+                'total_refunds' => round($totalRefundsSum, 2),
+                'total_expenses' => round($totalExpensesSum, 2),
+                'total_expected_cash' => round($totalExpectedCash, 2),
                 'total_closing_cash' => round($totalClosingCash, 2),
                 'total_variance' => round($totalVariance, 2),
+                'discrepancy_sessions' => $discrepancySessionsCount,
             ],
             'data' => $items,
             'pagination' => [
