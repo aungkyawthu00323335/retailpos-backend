@@ -5152,6 +5152,7 @@ class ReportController extends Controller
         // Get last sale date per product (optionally scoped to warehouse/outlet)
         $saleQuery = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->whereNotIn('sales.status', ['Voided', 'Cancelled'])
             ->select('sale_items.product_id', DB::raw('MAX(sales.date) as last_sale_date'));
 
         if ($warehouseId !== null) {
@@ -5202,8 +5203,8 @@ class ReportController extends Controller
             'products.category_name',
             'products.brand_name',
             'products.unit_name',
-            'products.cost_price',
-            'products.selling_price',
+            DB::raw('COALESCE(NULLIF(products.cost_price, 0), (SELECT AVG(cost_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.cost_price > 0), 0) as cost_price'),
+            DB::raw('COALESCE(NULLIF(products.selling_price, 0), (SELECT AVG(selling_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.selling_price > 0), 0) as selling_price'),
             'products.created_at',
         ];
 
