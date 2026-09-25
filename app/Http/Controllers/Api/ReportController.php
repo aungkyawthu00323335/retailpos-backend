@@ -5666,10 +5666,29 @@ class ReportController extends Controller
             $endDate = Carbon::now()->endOfMonth()->toDateString();
         }
 
-        // 1. Output Tax from Sales (collected from customers)
-        $salesQuery = DB::table('sales')->where('status', '!=', 'Voided');
+        $warehouseId = null;
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where('warehouse_name', $warehouse);
+            $matchedOutlet = DB::table('outlets')
+                ->where('name', $warehouse)
+                ->orWhere('id', $warehouse)
+                ->first();
+            if ($matchedOutlet) {
+                $warehouseId = $matchedOutlet->id;
+                $warehouse = $matchedOutlet->name;
+            }
+        }
+
+        // 1. Output Tax from Sales (collected from customers)
+        $salesQuery = DB::table('sales')->whereNotIn('status', ['Voided', 'Cancelled']);
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('sales.warehouse_id', $warehouseId)
+                      ->orWhere('sales.warehouse_name', $warehouse);
+                } else {
+                    $q->where('sales.warehouse_name', $warehouse);
+                }
+            });
         }
         $salesQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
 
@@ -5685,9 +5704,16 @@ class ReportController extends Controller
             ->first();
 
         // 2. Output Tax adjustment from Sale Returns (tax refunded to customers)
-        $srQuery = DB::table('sale_returns')->where('status', '!=', 'Cancelled');
+        $srQuery = DB::table('sale_returns')->whereNotIn('status', ['Cancelled', 'Voided']);
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $srQuery->where('warehouse_name', $warehouse);
+            $srQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('warehouse_id', $warehouseId)
+                      ->orWhere('warehouse_name', $warehouse);
+                } else {
+                    $q->where('warehouse_name', $warehouse);
+                }
+            });
         }
         $srQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
 
@@ -5701,9 +5727,16 @@ class ReportController extends Controller
             ->first();
 
         // 3. Input Tax from Purchases (tax paid to suppliers)
-        $purchQuery = DB::table('purchases')->where('status', '!=', 'Cancelled');
+        $purchQuery = DB::table('purchases')->whereNotIn('status', ['Cancelled', 'Voided']);
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $purchQuery->where('warehouse_name', $warehouse);
+            $purchQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('warehouse_id', $warehouseId)
+                      ->orWhere('warehouse_name', $warehouse);
+                } else {
+                    $q->where('warehouse_name', $warehouse);
+                }
+            });
         }
         $purchQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
 
@@ -5719,9 +5752,16 @@ class ReportController extends Controller
             ->first();
 
         // 4. Input Tax adjustment from Purchase Returns (tax recovered from suppliers)
-        $prQuery = DB::table('purchase_returns')->where('status', '!=', 'Cancelled');
+        $prQuery = DB::table('purchase_returns')->whereNotIn('status', ['Cancelled', 'Voided']);
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $prQuery->where('warehouse_name', $warehouse);
+            $prQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('warehouse_id', $warehouseId)
+                      ->orWhere('warehouse_name', $warehouse);
+                } else {
+                    $q->where('warehouse_name', $warehouse);
+                }
+            });
         }
         $prQuery->whereRaw("SUBSTRING(date, 1, 10) >= ? AND SUBSTRING(date, 1, 10) <= ?", [$startDate, $endDate]);
 
@@ -5751,14 +5791,28 @@ class ReportController extends Controller
             $taxCreditForward = round($netInputTax - $netOutputTax, 2);
         }
 
-        // Recent Invoices with Tax Breakdown (last 50)
-        $taxableSalesList = (clone $salesQuery)
+        // Taxable Invoices with Tax Breakdown (up to 2,000 records for client-side progressive chunked rendering)
+        $search = trim($request->query('search', ''));
+        $salesListQuery = (clone $salesQuery)->where('tax_amount', '>', 0);
+        if (!empty($search)) {
+            $salesListQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('customer_name', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $taxableSalesList = $salesListQuery
             ->select('id', 'reference_no', 'date', 'customer_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'subtotal', 'discount', 'grand_total')
-            ->where('tax_amount', '>', 0)
             ->orderBy('date', 'desc')
-            ->limit(50)
+            ->limit(2000)
             ->get()
             ->map(function ($row) {
+                $subtotal = (float)($row->subtotal ?? 0);
+                $discount = (float)($row->discount ?? 0);
+                $grandTotal = (float)($row->grand_total ?? 0);
+                $taxAmount = (float)($row->tax_amount ?? 0);
+                $taxableAmount = round($subtotal > 0 ? ($subtotal - $discount) : ($grandTotal - $taxAmount), 2);
                 return [
                     'id'             => $row->id,
                     'reference_no'   => $row->reference_no,
@@ -5766,20 +5820,32 @@ class ReportController extends Controller
                     'customer_name'  => $row->customer_name ?? 'Walk-in Customer',
                     'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
                     'tax_rate'       => (float)($row->tax_rate ?? 0),
-                    'tax_amount'     => (float)($row->tax_amount ?? 0),
-                    'subtotal'       => (float)($row->subtotal ?? 0),
-                    'discount'       => (float)($row->discount ?? 0),
-                    'grand_total'    => (float)($row->grand_total ?? 0),
+                    'tax_amount'     => $taxAmount,
+                    'taxable_amount' => $taxableAmount,
+                    'subtotal'       => $subtotal,
+                    'discount'       => $discount,
+                    'grand_total'    => $grandTotal,
                 ];
             });
 
-        $taxablePurchasesList = (clone $purchQuery)
+        $purchListQuery = (clone $purchQuery)->where('tax_amount', '>', 0);
+        if (!empty($search)) {
+            $purchListQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('supplier_name', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $taxablePurchasesList = $purchListQuery
             ->select('id', 'reference_no', 'date', 'supplier_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'discount', 'grand_total')
-            ->where('tax_amount', '>', 0)
             ->orderBy('date', 'desc')
-            ->limit(50)
+            ->limit(2000)
             ->get()
             ->map(function ($row) {
+                $grandTotal = (float)($row->grand_total ?? 0);
+                $taxAmount = (float)($row->tax_amount ?? 0);
+                $taxableAmount = round(max(0.0, $grandTotal - $taxAmount), 2);
                 return [
                     'id'             => $row->id,
                     'reference_no'   => $row->reference_no,
@@ -5787,9 +5853,10 @@ class ReportController extends Controller
                     'supplier_name'  => $row->supplier_name ?? 'Default Supplier',
                     'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
                     'tax_rate'       => (float)($row->tax_rate ?? 0),
-                    'tax_amount'     => (float)($row->tax_amount ?? 0),
+                    'tax_amount'     => $taxAmount,
+                    'taxable_amount' => $taxableAmount,
                     'discount'       => (float)($row->discount ?? 0),
-                    'grand_total'    => (float)($row->grand_total ?? 0),
+                    'grand_total'    => $grandTotal,
                 ];
             });
 
