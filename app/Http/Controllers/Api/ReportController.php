@@ -5395,24 +5395,90 @@ class ReportController extends Controller
         }
 
         $cashiers = $query->selectRaw("
-            COALESCE(created_by, user_name, 'Unknown Staff') as cashier_name,
+            COALESCE(user_name, created_by, 'Unknown Staff') as cashier_name,
             COALESCE(user_role, 'Cashier') as role,
             COALESCE(warehouse_name, 'Main Branch Outlet') as warehouse_name,
             COUNT(id) as total_bills,
-            SUM(grand_total) as total_sales,
+            SUM(grand_total) as net_revenue,
             SUM(paid_amount) as total_collected,
             SUM(due_amount) as total_due,
             SUM(discount) as total_discount,
             SUM(tax_amount) as total_tax,
-            SUM(CASE WHEN payment_type = 'Cash' THEN paid_amount ELSE 0 END) as cash_collected,
-            SUM(CASE WHEN payment_type != 'Cash' THEN paid_amount ELSE 0 END) as non_cash_collected
+            SUM(subtotal) as total_subtotal,
+            SUM(CASE WHEN payment_type = 'Cash' THEN paid_amount ELSE 0 END) as fallback_cash,
+            SUM(CASE WHEN payment_type != 'Cash' THEN paid_amount ELSE 0 END) as fallback_non_cash
         ")
         ->groupBy(
-            DB::raw("COALESCE(created_by, user_name, 'Unknown Staff')"),
+            DB::raw("COALESCE(user_name, created_by, 'Unknown Staff')"),
             DB::raw("COALESCE(user_role, 'Cashier')"),
             DB::raw("COALESCE(warehouse_name, 'Main Branch Outlet')")
         )
         ->get();
+
+        // Accurate multi-tender split from sale_payments with fallback to sales.payment_type
+        $tenderQuery = DB::table('sales')
+            ->leftJoin('sale_payments', 'sales.id', '=', 'sale_payments.sale_id')
+            ->where('sales.date', '>=', $startDate . ' 00:00:00')
+            ->where('sales.date', '<=', $endDate . ' 23:59:59')
+            ->whereNotIn('sales.status', ['Voided', 'Cancelled']);
+
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $tenderQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('sales.warehouse_id', $warehouseId)
+                      ->orWhere('sales.warehouse_name', $warehouse);
+                } else {
+                    $q->where('sales.warehouse_name', $warehouse);
+                }
+            });
+        }
+
+        $tenderMap = $tenderQuery->selectRaw("
+            COALESCE(sales.user_name, sales.created_by, 'Unknown Staff') as cashier_name,
+            COALESCE(sales.warehouse_name, 'Main Branch Outlet') as warehouse_name,
+            SUM(CASE 
+                WHEN sale_payments.id IS NOT NULL THEN (CASE WHEN sale_payments.payment_type = 'Cash' THEN sale_payments.amount ELSE 0 END)
+                ELSE (CASE WHEN sales.payment_type = 'Cash' THEN sales.paid_amount ELSE 0 END)
+            END) as cash_collected,
+            SUM(CASE 
+                WHEN sale_payments.id IS NOT NULL THEN (CASE WHEN sale_payments.payment_type != 'Cash' THEN sale_payments.amount ELSE 0 END)
+                ELSE (CASE WHEN sales.payment_type != 'Cash' THEN sales.paid_amount ELSE 0 END)
+            END) as non_cash_collected
+        ")
+        ->groupBy(
+            DB::raw("COALESCE(sales.user_name, sales.created_by, 'Unknown Staff')"),
+            DB::raw("COALESCE(sales.warehouse_name, 'Main Branch Outlet')")
+        )
+        ->get()
+        ->keyBy(function ($r) {
+            return $r->cashier_name . '|' . $r->warehouse_name;
+        });
+
+        // Aggregate register sessions across the period for drawer reconciliation
+        $regAgg = DB::table('cash_registers')
+            ->where(function ($q) use ($startDate, $endDate) {
+                if (!empty($startDate) && !empty($endDate)) {
+                    $q->whereBetween('opened_at', [$startDate . ' 00:00:00', $endDate . ' 23:59:59'])
+                      ->orWhereBetween('closed_at', [$startDate . ' 00:00:00', $endDate . ' 23:59:59']);
+                }
+            })
+            ->selectRaw("
+                COALESCE(user_name, 'Unknown Staff') as cashier_name,
+                COALESCE(warehouse_name, 'Main Branch Outlet') as warehouse_name,
+                COUNT(id) as total_shifts,
+                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_shifts,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_shifts,
+                SUM(opening_cash) as total_opening_cash,
+                SUM(CASE WHEN status = 'closed' THEN expected_cash ELSE 0 END) as total_expected_cash,
+                SUM(CASE WHEN status = 'closed' THEN closing_cash ELSE 0 END) as total_closing_cash,
+                SUM(CASE WHEN status = 'closed' THEN cash_difference ELSE 0 END) as total_cash_difference,
+                MAX(register_name) as last_register_name
+            ")
+            ->groupBy('user_name', 'warehouse_name')
+            ->get()
+            ->keyBy(function ($r) {
+                return $r->cashier_name . '|' . $r->warehouse_name;
+            });
 
         $items = [];
         $totalStoreSales = 0.0;
@@ -5426,43 +5492,47 @@ class ReportController extends Controller
 
         $idx = 1;
         foreach ($cashiers as $c) {
-            $sales = (float)$c->total_sales;
             $bills = (int)$c->total_bills;
-            $collected = (float)$c->total_collected;
-            $due = (float)$c->total_due;
-            $discount = (float)$c->total_discount;
-            $cash = (float)$c->cash_collected;
-            $nonCash = (float)$c->non_cash_collected;
-            $avgTicket = $bills > 0 ? round($sales / $bills, 2) : 0.0;
-            $netRevenue = $sales - $discount;
-            $discountRate = $sales > 0 ? round(($discount / $sales) * 100, 1) : 0.0;
+            $netRevenue = (float)$c->net_revenue; // SUM(grand_total)
+            $discount = (float)$c->total_discount; // SUM(discount)
+            $grossSales = $netRevenue + $discount; // Gross Sales = Net Revenue + Discounts Allowed
+            $collected = (float)$c->total_collected; // SUM(paid_amount)
+            $due = (float)$c->total_due; // SUM(due_amount)
+            $avgTicket = $bills > 0 ? round($grossSales / $bills, 2) : 0.0;
+            $discountRate = $grossSales > 0 ? round(($discount / $grossSales) * 100, 1) : 0.0;
 
-            // Find matching register for this cashier
-            $reg = null;
-            if (!empty($c->cashier_name) && $c->cashier_name !== 'Unknown Staff') {
-                $reg = DB::table('cash_registers')
-                    ->where('user_name', $c->cashier_name)
-                    ->orderBy('id', 'desc')
-                    ->first();
+            $key = $c->cashier_name . '|' . $c->warehouse_name;
+
+            // Multi-tender split resolution
+            $tender = $tenderMap->get($key);
+            $cash = $tender ? (float)$tender->cash_collected : (float)$c->fallback_cash;
+            $nonCash = $tender ? (float)$tender->non_cash_collected : (float)$c->fallback_non_cash;
+
+            // Drawer reconciliation across all register sessions in period
+            $reg = $regAgg->get($key);
+            if ($reg && (int)$reg->closed_shifts > 0) {
+                $expectedCash = (float)$reg->total_expected_cash;
+                $closingCash = (float)$reg->total_closing_cash;
+                $diff = (float)$reg->total_cash_difference;
+                $shiftLabel = (int)$reg->closed_shifts === 1 ? '1 shift' : $reg->closed_shifts . ' shifts';
+                $regName = ($reg->last_register_name ?? 'Register 01') . ' (' . $shiftLabel . ')';
+            } elseif ($reg) {
+                $expectedCash = round((float)$reg->total_opening_cash + $cash, 2);
+                $closingCash = $expectedCash;
+                $diff = 0.0;
+                $regName = ($reg->last_register_name ?? 'Register 01') . ' (Open)';
+            } else {
+                $expectedCash = round($cash, 2);
+                $closingCash = round($cash, 2);
+                $diff = 0.0;
+                $regName = 'Register 01';
             }
-            if (!$reg) {
-                $reg = DB::table('cash_registers')
-                    ->where('warehouse_name', $c->warehouse_name)
-                    ->orderBy('id', 'desc')
-                    ->first();
-            }
 
-            $openingCash = $reg ? (float)($reg->opening_cash ?? 0.0) : 0.0;
-            $expectedCash = $reg && $reg->expected_cash !== null ? (float)$reg->expected_cash : round($openingCash + $cash, 2);
-            $closingCash = $reg && $reg->closing_cash !== null ? (float)$reg->closing_cash : $expectedCash;
-            $diff = $reg && $reg->cash_difference !== null ? (float)$reg->cash_difference : round($closingCash - $expectedCash, 2);
-            $regName = $reg ? ($reg->register_name ?? 'Register 01') : 'Register 01';
-
-            // Audit risk
+            // Audit risk assessment
             $risk = 'healthy';
             if ($diff < -100) {
                 $risk = 'critical';
-            } elseif ($discountRate > 10.0 || abs($diff) > 0) {
+            } elseif ($discountRate > 10.0 || abs($diff) > 0.01) {
                 $risk = 'watch';
             }
 
@@ -5470,7 +5540,7 @@ class ReportController extends Controller
                 continue;
             }
 
-            $totalStoreSales += $sales;
+            $totalStoreSales += $grossSales;
             $totalStoreBills += $bills;
             $totalStoreDiscounts += $discount;
             $totalStoreCollected += $collected;
@@ -5485,8 +5555,9 @@ class ReportController extends Controller
                 ->where('date', '<=', $endDate . ' 23:59:59')
                 ->whereNotIn('sales.status', ['Voided', 'Cancelled'])
                 ->where(function($q) use ($c) {
-                    $q->where('created_by', $c->cashier_name)
-                      ->orWhere('user_name', $c->cashier_name);
+                    $q->where('user_name', $c->cashier_name)
+                      ->orWhere('created_by', $c->cashier_name)
+                      ->orWhere('created_by', 'like', $c->cashier_name . ' (%');
                 });
 
             if ($warehouseId !== null) {
@@ -5528,7 +5599,7 @@ class ReportController extends Controller
                 'warehouse_name' => $c->warehouse_name,
                 'register_name' => $regName,
                 'total_bills' => $bills,
-                'total_sales' => round($sales, 2),
+                'total_sales' => round($grossSales, 2),
                 'total_collected' => round($collected, 2),
                 'total_due' => round($due, 2),
                 'total_discount' => round($discount, 2),
