@@ -5357,12 +5357,32 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
+        $warehouseId = null;
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $matchedOutlet = DB::table('outlets')
+                ->where('name', $warehouse)
+                ->orWhere('id', $warehouse)
+                ->first();
+            if ($matchedOutlet) {
+                $warehouseId = $matchedOutlet->id;
+                $warehouse = $matchedOutlet->name;
+            }
+        }
+
         $query = DB::table('sales')
             ->where('date', '>=', $startDate . ' 00:00:00')
-            ->where('date', '<=', $endDate . ' 23:59:59');
+            ->where('date', '<=', $endDate . ' 23:59:59')
+            ->whereNotIn('sales.status', ['Voided', 'Cancelled']);
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where('warehouse_name', $warehouse);
+            $query->where(function ($q) use ($warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $q->where('sales.warehouse_id', $warehouseId)
+                      ->orWhere('sales.warehouse_name', $warehouse);
+                } else {
+                    $q->where('sales.warehouse_name', $warehouse);
+                }
+            });
         }
 
         if (!empty($search)) {
@@ -5417,16 +5437,26 @@ class ReportController extends Controller
             $netRevenue = $sales - $discount;
             $discountRate = $sales > 0 ? round(($discount / $sales) * 100, 1) : 0.0;
 
-            // Find matching register
-            $reg = DB::table('cash_registers')
-                ->where('warehouse_name', $c->warehouse_name)
-                ->orderBy('id', 'desc')
-                ->first();
+            // Find matching register for this cashier
+            $reg = null;
+            if (!empty($c->cashier_name) && $c->cashier_name !== 'Unknown Staff') {
+                $reg = DB::table('cash_registers')
+                    ->where('user_name', $c->cashier_name)
+                    ->orderBy('id', 'desc')
+                    ->first();
+            }
+            if (!$reg) {
+                $reg = DB::table('cash_registers')
+                    ->where('warehouse_name', $c->warehouse_name)
+                    ->orderBy('id', 'desc')
+                    ->first();
+            }
 
-            $expectedCash = $reg ? (float)($reg->expected_cash ?? 50000.0) : 50000.0;
-            $closingCash = $reg ? (float)($reg->closing_cash ?? 50000.0) : 50000.0;
-            $diff = $reg ? (float)($reg->cash_difference ?? 0.0) : 0.0;
-            $regName = $reg ? $reg->register_name : 'Register 01';
+            $openingCash = $reg ? (float)($reg->opening_cash ?? 0.0) : 0.0;
+            $expectedCash = $reg && $reg->expected_cash !== null ? (float)$reg->expected_cash : round($openingCash + $cash, 2);
+            $closingCash = $reg && $reg->closing_cash !== null ? (float)$reg->closing_cash : $expectedCash;
+            $diff = $reg && $reg->cash_difference !== null ? (float)$reg->cash_difference : round($closingCash - $expectedCash, 2);
+            $regName = $reg ? ($reg->register_name ?? 'Register 01') : 'Register 01';
 
             // Audit risk
             $risk = 'healthy';
@@ -5450,15 +5480,25 @@ class ReportController extends Controller
             $totalDiscrepancy += $diff;
 
             // Recent transactions drilldown (up to 15)
-            $txs = DB::table('sales')
+            $txsQuery = DB::table('sales')
                 ->where('date', '>=', $startDate . ' 00:00:00')
                 ->where('date', '<=', $endDate . ' 23:59:59')
+                ->whereNotIn('sales.status', ['Voided', 'Cancelled'])
                 ->where(function($q) use ($c) {
                     $q->where('created_by', $c->cashier_name)
                       ->orWhere('user_name', $c->cashier_name);
-                })
-                ->where('warehouse_name', $c->warehouse_name)
-                ->orderBy('date', 'desc')
+                });
+
+            if ($warehouseId !== null) {
+                $txsQuery->where(function($q) use ($warehouseId, $c) {
+                    $q->where('sales.warehouse_id', $warehouseId)
+                      ->orWhere('sales.warehouse_name', $c->warehouse_name);
+                });
+            } else {
+                $txsQuery->where('sales.warehouse_name', $c->warehouse_name);
+            }
+
+            $txs = $txsQuery->orderBy('date', 'desc')
                 ->limit(15)
                 ->select([
                     'id', 'reference_no', 'date', 'customer_name', 'payment_type',
