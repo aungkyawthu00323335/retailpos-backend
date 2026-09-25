@@ -5165,16 +5165,39 @@ class ReportController extends Controller
         $lastSales = $saleQuery->groupBy('sale_items.product_id')
             ->pluck('last_sale_date', 'product_id');
 
-        $prodQuery = DB::table('products');
+        $prodQuery = DB::table('products')
+            ->whereNull('products.deleted_at');
+
+        $selectFields = [
+            'products.id',
+            'products.code',
+            'products.sku',
+            'products.barcode',
+            'products.name',
+            'products.alternative_name',
+            'products.category_name',
+            'products.brand_name',
+            'products.unit_name',
+            DB::raw('COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), (SELECT AVG(cost_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.cost_price > 0), 0) as cost_price'),
+            DB::raw('COALESCE(NULLIF(products.selling_price, 0), NULLIF(products.retail_price, 0), (SELECT AVG(selling_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.selling_price > 0), 0) as selling_price'),
+            'products.created_at',
+        ];
 
         if ($warehouseId !== null) {
-            // Join stock_balances for this warehouse/outlet
-            $prodQuery->join('stock_balances', function ($join) use ($warehouseId) {
-                $join->on('products.id', '=', 'stock_balances.product_id')
-                     ->where('stock_balances.warehouse_id', '=', $warehouseId);
-            })->where('stock_balances.quantity', '>', 0);
+            // Group stock_balances per product to aggregate all variants and avoid duplicate product rows
+            $warehouseStockSub = DB::table('stock_balances')
+                ->where('warehouse_id', $warehouseId)
+                ->select('product_id', DB::raw('SUM(quantity) as stock_qty'))
+                ->groupBy('product_id')
+                ->having('stock_qty', '>', 0);
+
+            $prodQuery->joinSub($warehouseStockSub, 'wb', function ($join) {
+                $join->on('products.id', '=', 'wb.product_id');
+            });
+            $selectFields[] = 'wb.stock_qty as stock_quantity';
         } else {
             $prodQuery->where('products.stock_quantity', '>', 0);
+            $selectFields[] = 'products.stock_quantity';
         }
 
         if ($category !== 'All' && !empty($category)) {
@@ -5191,27 +5214,6 @@ class ReportController extends Controller
                   ->orWhere('products.brand_name', 'like', "%{$search}%")
                   ->orWhere('products.category_name', 'like', "%{$search}%");
             });
-        }
-
-        $selectFields = [
-            'products.id',
-            'products.code',
-            'products.sku',
-            'products.barcode',
-            'products.name',
-            'products.alternative_name',
-            'products.category_name',
-            'products.brand_name',
-            'products.unit_name',
-            DB::raw('COALESCE(NULLIF(products.cost_price, 0), (SELECT AVG(cost_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.cost_price > 0), 0) as cost_price'),
-            DB::raw('COALESCE(NULLIF(products.selling_price, 0), (SELECT AVG(selling_price) FROM product_variants WHERE product_variants.product_id = products.id AND product_variants.selling_price > 0), 0) as selling_price'),
-            'products.created_at',
-        ];
-
-        if ($warehouseId !== null) {
-            $selectFields[] = 'stock_balances.quantity as stock_quantity';
-        } else {
-            $selectFields[] = 'products.stock_quantity';
         }
 
         $products = $prodQuery->select($selectFields)->get();
@@ -5250,7 +5252,7 @@ class ReportController extends Controller
                 $capital = $qty * $cost;
                 $revenue = $qty * $retail;
 
-                $isDead = ($daysSince >= 90 || $lastSaleRaw === null);
+                $isDead = ($daysSince >= 90);
                 $velocityStatus = $isDead ? 'dead' : 'slow';
 
                 // Check velocity status filter
@@ -5290,7 +5292,7 @@ class ReportController extends Controller
                     'alternative_name' => (string)($p->alternative_name ?? ''),
                     'category_name' => $p->category_name ?? 'General',
                     'brand_name' => $p->brand_name ?? '',
-                    'warehouse_name' => $warehouse !== 'All' ? $warehouse : 'Main Branch Outlet',
+                    'warehouse_name' => $warehouse !== 'All' ? $warehouse : 'All Outlets & Warehouses',
                     'unit_name' => $p->unit_name ?? 'Pcs',
                     'stock_quantity' => round($qty, 2),
                     'cost_price' => round($cost, 2),
