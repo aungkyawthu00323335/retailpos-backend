@@ -4958,13 +4958,13 @@ class ReportController extends Controller
     public function productMarginsReport(Request $request)
     {
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
-        $startDate = $request->input('start_date') ?? Carbon::now()->startOfMonth()->toDateString();
-        $endDate = $request->input('end_date') ?? Carbon::now()->toDateString();
+        $startDate = $request->input('start_date');
+        $endDate = $request->input('end_date');
         $category = $request->input('category', 'All');
         $search = trim($request->input('search', ''));
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_prod_margins_' . md5(json_encode([$warehouse, $startDate, $endDate, $category, $search]));
+        $cacheKey = 'pos_prod_margins_' . md5(json_encode([$warehouse, $startDate ?? '', $endDate ?? '', $category, $search]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -4979,11 +4979,25 @@ class ReportController extends Controller
         $query = DB::table('sale_items')
             ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
             ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
-            ->where('sales.date', '>=', $startDate . ' 00:00:00')
-            ->where('sales.date', '<=', $endDate . ' 23:59:59');
+            ->whereNotIn('sales.status', ['Voided', 'Cancelled']);
+
+        if (!empty($startDate) && !empty($endDate)) {
+            $query->where('sales.date', '>=', $startDate . ' 00:00:00')
+                  ->where('sales.date', '<=', $endDate . ' 23:59:59');
+        } elseif (!empty($startDate)) {
+            $query->where('sales.date', '>=', $startDate . ' 00:00:00');
+        } elseif (!empty($endDate)) {
+            $query->where('sales.date', '<=', $endDate . ' 23:59:59');
+        }
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where('sales.warehouse_name', $warehouse);
+            $query->where(function ($q) use ($warehouse) {
+                if (is_numeric($warehouse)) {
+                    $q->where('sales.warehouse_id', (int)$warehouse);
+                } else {
+                    $q->where('sales.warehouse_name', $warehouse);
+                }
+            });
         }
 
         if ($category !== 'All' && !empty($category)) {
@@ -5072,8 +5086,8 @@ class ReportController extends Controller
                 'total_cogs' => round($totalCogs, 2),
                 'total_gross_profit' => round($totalProfit, 2),
                 'overall_margin_pct' => $overallMarginPct,
-                'start_date' => $startDate,
-                'end_date' => $endDate,
+                'start_date' => $startDate ?? '',
+                'end_date' => $endDate ?? '',
                 'warehouse' => $warehouse,
                 'category' => $category,
             ],
