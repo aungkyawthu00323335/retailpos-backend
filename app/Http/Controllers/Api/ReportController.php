@@ -2494,6 +2494,19 @@ class ReportController extends Controller
 
         $search = trim($request->input('search', ''));
 
+        // Handle variant isolation
+        $variantParam = $request->input('variant_id') ?? $request->input('product_variant_id');
+        $selectedVariantId = ($variantParam && $variantParam !== 'All' && $variantParam !== 'all')
+            ? (int)$variantParam
+            : null;
+
+        $selectedVariant = null;
+        if ($selectedVariantId !== null && $product->variants) {
+            $selectedVariant = $product->variants->firstWhere('id', $selectedVariantId);
+        }
+
+        $effectiveStockQty = (float)($selectedVariant ? $selectedVariant->stock_quantity : $product->stock_quantity);
+
         // 1. Warehouse Stocks Breakdown (Top Card)
         $balanceQuery = StockBalance::where('stock_balances.product_id', $product->id)
             ->join('outlets', 'stock_balances.warehouse_id', '=', 'outlets.id')
@@ -2503,6 +2516,10 @@ class ReportController extends Controller
                 DB::raw('SUM(stock_balances.quantity) as quantity')
             )
             ->groupBy('outlets.id', 'outlets.name');
+
+        if ($selectedVariantId !== null) {
+            $balanceQuery->where('stock_balances.product_variant_id', $selectedVariantId);
+        }
 
         if ($warehouseId !== null) {
             $balanceQuery->where('outlets.id', $warehouseId);
@@ -2525,7 +2542,7 @@ class ReportController extends Controller
                         [
                             'warehouse_id' => $matched ? $matched->id : $warehouseId,
                             'warehouse_name' => $matched ? $matched->name : 'Warehouse #' . $warehouseId,
-                            'quantity' => (float)$product->stock_quantity,
+                            'quantity' => $effectiveStockQty,
                         ]
                     ]);
                 } else {
@@ -2533,7 +2550,7 @@ class ReportController extends Controller
                         [
                             'warehouse_id' => $activeOutlets->first()->id,
                             'warehouse_name' => $activeOutlets->first()->name,
-                            'quantity' => (float)$product->stock_quantity,
+                            'quantity' => $effectiveStockQty,
                         ]
                     ]);
                 }
@@ -2542,28 +2559,44 @@ class ReportController extends Controller
                     [
                         'warehouse_id' => 1,
                         'warehouse_name' => 'Default Warehouse',
-                        'quantity' => (float)$product->stock_quantity,
+                        'quantity' => $effectiveStockQty,
                     ]
                 ]);
             }
         }
 
-        $variantIds = $product->variants->pluck('id')->toArray();
-        $productCodes = array_filter([$product->code, $product->sku, $product->barcode]);
-        foreach ($product->variants as $var) {
-            if (!empty($var->sku)) $productCodes[] = $var->sku;
-            if (!empty($var->barcode)) $productCodes[] = $var->barcode;
+        // Determine scope: if selectedVariantId is set, isolate movements to that variant only!
+        if ($selectedVariantId !== null) {
+            $variantIds = [$selectedVariantId];
+            $productCodes = [];
+            if ($selectedVariant) {
+                if (!empty($selectedVariant->sku)) $productCodes[] = $selectedVariant->sku;
+                if (!empty($selectedVariant->barcode)) $productCodes[] = $selectedVariant->barcode;
+            }
+        } else {
+            $variantIds = $product->variants ? $product->variants->pluck('id')->toArray() : [];
+            $productCodes = array_filter([$product->code, $product->sku, $product->barcode]);
+            if ($product->variants) {
+                foreach ($product->variants as $var) {
+                    if (!empty($var->sku)) $productCodes[] = $var->sku;
+                    if (!empty($var->barcode)) $productCodes[] = $var->barcode;
+                }
+            }
         }
 
+        $fallbackItemName = $selectedVariant
+            ? ($product->name . ' - ' . ($selectedVariant->name ?? $selectedVariant->sku ?? 'Variant #' . $selectedVariant->id))
+            : $product->name;
+
         // Helper for formatting created_on
-        $mapRow = function ($item, $fallbackName = null) use ($product) {
+        $mapRow = function ($item) use ($fallbackItemName) {
             $dateVal = $item->date ?? $item->created_at ?? date('Y-m-d H:i:s');
             $createdOn = (string)$dateVal;
             return [
                 'id' => (int)($item->transaction_id ?? $item->id ?? 0),
                 'created_on' => $createdOn,
                 'reference' => (string)($item->reference_no ?? '—'),
-                'name' => (string)($item->product_name ?? $fallbackName ?? $product->name),
+                'name' => (string)($item->product_name ?? $fallbackItemName),
                 'party_name' => (string)($item->party_name ?? '—'),
                 'warehouse_name' => (string)($item->warehouse_name ?? '—'),
                 'quantity' => (float)($item->quantity ?? 0),
@@ -2573,8 +2606,17 @@ class ReportController extends Controller
 
         // 2. Movements: Sales
         $salesQuery = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->where(function ($q) use ($product, $variantIds, $productCodes) {
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
+
+        if ($selectedVariantId !== null) {
+            $salesQuery->where(function ($q) use ($selectedVariantId, $productCodes) {
+                $q->where('sale_items.product_variant_id', $selectedVariantId);
+                if (!empty($productCodes)) {
+                    $q->orWhereIn('sale_items.product_code', $productCodes);
+                }
+            });
+        } else {
+            $salesQuery->where(function ($q) use ($product, $variantIds, $productCodes) {
                 $q->where('sale_items.product_id', $product->id);
                 if (!empty($variantIds)) {
                     $q->orWhereIn('sale_items.product_variant_id', $variantIds);
@@ -2582,18 +2624,20 @@ class ReportController extends Controller
                 if (!empty($productCodes)) {
                     $q->orWhereIn('sale_items.product_code', $productCodes);
                 }
-            })
-            ->select(
-                'sales.id as transaction_id',
-                'sales.date',
-                'sales.created_at',
-                'sales.reference_no',
-                'sale_items.product_name',
-                'sales.customer_name as party_name',
-                'sales.warehouse_name',
-                'sale_items.quantity',
-                'sale_items.subtotal'
-            );
+            });
+        }
+
+        $salesQuery->select(
+            'sales.id as transaction_id',
+            'sales.date',
+            'sales.created_at',
+            'sales.reference_no',
+            'sale_items.product_name',
+            'sales.customer_name as party_name',
+            'sales.warehouse_name',
+            'sale_items.quantity',
+            'sale_items.subtotal'
+        );
 
         if ($warehouseId !== null) {
             $salesQuery->where(function ($q) use ($warehouseId, $warehouseName) {
@@ -2616,8 +2660,17 @@ class ReportController extends Controller
 
         // 3. Movements: Purchases
         $purchQuery = DB::table('purchase_items')
-            ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
-            ->where(function ($q) use ($product, $variantIds, $productCodes) {
+            ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id');
+
+        if ($selectedVariantId !== null) {
+            $purchQuery->where(function ($q) use ($selectedVariantId, $productCodes) {
+                $q->where('purchase_items.product_variant_id', $selectedVariantId);
+                if (!empty($productCodes)) {
+                    $q->orWhereIn('purchase_items.product_code', $productCodes);
+                }
+            });
+        } else {
+            $purchQuery->where(function ($q) use ($product, $variantIds, $productCodes) {
                 $q->where('purchase_items.product_id', $product->id);
                 if (!empty($variantIds)) {
                     $q->orWhereIn('purchase_items.product_variant_id', $variantIds);
@@ -2625,18 +2678,20 @@ class ReportController extends Controller
                 if (!empty($productCodes)) {
                     $q->orWhereIn('purchase_items.product_code', $productCodes);
                 }
-            })
-            ->select(
-                'purchases.id as transaction_id',
-                'purchases.date',
-                'purchases.created_at',
-                'purchases.reference_no',
-                'purchase_items.product_name',
-                'purchases.supplier_name as party_name',
-                'purchases.warehouse_name',
-                'purchase_items.quantity',
-                'purchase_items.subtotal'
-            );
+            });
+        }
+
+        $purchQuery->select(
+            'purchases.id as transaction_id',
+            'purchases.date',
+            'purchases.created_at',
+            'purchases.reference_no',
+            'purchase_items.product_name',
+            'purchases.supplier_name as party_name',
+            'purchases.warehouse_name',
+            'purchase_items.quantity',
+            'purchase_items.subtotal'
+        );
 
         if ($warehouseId !== null) {
             $purchQuery->where(function ($q) use ($warehouseId, $warehouseName) {
@@ -2670,7 +2725,7 @@ class ReportController extends Controller
                 'date',
                 'created_at',
                 'reference_no',
-                DB::raw("'" . addslashes($product->name) . "' as product_name"),
+                DB::raw("'" . addslashes($fallbackItemName) . "' as product_name"),
                 'customer_name as party_name',
                 'warehouse_name',
                 DB::raw('1 as quantity'),
@@ -2709,7 +2764,7 @@ class ReportController extends Controller
                 'date',
                 'created_at',
                 'reference_no',
-                DB::raw("'" . addslashes($product->name) . "' as product_name"),
+                DB::raw("'" . addslashes($fallbackItemName) . "' as product_name"),
                 'supplier_name as party_name',
                 'warehouse_name',
                 DB::raw('1 as quantity'),
@@ -2737,8 +2792,17 @@ class ReportController extends Controller
 
         // 6. Movements: Adjustments
         $adjQuery = DB::table('stock_adjustment_items')
-            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-            ->where(function ($q) use ($product, $variantIds, $productCodes) {
+            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
+
+        if ($selectedVariantId !== null) {
+            $adjQuery->where(function ($q) use ($selectedVariantId, $productCodes) {
+                $q->where('stock_adjustment_items.product_variant_id', $selectedVariantId);
+                if (!empty($productCodes)) {
+                    $q->orWhereIn('stock_adjustment_items.product_code', $productCodes);
+                }
+            });
+        } else {
+            $adjQuery->where(function ($q) use ($product, $variantIds, $productCodes) {
                 $q->where('stock_adjustment_items.product_id', $product->id);
                 if (!empty($variantIds)) {
                     $q->orWhereIn('stock_adjustment_items.product_variant_id', $variantIds);
@@ -2746,18 +2810,20 @@ class ReportController extends Controller
                 if (!empty($productCodes)) {
                     $q->orWhereIn('stock_adjustment_items.product_code', $productCodes);
                 }
-            })
-            ->select(
-                'stock_adjustments.id as transaction_id',
-                'stock_adjustments.date',
-                'stock_adjustments.created_at',
-                'stock_adjustments.reference_no',
-                'stock_adjustment_items.product_name',
-                'stock_adjustment_items.type as party_name',
-                'stock_adjustments.warehouse_name',
-                'stock_adjustment_items.quantity',
-                'stock_adjustment_items.subtotal'
-            );
+            });
+        }
+
+        $adjQuery->select(
+            'stock_adjustments.id as transaction_id',
+            'stock_adjustments.date',
+            'stock_adjustments.created_at',
+            'stock_adjustments.reference_no',
+            'stock_adjustment_items.product_name',
+            'stock_adjustment_items.type as party_name',
+            'stock_adjustments.warehouse_name',
+            'stock_adjustment_items.quantity',
+            'stock_adjustment_items.subtotal'
+        );
 
         if ($warehouseId !== null) {
             $adjQuery->where(function ($q) use ($warehouseId, $warehouseName) {
@@ -2779,8 +2845,17 @@ class ReportController extends Controller
 
         // 7. Movements: Transfers
         $transQuery = DB::table('stock_transfer_items')
-            ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-            ->where(function ($q) use ($product, $variantIds, $productCodes) {
+            ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id');
+
+        if ($selectedVariantId !== null) {
+            $transQuery->where(function ($q) use ($selectedVariantId, $productCodes) {
+                $q->where('stock_transfer_items.product_variant_id', $selectedVariantId);
+                if (!empty($productCodes)) {
+                    $q->orWhereIn('stock_transfer_items.product_code', $productCodes);
+                }
+            });
+        } else {
+            $transQuery->where(function ($q) use ($product, $variantIds, $productCodes) {
                 $q->where('stock_transfer_items.product_id', $product->id);
                 if (!empty($variantIds)) {
                     $q->orWhereIn('stock_transfer_items.product_variant_id', $variantIds);
@@ -2788,18 +2863,20 @@ class ReportController extends Controller
                 if (!empty($productCodes)) {
                     $q->orWhereIn('stock_transfer_items.product_code', $productCodes);
                 }
-            })
-            ->select(
-                'stock_transfers.id as transaction_id',
-                'stock_transfers.date',
-                'stock_transfers.created_at',
-                'stock_transfers.reference_no',
-                'stock_transfer_items.product_name',
-                DB::raw("CONCAT(stock_transfers.from_warehouse, ' ➔ ', stock_transfers.to_warehouse) as party_name"),
-                'stock_transfers.to_warehouse as warehouse_name',
-                'stock_transfer_items.quantity',
-                'stock_transfer_items.subtotal'
-            );
+            });
+        }
+
+        $transQuery->select(
+            'stock_transfers.id as transaction_id',
+            'stock_transfers.date',
+            'stock_transfers.created_at',
+            'stock_transfers.reference_no',
+            'stock_transfer_items.product_name',
+            DB::raw("CONCAT(stock_transfers.from_warehouse, ' ➔ ', stock_transfers.to_warehouse) as party_name"),
+            'stock_transfers.to_warehouse as warehouse_name',
+            'stock_transfer_items.quantity',
+            'stock_transfer_items.subtotal'
+        );
 
         if ($warehouseId !== null) {
             $transQuery->where(function ($q) use ($warehouseId, $warehouseName) {
@@ -2826,15 +2903,16 @@ class ReportController extends Controller
             'data' => [
                 'product' => [
                     'id' => $product->id,
-                    'name' => $product->name,
-                    'code' => $product->code ?? $product->sku ?? '',
-                    'sku' => $product->sku ?? '',
+                    'variant_id' => $selectedVariant ? $selectedVariant->id : null,
+                    'name' => $fallbackItemName,
+                    'code' => $selectedVariant ? ($selectedVariant->sku ?? $selectedVariant->barcode ?? $product->code ?? '') : ($product->code ?? $product->sku ?? ''),
+                    'sku' => $selectedVariant ? ($selectedVariant->sku ?? $product->sku ?? '') : ($product->sku ?? ''),
                     'category_name' => $product->category_name ?? '',
                     'unit_name' => $product->unit_name ?? '',
-                    'stock_quantity' => (float)$product->stock_quantity,
-                    'cost_price' => (float)$product->cost_price,
-                    'retail_price' => (float)$product->retail_price,
-                    'image_url' => $product->image_url ?? '',
+                    'stock_quantity' => $effectiveStockQty,
+                    'cost_price' => (float)($selectedVariant ? $selectedVariant->cost_price : $product->cost_price),
+                    'retail_price' => (float)($selectedVariant ? $selectedVariant->retail_price : $product->retail_price),
+                    'image_url' => $selectedVariant && !empty($selectedVariant->image_url) ? $selectedVariant->image_url : ($product->image_url ?? ''),
                 ],
                 'warehouse_stocks' => $warehouseStocks,
                 'movements' => [
