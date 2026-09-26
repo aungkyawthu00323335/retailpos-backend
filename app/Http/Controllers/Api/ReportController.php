@@ -2021,8 +2021,11 @@ class ReportController extends Controller
                 'products.alternative_name',
                 'products.brand_name',
                 'products.category_name',
+                'products.cost_price',
                 'products.retail_price',
                 'products.stock_quantity',
+                'products.alert_quantity',
+                'products.has_variants',
                 'products.image_url',
                 DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_sold_quantity'),
                 DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales_revenue')
@@ -2035,8 +2038,11 @@ class ReportController extends Controller
                 'products.alternative_name',
                 'products.brand_name',
                 'products.category_name',
+                'products.cost_price',
                 'products.retail_price',
                 'products.stock_quantity',
+                'products.alert_quantity',
+                'products.has_variants',
                 'products.image_url'
             );
 
@@ -2077,9 +2083,12 @@ class ReportController extends Controller
                 'brand' => $p->brand_name ?? 'Generic',
                 'category_name' => $p->category_name ?? 'General',
                 'category' => $p->category_name ?? 'General',
+                'cost_price' => (float)($p->cost_price ?? 0),
                 'price' => $price,
                 'retail_price' => $price,
                 'stock_quantity' => (float)($p->stock_quantity ?? 0),
+                'alert_quantity' => (float)($p->alert_quantity ?? 0),
+                'has_variants' => (bool)($p->has_variants ?? false),
                 'total_sold_quantity' => $soldQty,
                 'total_quantity' => $soldQty,
                 'total_sales_revenue' => $salesRev,
