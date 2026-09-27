@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Schema;
 use App\Models\Sale;
 use App\Models\SaleReturn;
 use App\Models\Purchase;
+use App\Models\PurchaseReturn;
 use App\Models\Expense;
 use App\Models\Product;
 use App\Models\Customer;
@@ -1760,6 +1761,186 @@ class ReportController extends Controller
         } catch (\Throwable $e) {}
 
         return response($jsonPayload, 200, ['Content-Type' => 'application/json']);
+    }
+
+    /**
+     * Supplier Statement & Accounts Payable Ledger Drilldown
+     */
+    public function supplierStatement(Request $request, $id)
+    {
+        $supplier = Supplier::find($id);
+        if (!$supplier) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Supplier not found',
+            ], 404);
+        }
+
+        $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $search = trim($request->input('search', ''));
+        $startDate = $request->input('start_date') ?? $request->input('from_date');
+        $endDate = $request->input('end_date') ?? $request->input('to_date');
+
+        // 1. Purchases (Bill Invoices)
+        $purchQuery = Purchase::query()
+            ->where(function ($q) use ($id, $supplier) {
+                $q->where('supplier_id', $id);
+                if (!empty($supplier->name)) {
+                    $q->orWhere('supplier_name', $supplier->name);
+                }
+            });
+
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $purchQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($startDate)) {
+            $purchQuery->whereDate('date', '>=', $startDate);
+        }
+
+        if (!empty($endDate)) {
+            $purchQuery->whereDate('date', '<=', $endDate);
+        }
+
+        if (!empty($search)) {
+            $purchQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('payment_type', 'like', "%{$search}%")
+                  ->orWhere('payment_status', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $purchQuery->withCount('items')
+            ->orderBy('date', 'desc')
+            ->orderBy('id', 'desc');
+
+        $purchases = $purchQuery->get()->map(function ($p) {
+            return [
+                'id' => (int)$p->id,
+                'reference_no' => (string)$p->reference_no,
+                'date' => (string)$p->date,
+                'warehouse_name' => (string)($p->warehouse_name ?? 'Main Warehouse'),
+                'grand_total' => (float)$p->grand_total,
+                'paid_amount' => (float)$p->paid_amount,
+                'due_amount' => (float)$p->due_amount,
+                'status' => (string)($p->status ?? 'Received'),
+                'payment_status' => (string)($p->payment_status ?? 'Paid'),
+                'payment_type' => (string)($p->payment_type ?? 'Cash'),
+                'items_count' => (int)($p->items_count ?? 0),
+            ];
+        });
+
+        // 2. Purchase Returns (Debit Notes)
+        $returnsQuery = PurchaseReturn::query()
+            ->where(function ($q) use ($id, $supplier) {
+                $q->where('supplier_id', $id);
+                if (!empty($supplier->name)) {
+                    $q->orWhere('supplier_name', $supplier->name);
+                }
+            });
+
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $returnsQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($startDate)) {
+            $returnsQuery->whereDate('date', '>=', $startDate);
+        }
+
+        if (!empty($endDate)) {
+            $returnsQuery->whereDate('date', '<=', $endDate);
+        }
+
+        if (!empty($search)) {
+            $returnsQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('purchase_reference_no', 'like', "%{$search}%")
+                  ->orWhere('payment_type', 'like', "%{$search}%")
+                  ->orWhere('return_reason', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $returnsQuery->orderBy('date', 'desc')
+            ->orderBy('id', 'desc');
+
+        $returns = $returnsQuery->get()->map(function ($r) {
+            $items = $r->items ?? [];
+            return [
+                'id' => (int)$r->id,
+                'reference_no' => (string)$r->reference_no,
+                'purchase_reference_no' => (string)($r->purchase_reference_no ?? ''),
+                'date' => (string)$r->date,
+                'warehouse_name' => (string)($r->warehouse_name ?? 'Main Warehouse'),
+                'return_reason' => (string)($r->return_reason ?? 'Goods Return'),
+                'refund_tender' => (string)($r->payment_type ?? 'Cash'),
+                'grand_total' => (float)$r->grand_total,
+                'paid_amount' => (float)$r->paid_amount,
+                'due_amount' => (float)$r->due_amount,
+                'status' => (string)($r->status ?? 'Completed'),
+                'payment_status' => (string)($r->payment_status ?? 'Paid'),
+                'items_count' => is_array($items) ? count($items) : 1,
+                'items' => is_array($items) ? $items : [],
+            ];
+        });
+
+        // 3. Financial Summary & Net Accounts Payable Metrics
+        $totalPurchased = (float)$purchases->sum('grand_total');
+        $totalPaid = (float)$purchases->sum('paid_amount');
+        $totalDue = (float)$purchases->sum('due_amount');
+
+        $totalReturned = (float)$returns->sum('grand_total');
+        $totalRefunded = (float)$returns->sum('paid_amount');
+        $totalReturnDue = (float)$returns->sum('due_amount');
+
+        $netPurchased = max(0.0, $totalPurchased - $totalReturned);
+        $netPaid = max(0.0, $totalPaid - $totalRefunded);
+        $netDue = max(0.0, $totalDue - $totalReturnDue);
+        $returnRatePct = $totalPurchased > 0 ? round(($totalReturned / $totalPurchased) * 100, 2) : 0.0;
+        $paymentRatePct = $totalPurchased > 0 ? round(($totalPaid / $totalPurchased) * 100, 2) : 100.0;
+        $averagePurchaseValue = count($purchases) > 0 ? round($totalPurchased / count($purchases), 2) : 0.0;
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'supplier' => [
+                    'id' => (int)$supplier->id,
+                    'name' => (string)$supplier->name,
+                    'contact_person' => (string)($supplier->contact_person ?? ''),
+                    'phone' => (string)($supplier->phone ?? ''),
+                    'email' => (string)($supplier->email ?? ''),
+                    'category' => (string)($supplier->category ?? 'General'),
+                    'payment_terms' => (string)($supplier->payment_terms ?? 'Net 30'),
+                    'status' => (string)($supplier->status ?? 'Active'),
+                    'city' => (string)($supplier->city ?? ''),
+                    'address' => (string)($supplier->address ?? ''),
+                    'total_purchases_count' => count($purchases),
+                    'total_purchased_amount' => $totalPurchased > 0 ? $totalPurchased : (float)($supplier->total_purchased ?? 0),
+                    'total_paid_amount' => $totalPaid,
+                    'total_due' => $totalPurchased > 0 ? $totalDue : (float)($supplier->balance_due ?? 0),
+                    'last_purchase_date' => count($purchases) > 0 ? $purchases->first()['date'] : ($supplier->updated_at ?? ''),
+                ],
+                'summary' => [
+                    'purchases_count' => count($purchases),
+                    'total_purchased' => $totalPurchased,
+                    'total_paid' => $totalPaid,
+                    'total_due' => $totalDue,
+                    'returns_count' => count($returns),
+                    'total_returned' => $totalReturned,
+                    'total_refunded' => $totalRefunded,
+                    'total_return_due' => $totalReturnDue,
+                    'net_purchased' => $netPurchased,
+                    'net_paid' => $netPaid,
+                    'net_due' => $netDue,
+                    'return_rate_pct' => $returnRatePct,
+                    'payment_rate_pct' => $paymentRatePct,
+                    'average_purchase_value' => $averagePurchaseValue,
+                ],
+                'purchases' => $purchases,
+                'returns' => $returns,
+            ],
+        ]);
     }
 
     public function stockReport(Request $request)
