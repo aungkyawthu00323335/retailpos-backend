@@ -1212,7 +1212,7 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
-        // Subquery for sales aggregation per customer
+        // Subquery for sales aggregation per customer (consolidates unassigned walk-in sales to Customer 1)
         $salesQuery = Sale::query();
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
@@ -1226,15 +1226,15 @@ class ReportController extends Controller
         }
 
         $salesAgg = $salesQuery->select(
-            'customer_id',
+            DB::raw('COALESCE(customer_id, 1) as customer_id'),
             DB::raw('COUNT(*) as total_orders'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_spent'),
             DB::raw('COALESCE(SUM(paid_amount), 0) as total_paid'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
             DB::raw('MAX(date) as last_purchase_date')
-        )->groupBy('customer_id');
+        )->groupBy(DB::raw('COALESCE(customer_id, 1)'));
 
-        // Subquery for returns aggregation per customer
+        // Subquery for returns aggregation per customer (consolidates unassigned walk-in returns to Customer 1)
         $returnsQuery = SaleReturn::query();
         if (!empty($startDate) && !empty($endDate)) {
             $returnsQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''))
@@ -1245,12 +1245,12 @@ class ReportController extends Controller
         }
 
         $returnsAgg = $returnsQuery->select(
-            'customer_id',
+            DB::raw('COALESCE(customer_id, 1) as customer_id'),
             DB::raw('COUNT(*) as total_returns'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_returned_amount'),
             DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded_amount'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
-        )->groupBy('customer_id');
+        )->groupBy(DB::raw('COALESCE(customer_id, 1)'));
 
         $baseQuery = Customer::leftJoinSub($salesAgg, 'sa', function ($join) {
             $join->on('customers.id', '=', 'sa.customer_id');
@@ -1313,11 +1313,37 @@ class ReportController extends Controller
             $baseQuery->whereRaw('COALESCE(sa.total_due, 0) <= 0');
         }
 
-        // 1. Single-pass untruncated DB aggregates (Senior Accounting standard)
-        $summaryQuery = clone $baseQuery;
-        $summaryQuery->getQuery()->columns = null;
-        $summaryQuery->getQuery()->orders = null;
-        $summaryAgg = $summaryQuery->selectRaw('
+        // 1. Single-pass untruncated DB aggregates (Senior Accounting standard via DB::table to avoid Eloquent accessor collision)
+        $summaryTable = DB::table('customers')
+            ->leftJoinSub($salesAgg, 'sa', 'customers.id', '=', 'sa.customer_id')
+            ->leftJoinSub($returnsAgg, 'ra', 'customers.id', '=', 'ra.customer_id');
+
+        if (!empty($tier) && $tier !== 'All' && $tier !== 'all') {
+            $summaryTable->where('customers.tier', $tier);
+        }
+        if (!empty($status) && $status !== 'All' && $status !== 'all') {
+            $summaryTable->where('customers.status', $status);
+        }
+        if ($request->filled('search')) {
+            $search = trim($request->input('search'));
+            $digits = preg_replace('/[^0-9]/', '', $search);
+            $summaryTable->where(function ($q) use ($search, $digits) {
+                $q->where('customers.name', 'like', "%{$search}%")
+                  ->orWhere('customers.phone', 'like', "%{$search}%")
+                  ->orWhere('customers.email', 'like', "%{$search}%")
+                  ->orWhere('customers.tier', 'like', "%{$search}%");
+                if (!empty($digits)) {
+                    $q->orWhere('customers.phone', 'like', "%{$digits}%");
+                }
+            });
+        }
+        if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
+            $summaryTable->whereRaw('COALESCE(sa.total_due, 0) > 0');
+        } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
+            $summaryTable->whereRaw('COALESCE(sa.total_due, 0) <= 0');
+        }
+
+        $summaryRow = $summaryTable->selectRaw('
             COUNT(DISTINCT customers.id) as total_customers,
             COALESCE(SUM(COALESCE(sa.total_spent, customers.total_spent, 0)), 0) as total_revenue,
             COALESCE(SUM(COALESCE(ra.total_returned_amount, 0)), 0) as total_returned_amount,
@@ -1325,11 +1351,11 @@ class ReportController extends Controller
             COALESCE(SUM(COALESCE(sa.total_due, 0)), 0) as total_due
         ')->first();
 
-        $totalCustomers = (int)($summaryAgg->total_customers ?? 0);
-        $totalRevenue = (float)($summaryAgg->total_revenue ?? 0);
-        $totalReturnedAmount = (float)($summaryAgg->total_returned_amount ?? 0);
-        $totalPaid = (float)($summaryAgg->total_paid ?? 0);
-        $totalDue = (float)($summaryAgg->total_due ?? 0);
+        $totalCustomers = (int)($summaryRow->total_customers ?? 0);
+        $totalRevenue = (float)($summaryRow->total_revenue ?? 0);
+        $totalReturnedAmount = (float)($summaryRow->total_returned_amount ?? 0);
+        $totalPaid = (float)($summaryRow->total_paid ?? 0);
+        $totalDue = (float)($summaryRow->total_due ?? 0);
         $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
 
         // Sort items
@@ -1393,7 +1419,13 @@ class ReportController extends Controller
         }
 
         // 1. Sales Invoices
-        $salesQuery = Sale::where('customer_id', $id)
+        $salesQuery = Sale::query()
+            ->where(function ($q) use ($id) {
+                $q->where('customer_id', $id);
+                if ((int)$id === 1) {
+                    $q->orWhereNull('customer_id');
+                }
+            })
             ->withCount('items')
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc');
@@ -1414,8 +1446,12 @@ class ReportController extends Controller
         });
 
         // 2. Sale Returns
-        $returnsQuery = SaleReturn::where(function ($q) use ($id, $customer) {
+        $returnsQuery = SaleReturn::query()
+            ->where(function ($q) use ($id, $customer) {
                 $q->where('customer_id', $id);
+                if ((int)$id === 1) {
+                    $q->orWhereNull('customer_id');
+                }
                 if (!empty($customer->name)) {
                     $q->orWhere('customer_name', $customer->name);
                 }
