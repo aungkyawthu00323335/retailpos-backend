@@ -53,6 +53,9 @@ class Supplier extends Model
 
     public function getTotalDueAttribute()
     {
+        if (array_key_exists('total_due', $this->attributes)) {
+            return (float)$this->attributes['total_due'];
+        }
         return (float)($this->balance_due ?? 0.0);
     }
 }

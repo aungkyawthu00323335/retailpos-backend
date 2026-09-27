@@ -1680,8 +1680,31 @@ class ReportController extends Controller
             DB::raw('MAX(date) as last_purchase_date')
         )->groupBy('supplier_id');
 
+        // Subquery for purchase returns aggregation per supplier
+        $returnsQuery = PurchaseReturn::query();
+        if (!empty($startDate) && !empty($endDate)) {
+            $returnsQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''))
+                         ->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $returnsQuery->where('warehouse_name', $warehouse);
+        }
+
+        $returnsAgg = $returnsQuery->select(
+            'supplier_id',
+            DB::raw('COUNT(*) as total_returns_count'),
+            DB::raw('COALESCE(SUM(grand_total), 0) as total_returned_amount'),
+            DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded_amount'),
+            DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
+        )->groupBy('supplier_id');
+
+        $dueFormula = 'CASE WHEN (COALESCE(suppliers.balance_due, 0) + COALESCE(pa.total_due, 0) - COALESCE(ra.total_return_due, 0)) < 0 THEN 0 ELSE (COALESCE(suppliers.balance_due, 0) + COALESCE(pa.total_due, 0) - COALESCE(ra.total_return_due, 0)) END';
+
         $baseQuery = Supplier::leftJoinSub($purchAgg, 'pa', function ($join) {
             $join->on('suppliers.id', '=', 'pa.supplier_id');
+        })
+        ->leftJoinSub($returnsAgg, 'ra', function ($join) {
+            $join->on('suppliers.id', '=', 'ra.supplier_id');
         })
         ->select(
             'suppliers.id',
@@ -1694,10 +1717,17 @@ class ReportController extends Controller
             'suppliers.status',
             'suppliers.city',
             'suppliers.address',
+            'suppliers.balance_due as opening_balance_due',
             DB::raw('COALESCE(pa.total_purchases_count, 0) as total_purchases_count'),
             DB::raw('COALESCE(pa.total_purchased_amount, 0) as total_purchased_amount'),
+            DB::raw('COALESCE(ra.total_returns_count, 0) as total_returns_count'),
+            DB::raw('COALESCE(ra.total_returned_amount, 0) as total_returned_amount'),
+            DB::raw('COALESCE(ra.total_refunded_amount, 0) as total_refunded_amount'),
+            DB::raw('COALESCE(ra.total_return_due, 0) as total_return_due'),
+            DB::raw('(COALESCE(pa.total_purchased_amount, 0) - COALESCE(ra.total_returned_amount, 0)) as net_purchased_amount'),
             DB::raw('COALESCE(pa.total_paid_amount, 0) as total_paid_amount'),
-            DB::raw('COALESCE(pa.total_due, suppliers.balance_due, 0) as total_due'),
+            DB::raw('(COALESCE(pa.total_paid_amount, 0) - COALESCE(ra.total_refunded_amount, 0)) as net_paid_amount'),
+            DB::raw("{$dueFormula} as total_due"),
             DB::raw('COALESCE(pa.last_purchase_date, suppliers.updated_at) as last_purchase_date')
         );
 
@@ -1737,16 +1767,21 @@ class ReportController extends Controller
 
         // Due Filter
         $dueFilter = $request->input('due_filter');
+        $rawDueCalculation = '(COALESCE(suppliers.balance_due, 0) + COALESCE(pa.total_due, 0) - COALESCE(ra.total_return_due, 0))';
         if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
-            $baseQuery->whereRaw('COALESCE(pa.total_due, suppliers.balance_due, 0) > 0');
+            $baseQuery->whereRaw("{$rawDueCalculation} > 0");
         } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
-            $baseQuery->whereRaw('COALESCE(pa.total_due, suppliers.balance_due, 0) <= 0');
+            $baseQuery->whereRaw("{$rawDueCalculation} <= 0");
         }
 
         // Sort items
         $sortBy = $request->input('sort_by', 'total_purchased_amount');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['name', 'category', 'payment_terms', 'total_purchases_count', 'total_purchased_amount', 'total_paid_amount', 'total_due', 'last_purchase_date'];
+        $allowedSorts = [
+            'name', 'category', 'payment_terms', 'total_purchases_count',
+            'total_purchased_amount', 'net_purchased_amount', 'total_returned_amount',
+            'total_paid_amount', 'net_paid_amount', 'total_due', 'last_purchase_date'
+        ];
         if (in_array($sortBy, $allowedSorts, true)) {
             $baseQuery->orderBy($sortBy, $sortOrder);
         } else {
@@ -1758,16 +1793,24 @@ class ReportController extends Controller
 
         $totalSuppliers = $suppliers->count();
         $totalPurchased = (float)$suppliers->sum('total_purchased_amount');
+        $totalReturned = (float)$suppliers->sum('total_returned_amount');
+        $netPurchased = (float)$suppliers->sum('net_purchased_amount');
         $totalPaid = (float)$suppliers->sum('total_paid_amount');
+        $netPaid = (float)$suppliers->sum('net_paid_amount');
         $totalDue = (float)$suppliers->sum('total_due');
         $avgPurchased = $totalSuppliers > 0 ? ($totalPurchased / $totalSuppliers) : 0.0;
+        $avgNetPurchased = $totalSuppliers > 0 ? ($netPurchased / $totalSuppliers) : 0.0;
 
         $summary = [
             'total_suppliers' => $totalSuppliers,
             'total_purchased' => $totalPurchased,
+            'total_returned' => $totalReturned,
+            'net_purchased' => $netPurchased,
             'total_paid' => $totalPaid,
+            'net_paid' => $netPaid,
             'total_due' => $totalDue,
             'average_purchased' => $avgPurchased,
+            'average_net_purchased' => $avgNetPurchased,
         ];
 
         $payload = [
@@ -1775,9 +1818,13 @@ class ReportController extends Controller
             'data' => [
                 'total_suppliers' => $totalSuppliers,
                 'total_purchased' => $totalPurchased,
+                'total_returned' => $totalReturned,
+                'net_purchased' => $netPurchased,
                 'total_paid' => $totalPaid,
+                'net_paid' => $netPaid,
                 'total_due' => $totalDue,
                 'average_purchased' => $avgPurchased,
+                'average_net_purchased' => $avgNetPurchased,
                 'summary' => $summary,
                 'suppliers' => $suppliers,
             ],
@@ -1922,9 +1969,10 @@ class ReportController extends Controller
         $totalRefunded = (float)$returns->sum('paid_amount');
         $totalReturnDue = (float)$returns->sum('due_amount');
 
+        $openingBalance = (float)($supplier->balance_due ?? 0.0);
         $netPurchased = max(0.0, $totalPurchased - $totalReturned);
         $netPaid = max(0.0, $totalPaid - $totalRefunded);
-        $netDue = max(0.0, $totalDue - $totalReturnDue);
+        $trueNetDue = max(0.0, $openingBalance + $totalDue - $totalReturnDue);
         $returnRatePct = $totalPurchased > 0 ? round(($totalReturned / $totalPurchased) * 100, 2) : 0.0;
         $paymentRatePct = $totalPurchased > 0 ? round(($totalPaid / $totalPurchased) * 100, 2) : 100.0;
         $averagePurchaseValue = count($purchases) > 0 ? round($totalPurchased / count($purchases), 2) : 0.0;
@@ -1943,10 +1991,12 @@ class ReportController extends Controller
                     'status' => (string)($supplier->status ?? 'Active'),
                     'city' => (string)($supplier->city ?? ''),
                     'address' => (string)($supplier->address ?? ''),
+                    'opening_balance_due' => $openingBalance,
                     'total_purchases_count' => count($purchases),
                     'total_purchased_amount' => $totalPurchased > 0 ? $totalPurchased : (float)($supplier->total_purchased ?? 0),
+                    'net_purchased_amount' => $netPurchased,
                     'total_paid_amount' => $totalPaid,
-                    'total_due' => $totalPurchased > 0 ? $totalDue : (float)($supplier->balance_due ?? 0),
+                    'total_due' => $trueNetDue,
                     'last_purchase_date' => count($purchases) > 0 ? $purchases->first()['date'] : ($supplier->updated_at ?? ''),
                 ],
                 'summary' => [
@@ -1960,7 +2010,8 @@ class ReportController extends Controller
                     'total_return_due' => $totalReturnDue,
                     'net_purchased' => $netPurchased,
                     'net_paid' => $netPaid,
-                    'net_due' => $netDue,
+                    'net_due' => $trueNetDue,
+                    'opening_balance' => $openingBalance,
                     'return_rate_pct' => $returnRatePct,
                     'payment_rate_pct' => $paymentRatePct,
                     'average_purchase_value' => $averagePurchaseValue,
