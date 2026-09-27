@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
 use App\Models\Sale;
+use App\Models\SaleReturn;
 use App\Models\Purchase;
 use App\Models\Expense;
 use App\Models\Product;
@@ -1233,8 +1234,29 @@ class ReportController extends Controller
             DB::raw('MAX(date) as last_purchase_date')
         )->groupBy('customer_id');
 
+        // Subquery for returns aggregation per customer
+        $returnsQuery = SaleReturn::query();
+        if (!empty($startDate) && !empty($endDate)) {
+            $returnsQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''))
+                         ->where('date', '<=', $endDate . (strlen($endDate) <= 10 ? ' 23:59:59' : ''));
+        }
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $returnsQuery->where('warehouse_name', $warehouse);
+        }
+
+        $returnsAgg = $returnsQuery->select(
+            'customer_id',
+            DB::raw('COUNT(*) as total_returns'),
+            DB::raw('COALESCE(SUM(grand_total), 0) as total_returned_amount'),
+            DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded_amount'),
+            DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
+        )->groupBy('customer_id');
+
         $baseQuery = Customer::leftJoinSub($salesAgg, 'sa', function ($join) {
             $join->on('customers.id', '=', 'sa.customer_id');
+        })
+        ->leftJoinSub($returnsAgg, 'ra', function ($join) {
+            $join->on('customers.id', '=', 'ra.customer_id');
         })
         ->select(
             'customers.id',
@@ -1247,8 +1269,12 @@ class ReportController extends Controller
             'customers.reward_points',
             DB::raw('COALESCE(sa.total_orders, customers.total_visits, 0) as total_orders'),
             DB::raw('COALESCE(sa.total_spent, customers.total_spent, 0) as total_spent'),
-            DB::raw('COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN (customers.total_spent - COALESCE(customers.total_due, 0)) ELSE 0 END, 0) as total_paid'),
-            DB::raw('COALESCE(sa.total_due, customers.total_due, 0) as total_due'),
+            DB::raw('COALESCE(ra.total_returns, 0) as total_returns'),
+            DB::raw('COALESCE(ra.total_returned_amount, 0) as total_returned_amount'),
+            DB::raw('COALESCE(ra.total_refunded_amount, 0) as total_refunded_amount'),
+            DB::raw('(COALESCE(sa.total_spent, customers.total_spent, 0) - COALESCE(ra.total_returned_amount, 0)) as net_spent'),
+            DB::raw('COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN customers.total_spent ELSE 0 END, 0) as total_paid'),
+            DB::raw('COALESCE(sa.total_due, 0) as total_due'),
             DB::raw('COALESCE(sa.last_purchase_date, customers.updated_at) as last_purchase_date')
         );
 
@@ -1282,9 +1308,9 @@ class ReportController extends Controller
         // Due Filter
         $dueFilter = $request->input('due_filter');
         if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
-            $baseQuery->whereRaw('COALESCE(sa.total_due, customers.total_due, 0) > 0');
+            $baseQuery->whereRaw('COALESCE(sa.total_due, 0) > 0');
         } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
-            $baseQuery->whereRaw('COALESCE(sa.total_due, customers.total_due, 0) <= 0');
+            $baseQuery->whereRaw('COALESCE(sa.total_due, 0) <= 0');
         }
 
         // 1. Single-pass untruncated DB aggregates (Senior Accounting standard)
@@ -1294,12 +1320,14 @@ class ReportController extends Controller
         $summaryAgg = $summaryQuery->selectRaw('
             COUNT(DISTINCT customers.id) as total_customers,
             COALESCE(SUM(COALESCE(sa.total_spent, customers.total_spent, 0)), 0) as total_revenue,
-            COALESCE(SUM(COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN (customers.total_spent - COALESCE(customers.total_due, 0)) ELSE 0 END, 0)), 0) as total_paid,
-            COALESCE(SUM(COALESCE(sa.total_due, customers.total_due, 0)), 0) as total_due
+            COALESCE(SUM(COALESCE(ra.total_returned_amount, 0)), 0) as total_returned_amount,
+            COALESCE(SUM(COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN customers.total_spent ELSE 0 END, 0)), 0) as total_paid,
+            COALESCE(SUM(COALESCE(sa.total_due, 0)), 0) as total_due
         ')->first();
 
         $totalCustomers = (int)($summaryAgg->total_customers ?? 0);
         $totalRevenue = (float)($summaryAgg->total_revenue ?? 0);
+        $totalReturnedAmount = (float)($summaryAgg->total_returned_amount ?? 0);
         $totalPaid = (float)($summaryAgg->total_paid ?? 0);
         $totalDue = (float)($summaryAgg->total_due ?? 0);
         $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
@@ -1307,7 +1335,7 @@ class ReportController extends Controller
         // Sort items
         $sortBy = $request->input('sort_by', 'total_spent');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['name', 'tier', 'total_orders', 'total_spent', 'total_paid', 'total_due', 'last_purchase_date'];
+        $allowedSorts = ['name', 'tier', 'total_orders', 'total_spent', 'total_returns', 'total_returned_amount', 'net_spent', 'total_paid', 'total_due', 'last_purchase_date'];
         if (in_array($sortBy, $allowedSorts, true)) {
             $baseQuery->orderBy($sortBy, $sortOrder);
         } else {
@@ -1320,6 +1348,8 @@ class ReportController extends Controller
         $summary = [
             'total_customers' => $totalCustomers,
             'total_revenue' => $totalRevenue,
+            'total_returned' => $totalReturnedAmount,
+            'net_revenue' => max(0.0, $totalRevenue - $totalReturnedAmount),
             'total_paid' => $totalPaid,
             'total_due' => $totalDue,
             'average_spent' => $avgSpent,
@@ -1330,6 +1360,8 @@ class ReportController extends Controller
             'data' => [
                 'total_customers' => $totalCustomers,
                 'total_revenue' => $totalRevenue,
+                'total_returned' => $totalReturnedAmount,
+                'net_revenue' => max(0.0, $totalRevenue - $totalReturnedAmount),
                 'total_paid' => $totalPaid,
                 'total_due' => $totalDue,
                 'average_spent' => $avgSpent,
@@ -1360,6 +1392,7 @@ class ReportController extends Controller
             ], 404);
         }
 
+        // 1. Sales Invoices
         $salesQuery = Sale::where('customer_id', $id)
             ->withCount('items')
             ->orderBy('date', 'desc')
@@ -1380,9 +1413,50 @@ class ReportController extends Controller
             ];
         });
 
+        // 2. Sale Returns
+        $returnsQuery = SaleReturn::where(function ($q) use ($id, $customer) {
+                $q->where('customer_id', $id);
+                if (!empty($customer->name)) {
+                    $q->orWhere('customer_name', $customer->name);
+                }
+            })
+            ->orderBy('date', 'desc')
+            ->orderBy('id', 'desc');
+
+        $returns = $returnsQuery->get()->map(function ($r) {
+            $items = $r->items ?? [];
+            return [
+                'id' => (int)$r->id,
+                'reference_no' => (string)$r->reference_no,
+                'sale_reference_no' => (string)($r->sale_reference_no ?? ''),
+                'date' => (string)$r->date,
+                'warehouse_name' => (string)($r->warehouse_name ?? 'Main Outlet'),
+                'return_reason' => (string)($r->return_reason ?? 'Customer Return'),
+                'refund_tender' => (string)($r->refund_tender ?? ($r->payment_type ?? 'Cash')),
+                'grand_total' => (float)$r->grand_total,
+                'paid_amount' => (float)$r->paid_amount,
+                'due_amount' => (float)$r->due_amount,
+                'status' => (string)($r->status ?? 'Completed'),
+                'payment_status' => (string)($r->payment_status ?? 'Paid'),
+                'items_count' => is_array($items) ? count($items) : 1,
+                'items' => is_array($items) ? $items : [],
+            ];
+        });
+
         $totalInvoiced = (float)$invoices->sum('grand_total');
         $totalPaid = (float)$invoices->sum('paid_amount');
         $totalDue = (float)$invoices->sum('due_amount');
+
+        $totalReturned = (float)$returns->sum('grand_total');
+        $totalRefunded = (float)$returns->sum('paid_amount');
+        $totalReturnDue = (float)$returns->sum('due_amount');
+
+        $netInvoiced = max(0.0, $totalInvoiced - $totalReturned);
+        $netPaid = max(0.0, $totalPaid - $totalRefunded);
+        $netDue = max(0.0, $totalDue - $totalReturnDue);
+        $returnRatePct = $totalInvoiced > 0 ? round(($totalReturned / $totalInvoiced) * 100, 2) : 0.0;
+        $paymentRatePct = $totalInvoiced > 0 ? round(($totalPaid / $totalInvoiced) * 100, 2) : 100.0;
+        $averageOrderValue = count($invoices) > 0 ? round($totalInvoiced / count($invoices), 2) : 0.0;
 
         return response()->json([
             'status' => 'success',
@@ -1397,17 +1471,35 @@ class ReportController extends Controller
                     'status' => (string)($customer->status ?? 'Active'),
                     'reward_points' => (int)($customer->reward_points ?? 0),
                     'total_orders' => count($invoices),
+                    'total_returns' => count($returns),
                     'total_spent' => $totalInvoiced > 0 ? $totalInvoiced : (float)($customer->total_spent ?? 0),
+                    'total_returned' => $totalReturned,
+                    'net_spent' => $netInvoiced > 0 ? $netInvoiced : (float)($customer->total_spent ?? 0),
                     'total_paid' => $totalInvoiced > 0 ? $totalPaid : (float)(($customer->total_spent ?? 0) - ($customer->total_due ?? 0)),
+                    'total_refunded' => $totalRefunded,
+                    'net_paid' => $netPaid,
                     'total_due' => $totalInvoiced > 0 ? $totalDue : (float)($customer->total_due ?? 0),
+                    'net_due' => $netDue,
+                    'return_rate_pct' => $returnRatePct,
                 ],
                 'summary' => [
                     'invoices_count' => count($invoices),
                     'total_invoiced' => $totalInvoiced,
                     'total_paid' => $totalPaid,
                     'total_due' => $totalDue,
+                    'returns_count' => count($returns),
+                    'total_returned' => $totalReturned,
+                    'total_refunded' => $totalRefunded,
+                    'total_return_due' => $totalReturnDue,
+                    'net_invoiced' => $netInvoiced,
+                    'net_paid' => $netPaid,
+                    'net_due' => $netDue,
+                    'return_rate_pct' => $returnRatePct,
+                    'payment_rate_pct' => $paymentRatePct,
+                    'average_order_value' => $averageOrderValue,
                 ],
                 'invoices' => $invoices,
+                'returns' => $returns,
             ],
         ]);
     }
