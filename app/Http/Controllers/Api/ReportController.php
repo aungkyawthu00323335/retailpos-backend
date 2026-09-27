@@ -1438,6 +1438,9 @@ class ReportController extends Controller
             ], 404);
         }
 
+        $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $search = trim($request->input('search', ''));
+
         // 1. Sales Invoices
         $salesQuery = Sale::query()
             ->where(function ($q) use ($id) {
@@ -1445,8 +1448,22 @@ class ReportController extends Controller
                 if ((int)$id === 1) {
                     $q->orWhereNull('customer_id');
                 }
-            })
-            ->withCount('items')
+            });
+
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $salesQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($search)) {
+            $salesQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('payment_type', 'like', "%{$search}%")
+                  ->orWhere('payment_status', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $salesQuery->withCount('items')
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc');
 
@@ -1475,8 +1492,23 @@ class ReportController extends Controller
                 if (!empty($customer->name)) {
                     $q->orWhere('customer_name', $customer->name);
                 }
-            })
-            ->orderBy('date', 'desc')
+            });
+
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $returnsQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($search)) {
+            $returnsQuery->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('sale_reference_no', 'like', "%{$search}%")
+                  ->orWhere('refund_tender', 'like', "%{$search}%")
+                  ->orWhere('return_reason', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        }
+
+        $returnsQuery->orderBy('date', 'desc')
             ->orderBy('id', 'desc');
 
         $returns = $returnsQuery->get()->map(function ($r) {
