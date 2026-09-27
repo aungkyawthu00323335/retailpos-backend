@@ -3863,6 +3863,80 @@ class ReportController extends Controller
             COALESCE(SUM(due_amount), 0) as total_due_amount
         ')->first();
 
+        $totalReturnsCount = (int)($summary->total_returns ?? 0);
+        $totalReturnedAmt = (float)($summary->total_returned_amount ?? 0);
+        $totalPaidAmt = (float)($summary->total_paid_amount ?? 0);
+        $totalDueAmt = (float)($summary->total_due_amount ?? 0);
+        $avgReturnAmt = $totalReturnsCount > 0 ? round($totalReturnedAmt / $totalReturnsCount, 2) : 0.0;
+
+        // Breakdown by Refund Tender / Settlement Method
+        $paymentBreakdown = (clone $query)->select(
+            DB::raw("COALESCE(NULLIF(payment_type, ''), 'Cash') as method_name"),
+            DB::raw('COUNT(*) as count'),
+            DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded'),
+            DB::raw('COALESCE(SUM(grand_total), 0) as total_returned')
+        )
+        ->groupBy('method_name')
+        ->orderByDesc('total_refunded')
+        ->get();
+
+        $byPaymentMethodList = [];
+        foreach ($paymentBreakdown as $pb) {
+            $pRefunded = (float)$pb->total_refunded;
+            $byPaymentMethodList[] = [
+                'payment_type' => $pb->method_name,
+                'count' => (int)$pb->count,
+                'total' => $pRefunded,
+                'total_amount' => $pRefunded,
+                'total_returned' => (float)$pb->total_returned,
+                'percentage' => $totalPaidAmt > 0 ? round(($pRefunded / $totalPaidAmt) * 100, 2) : 0.0,
+            ];
+        }
+
+        // Breakdown by Product
+        $productMap = [];
+        $returnRowsWithPayload = (clone $query)->select('id', 'items_payload', 'grand_total', 'reference_no')->limit(1000)->get();
+        foreach ($returnRowsWithPayload as $row) {
+            if (!empty($row->items_payload)) {
+                $decoded = json_decode($row->items_payload, true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $item) {
+                        $pName = (string)($item['product_name'] ?? $item['name'] ?? 'Returned Item');
+                        $pCode = (string)($item['product_code'] ?? $item['code'] ?? 'SKU-001');
+                        $qty = (float)($item['quantity'] ?? $item['qty'] ?? 1);
+                        $subtotal = (float)($item['subtotal'] ?? $item['total'] ?? ($qty * (float)($item['unit_price'] ?? $item['unit_cost'] ?? 0)));
+                        $key = $pCode . '|' . $pName;
+                        if (!isset($productMap[$key])) {
+                            $productMap[$key] = [
+                                'product_name' => $pName,
+                                'product_code' => $pCode,
+                                'quantity' => 0.0,
+                                'total_amount' => 0.0,
+                            ];
+                        }
+                        $productMap[$key]['quantity'] += $qty;
+                        $productMap[$key]['total_amount'] += $subtotal;
+                    }
+                }
+            }
+        }
+
+        $byProductList = [];
+        foreach ($productMap as $prod) {
+            $amt = (float)$prod['total_amount'];
+            $byProductList[] = [
+                'product_name' => $prod['product_name'],
+                'product_code' => $prod['product_code'],
+                'quantity' => (float)$prod['quantity'],
+                'total_amount' => $amt,
+                'total' => $amt,
+                'percentage' => $totalReturnedAmt > 0 ? round(($amt / $totalReturnedAmt) * 100, 2) : 0.0,
+            ];
+        }
+        usort($byProductList, function ($a, $b) {
+            return $b['total_amount'] <=> $a['total_amount'];
+        });
+
         // 3. Paginated Results
         $paginated = $query->orderByDesc('date')
             ->orderByDesc('id')
@@ -3898,12 +3972,16 @@ class ReportController extends Controller
         $responsePayload = [
             'status' => 'success',
             'summary' => [
-                'total_returns' => (int)($summary->total_returns ?? 0),
-                'total_returned_amount' => (float)($summary->total_returned_amount ?? 0),
-                'total_paid_amount' => (float)($summary->total_paid_amount ?? 0),
-                'total_due_amount' => (float)($summary->total_due_amount ?? 0),
+                'total_returns' => $totalReturnsCount,
+                'total_returned_amount' => $totalReturnedAmt,
+                'total_paid_amount' => $totalPaidAmt,
+                'total_due_amount' => $totalDueAmt,
+                'average_return_amount' => $avgReturnAmt,
             ],
             'data' => $items,
+            'by_product' => $byProductList,
+            'by_refund_tender' => $byPaymentMethodList,
+            'by_payment_method' => $byPaymentMethodList,
             'pagination' => [
                 'current_page' => $paginated->currentPage(),
                 'per_page' => $paginated->perPage(),
@@ -3912,9 +3990,9 @@ class ReportController extends Controller
             ],
         ];
 
-        // Cache 5 minutes
+        // Cache 60 seconds
         try {
-            Cache::store('file')->put($cacheKey, $responsePayload, now()->addMinutes(5));
+            Cache::store('file')->put($cacheKey, $responsePayload, 60);
         } catch (\Throwable $e) {}
 
         return response()->json($responsePayload);
