@@ -1369,7 +1369,27 @@ class ReportController extends Controller
         }
 
         $perPage = max(1, min(10000, (int)$request->input('per_page', 5000)));
-        $customers = $baseQuery->limit($perPage)->get();
+        $customers = $baseQuery->limit($perPage)->get()->map(function ($c) {
+            return [
+                'id' => (int)$c->id,
+                'code' => (string)($c->code ?? ('CUST-' . str_pad($c->id, 3, '0', STR_PAD_LEFT))),
+                'name' => (string)$c->name,
+                'phone' => (string)($c->phone ?? ''),
+                'email' => (string)($c->email ?? ''),
+                'tier' => (string)($c->tier ?? 'General'),
+                'status' => (string)($c->status ?? 'Active'),
+                'reward_points' => (int)($c->reward_points ?? 0),
+                'total_orders' => (int)($c->total_orders ?? 0),
+                'total_spent' => (float)($c->total_spent ?? 0),
+                'total_returns' => (int)($c->total_returns ?? 0),
+                'total_returned_amount' => (float)($c->total_returned_amount ?? 0),
+                'total_refunded_amount' => (float)($c->total_refunded_amount ?? 0),
+                'net_spent' => (float)($c->net_spent ?? 0),
+                'total_paid' => (float)($c->total_paid ?? 0),
+                'total_due' => (float)($c->total_due ?? 0),
+                'last_purchase_date' => (string)($c->last_purchase_date ?? ''),
+            ];
+        });
 
         $summary = [
             'total_customers' => $totalCustomers,
