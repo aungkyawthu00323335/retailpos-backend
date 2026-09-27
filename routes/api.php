@@ -160,6 +160,7 @@ Route::get('reports/sale-returns', [ReportController::class, 'saleReturnsReport'
 Route::get('reports/purchase-returns', [ReportController::class, 'purchaseReturnsReport']);
 Route::get('reports/top-selling', [ReportController::class, 'topSellingReport']);
 Route::get('reports/customers', [ReportController::class, 'customerReport']);
+Route::get('reports/customers/{id}/statement', [ReportController::class, 'customerStatement']);
 Route::get('reports/suppliers', [ReportController::class, 'supplierReport']);
 Route::get('reports/expenses', [ReportController::class, 'expenseReport']);
 Route::get('reports/register', [ReportController::class, 'registerReport']);

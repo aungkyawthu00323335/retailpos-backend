@@ -1238,6 +1238,7 @@ class ReportController extends Controller
         })
         ->select(
             'customers.id',
+            DB::raw('COALESCE(customers.customer_id, CONCAT("CUST-", LPAD(customers.id, 3, "0"))) as code'),
             'customers.name',
             'customers.phone',
             'customers.email',
@@ -1246,8 +1247,8 @@ class ReportController extends Controller
             'customers.reward_points',
             DB::raw('COALESCE(sa.total_orders, customers.total_visits, 0) as total_orders'),
             DB::raw('COALESCE(sa.total_spent, customers.total_spent, 0) as total_spent'),
-            DB::raw('COALESCE(sa.total_paid, customers.total_spent, 0) as total_paid'),
-            DB::raw('COALESCE(sa.total_due, 0) as total_due'),
+            DB::raw('COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN (customers.total_spent - COALESCE(customers.total_due, 0)) ELSE 0 END, 0) as total_paid'),
+            DB::raw('COALESCE(sa.total_due, customers.total_due, 0) as total_due'),
             DB::raw('COALESCE(sa.last_purchase_date, customers.updated_at) as last_purchase_date')
         );
 
@@ -1281,10 +1282,27 @@ class ReportController extends Controller
         // Due Filter
         $dueFilter = $request->input('due_filter');
         if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
-            $baseQuery->whereRaw('COALESCE(sa.total_due, 0) > 0');
+            $baseQuery->whereRaw('COALESCE(sa.total_due, customers.total_due, 0) > 0');
         } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
-            $baseQuery->whereRaw('COALESCE(sa.total_due, 0) <= 0');
+            $baseQuery->whereRaw('COALESCE(sa.total_due, customers.total_due, 0) <= 0');
         }
+
+        // 1. Single-pass untruncated DB aggregates (Senior Accounting standard)
+        $summaryQuery = clone $baseQuery;
+        $summaryQuery->getQuery()->columns = null;
+        $summaryQuery->getQuery()->orders = null;
+        $summaryAgg = $summaryQuery->selectRaw('
+            COUNT(DISTINCT customers.id) as total_customers,
+            COALESCE(SUM(COALESCE(sa.total_spent, customers.total_spent, 0)), 0) as total_revenue,
+            COALESCE(SUM(COALESCE(sa.total_paid, CASE WHEN customers.total_spent > 0 THEN (customers.total_spent - COALESCE(customers.total_due, 0)) ELSE 0 END, 0)), 0) as total_paid,
+            COALESCE(SUM(COALESCE(sa.total_due, customers.total_due, 0)), 0) as total_due
+        ')->first();
+
+        $totalCustomers = (int)($summaryAgg->total_customers ?? 0);
+        $totalRevenue = (float)($summaryAgg->total_revenue ?? 0);
+        $totalPaid = (float)($summaryAgg->total_paid ?? 0);
+        $totalDue = (float)($summaryAgg->total_due ?? 0);
+        $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
 
         // Sort items
         $sortBy = $request->input('sort_by', 'total_spent');
@@ -1298,12 +1316,6 @@ class ReportController extends Controller
 
         $perPage = max(1, min(10000, (int)$request->input('per_page', 5000)));
         $customers = $baseQuery->limit($perPage)->get();
-
-        $totalCustomers = $customers->count();
-        $totalRevenue = (float)$customers->sum('total_spent');
-        $totalPaid = (float)$customers->sum('total_paid');
-        $totalDue = (float)$customers->sum('total_due');
-        $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
 
         $summary = [
             'total_customers' => $totalCustomers,
@@ -1332,6 +1344,72 @@ class ReportController extends Controller
         } catch (\Throwable $e) {}
 
         return response($jsonPayload, 200, ['Content-Type' => 'application/json']);
+    }
+
+    /**
+     * Customer Account Statement & Sales Invoice Ledger
+     * Provides 100% auditability and substantive voucher tracing for Senior Accountants
+     */
+    public function customerStatement(Request $request, $id)
+    {
+        $customer = Customer::find($id);
+        if (!$customer) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Customer not found',
+            ], 404);
+        }
+
+        $salesQuery = Sale::where('customer_id', $id)
+            ->withCount('items')
+            ->orderBy('date', 'desc')
+            ->orderBy('id', 'desc');
+
+        $invoices = $salesQuery->get()->map(function ($s) {
+            return [
+                'id' => (int)$s->id,
+                'reference_no' => (string)$s->reference_no,
+                'date' => (string)$s->date,
+                'warehouse_name' => (string)($s->warehouse_name ?? 'Main Outlet'),
+                'grand_total' => (float)$s->grand_total,
+                'paid_amount' => (float)$s->paid_amount,
+                'due_amount' => (float)$s->due_amount,
+                'payment_status' => (string)$s->payment_status,
+                'payment_type' => (string)$s->payment_type,
+                'items_count' => (int)($s->items_count ?? 0),
+            ];
+        });
+
+        $totalInvoiced = (float)$invoices->sum('grand_total');
+        $totalPaid = (float)$invoices->sum('paid_amount');
+        $totalDue = (float)$invoices->sum('due_amount');
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'customer' => [
+                    'id' => (int)$customer->id,
+                    'code' => (string)($customer->customer_id ?? ('CUST-' . str_pad($customer->id, 3, '0', STR_PAD_LEFT))),
+                    'name' => (string)$customer->name,
+                    'phone' => (string)($customer->phone ?? ''),
+                    'email' => (string)($customer->email ?? ''),
+                    'tier' => (string)($customer->tier ?? 'General'),
+                    'status' => (string)($customer->status ?? 'Active'),
+                    'reward_points' => (int)($customer->reward_points ?? 0),
+                    'total_orders' => count($invoices),
+                    'total_spent' => $totalInvoiced > 0 ? $totalInvoiced : (float)($customer->total_spent ?? 0),
+                    'total_paid' => $totalInvoiced > 0 ? $totalPaid : (float)(($customer->total_spent ?? 0) - ($customer->total_due ?? 0)),
+                    'total_due' => $totalInvoiced > 0 ? $totalDue : (float)($customer->total_due ?? 0),
+                ],
+                'summary' => [
+                    'invoices_count' => count($invoices),
+                    'total_invoiced' => $totalInvoiced,
+                    'total_paid' => $totalPaid,
+                    'total_due' => $totalDue,
+                ],
+                'invoices' => $invoices,
+            ],
+        ]);
     }
 
     /**
