@@ -1095,6 +1095,11 @@ class ReportController extends Controller
             $baseQuery->where('user_id', $request->input('user_id'));
         }
 
+        $paymentMethod = $request->input('payment_method') ?? $request->input('payment_type');
+        if (!empty($paymentMethod) && $paymentMethod !== 'All' && $paymentMethod !== 'all') {
+            $baseQuery->where('payment_method', $paymentMethod);
+        }
+
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $digits = preg_replace('/[^0-9]/', '', $search);
@@ -1150,6 +1155,28 @@ class ReportController extends Controller
             ];
         }
 
+        // Payment method breakdown aggregation
+        $paymentBreakdown = (clone $baseQuery)->select(
+            DB::raw("COALESCE(NULLIF(payment_method, ''), 'Cash') as method_name"),
+            DB::raw('COUNT(*) as count'),
+            DB::raw('COALESCE(SUM(amount), 0) as total')
+        )
+        ->groupBy('method_name')
+        ->orderByDesc('total')
+        ->get();
+
+        $byPaymentMethodList = [];
+        foreach ($paymentBreakdown as $pb) {
+            $pmTotal = (float)$pb->total;
+            $byPaymentMethodList[] = [
+                'payment_method' => $pb->method_name,
+                'total' => $pmTotal,
+                'total_amount' => $pmTotal,
+                'count' => (int)$pb->count,
+                'percentage' => $totalAmount > 0 ? round(($pmTotal / $totalAmount) * 100, 2) : 0.0,
+            ];
+        }
+
         // Sort items
         $sortBy = $request->input('sort_by', 'date');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
@@ -1182,6 +1209,7 @@ class ReportController extends Controller
                 'top_category_amount' => $topCategoryAmount,
                 'summary' => $summary,
                 'by_category' => $byCategoryList,
+                'by_payment_method' => $byPaymentMethodList,
                 'expenses' => $expenses,
             ],
         ];
