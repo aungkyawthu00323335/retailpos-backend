@@ -4663,6 +4663,8 @@ class ReportController extends Controller
                 'user_role' => 'Lead Cashier',
                 'payment_breakdown' => [
                     ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count],
+                    ['method' => 'Card', 'amount' => round($cdSales, 2), 'count' => $cdSales > 0 ? 1 : 0],
+                    ['method' => 'Digital', 'amount' => round($dgSales, 2), 'count' => $dgSales > 0 ? 1 : 0],
                 ],
             ];
         }
@@ -4672,13 +4674,17 @@ class ReportController extends Controller
             return strcmp($b['opened_at'] ?? $b['date'], $a['opened_at'] ?? $a['date']);
         });
 
-        // Calculate summary
+        // Calculate summary and drawer flow aggregates
         $totalShiftSales = 0.0;
         $totalOpeningCash = 0.0;
         $totalCashSales = 0.0;
         $totalNonCashSales = 0.0;
         $totalRefundsSum = 0.0;
+        $totalCashRefundsSum = 0.0;
         $totalExpensesSum = 0.0;
+        $totalCashExpensesSum = 0.0;
+        $totalFloatsInSum = 0.0;
+        $totalCashDropsSum = 0.0;
         $totalExpectedCash = 0.0;
         $totalClosingCash = 0.0;
         $totalVariance = 0.0;
@@ -4687,13 +4693,19 @@ class ReportController extends Controller
         $closedSessionsCount = 0;
         $discrepancySessionsCount = 0;
 
+        $tenderAgg = [];
+
         foreach ($items as $item) {
             $totalShiftSales += (float)$item['total_sales'];
             $totalOpeningCash += (float)$item['opening_cash'];
             $totalCashSales += (float)$item['cash_sales'];
             $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
             $totalRefundsSum += (float)$item['total_refunds'];
+            $totalCashRefundsSum += (float)($item['cash_refunds'] ?? 0.0);
             $totalExpensesSum += (float)$item['total_expenses'];
+            $totalCashExpensesSum += (float)($item['cash_expenses'] ?? 0.0);
+            $totalFloatsInSum += (float)($item['floats_in'] ?? 0.0);
+            $totalCashDropsSum += (float)($item['cash_drops'] ?? 0.0);
             $totalExpectedCash += (float)$item['expected_cash'];
             $totalClosingCash += (float)$item['closing_cash'];
             $totalVariance += (float)$item['difference'];
@@ -4707,7 +4719,76 @@ class ReportController extends Controller
             if (abs((float)$item['difference']) > 0.009) {
                 $discrepancySessionsCount++;
             }
+
+            // Aggregate payment tenders
+            if (!empty($item['payment_breakdown']) && is_array($item['payment_breakdown'])) {
+                foreach ($item['payment_breakdown'] as $pb) {
+                    $m = trim((string)($pb['method'] ?? 'Other'));
+                    if (empty($m)) $m = 'Other';
+                    if (!isset($tenderAgg[$m])) {
+                        $tenderAgg[$m] = ['count' => 0, 'total_amount' => 0.0];
+                    }
+                    $tenderAgg[$m]['count'] += (int)($pb['count'] ?? 0);
+                    $tenderAgg[$m]['total_amount'] += (float)($pb['amount'] ?? 0.0);
+                }
+            } else {
+                if ((float)$item['cash_sales'] > 0) {
+                    $tenderAgg['Cash'] = [
+                        'count' => ($tenderAgg['Cash']['count'] ?? 0) + (int)$item['total_transactions'],
+                        'total_amount' => ($tenderAgg['Cash']['total_amount'] ?? 0.0) + (float)$item['cash_sales'],
+                    ];
+                }
+                if ((float)$item['card_sales'] > 0) {
+                    $tenderAgg['Card'] = [
+                        'count' => ($tenderAgg['Card']['count'] ?? 0) + 1,
+                        'total_amount' => ($tenderAgg['Card']['total_amount'] ?? 0.0) + (float)$item['card_sales'],
+                    ];
+                }
+                if ((float)$item['digital_sales'] > 0) {
+                    $tenderAgg['Digital'] = [
+                        'count' => ($tenderAgg['Digital']['count'] ?? 0) + 1,
+                        'total_amount' => ($tenderAgg['Digital']['total_amount'] ?? 0.0) + (float)$item['digital_sales'],
+                    ];
+                }
+            }
         }
+
+        $totalTenderCollected = array_sum(array_column($tenderAgg, 'total_amount'));
+        $byPaymentTender = [];
+        foreach ($tenderAgg as $method => $tData) {
+            if ($tData['total_amount'] > 0 || $tData['count'] > 0) {
+                $byPaymentTender[] = [
+                    'payment_type' => $method,
+                    'count' => (int)$tData['count'],
+                    'total_amount' => round((float)$tData['total_amount'], 2),
+                    'percentage' => $totalTenderCollected > 0 ? round(($tData['total_amount'] / $totalTenderCollected) * 100, 1) : 0.0,
+                ];
+            }
+        }
+        if (empty($byPaymentTender)) {
+            $byPaymentTender[] = [
+                'payment_type' => 'Cash',
+                'count' => 0,
+                'total_amount' => 0.0,
+                'percentage' => 0.0,
+            ];
+        }
+        usort($byPaymentTender, function ($a, $b) {
+            return $b['total_amount'] <=> $a['total_amount'];
+        });
+
+        $drawerFlowSummary = [
+            'total_opening_float' => round($totalOpeningCash, 2),
+            'total_cash_sales' => round($totalCashSales, 2),
+            'total_floats_in' => round($totalFloatsInSum, 2),
+            'total_cash_drops' => round($totalCashDropsSum, 2),
+            'total_cash_refunds' => round($totalCashRefundsSum, 2),
+            'total_cash_expenses' => round($totalCashExpensesSum, 2),
+            'net_cash_movement' => round($totalCashSales + $totalFloatsInSum - $totalCashDropsSum - $totalCashRefundsSum - $totalCashExpensesSum, 2),
+            'expected_cash' => round($totalExpectedCash, 2),
+            'closing_cash' => round($totalClosingCash, 2),
+            'total_variance' => round($totalVariance, 2),
+        ];
 
         $responsePayload = [
             'status' => 'success',
@@ -4727,6 +4808,8 @@ class ReportController extends Controller
                 'total_variance' => round($totalVariance, 2),
                 'discrepancy_sessions' => $discrepancySessionsCount,
             ],
+            'drawer_flow_summary' => $drawerFlowSummary,
+            'by_payment_tender' => $byPaymentTender,
             'data' => $items,
             'sessions' => $items,
             'pagination' => [
