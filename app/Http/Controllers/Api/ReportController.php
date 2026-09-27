@@ -1440,6 +1440,8 @@ class ReportController extends Controller
 
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
         $search = trim($request->input('search', ''));
+        $startDate = $request->input('start_date') ?? $request->input('from_date');
+        $endDate = $request->input('end_date') ?? $request->input('to_date');
 
         // 1. Sales Invoices
         $salesQuery = Sale::query()
@@ -1452,6 +1454,14 @@ class ReportController extends Controller
 
         if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
             $salesQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($startDate)) {
+            $salesQuery->whereDate('date', '>=', $startDate);
+        }
+
+        if (!empty($endDate)) {
+            $salesQuery->whereDate('date', '<=', $endDate);
         }
 
         if (!empty($search)) {
@@ -1496,6 +1506,14 @@ class ReportController extends Controller
 
         if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
             $returnsQuery->where('warehouse_name', $warehouse);
+        }
+
+        if (!empty($startDate)) {
+            $returnsQuery->whereDate('date', '>=', $startDate);
+        }
+
+        if (!empty($endDate)) {
+            $returnsQuery->whereDate('date', '<=', $endDate);
         }
 
         if (!empty($search)) {
