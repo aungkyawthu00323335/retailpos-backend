@@ -27,6 +27,7 @@ class Purchase extends Model
         'payment_status', // Paid, Unpaid, Partial
         'payment_type', // Cash, Card, Bank Transfer, Cheque, etc.
         'notes',
+        'payments_payload',
         'created_by',
         'user_id',
         'user_name',
@@ -42,6 +43,43 @@ class Purchase extends Model
         'paid_amount' => 'float',
         'due_amount' => 'float',
     ];
+
+    protected $appends = ['payments'];
+
+    /**
+     * Decode stored payments_payload JSON into array.
+     * If payments_payload is not set but paid_amount > 0 and payment_status is not Unpaid,
+     * synthesize the default payment record for full backward compatibility.
+     * If paid_amount <= 0 or payment_status == 'Unpaid', return empty array.
+     */
+    public function getPaymentsAttribute(): array
+    {
+        if ($this->payments_payload !== null && $this->payments_payload !== '') {
+            $decoded = json_decode($this->payments_payload, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        if ((float)$this->paid_amount > 0.05 && strtolower(trim((string)$this->payment_status)) !== 'unpaid') {
+            return [
+                [
+                    'id'              => 1,
+                    'reference_no'    => !empty($this->reference_no) ? 'PAY-' . $this->reference_no : 'PAY-PU-001',
+                    'payment_date'    => $this->date ?: now()->toDateTimeString(),
+                    'payment_type'    => $this->payment_type ?: 'Cash',
+                    'amount'          => (float)$this->paid_amount,
+                    'received_amount' => (float)$this->paid_amount,
+                    'change_amount'   => 0.0,
+                    'user_name'       => $this->user_name ?: ($this->created_by ?: 'Super Admin'),
+                    'user_role'       => $this->user_role ?: 'Super Admin',
+                    'notes'           => $this->notes ?: '',
+                ]
+            ];
+        }
+
+        return [];
+    }
 
     public function items()
     {

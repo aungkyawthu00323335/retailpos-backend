@@ -277,6 +277,89 @@ class ProductCreateEnterpriseTest extends TestCase
     }
 
     /**
+     * 6b. Check Identifier & Self Edit Test: Editing product with variants ignores its own SKU and variant SKUs
+     */
+    public function test_check_identifier_and_update_with_own_variants_does_not_trigger_duplicate_error(): void
+    {
+        $product = Product::create([
+            'name' => 'Original Polo Shirt',
+            'code' => 'POLO-001',
+            'sku' => 'POLO-001',
+            'has_variants' => true,
+        ]);
+
+        $v1 = ProductVariant::create([
+            'product_id' => $product->id,
+            'name' => 'Size 32',
+            'sku' => '1000000000000111',
+            'cost_price' => 3000,
+            'selling_price' => 5000,
+        ]);
+
+        $v2 = ProductVariant::create([
+            'product_id' => $product->id,
+            'name' => 'Size 34',
+            'sku' => '1000000000000311',
+            'cost_price' => 3000,
+            'selling_price' => 5000,
+        ]);
+
+        // 1. Without ignore_id, 1000000000000111 is detected as existing
+        $checkRes1 = $this->getJson('/api/products/check-identifier?sku=1000000000000111');
+        $checkRes1->assertStatus(200)->assertJsonPath('data.available', false);
+
+        // 2. With ignore_id=$product->id, 1000000000000111 is available because it belongs to this product
+        $checkRes2 = $this->getJson("/api/products/check-identifier?sku=1000000000000111&ignore_id={$product->id}");
+        $checkRes2->assertStatus(200)->assertJsonPath('data.available', true);
+
+        // 3. Check with ignore_variant_id=$v1->id is also available
+        $checkRes3 = $this->getJson("/api/products/check-identifier?sku=1000000000000111&ignore_variant_id={$v1->id}");
+        $checkRes3->assertStatus(200)->assertJsonPath('data.available', true);
+
+        // 4. Another product's variant SKU is still blocked
+        $otherProduct = Product::create([
+            'name' => 'Other Shirt',
+            'code' => 'OTHER-001',
+            'sku' => 'OTHER-001',
+            'has_variants' => true,
+        ]);
+        ProductVariant::create([
+            'product_id' => $otherProduct->id,
+            'name' => 'Other Size',
+            'sku' => 'OTHER-VAR-999',
+            'cost_price' => 1000,
+            'selling_price' => 2000,
+        ]);
+
+        $checkRes4 = $this->getJson("/api/products/check-identifier?sku=OTHER-VAR-999&ignore_id={$product->id}");
+        $checkRes4->assertStatus(200)->assertJsonPath('data.available', false);
+
+        // 5. Updating the product with its own variants succeeds
+        $updateRes = $this->putJson("/api/products/{$product->id}", [
+            'name' => 'Updated Polo Shirt',
+            'sku' => 'POLO-001',
+            'has_variants' => true,
+            'variants' => [
+                [
+                    'id' => $v1->id,
+                    'name' => 'Size 32',
+                    'sku' => '1000000000000111',
+                    'cost_price' => 3200,
+                    'selling_price' => 5500,
+                ],
+                [
+                    'id' => $v2->id,
+                    'name' => 'Size 34',
+                    'sku' => '1000000000000311',
+                    'cost_price' => 3200,
+                    'selling_price' => 5500,
+                ],
+            ],
+        ]);
+        $updateRes->assertStatus(200)->assertJsonPath('success', true);
+    }
+
+    /**
      * 7. Product unit links normalize purchase and sale stock quantities.
      */
     public function test_product_unit_links_normalize_purchase_and_sale_stock(): void

@@ -52,4 +52,9 @@ class SaleItem extends Model
     {
         return $this->hasMany(SaleItemCostLayer::class, 'sale_item_id');
     }
+
+    public function variant()
+    {
+        return $this->belongsTo(ProductVariant::class, 'product_variant_id');
+    }
 }

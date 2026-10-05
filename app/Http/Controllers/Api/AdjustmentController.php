@@ -113,8 +113,12 @@ class AdjustmentController extends Controller
         }
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
+        $orderedQuery = $query->orderBy($sortBy, $sortOrder);
+        if ($sortBy !== 'id') {
+            $orderedQuery->orderBy('id', $sortOrder);
+        }
         if ($isAll) {
-            $adjustments = $query->orderBy($sortBy, $sortOrder)->get();
+            $adjustments = $orderedQuery->get();
             $data = $adjustments->map(function ($adj) {
                 if ($adj->user) {
                     $adj->created_by = $adj->user->name;
@@ -138,7 +142,7 @@ class AdjustmentController extends Controller
         }
 
         $perPage = min(max((int)$request->input('per_page', 25), 1), 1000);
-        $adjustments = $query->orderBy($sortBy, $sortOrder)->paginate($perPage);
+        $adjustments = $orderedQuery->paginate($perPage);
 
         $data = collect($adjustments->items())->map(function ($adj) {
             if ($adj->user) {

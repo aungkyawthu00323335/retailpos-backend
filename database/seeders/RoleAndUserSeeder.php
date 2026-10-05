@@ -220,6 +220,7 @@ class RoleAndUserSeeder extends Seeder
         $admin = User::updateOrCreate(
             ['email' => 'admin@infypos.com'],
             [
+                'user_id' => '100001',
                 'name' => 'Super Admin',
                 'phone' => '+95 9 790 123 456',
                 'password' => Hash::make('admin123'),
@@ -231,8 +232,78 @@ class RoleAndUserSeeder extends Seeder
             ]
         );
 
-        // Attach all active outlets to Super Admin
         $activeOutletIds = Outlet::where('is_active', true)->pluck('id')->toArray();
         $admin->outlets()->sync($activeOutletIds);
+
+        // 3. Seed Cashier User (aung@restaurant.com)
+        $cashierRole = Role::where('slug', 'cashier')->first();
+        $cashierUser = User::updateOrCreate(
+            ['email' => 'aung@restaurant.com'],
+            [
+                'user_id' => '100002',
+                'name' => 'Aung Ko Ko',
+                'phone' => '+95 9 791 234 567',
+                'password' => Hash::make('cashier123'),
+                'role_id' => $cashierRole?->id,
+                'role' => 'Cashier',
+                'branch' => 'Main Branch Outlet',
+                'avatar' => 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150',
+                'status' => 'Active',
+            ]
+        );
+        $cashierUser->outlets()->sync($activeOutletIds);
+
+        // 4. Seed Store Manager User (su@restaurant.com)
+        $managerRole = Role::where('slug', 'store_manager')->first();
+        $managerUser = User::updateOrCreate(
+            ['email' => 'su@restaurant.com'],
+            [
+                'user_id' => '100003',
+                'name' => 'Su Su Hlaing',
+                'phone' => '+95 9 792 345 678',
+                'password' => Hash::make('manager123'),
+                'role_id' => $managerRole?->id,
+                'role' => 'Store Manager',
+                'branch' => 'Main Branch Outlet',
+                'avatar' => 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150',
+                'status' => 'Active',
+            ]
+        );
+        $managerUser->outlets()->sync($activeOutletIds);
+
+        // 5. Seed Floor Supervisor User (kyaw@restaurant.com)
+        $supervisorRole = Role::where('slug', 'floor_supervisor')->first();
+        $supervisorUser = User::updateOrCreate(
+            ['email' => 'kyaw@restaurant.com'],
+            [
+                'user_id' => '100004',
+                'name' => 'Kyaw Kyaw',
+                'phone' => '+95 9 793 456 789',
+                'password' => Hash::make('supervisor123'),
+                'role_id' => $supervisorRole?->id,
+                'role' => 'Floor Supervisor',
+                'branch' => 'Main Branch Outlet',
+                'avatar' => 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150',
+                'status' => 'Active',
+            ]
+        );
+        $supervisorUser->outlets()->sync($activeOutletIds);
+
+        // 6. Seed Kitchen Chef / Staff User (mario@restaurant.com)
+        $marioUser = User::updateOrCreate(
+            ['email' => 'mario@restaurant.com'],
+            [
+                'user_id' => '100005',
+                'name' => 'Chef Mario',
+                'phone' => '+95 9 794 567 890',
+                'password' => Hash::make('chef123'),
+                'role_id' => $cashierRole?->id,
+                'role' => 'Kitchen Chef',
+                'branch' => 'Main Branch Outlet',
+                'avatar' => 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150',
+                'status' => 'Active',
+            ]
+        );
+        $marioUser->outlets()->sync($activeOutletIds);
     }
 }

@@ -22,6 +22,7 @@ class ProductVariant extends Model
         'wholesale_prices',
         'is_active',
         'sort_order',
+        'image_url',
     ];
 
     protected $casts = [

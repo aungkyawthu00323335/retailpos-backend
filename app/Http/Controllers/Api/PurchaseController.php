@@ -33,9 +33,6 @@ class PurchaseController extends Controller
 
         if (!$request->boolean('no_items', false)) {
             $relations[] = 'items:id,purchase_id,product_id,product_variant_id,variant_name,product_code,product_name,unit_id,unit_name,conversion_rate,unit_cost,quantity,base_quantity,base_unit_cost,tax,discount,subtotal';
-            $relations[] = 'items.variant.values';
-            $relations[] = 'items.variant.attributeValues';
-            $relations[] = 'items.product';
         }
 
         $query->with($relations);
@@ -150,6 +147,13 @@ class PurchaseController extends Controller
             'items.*.tax'               => 'nullable|numeric|min:0',
             'items.*.discount'          => 'nullable|numeric|min:0',
             'items.*.subtotal'          => 'required|numeric|min:0',
+            'payments'                  => 'nullable|array',
+            'payments.*.amount'         => 'nullable|numeric|min:0.01',
+            'payments.*.payment_type'   => 'nullable|string',
+            'payments.*.received_amount'=> 'nullable|numeric|min:0',
+            'payments.*.change_amount'  => 'nullable|numeric|min:0',
+            'payments.*.payment_date'   => 'nullable|string',
+            'payments.*.notes'          => 'nullable|string',
         ]);
 
         DB::beginTransaction();
@@ -318,6 +322,46 @@ class PurchaseController extends Controller
                 }
             }
 
+            // Initialize payment transaction record(s) in payments_payload - supporting Split Payments & multi-tenders
+            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                $savedPayments = [];
+                $tenderIdx = 1;
+                foreach ($validated['payments'] as $p) {
+                    $pAmount = (float)($p['amount'] ?? 0);
+                    if ($pAmount <= 0) continue;
+                    $savedPayments[] = [
+                        'id'              => $tenderIdx,
+                        'reference_no'    => 'PAY-' . ($purchase->reference_no ?: $purchase->id) . '-' . str_pad($tenderIdx, 2, '0', STR_PAD_LEFT),
+                        'payment_date'    => !empty($p['payment_date']) ? $p['payment_date'] : (!empty($validated['date']) ? $validated['date'] : now()->toDateTimeString()),
+                        'payment_type'    => $p['payment_type'] ?? ($purchase->payment_type ?: 'Cash'),
+                        'amount'          => $pAmount,
+                        'received_amount' => (float)($p['received_amount'] ?? $pAmount),
+                        'change_amount'   => (float)($p['change_amount'] ?? 0),
+                        'user_name'       => $validated['user_name'] ?? ($purchase->user_name ?: $userName),
+                        'user_role'       => $validated['user_role'] ?? ($purchase->user_role ?: $userRole),
+                        'notes'           => $p['notes'] ?? ($purchase->payment_type === 'Split Payment' ? 'Split payment line' : ($validated['notes'] ?? '')),
+                    ];
+                    $tenderIdx++;
+                }
+                if (!empty($savedPayments)) {
+                    $purchase->update(['payments_payload' => json_encode($savedPayments)]);
+                }
+            } elseif (!empty($validated['paid_amount']) && (float)$validated['paid_amount'] > 0) {
+                $initialPayment = [
+                    'id'              => 1,
+                    'reference_no'    => 'PAY-' . ($purchase->reference_no ?: $purchase->id) . '-01',
+                    'payment_date'    => !empty($validated['date']) ? $validated['date'] : now()->toDateTimeString(),
+                    'payment_type'    => $validated['payment_type'] ?? 'Cash',
+                    'amount'          => (float)$validated['paid_amount'],
+                    'received_amount' => (float)$validated['paid_amount'],
+                    'change_amount'   => 0.0,
+                    'user_name'       => $validated['user_name'] ?? ($validated['created_by'] ?? 'Super Admin'),
+                    'user_role'       => $validated['user_role'] ?? 'Super Admin',
+                    'notes'           => $validated['notes'] ?? '',
+                ];
+                $purchase->update(['payments_payload' => json_encode([$initialPayment])]);
+            }
+
             DB::commit();
 
             return response()->json([
@@ -444,38 +488,178 @@ class PurchaseController extends Controller
 
     public function addPayment(Request $request, $id)
     {
-        $purchase = Purchase::with('items')->find($id) ?? Purchase::with('items')->where('reference_no', $id)->first();
+        $purchase = Purchase::with(['items', 'supplier'])->find($id) ?? Purchase::with(['items', 'supplier'])->where('reference_no', $id)->first();
         if (!$purchase) {
             return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
         }
 
         $validated = $request->validate([
-            'amount' => 'required|numeric|min:0.01',
-            'payment_type' => 'required|string',
+            'amount' => 'required_without:payments|nullable|numeric|min:0.01',
+            'payment_type' => 'required_without:payments|nullable|string',
             'payment_date' => 'nullable|string',
             'notes' => 'nullable|string',
+            'payments' => 'nullable|array|min:1',
+            'payments.*.amount' => 'required|numeric|min:0.01',
+            'payments.*.payment_type' => 'required|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount' => 'nullable|numeric|min:0',
+            'payments.*.payment_date' => 'nullable|string',
+            'payments.*.notes' => 'nullable|string',
+            'user_name' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:255',
         ]);
 
-        $payingAmount = (float)$validated['amount'];
-        $newPaid = (float)$purchase->paid_amount + $payingAmount;
+        $existingPayments = $purchase->payments;
+        $updatedPayments = array_values($existingPayments);
+        $authUser = $request->user();
+        $globalUserName = $validated['user_name'] ?? ($authUser?->name ?? ($purchase->user_name ?: 'Super Admin'));
+        $globalUserRole = $validated['user_role'] ?? ($authUser?->role ?? ($purchase->user_role ?: 'Super Admin'));
+
+        if (!empty($validated['payments']) && is_array($validated['payments'])) {
+            foreach ($validated['payments'] as $tender) {
+                $pAmt = (float)$tender['amount'];
+                $newPaymentId = count($updatedPayments) + 1;
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$purchase->reference_no));
+                $paymentRef = 'PAY-' . ($cleanRef ?: $purchase->id) . '-' . time() . '-' . rand(100, 999);
+                $updatedPayments[] = [
+                    'id'              => $newPaymentId,
+                    'reference_no'    => $paymentRef,
+                    'payment_date'    => !empty($tender['payment_date']) ? $tender['payment_date'] : (!empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString()),
+                    'payment_type'    => $tender['payment_type'],
+                    'amount'          => $pAmt,
+                    'received_amount' => !empty($tender['received_amount']) ? (float)$tender['received_amount'] : $pAmt,
+                    'change_amount'   => !empty($tender['change_amount']) ? (float)$tender['change_amount'] : 0.0,
+                    'user_name'       => $tender['user_name'] ?? $globalUserName,
+                    'user_role'       => $tender['user_role'] ?? $globalUserRole,
+                    'notes'           => $tender['notes'] ?? ($validated['notes'] ?? ''),
+                ];
+            }
+        } else {
+            $payingAmount = (float)$validated['amount'];
+            $newPaymentId = count($updatedPayments) + 1;
+            $cleanRef = preg_replace('/^#\s*/', '', trim((string)$purchase->reference_no));
+            $paymentRef = 'PAY-' . ($cleanRef ?: $purchase->id) . '-' . time() . '-' . rand(100, 999);
+            $updatedPayments[] = [
+                'id'              => $newPaymentId,
+                'reference_no'    => $paymentRef,
+                'payment_date'    => !empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString(),
+                'payment_type'    => $validated['payment_type'],
+                'amount'          => $payingAmount,
+                'received_amount' => $payingAmount,
+                'change_amount'   => 0.0,
+                'user_name'       => $globalUserName,
+                'user_role'       => $globalUserRole,
+                'notes'           => $validated['notes'] ?? '',
+            ];
+        }
+
+        $newPaid = (float)collect($updatedPayments)->sum('amount');
         $newDue = max(0, (float)$purchase->grand_total - $newPaid);
-        $newStatus = $newDue <= 0 ? 'Paid' : 'Partial';
+        $newStatus = $newDue <= 0.001 ? 'Paid' : ($newPaid > 0 ? 'Partial' : 'Unpaid');
+
+        $uniqueTypes = collect($updatedPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $validated['payment_type'] ?: 'Cash';
+        }
 
         DB::beginTransaction();
         try {
             $purchase->update([
-                'paid_amount' => $newPaid,
-                'due_amount' => $newDue,
-                'payment_status' => $newStatus,
-                'payment_type' => $validated['payment_type'],
+                'payments_payload' => json_encode($updatedPayments),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
             ]);
 
             DB::commit();
 
             return response()->json([
-                'status' => 'success',
+                'status'  => 'success',
                 'message' => 'Payment added successfully',
-                'data' => $purchase->fresh()->load('items'),
+                'data'    => $purchase->fresh()->load(['items', 'supplier']),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    public function deletePayment(Request $request, $purchaseId, $paymentId = null)
+    {
+        $purchase = Purchase::with(['items', 'supplier'])->find($purchaseId) ?? Purchase::with(['items', 'supplier'])->where('reference_no', $purchaseId)->first();
+        if (!$purchase) {
+            return response()->json(['status' => 'error', 'message' => 'Purchase not found'], 404);
+        }
+
+        $existingPayments = $purchase->payments;
+        if (empty($existingPayments)) {
+            $purchase->update([
+                'payments_payload' => json_encode([]),
+                'paid_amount'      => 0.0,
+                'due_amount'       => (float)$purchase->grand_total,
+                'payment_status'   => 'Unpaid',
+            ]);
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored.',
+                'data'    => $purchase->fresh()->load(['items', 'supplier']),
+            ]);
+        }
+
+        $targetIdentifier = trim((string)($paymentId ?? $purchaseId));
+        $remainingPayments = [];
+        $deletedFound = false;
+
+        foreach ($existingPayments as $p) {
+            $pId  = isset($p['id']) ? trim((string)$p['id']) : '';
+            $pRef = isset($p['reference_no']) ? trim((string)$p['reference_no']) : '';
+
+            $matchById = ($pId !== '' && $pId === $targetIdentifier);
+            $matchByRef = ($pRef !== '' && ($pRef === $targetIdentifier || str_contains($pRef, $targetIdentifier) || str_contains($targetIdentifier, $pRef)));
+
+            if (!$deletedFound && ($matchById || $matchByRef)) {
+                $deletedFound = true;
+                continue;
+            }
+            $remainingPayments[] = $p;
+        }
+
+        $newPaid = (float)collect($remainingPayments)->sum('amount');
+        $grandTotal = (float)$purchase->grand_total;
+        $newDue = max(0.0, $grandTotal - $newPaid);
+        $newStatus = $newPaid <= 0.001 ? 'Unpaid' : ($newDue <= 0.001 ? 'Paid' : 'Partial');
+
+        $uniqueTypes = collect($remainingPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $purchase->payment_type ?: 'Cash';
+        }
+
+        DB::beginTransaction();
+        try {
+            $purchase->update([
+                'payments_payload' => json_encode(array_values($remainingPayments)),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored to ' . number_format($newDue, 2),
+                'data'    => $purchase->fresh()->load(['items', 'supplier']),
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();

@@ -125,6 +125,13 @@ class SaleReturnController extends Controller
             'return_reason'    => 'nullable|string|max:255',
             'refund_tender'    => 'nullable|string|max:100',
             'items'            => 'nullable|array',
+            'payments'         => 'nullable|array',
+            'payments.*.amount' => 'nullable|numeric|min:0.01',
+            'payments.*.payment_type' => 'nullable|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount' => 'nullable|numeric|min:0',
+            'payments.*.payment_date' => 'nullable|string',
+            'payments.*.notes' => 'nullable|string',
             'created_by'       => 'nullable|string|max:255',
             'user_id'          => 'nullable|integer',
             'user_name'        => 'nullable|string|max:255',
@@ -181,8 +188,9 @@ class SaleReturnController extends Controller
         $fifoService = app(\App\Services\FifoInventoryService::class);
         $warehouseId = $unitService->warehouseId(null, $validated['warehouse_name'] ?? null);
 
-        // Build items payload
-        $itemsPayload = !empty($validated['items']) ? json_encode($validated['items']) : null;
+        // Build items and payments payload
+        $itemsPayload    = !empty($validated['items']) ? json_encode($validated['items']) : null;
+        $paymentsPayload = !empty($validated['payments']) ? json_encode($validated['payments']) : null;
 
         DB::beginTransaction();
         try {
@@ -214,6 +222,7 @@ class SaleReturnController extends Controller
                 'return_reason'    => $validated['return_reason'] ?? null,
                 'refund_tender'    => $refundTender,
                 'items_payload'    => $itemsPayload,
+                'payments_payload' => $paymentsPayload,
                 'created_by'       => $createdBy,
                 'user_id'          => $userId,
                 'user_name'        => $userName,
@@ -270,10 +279,61 @@ class SaleReturnController extends Controller
                 }
             }
 
+            // Record refund payment transaction(s) - supporting Split Payments & multi-tenders
+            $cashRefundPortion = 0.0;
+            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                $savedPayments = [];
+                $tenderIdx = 1;
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                foreach ($validated['payments'] as $p) {
+                    $pAmount = (float)($p['amount'] ?? 0);
+                    if ($pAmount <= 0) continue;
+                    $pType = $p['payment_type'] ?? ($return->payment_type ?: 'Cash');
+                    if (strtolower(trim($pType)) === 'cash') {
+                        $cashRefundPortion += $pAmount;
+                    }
+                    $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                    $savedPayments[] = [
+                        'id'              => $tenderIdx,
+                        'reference_no'    => $paymentRef,
+                        'payment_date'    => !empty($p['payment_date']) ? $p['payment_date'] : (!empty($validated['date']) ? $validated['date'] : now()->toDateTimeString()),
+                        'payment_type'    => $pType,
+                        'amount'          => $pAmount,
+                        'received_amount' => !empty($p['received_amount']) ? (float)$p['received_amount'] : $pAmount,
+                        'change_amount'   => !empty($p['change_amount']) ? (float)$p['change_amount'] : 0.0,
+                        'user_name'       => $p['user_name'] ?? $userName,
+                        'user_role'       => $p['user_role'] ?? $userRole,
+                        'notes'           => $p['notes'] ?? ($return->payment_type === 'Split Payment' ? 'Split refund line' : ($validated['notes'] ?? '')),
+                    ];
+                    $tenderIdx++;
+                }
+                if (!empty($savedPayments)) {
+                    $return->update(['payments_payload' => json_encode($savedPayments)]);
+                }
+            } elseif ($paidAmount > 0) {
+                if (strtolower(trim($refundTender)) === 'cash') {
+                    $cashRefundPortion = $paidAmount;
+                }
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                $initialPayment = [
+                    'id'              => 1,
+                    'reference_no'    => $paymentRef,
+                    'payment_date'    => $txDate,
+                    'payment_type'    => $refundTender,
+                    'amount'          => $paidAmount,
+                    'received_amount' => $paidAmount,
+                    'change_amount'   => 0.0,
+                    'user_name'       => $userName,
+                    'user_role'       => $userRole,
+                    'notes'           => $validated['notes'] ?? '',
+                ];
+                $return->update(['payments_payload' => json_encode([$initialPayment])]);
+            }
+
             // ── Cash Register Deduction (only for Cash refunds) ───────────────
-            // If refund_tender is Cash, deduct from open drawer.
-            // Non-cash refunds (KBZPay, WavePay, Bank Transfer, Store Credit) do NOT touch the cash drawer.
-            if ($return->status === 'Completed' && $paidAmount > 0 && strtolower($refundTender) === 'cash') {
+            // If refund includes Cash tender, deduct only the Cash portion from open drawer.
+            if ($return->status === 'Completed' && $cashRefundPortion > 0) {
                 $activeReg = \App\Models\CashRegister::where('status', 'open')
                     ->where(function ($q) use ($validated, $warehouseId) {
                         if ($warehouseId) {
@@ -286,9 +346,9 @@ class SaleReturnController extends Controller
                     ->first();
 
                 if ($activeReg) {
-                    $activeReg->decrement('expected_cash', $paidAmount);
+                    $activeReg->decrement('expected_cash', $cashRefundPortion);
                     if ($activeReg->closing_cash !== null) {
-                        $activeReg->decrement('closing_cash', $paidAmount);
+                        $activeReg->decrement('closing_cash', $cashRefundPortion);
                     }
                 }
             }
@@ -349,6 +409,7 @@ class SaleReturnController extends Controller
             'return_reason'    => 'nullable|string|max:255',
             'refund_tender'    => 'nullable|string|max:100',
             'items'            => 'nullable|array',
+            'payments'         => 'nullable|array',
             'created_by'       => 'nullable|string|max:255',
             'user_id'          => 'nullable|integer',
             'user_name'        => 'nullable|string|max:255',
@@ -368,6 +429,11 @@ class SaleReturnController extends Controller
         if (isset($validated['items'])) {
             $validated['items_payload'] = json_encode($validated['items']);
             unset($validated['items']);
+        }
+
+        if (isset($validated['payments'])) {
+            $validated['payments_payload'] = json_encode($validated['payments']);
+            unset($validated['payments']);
         }
 
         $return->update($validated);
@@ -448,5 +514,258 @@ class SaleReturnController extends Controller
 
         $return->delete();
         return response()->json(['status' => 'success', 'message' => 'Sale return deleted']);
+    }
+
+    /**
+     * Add a refund payment to a sale return
+     */
+    public function addPayment(Request $request, $id)
+    {
+        $return = is_numeric($id)
+            ? SaleReturn::find($id)
+            : SaleReturn::where('reference_no', $id)->first();
+        if (!$return) {
+            return response()->json(['status' => 'error', 'message' => 'Sale return record not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'amount'       => 'required_without:payments|nullable|numeric|min:0.01',
+            'payment_type' => 'required_without:payments|nullable|string',
+            'payment_date' => 'nullable|string',
+            'notes'        => 'nullable|string',
+            'payments'     => 'nullable|array|min:1',
+            'payments.*.amount'          => 'required|numeric|min:0.01',
+            'payments.*.payment_type'    => 'required|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount'   => 'nullable|numeric|min:0',
+            'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.notes'           => 'nullable|string',
+            'user_name'    => 'nullable|string|max:255',
+            'user_role'    => 'nullable|string|max:255',
+        ]);
+
+        $existingPayments = $return->payments;
+        $updatedPayments = array_values($existingPayments);
+        $authUser = $request->user();
+        $globalUserName = $validated['user_name'] ?? ($authUser?->name ?? ($return->user_name ?: 'Super Admin'));
+        $globalUserRole = $validated['user_role'] ?? ($authUser?->role ?? ($return->user_role ?: 'Super Admin'));
+
+        $cashRefundAdded = 0.0;
+
+        if (!empty($validated['payments']) && is_array($validated['payments'])) {
+            foreach ($validated['payments'] as $tender) {
+                $pAmt = (float)$tender['amount'];
+                if ($pAmt <= 0) continue;
+                $newPaymentId = count($updatedPayments) + 1;
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                $pType = $tender['payment_type'] ?? 'Cash';
+                if (strtolower(trim($pType)) === 'cash') {
+                    $cashRefundAdded += $pAmt;
+                }
+                $updatedPayments[] = [
+                    'id'              => $newPaymentId,
+                    'reference_no'    => $paymentRef,
+                    'payment_date'    => !empty($tender['payment_date']) ? $tender['payment_date'] : (!empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString()),
+                    'payment_type'    => $pType,
+                    'amount'          => $pAmt,
+                    'received_amount' => !empty($tender['received_amount']) ? (float)$tender['received_amount'] : $pAmt,
+                    'change_amount'   => !empty($tender['change_amount']) ? (float)$tender['change_amount'] : 0.0,
+                    'user_name'       => $tender['user_name'] ?? $globalUserName,
+                    'user_role'       => $tender['user_role'] ?? $globalUserRole,
+                    'notes'           => $tender['notes'] ?? ($validated['notes'] ?? ''),
+                ];
+            }
+        } else {
+            $payingAmount = (float)$validated['amount'];
+            $newPaymentId = count($updatedPayments) + 1;
+            $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+            $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+            $pType = $validated['payment_type'] ?? 'Cash';
+            if (strtolower(trim($pType)) === 'cash') {
+                $cashRefundAdded += $payingAmount;
+            }
+            $updatedPayments[] = [
+                'id'              => $newPaymentId,
+                'reference_no'    => $paymentRef,
+                'payment_date'    => !empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString(),
+                'payment_type'    => $pType,
+                'amount'          => $payingAmount,
+                'received_amount' => $payingAmount,
+                'change_amount'   => 0.0,
+                'user_name'       => $globalUserName,
+                'user_role'       => $globalUserRole,
+                'notes'           => $validated['notes'] ?? '',
+            ];
+        }
+
+        $newPaid = (float)collect($updatedPayments)->sum('amount');
+        $newDue = max(0, (float)$return->grand_total - $newPaid);
+        $newStatus = $newDue <= 0.001 ? 'Paid' : ($newPaid > 0 ? 'Partial' : 'Unpaid');
+
+        $uniqueTypes = collect($updatedPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $return->payment_type ?: 'Cash';
+        }
+
+        DB::beginTransaction();
+        try {
+            $return->update([
+                'payments_payload' => json_encode($updatedPayments),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
+            ]);
+
+            // Deduct cash from active drawer if Cash refund tender was added
+            if ($cashRefundAdded > 0) {
+                $warehouseId = $return->warehouse_id;
+                $activeReg = \App\Models\CashRegister::where('status', 'open')
+                    ->where(function ($q) use ($return, $warehouseId) {
+                        if ($warehouseId) {
+                            $q->where('warehouse_id', $warehouseId);
+                        } elseif (!empty($return->warehouse_name)) {
+                            $q->where('warehouse_name', $return->warehouse_name);
+                        }
+                    })
+                    ->latest()
+                    ->first();
+                if ($activeReg) {
+                    $activeReg->decrement('expected_cash', $cashRefundAdded);
+                    if ($activeReg->closing_cash !== null) {
+                        $activeReg->decrement('closing_cash', $cashRefundAdded);
+                    }
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment added successfully',
+                'data'    => $return->fresh(),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Delete a refund payment transaction from a sale return
+     */
+    public function deletePayment(Request $request, $returnId, $paymentId = null)
+    {
+        $return = is_numeric($returnId)
+            ? SaleReturn::find($returnId)
+            : SaleReturn::where('reference_no', $returnId)->first();
+
+        if (!$return) {
+            return response()->json(['status' => 'error', 'message' => 'Sale return record not found'], 404);
+        }
+
+        $existingPayments = $return->payments;
+        if (empty($existingPayments)) {
+            $return->update([
+                'payments_payload' => json_encode([]),
+                'paid_amount'      => 0.0,
+                'due_amount'       => (float)$return->grand_total,
+                'payment_status'   => 'Unpaid',
+            ]);
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored.',
+                'data'    => $return->fresh(),
+            ]);
+        }
+
+        $targetIdentifier = trim((string)($paymentId ?? $returnId));
+
+        $remainingPayments = [];
+        $deletedPayment = null;
+
+        foreach ($existingPayments as $p) {
+            $pId  = isset($p['id']) ? trim((string)$p['id']) : '';
+            $pRef = isset($p['reference_no']) ? trim((string)$p['reference_no']) : '';
+
+            $matchById = ($pId !== '' && $pId === $targetIdentifier);
+            $matchByRef = ($pRef !== '' && ($pRef === $targetIdentifier || str_contains($pRef, $targetIdentifier) || str_contains($targetIdentifier, $pRef)));
+
+            if ($deletedPayment === null && ($matchById || $matchByRef)) {
+                $deletedPayment = $p;
+                continue;
+            }
+            $remainingPayments[] = $p;
+        }
+
+        if ($deletedPayment === null && count($existingPayments) === 1) {
+            $deletedPayment = $existingPayments[0];
+            $remainingPayments = [];
+        }
+
+        $newPaid = (float)collect($remainingPayments)->sum('amount');
+        $newDue = max(0, (float)$return->grand_total - $newPaid);
+        $newStatus = $newPaid <= 0.001 ? 'Unpaid' : ($newDue <= 0.001 ? 'Paid' : 'Partial');
+
+        $uniqueTypes = collect($remainingPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $return->payment_type ?: 'Cash';
+        }
+
+        DB::beginTransaction();
+        try {
+            $return->update([
+                'payments_payload' => json_encode(array_values($remainingPayments)),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
+            ]);
+
+            // If deleted payment was Cash, restore drawer cash
+            if ($deletedPayment && strtolower(trim($deletedPayment['payment_type'] ?? '')) === 'cash') {
+                $delAmount = (float)($deletedPayment['amount'] ?? 0);
+                if ($delAmount > 0) {
+                    $warehouseId = $return->warehouse_id;
+                    $activeReg = \App\Models\CashRegister::where('status', 'open')
+                        ->where(function ($q) use ($return, $warehouseId) {
+                            if ($warehouseId) {
+                                $q->where('warehouse_id', $warehouseId);
+                            } elseif (!empty($return->warehouse_name)) {
+                                $q->where('warehouse_name', $return->warehouse_name);
+                            }
+                        })
+                        ->latest()
+                        ->first();
+                    if ($activeReg) {
+                        $activeReg->increment('expected_cash', $delAmount);
+                        if ($activeReg->closing_cash !== null) {
+                            $activeReg->increment('closing_cash', $delAmount);
+                        }
+                    }
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored.',
+                'data'    => $return->fresh(),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => 'Failed to delete payment: ' . $e->getMessage()], 500);
+        }
     }
 }

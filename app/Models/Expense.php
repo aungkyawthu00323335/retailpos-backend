@@ -17,6 +17,9 @@ class Expense extends Model
         'expense_category_name',
         'title',
         'amount',
+        'paid_amount',
+        'due_amount',
+        'payment_status',
         'payment_method',
         'payment_method_id',
         'date',
@@ -32,6 +35,8 @@ class Expense extends Model
         'payment_method_id' => 'integer',
         'user_id' => 'integer',
         'amount' => 'float',
+        'paid_amount' => 'float',
+        'due_amount' => 'float',
     ];
 
     public function category()
@@ -42,5 +47,10 @@ class Expense extends Model
     public function paymentMethod()
     {
         return $this->belongsTo(PaymentMethod::class, 'payment_method_id');
+    }
+
+    public function payments()
+    {
+        return $this->hasMany(ExpensePayment::class, 'expense_id');
     }
 }

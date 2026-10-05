@@ -125,6 +125,13 @@ class PurchaseReturnController extends Controller
             'notes'                 => 'nullable|string',
             'return_reason'         => 'nullable|string|max:255',
             'items'                 => 'nullable|array',
+            'payments'              => 'nullable|array',
+            'payments.*.amount'     => 'nullable|numeric|min:0.01',
+            'payments.*.payment_type' => 'nullable|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount' => 'nullable|numeric|min:0',
+            'payments.*.payment_date' => 'nullable|string',
+            'payments.*.notes'      => 'nullable|string',
             'created_by'            => 'nullable|string|max:255',
             'user_id'               => 'nullable|integer',
             'user_name'             => 'nullable|string|max:255',
@@ -259,6 +266,50 @@ class PurchaseReturnController extends Controller
                 }
             }
 
+            // Record initial refund payment transaction(s) - supporting Split Payments & multi-tenders
+            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                $savedPayments = [];
+                $tenderIdx = 1;
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                foreach ($validated['payments'] as $p) {
+                    $pAmount = (float)($p['amount'] ?? 0);
+                    if ($pAmount <= 0) continue;
+                    $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                    $savedPayments[] = [
+                        'id'              => $tenderIdx,
+                        'reference_no'    => $paymentRef,
+                        'payment_date'    => !empty($p['payment_date']) ? $p['payment_date'] : (!empty($validated['date']) ? $validated['date'] : now()->toDateTimeString()),
+                        'payment_type'    => $p['payment_type'] ?? ($return->payment_type ?: 'Cash'),
+                        'amount'          => $pAmount,
+                        'received_amount' => !empty($p['received_amount']) ? (float)$p['received_amount'] : $pAmount,
+                        'change_amount'   => !empty($p['change_amount']) ? (float)$p['change_amount'] : 0.0,
+                        'user_name'       => $p['user_name'] ?? $userName,
+                        'user_role'       => $p['user_role'] ?? $userRole,
+                        'notes'           => $p['notes'] ?? ($return->payment_type === 'Split Payment' ? 'Split refund line' : ($validated['notes'] ?? '')),
+                    ];
+                    $tenderIdx++;
+                }
+                if (!empty($savedPayments)) {
+                    $return->update(['payments_payload' => json_encode($savedPayments)]);
+                }
+            } elseif ($paidAmount > 0) {
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                $initialPayment = [
+                    'id'              => 1,
+                    'reference_no'    => $paymentRef,
+                    'payment_date'    => $txDate,
+                    'payment_type'    => $validated['payment_type'] ?? 'Cash',
+                    'amount'          => $paidAmount,
+                    'received_amount' => $paidAmount,
+                    'change_amount'   => 0.0,
+                    'user_name'       => $userName,
+                    'user_role'       => $userRole,
+                    'notes'           => $validated['notes'] ?? '',
+                ];
+                $return->update(['payments_payload' => json_encode([$initialPayment])]);
+            }
+
             DB::commit();
 
             return response()->json([
@@ -284,12 +335,12 @@ class PurchaseReturnController extends Controller
             'reference_no'          => 'nullable|string|max:100',
             'purchase_reference_no' => 'nullable|string|max:100',
             'supplier_id'           => 'nullable|integer',
-            'supplier_name'         => 'required|string|max:255',
+            'supplier_name'         => 'sometimes|required|string|max:255',
             'warehouse_id'          => 'nullable|integer',
-            'warehouse_name'        => 'required|string|max:255',
+            'warehouse_name'        => 'sometimes|required|string|max:255',
             'outlet_id'             => 'nullable|integer',
-            'date'                  => 'required|string',
-            'grand_total'           => 'required|numeric|min:0',
+            'date'                  => 'sometimes|required|string',
+            'grand_total'           => 'sometimes|required|numeric|min:0',
             'paid_amount'           => 'nullable|numeric|min:0',
             'status'                => 'nullable|string|in:Completed,Pending,Received',
             'payment_status'        => 'nullable|string',
@@ -308,9 +359,9 @@ class PurchaseReturnController extends Controller
             'user_role'             => 'nullable|string|max:255',
         ]);
 
-        $grandTotal    = (float)$validated['grand_total'];
-        $paidAmount    = (float)($validated['paid_amount'] ?? $return->paid_amount);
-        $dueAmount     = max(0, $grandTotal - $paidAmount);
+        $grandTotal    = isset($validated['grand_total']) ? (float)$validated['grand_total'] : (float)$return->grand_total;
+        $paidAmount    = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : (float)$return->paid_amount;
+        $dueAmount     = isset($validated['due_amount']) ? (float)$validated['due_amount'] : max(0, $grandTotal - $paidAmount);
         $paymentStatus = $validated['payment_status'] ?? ($dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid'));
 
         $userName  = !empty($validated['user_name'])
@@ -327,11 +378,11 @@ class PurchaseReturnController extends Controller
             'reference_no'          => $validated['reference_no'] ?? $return->reference_no,
             'purchase_reference_no' => $validated['purchase_reference_no'] ?? $return->purchase_reference_no,
             'supplier_id'           => $validated['supplier_id'] ?? $return->supplier_id,
-            'supplier_name'         => $validated['supplier_name'],
+            'supplier_name'         => $validated['supplier_name'] ?? $return->supplier_name,
             'warehouse_id'          => $validated['warehouse_id'] ?? $validated['outlet_id'] ?? $return->warehouse_id,
-            'warehouse_name'        => $validated['warehouse_name'],
+            'warehouse_name'        => $validated['warehouse_name'] ?? $return->warehouse_name,
             'outlet_id'             => $validated['outlet_id'] ?? $validated['warehouse_id'] ?? $return->outlet_id,
-            'date'                  => $validated['date'],
+            'date'                  => $validated['date'] ?? $return->date,
             'status'                => $validated['status'] ?? $return->status,
             'grand_total'           => $grandTotal,
             'paid_amount'           => $paidAmount,
@@ -360,7 +411,7 @@ class PurchaseReturnController extends Controller
         return response()->json([
             'status'  => 'success',
             'message' => 'Purchase return updated successfully',
-            'data'    => $return,
+            'data'    => $return->fresh(),
         ]);
     }
 
@@ -438,4 +489,204 @@ class PurchaseReturnController extends Controller
         $return->delete();
         return response()->json(['status' => 'success', 'message' => 'Purchase return deleted']);
     }
+
+    /**
+     * Add a refund payment to a purchase return
+     */
+    public function addPayment(Request $request, $id)
+    {
+        $return = PurchaseReturn::find($id) ?? PurchaseReturn::where('reference_no', $id)->first();
+        if (!$return) {
+            return response()->json(['status' => 'error', 'message' => 'Purchase return not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'amount'       => 'required_without:payments|nullable|numeric|min:0.01',
+            'payment_type' => 'required_without:payments|nullable|string',
+            'payment_date' => 'nullable|string',
+            'notes'        => 'nullable|string',
+            'payments'     => 'nullable|array|min:1',
+            'payments.*.amount'          => 'required|numeric|min:0.01',
+            'payments.*.payment_type'    => 'required|string',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount'   => 'nullable|numeric|min:0',
+            'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.notes'           => 'nullable|string',
+            'user_name'    => 'nullable|string|max:255',
+            'user_role'    => 'nullable|string|max:255',
+        ]);
+
+        $existingPayments = $return->payments;
+        $updatedPayments = array_values($existingPayments);
+        $authUser = $request->user();
+        $globalUserName = $validated['user_name'] ?? ($authUser?->name ?? ($return->user_name ?: 'Admin User'));
+        $globalUserRole = $validated['user_role'] ?? ($authUser?->role ?? ($return->user_role ?: 'Super Admin'));
+
+        if (!empty($validated['payments']) && is_array($validated['payments'])) {
+            foreach ($validated['payments'] as $tender) {
+                $pAmt = (float)$tender['amount'];
+                $newPaymentId = count($updatedPayments) + 1;
+                $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+                $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+                $updatedPayments[] = [
+                    'id'              => $newPaymentId,
+                    'reference_no'    => $paymentRef,
+                    'payment_date'    => !empty($tender['payment_date']) ? $tender['payment_date'] : (!empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString()),
+                    'payment_type'    => $tender['payment_type'],
+                    'amount'          => $pAmt,
+                    'received_amount' => !empty($tender['received_amount']) ? (float)$tender['received_amount'] : $pAmt,
+                    'change_amount'   => !empty($tender['change_amount']) ? (float)$tender['change_amount'] : 0.0,
+                    'user_name'       => $tender['user_name'] ?? $globalUserName,
+                    'user_role'       => $tender['user_role'] ?? $globalUserRole,
+                    'notes'           => $tender['notes'] ?? ($validated['notes'] ?? ''),
+                ];
+            }
+        } else {
+            $payingAmount = (float)$validated['amount'];
+            $newPaymentId = count($updatedPayments) + 1;
+            $cleanRef = preg_replace('/^#\s*/', '', trim((string)$return->reference_no));
+            $paymentRef = 'PAY-' . ($cleanRef ?: $return->id) . '-' . time() . '-' . rand(100, 999);
+            $updatedPayments[] = [
+                'id'              => $newPaymentId,
+                'reference_no'    => $paymentRef,
+                'payment_date'    => !empty($validated['payment_date']) ? $validated['payment_date'] : now()->toDateTimeString(),
+                'payment_type'    => $validated['payment_type'],
+                'amount'          => $payingAmount,
+                'received_amount' => $payingAmount,
+                'change_amount'   => 0.0,
+                'user_name'       => $globalUserName,
+                'user_role'       => $globalUserRole,
+                'notes'           => $validated['notes'] ?? '',
+            ];
+        }
+
+        $newPaid = (float)collect($updatedPayments)->sum('amount');
+        $newDue = max(0, (float)$return->grand_total - $newPaid);
+        $newStatus = $newDue <= 0.001 ? 'Paid' : ($newPaid > 0 ? 'Partial' : 'Unpaid');
+
+        $uniqueTypes = collect($updatedPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $return->payment_type ?: 'Cash';
+        }
+
+        DB::beginTransaction();
+        try {
+            $return->update([
+                'payments_payload' => json_encode($updatedPayments),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment added successfully',
+                'data'    => $return->fresh(),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Delete a refund payment transaction from a purchase return
+     */
+    public function deletePayment(Request $request, $returnId, $paymentId = null)
+    {
+        if ($paymentId === null) {
+            $return = PurchaseReturn::find($returnId) ?? PurchaseReturn::where('reference_no', $returnId)->first();
+        } else {
+            $return = PurchaseReturn::find($returnId) ?? PurchaseReturn::where('reference_no', $returnId)->first();
+        }
+
+        if (!$return) {
+            return response()->json(['status' => 'error', 'message' => 'Purchase return not found'], 404);
+        }
+
+        $existingPayments = $return->payments;
+        if (empty($existingPayments)) {
+            $return->update([
+                'payments_payload' => json_encode([]),
+                'paid_amount'      => 0.0,
+                'due_amount'       => (float)$return->grand_total,
+                'payment_status'   => 'Unpaid',
+            ]);
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored.',
+                'data'    => $return->fresh(),
+            ]);
+        }
+
+        // Target payment identifier (can be id or reference_no)
+        $targetIdentifier = trim((string)($paymentId ?? $returnId));
+
+        $remainingPayments = [];
+        $deletedFound = false;
+
+        foreach ($existingPayments as $p) {
+            $pId  = isset($p['id']) ? trim((string)$p['id']) : '';
+            $pRef = isset($p['reference_no']) ? trim((string)$p['reference_no']) : '';
+
+            $matchById = ($pId !== '' && $pId === $targetIdentifier);
+            $matchByRef = ($pRef !== '' && ($pRef === $targetIdentifier || str_contains($pRef, $targetIdentifier) || str_contains($targetIdentifier, $pRef)));
+
+            if (!$deletedFound && ($matchById || $matchByRef)) {
+                $deletedFound = true;
+                continue;
+            }
+            $remainingPayments[] = $p;
+        }
+
+        // If target wasn't found by identifier and there was only 1 payment, delete that payment
+        if (!$deletedFound && count($existingPayments) === 1) {
+            $deletedFound = true;
+            $remainingPayments = [];
+        }
+
+        $newPaid = (float)collect($remainingPayments)->sum('amount');
+        $newDue = max(0, (float)$return->grand_total - $newPaid);
+        $newStatus = $newPaid <= 0.001 ? 'Unpaid' : ($newDue <= 0.001 ? 'Paid' : 'Partial');
+
+        $uniqueTypes = collect($remainingPayments)->pluck('payment_type')->filter()->unique();
+        if ($uniqueTypes->count() > 1) {
+            $newPaymentType = 'Split Payment';
+        } elseif ($uniqueTypes->count() === 1) {
+            $newPaymentType = $uniqueTypes->first();
+        } else {
+            $newPaymentType = $return->payment_type ?: 'Cash';
+        }
+
+        DB::beginTransaction();
+        try {
+            $return->update([
+                'payments_payload' => json_encode(array_values($remainingPayments)),
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_type'     => $newPaymentType,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Payment deleted successfully. Due balance restored.',
+                'data'    => $return->fresh(),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => 'Failed to delete payment: ' . $e->getMessage()], 500);
+        }
+    }
 }
+

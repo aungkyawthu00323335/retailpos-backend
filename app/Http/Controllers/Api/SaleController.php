@@ -29,15 +29,15 @@ class SaleController extends Controller
         ]);
 
         $relations = [
-            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount,notes',
+            'payments:id,sale_id,reference_no,payment_date,payment_type,amount,received_amount,change_amount,notes,user_id,user_name,user_role,created_by',
             'customer:id,name',
         ];
 
         if (!$request->boolean('no_items', false)) {
             if ($includeFull) {
-                $relations[] = 'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,unit_price,quantity,tax,discount,subtotal';
+                $relations[] = 'items:id,sale_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,variant_name,unit_price,quantity,tax,discount,subtotal';
             } else {
-                $relations[] = 'items:id,sale_id,product_id,product_code,product_name,unit_name,unit_price,quantity,subtotal';
+                $relations[] = 'items:id,sale_id,product_id,product_variant_id,product_code,product_name,variant_name,unit_name,unit_price,quantity,subtotal';
             }
         }
 
@@ -272,8 +272,8 @@ class SaleController extends Controller
                 'tax_rate' => (float)($validated['tax_rate'] ?? 0),
                 'tax_amount' => (float)($validated['tax_amount'] ?? 0),
                 'discount' => (float)($validated['discount'] ?? 0),
-                'redeemed_points' => 0,
-                'points_discount' => 0.0,
+                'redeemed_points' => (int)($validated['redeemed_points'] ?? 0),
+                'points_discount' => (float)($validated['points_discount'] ?? 0),
                 'shipping' => (float)($validated['shipping'] ?? 0),
                 'subtotal' => (float)$validated['subtotal'],
                 'grand_total' => $grandTotal,
@@ -410,6 +410,24 @@ class SaleController extends Controller
                 $baseQuantity = $unitService->baseQuantity($quantity, (float)$linkedUnit['conversion_rate']);
                 $baseUnitPrice = $unitService->basePrice((float)$item['unit_price'], (float)$linkedUnit['conversion_rate']);
 
+                $vName = $item['variant_name'] ?? null;
+                if (!$vName && $variantId) {
+                    $vObj = ($product && $product->relationLoaded('variants'))
+                        ? $product->variants->firstWhere('id', $variantId)
+                        : \App\Models\ProductVariant::with(['attributeValues', 'values'])->find($variantId);
+                    if ($vObj) {
+                        $attrs = ($vObj->relationLoaded('attributeValues') && $vObj->attributeValues->isNotEmpty())
+                            ? $vObj->attributeValues
+                            : ($vObj->relationLoaded('values') ? $vObj->values : null);
+                        if ($attrs && $attrs->isNotEmpty()) {
+                            $vName = $attrs->map(fn($val) => $val->attribute_value)->filter()->implode(' : ');
+                        }
+                        if (!$vName) {
+                            $vName = $vObj->name;
+                        }
+                    }
+                }
+
                 $saleItem = SaleItem::create([
                     'sale_id' => $sale->id,
                     'product_id' => $product?->id,
@@ -419,6 +437,7 @@ class SaleController extends Controller
                     'conversion_rate' => $linkedUnit['conversion_rate'],
                     'product_code' => $item['product_code'],
                     'product_name' => $item['product_name'],
+                    'variant_name' => $vName,
                     'unit_price' => (float)$item['unit_price'],
                     'base_unit_price' => $baseUnitPrice,
                     'quantity' => $quantity,
@@ -492,6 +511,9 @@ class SaleController extends Controller
                         'change_amount' => (float)($p['change_amount'] ?? 0),
                         'notes' => $p['notes'] ?? ($sale->payment_type === 'Split Payment' ? 'Split payment line' : 'Payment recorded at POS checkout'),
                         'created_by' => $sale->created_by,
+                        'user_id' => $sale->user_id,
+                        'user_name' => $sale->user_name ?? $sale->created_by,
+                        'user_role' => $sale->user_role ?? 'Cashier',
                     ]);
                 }
             } elseif ($paidAmount > 0) {
@@ -505,6 +527,9 @@ class SaleController extends Controller
                     'change_amount' => $change,
                     'notes' => 'Payment recorded at POS checkout',
                     'created_by' => $sale->created_by,
+                    'user_id' => $sale->user_id,
+                    'user_name' => $sale->user_name ?? $sale->created_by,
+                    'user_role' => $sale->user_role ?? 'Cashier',
                 ]);
             }
 
@@ -557,7 +582,7 @@ class SaleController extends Controller
 
     public function addPayment(Request $request, $id)
     {
-        $sale = Sale::find($id);
+        $sale = Sale::find($id) ?? Sale::where('reference_no', $id)->first();
         if (!$sale) {
             return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
         }
@@ -567,6 +592,10 @@ class SaleController extends Controller
             'payment_type' => 'required_without:payments|nullable|string',
             'payment_date' => 'nullable|string',
             'notes' => 'nullable|string',
+            'user_id' => 'nullable|integer',
+            'user_name' => 'nullable|string|max:255',
+            'user_role' => 'nullable|string|max:100',
+            'created_by' => 'nullable|string|max:255',
             'payments' => 'nullable|array|min:1',
             'payments.*.amount' => 'required|numeric|min:0.01',
             'payments.*.payment_type' => 'required|string',
@@ -574,9 +603,21 @@ class SaleController extends Controller
             'payments.*.change_amount' => 'nullable|numeric|min:0',
             'payments.*.payment_date' => 'nullable|string',
             'payments.*.notes' => 'nullable|string',
+            'payments.*.user_id' => 'nullable|integer',
+            'payments.*.user_name' => 'nullable|string|max:255',
+            'payments.*.user_role' => 'nullable|string|max:100',
+            'payments.*.created_by' => 'nullable|string|max:255',
         ]);
 
-        $createdBy = $request->user()?->name ?? 'Cashier';
+        $user = $request->user() ?? auth('sanctum')->user() ?? $request->user('sanctum');
+        $userName = !empty($validated['user_name'])
+            ? trim($validated['user_name'])
+            : ($user?->name ?? (!empty($validated['created_by']) ? trim($validated['created_by']) : ($sale->user_name ?: ($sale->created_by ?: 'Super Admin'))));
+        $userRole = !empty($validated['user_role'])
+            ? trim($validated['user_role'])
+            : ($user?->role ?? ($user?->roleModel?->name ?? ($sale->user_role ?: 'Cashier')));
+        $userId = $validated['user_id'] ?? $user?->id ?? $sale->user_id;
+        $createdBy = !empty($validated['created_by']) ? trim($validated['created_by']) : "$userName ($userRole)";
 
         DB::beginTransaction();
         try {
@@ -597,6 +638,9 @@ class SaleController extends Controller
                         'change_amount' => (float)($p['change_amount'] ?? 0),
                         'notes' => $p['notes'] ?? ($validated['notes'] ?? 'Additional split payment'),
                         'created_by' => $createdBy,
+                        'user_id' => $userId,
+                        'user_name' => $userName,
+                        'user_role' => $userRole,
                     ]);
                 }
 
@@ -638,6 +682,9 @@ class SaleController extends Controller
                     'change_amount' => 0,
                     'notes' => $validated['notes'] ?? null,
                     'created_by' => $createdBy,
+                    'user_id' => $userId,
+                    'user_name' => $userName,
+                    'user_role' => $userRole,
                 ]);
 
                 $sale->update([
@@ -687,6 +734,13 @@ class SaleController extends Controller
         }
 
         if (!$payment) {
+            if (isset($sale) && $sale) {
+                return response()->json([
+                    'status' => 'success',
+                    'message' => 'Payment record already deleted.',
+                    'data' => $sale->load(['items', 'payments', 'customer']),
+                ]);
+            }
             return response()->json(['status' => 'error', 'message' => 'Payment record not found for this sale'], 404);
         }
 
@@ -959,16 +1013,45 @@ class SaleController extends Controller
             return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
         }
 
-        // Prevent hard deletion of completed sales to protect audit trail
-        if ($sale->status === 'Completed') {
-            return response()->json([
-                'status'  => 'error',
-                'message' => 'Completed sales cannot be permanently deleted to prevent audit trail destruction. Please use Void Sale (/api/sales/' . $sale->id . '/void) with Manager Authorization.',
-            ], 422);
-        }
-
         DB::beginTransaction();
         try {
+            // If sale was completed, revert inventory stock back ('in') and reverse FIFO
+            if ($sale->status === 'Completed') {
+                $unitService = app(\App\Services\ProductUnitConversionService::class);
+                $warehouseId = $unitService->warehouseId($sale->warehouse_id ?? null, $sale->warehouse_name);
+
+                foreach ($sale->items as $item) {
+                    $product = \App\Models\Product::find($item->product_id);
+                    if ($product) {
+                        $baseQuantity = (float)($item->base_quantity > 0 ? $item->base_quantity : ($item->quantity * ($item->conversion_rate ?: 1)));
+                        $unitService->applyStock(
+                            $product,
+                            $warehouseId,
+                            $item->product_variant_id,
+                            $baseQuantity,
+                            'in',
+                            'sale_delete',
+                            'sale',
+                            (string)$sale->id,
+                            'Sale #' . $sale->reference_no . ' deleted - Stock restored'
+                        );
+                    }
+                }
+
+                app(\App\Services\FifoInventoryService::class)->reverseSaleFifo($sale);
+
+                if ($sale->customer_id) {
+                    $cust = \App\Models\Customer::find($sale->customer_id);
+                    if ($cust) {
+                        $newTotalSpent = max(0, (float)$cust->total_spent - (float)$sale->grand_total);
+                        $cust->update([
+                            'total_spent'   => $newTotalSpent,
+                            'total_visits'  => max(0, (int)$cust->total_visits - 1),
+                        ]);
+                    }
+                }
+            }
+
             $sale->items()->delete();
             $sale->payments()->delete();
             $sale->delete();

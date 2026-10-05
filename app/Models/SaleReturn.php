@@ -32,6 +32,7 @@ class SaleReturn extends Model
         'return_reason',      // New: reason for the return
         'refund_tender',      // New: how refund is given (Cash, KBZPay, Store Credit, etc.)
         'items_payload',
+        'payments_payload',
         'created_by',
         'user_id',
         'user_name',
@@ -51,7 +52,36 @@ class SaleReturn extends Model
         'user_id'      => 'integer',
     ];
 
-    protected $appends = ['items'];
+    protected $appends = ['items', 'payments'];
+
+    public function getPaymentsAttribute(): array
+    {
+        if ($this->payments_payload !== null && $this->payments_payload !== '') {
+            $decoded = json_decode($this->payments_payload, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        if ((float)$this->paid_amount > 0.05 && strtolower(trim((string)$this->payment_status)) !== 'unpaid') {
+            return [
+                [
+                    'id'              => 1,
+                    'reference_no'    => !empty($this->reference_no) ? 'REF-' . $this->reference_no : 'REF-SR-001',
+                    'payment_date'    => $this->date ?: now()->toDateTimeString(),
+                    'payment_type'    => $this->refund_tender ?: ($this->payment_type ?: 'Cash'),
+                    'amount'          => (float)$this->paid_amount,
+                    'received_amount' => (float)$this->paid_amount,
+                    'change_amount'   => 0.0,
+                    'user_name'       => $this->user_name ?: ($this->created_by ?: 'Super Admin'),
+                    'user_role'       => $this->user_role ?: 'Super Admin',
+                    'notes'           => $this->notes ?: $this->return_reason,
+                ]
+            ];
+        }
+
+        return [];
+    }
 
     public function getItemsAttribute()
     {

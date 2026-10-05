@@ -39,6 +39,7 @@ class CheckPermission
         if (!$user) {
             return response()->json([
                 'status'  => 'error',
+                'code'    => 'UNAUTHENTICATED',
                 'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
             ], 401);
         }
@@ -81,6 +82,12 @@ class CheckPermission
         if ($token) {
             $user = User::with('roleModel')->where('api_token', $token)->first();
             if ($user) {
+                if ($user->isApiTokenExpired()) {
+                    $user->api_token = null;
+                    $user->api_token_created_at = null;
+                    $user->save();
+                    return null;
+                }
                 return $user;
             }
         }

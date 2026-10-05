@@ -180,6 +180,7 @@ class ProductCreateService
                             'wholesale_prices' => $vWholesalePrices,
                             'is_active' => $vActive,
                             'sort_order' => $sortOrder++,
+                            'image_url' => $vData['image_url'] ?? null,
                         ]);
 
                         // Link attribute values
@@ -704,6 +705,7 @@ class ProductCreateService
                         'wholesale_prices' => $variantWholesalePrices,
                         'is_active' => array_key_exists('is_active', $variantData) ? (bool)$variantData['is_active'] : true,
                         'sort_order' => (int)$sortOrder,
+                        'image_url' => array_key_exists('image_url', $variantData) ? $variantData['image_url'] : ($variant->image_url ?? null),
                     ]);
                     $variant->save();
                     $keptVariantIds[] = $variant->id;

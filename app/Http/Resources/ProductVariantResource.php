@@ -41,6 +41,8 @@ class ProductVariantResource extends JsonResource
             'wholesale_prices' => $this->wholesale_prices ?? ($this->wholesale_price ? [(float)$this->wholesale_price] : []),
             'is_active' => (bool) $this->is_active,
             'sort_order' => $this->sort_order,
+            'image_url' => $this->image_url,
+            'imageUrl' => $this->image_url,
             'stock_quantity' => $stockQty,
             'stockQuantity' => $stockQty,
             'warehouse_stocks' => $this->relationLoaded('stockBalances')

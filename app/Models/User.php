@@ -26,7 +26,10 @@ class User extends Authenticatable
         'avatar',
         'status',
         'api_token',
+        'api_token_created_at',
     ];
+
+    public const TOKEN_LIFETIME_HOURS = 24;
 
     protected $hidden = [
         'password',
@@ -42,6 +45,7 @@ class User extends Authenticatable
     {
         return [
             'email_verified_at' => 'datetime',
+            'api_token_created_at' => 'datetime',
             'password' => 'hashed',
         ];
     }
@@ -163,12 +167,40 @@ class User extends Authenticatable
         return false;
     }
 
+    /**
+     * Determine if the user's API access token has expired (24 hours standard).
+     */
+    public function isApiTokenExpired(): bool
+    {
+        if (empty($this->api_token)) {
+            return true;
+        }
+
+        // Strict 24-hour window from creation timestamp
+        if ($this->api_token_created_at) {
+            return $this->api_token_created_at->addHours(self::TOKEN_LIFETIME_HOURS)->isPast();
+        }
+
+        // Fallback to updated_at if token creation timestamp is null
+        if ($this->updated_at) {
+            return $this->updated_at->addHours(self::TOKEN_LIFETIME_HOURS)->isPast();
+        }
+
+        return false;
+    }
+
     public static function resolveFromRequest(Request $request): ?User
     {
         $token = $request->bearerToken();
         if ($token) {
             $user = static::with('roleModel')->where('api_token', $token)->first();
             if ($user) {
+                if ($user->isApiTokenExpired()) {
+                    $user->api_token = null;
+                    $user->api_token_created_at = null;
+                    $user->save();
+                    return null;
+                }
                 return $user;
             }
         }

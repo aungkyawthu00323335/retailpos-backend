@@ -89,6 +89,7 @@ class StoreProductRequest extends FormRequest
             'variants.*.wholesale_prices' => ['nullable', 'array'],
             'variants.*.wholesale_prices.*' => ['numeric', 'min:0'],
             'variants.*.is_active' => ['nullable', 'boolean'],
+            'variants.*.image_url' => ['nullable', 'string'],
             'variants.*.attribute_value_ids' => ['nullable', 'array'],
             'variants.*.attribute_values' => ['nullable', 'array'],
 

@@ -32,6 +32,7 @@ class PurchaseReturn extends Model
         'notes',
         'return_reason',    // New: why goods are returned to supplier
         'items_payload',    // New: JSON encoded returned items detail
+        'payments_payload', // New: JSON encoded refund payment transactions
         'created_by',
         'user_id',
         'user_name',
@@ -53,7 +54,43 @@ class PurchaseReturn extends Model
         'user_id'      => 'integer',
     ];
 
-    protected $appends = ['items'];
+    protected $appends = ['items', 'payments'];
+
+    /**
+     * Decode stored payments_payload JSON into array.
+     * If payments_payload is not set but paid_amount > 0 and payment_status is not Unpaid,
+     * synthesize the default payment record for full backward compatibility.
+     * If paid_amount <= 0 or payment_status == 'Unpaid', return empty array.
+     */
+    public function getPaymentsAttribute(): array
+    {
+        if ($this->payments_payload !== null && $this->payments_payload !== '') {
+            $decoded = json_decode($this->payments_payload, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        // Backward compatibility: If no payments_payload stored yet, but paid_amount > 0 and not Unpaid
+        if ((float)$this->paid_amount > 0.05 && strtolower(trim((string)$this->payment_status)) !== 'unpaid') {
+            return [
+                [
+                    'id'              => 1,
+                    'reference_no'    => !empty($this->reference_no) ? 'REF-' . $this->reference_no : 'REF-PR-001',
+                    'payment_date'    => $this->date ?: now()->toDateTimeString(),
+                    'payment_type'    => $this->payment_type ?: 'Cash',
+                    'amount'          => (float)$this->paid_amount,
+                    'received_amount' => (float)$this->paid_amount,
+                    'change_amount'   => 0.0,
+                    'user_name'       => $this->user_name ?: ($this->created_by ?: 'Super Admin'),
+                    'user_role'       => $this->user_role ?: 'Super Admin',
+                    'notes'           => $this->notes ?: $this->return_reason,
+                ]
+            ];
+        }
+
+        return [];
+    }
 
     /**
      * Decode stored items_payload JSON into array.

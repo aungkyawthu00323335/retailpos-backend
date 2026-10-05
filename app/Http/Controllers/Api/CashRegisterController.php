@@ -20,7 +20,15 @@ class CashRegisterController extends Controller
         $token = $request->bearerToken();
         if ($token) {
             $user = User::with('roleModel')->where('api_token', $token)->first();
-            if ($user) return $user;
+            if ($user) {
+                if ($user->isApiTokenExpired()) {
+                    $user->api_token = null;
+                    $user->api_token_created_at = null;
+                    $user->save();
+                    return null;
+                }
+                return $user;
+            }
         }
         if ($request->filled('user_id')) {
             $user = User::with('roleModel')->find($request->input('user_id'));
@@ -139,7 +147,7 @@ class CashRegisterController extends Controller
             'status' => 'success',
             'message' => 'Cash register opened successfully',
             'has_open_register' => true,
-            'register' => $this->buildRegisterDetailsPayload($register, $user),
+            'register' => $this->buildInitialRegisterPayload($register, $user),
         ]);
     }
 
@@ -218,20 +226,33 @@ class CashRegisterController extends Controller
         $closingCash = isset($validated['closing_cash']) ? (float)$validated['closing_cash'] : $expectedCash;
         $difference = $closingCash - $expectedCash;
 
+        $closedAt = now();
+        $closingNotes = $validated['closing_notes'] ?? null;
+        $denominations = $validated['denominations'] ?? null;
+
         $register->update([
             'closing_cash' => $closingCash,
             'expected_cash' => $expectedCash,
             'cash_difference' => $difference,
             'status' => 'closed',
-            'closed_at' => now(),
-            'closing_notes' => $validated['closing_notes'] ?? null,
-            'denominations' => $validated['denominations'] ?? null,
+            'closed_at' => $closedAt,
+            'closing_notes' => $closingNotes,
+            'denominations' => $denominations,
         ]);
+
+        $payload['closing_cash'] = round($closingCash, 2);
+        $payload['expected_cash'] = round($expectedCash, 2);
+        $payload['difference'] = round($difference, 2);
+        $payload['status'] = 'Closed';
+        $payload['closed_at'] = (string)$closedAt;
+        $payload['closing_notes'] = (string)($closingNotes ?? '');
+        $payload['notes'] = (string)($closingNotes ?? $payload['notes']);
+        $payload['denominations'] = $denominations;
 
         return response()->json([
             'status' => 'success',
             'message' => 'Cash register closed successfully',
-            'register' => $this->buildRegisterDetailsPayload($register, $user),
+            'register' => $payload,
         ]);
     }
 
@@ -317,6 +338,92 @@ class CashRegisterController extends Controller
         ]);
     }
 
+    /**
+     * Normalize payment method names to eliminate generic "Digital / Mobile"
+     * and accurately show individual tender types (KBZPay, WavePay, KPay, Card, Cash, etc.)
+     */
+    private function normalizePaymentMethodName(string $raw): string
+    {
+        $trimmed = trim($raw);
+        if ($trimmed === '') {
+            return 'Other';
+        }
+        $lower = strtolower($trimmed);
+        if ($lower === 'cash') return 'Cash';
+        if (in_array($lower, ['kbzpay', 'kbz pay', 'kbz_pay'])) return 'KBZPay';
+        if (in_array($lower, ['kpay', 'k pay', 'k-pay'])) return 'KPay';
+        if (in_array($lower, ['wave', 'wavepay', 'wave pay', 'wave_pay'])) return 'WavePay';
+        if (in_array($lower, ['aya pay', 'ayapay'])) return 'AYA Pay';
+        if (in_array($lower, ['cb pay', 'cbpay'])) return 'CB Pay';
+        if (in_array($lower, ['one pay', 'onepay'])) return 'OnePay';
+        if (in_array($lower, ['uab pay', 'uabpay'])) return 'UABPay';
+        if (in_array($lower, ['card', 'credit card', 'pos card', 'credit_card'])) return 'Credit Card';
+        if (in_array($lower, ['debit card', 'debit_card'])) return 'Debit Card';
+        if (in_array($lower, ['visa'])) return 'Visa';
+        if (in_array($lower, ['mastercard'])) return 'MasterCard';
+        if (in_array($lower, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) return 'Bank Transfer';
+        if (in_array($lower, ['cheque', 'check'])) return 'Cheque';
+        if (in_array($lower, ['digital', 'digital / mobile', 'mobile money', 'wallet'])) {
+            return 'Mobile Wallet';
+        }
+        return ucwords($trimmed);
+    }
+
+    private function buildInitialRegisterPayload(CashRegister $register, ?User $user = null): array
+    {
+        $openedAt = (string)$register->opened_at;
+        $userName = $register->user_name ?? ($user?->name ?? 'Super Admin');
+        $userRole = $user?->role ?? ($user?->roleModel?->name ?? 'Lead Cashier');
+        $openingCash = (float)$register->opening_cash;
+
+        return [
+            'id' => (int)$register->id,
+            'reference_no' => $register->reference_no,
+            'register_id' => $register->register_name ?? 'Register 01',
+            'warehouse_id' => (int)($register->warehouse_id ?? 1),
+            'warehouse_name' => $register->warehouse_name ?? 'Main Branch Outlet',
+            'date' => substr($openedAt, 0, 10),
+            'opened_at' => $openedAt,
+            'closed_at' => '',
+            'total_transactions' => 0,
+            'opening_cash' => $openingCash,
+            'total_sales' => 0.0,
+            'cash_sales' => 0.0,
+            'cheque_sales' => 0.0,
+            'bank_transfer_sales' => 0.0,
+            'card_sales' => 0.0,
+            'digital_sales' => 0.0,
+            'other_sales' => 0.0,
+            'total_collections' => 0.0,
+            'total_payment' => $openingCash,
+            'total_refunds' => 0.0,
+            'cash_refunds' => 0.0,
+            'total_expenses' => 0.0,
+            'cash_expenses' => 0.0,
+            'digital_expenses' => 0.0,
+            'floats_in' => 0.0,
+            'cash_drops' => 0.0,
+            'safe_drops' => 0.0,
+            'expected_cash' => $openingCash,
+            'closing_cash' => $openingCash,
+            'difference' => 0.0,
+            'status' => 'Open',
+            'primary_payment_type' => 'Cash',
+            'notes' => (string)($register->opening_notes ?? ''),
+            'closing_notes' => '',
+            'created_by' => $userName,
+            'cashier_name' => $userName,
+            'user_name' => $userName,
+            'user_role' => $userRole,
+            'payment_breakdown' => [
+                ['method' => 'Cash', 'amount' => 0.0, 'count' => 0],
+            ],
+            'recent_transactions' => [],
+            'denominations' => null,
+            'register_transactions' => [],
+        ];
+    }
+
     private function buildRegisterDetailsPayload(CashRegister $register, ?User $user = null, bool $forInternalCalculation = false): array
     {
         $openedAt = $register->opened_at;
@@ -329,10 +436,7 @@ class CashRegisterController extends Controller
                   ->orWhere(function ($sub) use ($register, $openedAt, $closedAt) {
                       $sub->whereNull('cash_register_id')
                           ->where('warehouse_name', $register->warehouse_name)
-                          ->where(function ($dq) use ($openedAt, $closedAt) {
-                              $dq->whereBetween('created_at', [$openedAt, $closedAt])
-                                 ->orWhereBetween('date', [substr((string)$openedAt, 0, 10), substr((string)$closedAt, 0, 10)]);
-                          });
+                          ->whereBetween('created_at', [$openedAt, $closedAt]);
                       if ($register->user_id) {
                           $sub->where('user_id', $register->user_id);
                       }
@@ -342,14 +446,7 @@ class CashRegisterController extends Controller
         $sales = $salesQuery->get(['id', 'reference_no', 'customer_name', 'grand_total', 'paid_amount', 'due_amount', 'payment_status', 'payment_type', 'date', 'created_at']);
 
         $totalSales = 0.0;
-        $cashSales = 0.0;
-        $cardSales = 0.0;
-        $digitalSales = 0.0;
-        $chequeSales = 0.0;
-        $bankTransferSales = 0.0;
-        $otherSales = 0.0;
         $txCount = $sales->count();
-
         $saleIds = $sales->pluck('id')->toArray();
 
         // 2. Query SalePayments for accurate tender breakdown (especially for Split Payments)
@@ -357,45 +454,67 @@ class CashRegisterController extends Controller
             ? DB::table('sale_payments')->whereIn('sale_id', $saleIds)->get()
             : collect([]);
 
+        $tenderTotals = [];
+        $tenderCounts = [];
+
         if ($payments->isNotEmpty()) {
             foreach ($payments as $p) {
-                $pType = strtolower(trim((string)$p->payment_type));
+                $rawMethod = (string)($p->payment_type ?? 'Cash');
+                $methodName = $this->normalizePaymentMethodName($rawMethod);
                 $amount = (float)$p->amount;
                 $change = (float)($p->change_amount ?? 0);
-                if ($pType === 'cash') {
-                    // Net cash retained in till drawer = amount collected minus change given back to customer
-                    $cashSales += max(0, $amount - $change);
-                } elseif (in_array($pType, ['cheque', 'check'])) {
-                    $chequeSales += $amount;
-                } elseif (in_array($pType, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) {
-                    $bankTransferSales += $amount;
-                } elseif (in_array($pType, ['card', 'credit card', 'pos card', 'visa', 'mastercard'])) {
-                    $cardSales += $amount;
-                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet'])) {
-                    $digitalSales += $amount;
-                } else {
-                    $otherSales += $amount;
+
+                // Net cash retained in till drawer = amount collected minus change given back to customer
+                $netAmount = ($methodName === 'Cash') ? max(0, $amount - $change) : $amount;
+
+                $tenderTotals[$methodName] = ($tenderTotals[$methodName] ?? 0.0) + $netAmount;
+                $tenderCounts[$methodName] = ($tenderCounts[$methodName] ?? 0) + 1;
+            }
+
+            // Include any sales in this session that had no individual sale_payments records
+            $paidSaleIds = $payments->pluck('sale_id')->unique()->toArray();
+            $unpaidSales = $sales->whereNotIn('id', $paidSaleIds);
+            foreach ($unpaidSales as $s) {
+                $rawMethod = (string)($s->payment_type ?? 'Cash');
+                $methodName = $this->normalizePaymentMethodName($rawMethod);
+                $paid = (float)$s->paid_amount;
+                if ($paid > 0) {
+                    $tenderTotals[$methodName] = ($tenderTotals[$methodName] ?? 0.0) + $paid;
+                    $tenderCounts[$methodName] = ($tenderCounts[$methodName] ?? 0) + 1;
                 }
             }
             $totalSales = (float)$sales->sum('grand_total');
         } else {
             foreach ($sales as $s) {
                 $totalSales += (float)$s->grand_total;
-                $pType = strtolower(trim((string)$s->payment_type));
+                $rawMethod = (string)($s->payment_type ?? 'Cash');
+                $methodName = $this->normalizePaymentMethodName($rawMethod);
                 $paid = (float)$s->paid_amount;
-                if ($pType === 'cash') {
-                    $cashSales += $paid;
-                } elseif (in_array($pType, ['cheque', 'check'])) {
-                    $chequeSales += $paid;
-                } elseif (in_array($pType, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) {
-                    $bankTransferSales += $paid;
-                } elseif (in_array($pType, ['card', 'credit card', 'pos card', 'visa', 'mastercard'])) {
-                    $cardSales += $paid;
-                } elseif (in_array($pType, ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet'])) {
-                    $digitalSales += $paid;
-                } else {
-                    $otherSales += $paid;
-                }
+
+                $tenderTotals[$methodName] = ($tenderTotals[$methodName] ?? 0.0) + $paid;
+                $tenderCounts[$methodName] = ($tenderCounts[$methodName] ?? 0) + 1;
+            }
+        }
+
+        // Categorize tenders for backward compatibility with root scalar fields
+        $cashSales = (float)($tenderTotals['Cash'] ?? 0.0);
+        $chequeSales = (float)($tenderTotals['Cheque'] ?? 0.0);
+        $bankTransferSales = (float)($tenderTotals['Bank Transfer'] ?? 0.0);
+        $cardSales = 0.0;
+        $digitalSales = 0.0;
+        $otherSales = 0.0;
+
+        foreach ($tenderTotals as $m => $amt) {
+            if ($m === 'Cash' || $m === 'Cheque' || $m === 'Bank Transfer') {
+                continue;
+            }
+            $mLower = strtolower($m);
+            if (str_contains($mLower, 'card') || in_array($mLower, ['visa', 'mastercard'])) {
+                $cardSales += $amt;
+            } elseif (in_array($m, ['KBZPay', 'KPay', 'WavePay', 'AYA Pay', 'CB Pay', 'OnePay', 'UABPay', 'Mobile Wallet']) || str_contains($mLower, 'pay') || str_contains($mLower, 'wallet')) {
+                $digitalSales += $amt;
+            } else {
+                $otherSales += $amt;
             }
         }
 
@@ -467,40 +586,28 @@ class CashRegisterController extends Controller
         $canViewExpected = $forInternalCalculation || ($user ? $user->hasPermission('cash_register.view_expected') : false);
         $hideExpected = (strtolower((string)$register->status) === 'open' && !$canViewExpected);
 
-        $paymentBreakdown = [
-            [
-                'method' => 'Cash',
-                'amount' => round($cashSales, 2),
-                'count' => $sales->filter(fn($s) => strtolower($s->payment_type) === 'cash')->count(),
-            ],
-            [
-                'method' => 'Cheque',
-                'amount' => round($chequeSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['cheque', 'check']))->count(),
-            ],
-            [
-                'method' => 'Bank Transfer',
-                'amount' => round($bankTransferSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['bank transfer', 'bank_transfer', 'wire', 'bank']))->count(),
-            ],
-            [
-                'method' => 'Card',
-                'amount' => round($cardSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['card', 'credit card', 'pos card', 'visa', 'mastercard']))->count(),
-            ],
-            [
-                'method' => 'Digital / Mobile',
-                'amount' => round($digitalSales, 2),
-                'count' => $sales->filter(fn($s) => in_array(strtolower($s->payment_type), ['kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet']))->count(),
-            ],
-            [
-                'method' => 'Other',
-                'amount' => round($otherSales, 2),
-                'count' => $sales->filter(fn($s) => !in_array(strtolower($s->payment_type), ['cash', 'cheque', 'check', 'bank transfer', 'bank_transfer', 'wire', 'bank', 'card', 'credit card', 'pos card', 'visa', 'mastercard', 'kbzpay', 'wavepay', 'kpay', 'mobile money', 'digital', 'gpay', 'razorpay', 'wallet']))->count(),
-            ],
+        $paymentBreakdown = [];
+        // Cash is always listed first
+        $paymentBreakdown[] = [
+            'method' => 'Cash',
+            'amount' => round($cashSales, 2),
+            'count' => (int)($tenderCounts['Cash'] ?? 0),
         ];
 
-        $totalCollections = round($cashSales + $cardSales + $digitalSales + $chequeSales + $bankTransferSales + $otherSales, 2);
+        // Add every other tender that has recorded sales
+        foreach ($tenderTotals as $m => $amt) {
+            if ($m === 'Cash') continue;
+            $cnt = (int)($tenderCounts[$m] ?? 0);
+            if ($amt > 0 || $cnt > 0) {
+                $paymentBreakdown[] = [
+                    'method' => $m,
+                    'amount' => round($amt, 2),
+                    'count' => $cnt,
+                ];
+            }
+        }
+
+        $totalCollections = round(array_sum($tenderTotals), 2);
         // Ultimate POS Standard: Total Payment in Register Summary is Gross Inflow (Cash In Hand + Total Collections)
         $totalPayment = round($openingCash + $totalCollections, 2);
 

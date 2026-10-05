@@ -12,20 +12,45 @@ class AuthController extends Controller
 {
     /**
      * Authenticate user and issue API access token.
+     * Supports login via Email, User ID / Code, or Phone Number.
      */
     public function login(Request $request)
     {
         $validated = $request->validate([
-            'email' => 'required|email',
+            'email' => 'nullable|string',
+            'login' => 'nullable|string',
             'password' => 'required|string',
         ]);
 
-        $user = User::with(['roleModel', 'outlets'])->where('email', $validated['email'])->first();
+        $identifier = trim($validated['login'] ?? $validated['email'] ?? '');
+
+        if (empty($identifier)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Email, User ID, or Phone number is required.',
+            ], 422);
+        }
+
+        // Extract digits for flexible phone number normalization
+        $digitsOnly = preg_replace('/\D+/', '', $identifier);
+
+        $user = User::with(['roleModel', 'outlets'])
+            ->where(function ($q) use ($identifier, $digitsOnly) {
+                $q->where('email', $identifier)
+                  ->orWhere('user_id', $identifier)
+                  ->orWhere('phone', $identifier);
+
+                if (!empty($digitsOnly) && strlen($digitsOnly) >= 7) {
+                    $last7 = substr($digitsOnly, -7);
+                    $q->orWhereRaw("REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), '(', '') LIKE ?", ["%{$last7}"]);
+                }
+            })
+            ->first();
 
         if (!$user || !Hash::check($validated['password'], $user->password)) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Invalid email or password. Please verify your credentials.',
+                'message' => 'Invalid credentials. Please verify your login details and password.',
             ], 401);
         }
 
@@ -36,9 +61,10 @@ class AuthController extends Controller
             ], 403);
         }
 
-        // Generate stateless secure token
+        // Generate stateless secure token with 24-hour expiration timestamp
         $token = Str::random(60);
         $user->api_token = $token;
+        $user->api_token_created_at = now();
         $user->save();
 
         $allowedOutlets = $user->getAllowedOutlets();
@@ -80,6 +106,7 @@ class AuthController extends Controller
             $user = User::where('api_token', $token)->first();
             if ($user) {
                 $user->api_token = null;
+                $user->api_token_created_at = null;
                 $user->save();
             }
         }
@@ -100,10 +127,16 @@ class AuthController extends Controller
         $user = null;
         if ($token) {
             $user = User::with(['roleModel', 'outlets'])->where('api_token', $token)->first();
+            if ($user && $user->isApiTokenExpired()) {
+                $user->api_token = null;
+                $user->api_token_created_at = null;
+                $user->save();
+                $user = null;
+            }
         }
 
-        if (!$user) {
-            // High-reliability POS client fallback to active session user
+        if (!$user && app()->environment('testing') && !$request->bearerToken()) {
+            // High-reliability POS client fallback to active session user during headless testing without token
             $user = User::with(['roleModel', 'outlets'])->where('role', 'Super Admin')->first()
                 ?: User::with(['roleModel', 'outlets'])->first();
         }
@@ -111,8 +144,9 @@ class AuthController extends Controller
         if (!$user) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'User session not found',
-            ], 404);
+                'code' => 'UNAUTHENTICATED',
+                'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
+            ], 401);
         }
 
         $allowedOutlets = $user->getAllowedOutlets();
@@ -120,6 +154,96 @@ class AuthController extends Controller
 
         return response()->json([
             'status' => 'success',
+            'user' => [
+                'id' => $user->id,
+                'user_id' => $user->user_id,
+                'name' => $user->name,
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'role_id' => $user->role_id,
+                'role' => $user->role,
+                'is_super_admin' => $user->isSuperAdmin(),
+                'permissions' => $permissions,
+                'branch' => $user->branch,
+                'avatar' => $user->avatar,
+                'status' => $user->status,
+                'outlets' => $allowedOutlets,
+            ],
+        ]);
+    }
+
+    /**
+     * Change current authenticated user's password.
+     */
+    public function changePassword(Request $request)
+    {
+        $user = User::resolveFromRequest($request);
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
+            ], 401);
+        }
+
+        $validated = $request->validate([
+            'current_password' => 'required|string',
+            'new_password' => 'required|string|min:6',
+            'new_password_confirmation' => 'required|string|same:new_password',
+        ]);
+
+        if (!Hash::check($validated['current_password'], $user->password)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Current password does not match our records.',
+            ], 422);
+        }
+
+        $user->password = $validated['new_password'];
+        $user->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Password changed successfully.',
+        ]);
+    }
+
+    /**
+     * Update current authenticated user's profile information (name, phone, avatar).
+     */
+    public function updateProfile(Request $request)
+    {
+        $user = User::resolveFromRequest($request);
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
+            ], 401);
+        }
+
+        $validated = $request->validate([
+            'name' => 'sometimes|required|string|max:255',
+            'phone' => 'nullable|string|max:50',
+            'avatar' => 'nullable|string',
+        ]);
+
+        if ($request->has('name')) {
+            $user->name = $validated['name'];
+        }
+        if ($request->has('phone')) {
+            $user->phone = $validated['phone'];
+        }
+        if ($request->has('avatar')) {
+            $user->avatar = $validated['avatar'];
+        }
+
+        $user->save();
+
+        $allowedOutlets = $user->getAllowedOutlets();
+        $permissions = $user->roleModel ? ($user->roleModel->permissions ?? []) : [];
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Profile updated successfully.',
             'user' => [
                 'id' => $user->id,
                 'user_id' => $user->user_id,

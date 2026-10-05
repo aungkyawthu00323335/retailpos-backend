@@ -43,6 +43,8 @@ use App\Http\Controllers\Api\CashRegisterController;
 Route::post('login', [AuthController::class, 'login']);
 Route::post('logout', [AuthController::class, 'logout']);
 Route::get('me', [AuthController::class, 'me']);
+Route::post('change-password', [AuthController::class, 'changePassword']);
+Route::post('update-profile', [AuthController::class, 'updateProfile']);
 
 // Outlets & Warehouses
 Route::apiResource('outlets', OutletController::class);
@@ -70,6 +72,8 @@ Route::get('products/create-options', [ProductController::class, 'createOptions'
 Route::get('products/check-identifier', [ProductController::class, 'checkIdentifier']);
 Route::post('products/generate-sku', [ProductController::class, 'generateSku']);
 Route::post('products/generate-barcode', [ProductController::class, 'generateBarcode']);
+Route::post('products/upload-image', [ProductController::class, 'uploadImage']);
+Route::post('upload-image', [ProductController::class, 'uploadImage']);
 Route::get('products/template', [ProductController::class, 'downloadTemplate']);
 Route::get('products/export', [ProductController::class, 'export']);
 Route::post('products/bulk-import', [ProductController::class, 'bulkImport']);
@@ -87,11 +91,19 @@ Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateC
 Route::apiResource('adjustments', AdjustmentController::class);
 Route::get('transfers/generate-code', [TransferController::class, 'generateCode']);
 Route::post('transfers/{id}/receive', [TransferController::class, 'receiveTransfer']);
+Route::get('transfers/{id}/payments', [TransferController::class, 'getPayments']);
+Route::post('transfers/{id}/payments', [TransferController::class, 'addPayment']);
+Route::delete('transfers/{id}/payments/{paymentId}', [TransferController::class, 'deletePayment']);
 Route::apiResource('transfers', TransferController::class);
 
 // Purchases & Purchase Returns
 Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']);
+Route::delete('purchases/{id}/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
+Route::delete('purchases/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
 Route::apiResource('purchases', PurchaseController::class);
+Route::post('purchase-returns/{id}/payments', [PurchaseReturnController::class, 'addPayment']);
+Route::delete('purchase-returns/{returnId}/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
+Route::delete('purchase-returns/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
 Route::apiResource('purchase-returns', PurchaseReturnController::class);
 
 // Cash Register & POS Shift Management
@@ -106,6 +118,9 @@ Route::delete('sales/{saleId}/payments/{paymentId}', [SaleController::class, 'de
 Route::delete('sales/payments/{paymentId}', [SaleController::class, 'deletePayment']);
 Route::post('sales/{id}/void', [SaleController::class, 'voidSale'])->middleware('permission:sales.void');
 Route::apiResource('sales', SaleController::class);
+Route::post('sale-returns/{id}/payments', [SaleReturnController::class, 'addPayment']);
+Route::delete('sale-returns/{returnId}/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
+Route::delete('sale-returns/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
 Route::apiResource('sale-returns', SaleReturnController::class);
 
 // Quotations
@@ -115,6 +130,9 @@ Route::apiResource('quotations', QuotationController::class);
 // Expenses & Expense Categories
 Route::apiResource('expense-categories', ExpenseCategoryController::class);
 Route::get('expenses/generate-code', [ExpenseController::class, 'generateCode']);
+Route::post('expenses/{id}/payments', [ExpenseController::class, 'addPayment']);
+Route::delete('expenses/{expenseId}/payments/{paymentId}', [ExpenseController::class, 'deletePayment']);
+Route::delete('expenses/payments/{paymentId}', [ExpenseController::class, 'deletePayment']);
 Route::apiResource('expenses', ExpenseController::class);
 
 // Payment Methods (InfyPOS /app/payment-methods)

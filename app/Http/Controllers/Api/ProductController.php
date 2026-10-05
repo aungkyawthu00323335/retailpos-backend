@@ -50,7 +50,7 @@ class ProductController extends Controller
             // catalogs that were migrated with the legacy image_url column.
             ->with([
                 'primaryImage:id,product_id,disk,path,is_primary,sort_order',
-                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
+                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
                 'variants.values:id,product_variant_id,attribute_name,attribute_value',
                 'variants.stockBalances' => function ($q) use ($warehouseId) {
                     $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
@@ -303,6 +303,9 @@ class ProductController extends Controller
             if (!empty($ignoreVariantId)) {
                 $variantQuery->where('id', '!=', $ignoreVariantId);
             }
+            if (!empty($ignoreId)) {
+                $variantQuery->where('product_id', '!=', $ignoreId);
+            }
             $existsInVariants = $variantQuery->exists();
 
             if ($existsInProducts || $existsInVariants) {
@@ -321,6 +324,9 @@ class ProductController extends Controller
             $variantQuery = ProductVariant::withTrashed()->where('barcode', $barcode);
             if (!empty($ignoreVariantId)) {
                 $variantQuery->where('id', '!=', $ignoreVariantId);
+            }
+            if (!empty($ignoreId)) {
+                $variantQuery->where('product_id', '!=', $ignoreId);
             }
             $existsInVariants = $variantQuery->exists();
 
@@ -427,6 +433,41 @@ class ProductController extends Controller
         ], 201);
     }
 
+    /**
+     * Upload and store product image on public disk.
+     * Optimized for lightweight local storage on $6 DigitalOcean droplet.
+     */
+    public function uploadImage(Request $request)
+    {
+        $validated = $request->validate([
+            'image' => ['required', 'file', 'image', 'mimes:jpeg,png,jpg,webp,gif', 'max:5120'],
+            'folder' => ['nullable', 'string', 'in:products,brands,categories,company,users,avatars,settings'],
+        ]);
+
+        $folder = $validated['folder'] ?? 'products';
+        $file = $request->file('image');
+
+        // Store file in storage/app/public/{folder}
+        $path = $file->store($folder, 'public');
+
+        // Generate full reachable URL
+        $baseHost = $request->getSchemeAndHttpHost() ?: config('app.url');
+        $url = rtrim($baseHost, '/') . '/storage/' . ltrim($path, '/');
+
+        return response()->json([
+            'success' => true,
+            'status' => 'success',
+            'message' => 'Image uploaded successfully.',
+            'data' => [
+                'path' => $path,
+                'url' => $url,
+                'file_name' => $file->getClientOriginalName(),
+                'size_bytes' => $file->getSize(),
+                'size_kb' => round($file->getSize() / 1024, 1),
+            ],
+        ], 200);
+    }
+
     public function show($id)
     {
         $product = Product::with($this->productDetailRelations())->find($id);
@@ -504,6 +545,7 @@ class ProductController extends Controller
             'variants.*.values' => ['nullable', 'array'],
             'variants.*.attribute_values' => ['nullable', 'array'],
             'variants.*.is_active' => ['nullable', 'boolean'],
+            'variants.*.image_url' => ['nullable', 'string'],
             'unit_links' => ['nullable', 'array'],
             'unit_links.*.product_variant_id' => ['nullable', 'integer'],
             'unit_links.*.variant_sku' => ['nullable', 'string', 'max:100'],
@@ -620,7 +662,7 @@ class ProductController extends Controller
     private function productDetailRelations(): array
     {
         return [
-            'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order',
+            'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
             'variants.values:id,product_variant_id,variation_attribute_id,variation_value_id,attribute_name,attribute_value',
             'variants.stockBalances.warehouse',
             'images:id,product_id,disk,path,original_name,is_primary,sort_order',

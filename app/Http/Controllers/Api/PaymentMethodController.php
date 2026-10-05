@@ -16,24 +16,28 @@ class PaymentMethodController extends Controller
     {
         $hasFilters = $request->filled('search') || ($request->filled('status') && $request->input('status') !== 'All');
 
-        // Fast Cache hit if unfiltered
+        // Fast Cache hit if unfiltered and clean array
         if (!$hasFilters && Cache::has(self::CACHE_KEY)) {
-            return response()->json([
-                'status' => 'success',
-                'data' => Cache::get(self::CACHE_KEY),
-            ], 200, ['X-Cache' => 'HIT']);
+            $cached = Cache::get(self::CACHE_KEY);
+            if (is_array($cached) && !empty($cached) && !isset($cached['__PHP_Incomplete_Class_Name'])) {
+                return response()->json([
+                    'status' => 'success',
+                    'data' => $cached,
+                ], 200, ['X-Cache' => 'HIT']);
+            }
+            Cache::forget(self::CACHE_KEY);
         }
 
         // Seed default methods if empty
         if (PaymentMethod::count() === 0) {
             $defaultMethods = [
                 ['name' => 'Cash', 'code' => 'CASH', 'icon' => 'payments_rounded', 'is_active' => true, 'is_default' => true, 'description' => 'Direct cash currency exchange at counter'],
-                ['name' => 'Cheque', 'code' => 'CHEQUE', 'icon' => 'receipt_long_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Commercial bank draft or order cheque'],
+                ['name' => 'Credit / Debit Card', 'code' => 'CARD', 'icon' => 'credit_card_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'POS debit and credit card terminal payment'],
                 ['name' => 'Bank Transfer', 'code' => 'BANK', 'icon' => 'account_balance_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Direct electronic banking transfer or invoice'],
+                ['name' => 'KBZPay', 'code' => 'KBZPAY', 'icon' => 'qr_code_scanner_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'KBZPay mobile QR digital tender'],
+                ['name' => 'WavePay', 'code' => 'WAVEPAY', 'icon' => 'phone_android_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'WavePay digital wallet transaction'],
+                ['name' => 'Cheque', 'code' => 'CHEQUE', 'icon' => 'receipt_long_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Commercial bank draft or order cheque'],
                 ['name' => 'Other', 'code' => 'OTHER', 'icon' => 'category_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Custom tender or gift voucher payment'],
-                ['name' => 'Razorpay', 'code' => 'RAZORPAY', 'icon' => 'bolt_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Razorpay payment gateway integration'],
-                ['name' => 'cred', 'code' => 'CRED', 'icon' => 'credit_card_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'cred digital payment and credit rewards'],
-                ['name' => 'Gpay', 'code' => 'GPAY', 'icon' => 'credit_card_rounded', 'is_active' => true, 'is_default' => false, 'description' => 'Google Pay mobile contactless payment'],
             ];
 
             PaymentMethod::insert(array_map(function ($method) {
@@ -62,14 +66,15 @@ class PaymentMethodController extends Controller
         }
 
         $methods = $query->orderBy('id', 'desc')->get();
+        $methodsArray = $methods->toArray();
 
         if (!$hasFilters) {
-            Cache::put(self::CACHE_KEY, $methods, 3600);
+            Cache::put(self::CACHE_KEY, $methodsArray, 3600);
         }
 
         return response()->json([
             'status' => 'success',
-            'data' => $methods,
+            'data' => $methodsArray,
         ], 200, ['X-Cache' => 'MISS']);
     }
 

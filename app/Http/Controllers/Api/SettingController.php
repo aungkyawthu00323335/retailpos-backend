@@ -63,6 +63,16 @@ class SettingController extends Controller
             'expense_prefix' => 'EXP_',
             'quotation_prefix' => 'QUO_',
             'pos_prefix' => 'POS_',
+            'delete_security_pin' => '',
+            // 🧾 POS Voucher Customization Settings
+            'show_voucher_logo' => '1',
+            'show_voucher_shop_name' => '1',
+            'show_voucher_address' => '1',
+            'show_voucher_phone' => '1',
+            'show_voucher_email' => '1',
+            'show_voucher_footer' => '1',
+            'voucher_footer_text' => 'ကျေးဇူးတင်ပါသည်၊ နောက်လည်း လာရောက်အားပေးပါရန် ဖိတ်ခေါ်အပ်ပါသည်။',
+            'voucher_paper_size' => '80mm',
         ];
 
         $settings = Setting::all()->pluck('value', 'key')->toArray();

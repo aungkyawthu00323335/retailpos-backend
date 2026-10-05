@@ -135,6 +135,7 @@ class ReportController extends Controller
             COALESCE(SUM(grand_total), 0) as total_sales,
             COALESCE(SUM(paid_amount), 0) as paid_amount,
             COALESCE(SUM(due_amount), 0) as due_amount,
+            COALESCE(SUM(total_cogs), 0) as total_cogs,
             COUNT(*) as orders_count
         ')->first();
 
@@ -142,16 +143,19 @@ class ReportController extends Controller
         $periodPaid = (float)($periodSalesAgg->paid_amount ?? 0);
         $periodDue = (float)($periodSalesAgg->due_amount ?? 0);
         $ordersCount = (int)($periodSalesAgg->orders_count ?? 0);
+        $totalCogs = (float)($periodSalesAgg->total_cogs ?? 0);
 
         // Real-time Pulse Metrics (Today vs Yesterday)
         $pulseSalesAgg = (clone $salesBaseQuery)->selectRaw('
             COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as today_sales,
             COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN 1 ELSE 0 END), 0) as today_sales_count,
+            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN total_cogs ELSE 0 END), 0) as today_cogs,
             COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
-        ', [$todayPrefix, $today, $todayPrefix, $today, $yesterdayPrefix, $yesterday])->first();
+        ', [$todayPrefix, $today, $todayPrefix, $today, $todayPrefix, $today, $yesterdayPrefix, $yesterday])->first();
 
         $todaySales = (float)($pulseSalesAgg->today_sales ?? 0);
         $todaySalesCount = (int)($pulseSalesAgg->today_sales_count ?? 0);
+        $todayCogs = (float)($pulseSalesAgg->today_cogs ?? 0);
         $yesterdaySales = (float)($pulseSalesAgg->yesterday_sales ?? 0);
         $salesGrowthPct = $yesterdaySales > 0
             ? round((($todaySales - $yesterdaySales) / $yesterdaySales) * 100, 1)
@@ -218,28 +222,25 @@ class ReportController extends Controller
             ->sum('amount');
 
         // 5. Cost of Goods Sold (COGS) & GAAP/IFRS Operational Profitability
-        $cogsBaseQuery = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
-            ->where('sales.status', '!=', 'Voided');
+        // Fallback calculation only if sales table has empty cogs but non-zero sales
+        if ($totalCogs == 0.0 && $totalSales > 0.0) {
+            try {
+                $cogsBaseQuery = DB::table('sale_items')
+                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                    ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+                    ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                    ->where('sales.status', '!=', 'Voided');
 
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $cogsBaseQuery->where('sales.warehouse_name', $warehouse);
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $cogsBaseQuery->where('sales.warehouse_name', $warehouse);
+                }
+
+                $cogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0) as total_cogs';
+                $periodCogsQuery = clone $cogsBaseQuery;
+                $applyDateScope($periodCogsQuery, 'sales.date');
+                $totalCogs = (float)$periodCogsQuery->selectRaw($cogsExpr)->value('total_cogs');
+            } catch (\Throwable $e) {}
         }
-
-        $cogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0) as total_cogs';
-
-        $periodCogsQuery = clone $cogsBaseQuery;
-        $applyDateScope($periodCogsQuery, 'sales.date');
-        $totalCogs = (float)$periodCogsQuery->selectRaw($cogsExpr)->value('total_cogs');
-
-        $todayCogs = (float)(clone $cogsBaseQuery)
-            ->where(function ($q) use ($todayPrefix, $today) {
-                $q->where('sales.date', 'LIKE', $todayPrefix)->orWhere('sales.date', $today);
-            })
-            ->selectRaw($cogsExpr)
-            ->value('total_cogs');
 
         $grossProfit = round($netSales - $totalCogs, 2);
         $netProfit = round($grossProfit - $totalExpenses, 2);
@@ -337,13 +338,10 @@ class ReportController extends Controller
         }
 
         // Group COGS by month for true operational monthly profitability
-        $monthSalesExpr = $isSqlite ? DB::raw("CAST(strftime('%m', sales.date) AS integer) as m") : DB::raw('MONTH(sales.date) as m');
-        $monthSalesGroup = $isSqlite ? DB::raw("CAST(strftime('%m', sales.date) AS integer)") : DB::raw('MONTH(sales.date)');
-
-        $cogsByMonth = (clone $cogsBaseQuery)
-            ->whereYear('sales.date', $year)
-            ->select($monthSalesExpr, DB::raw($cogsExpr))
-            ->groupBy($monthSalesGroup)
+        $cogsByMonth = (clone $salesBaseQuery)
+            ->whereYear('date', $year)
+            ->select($monthExpr, DB::raw('SUM(total_cogs) as total_cogs'))
+            ->groupBy($monthGroup)
             ->pluck('total_cogs', 'm');
 
         $monthlyCogs = array_fill(0, 12, 0.0);
@@ -4443,12 +4441,8 @@ class ReportController extends Controller
                 $salesTotal = (float)$shiftSales->sum('grand_total');
                 $saleIds = $shiftSales->pluck('id')->all();
 
-                $cashSales = 0.0;
-                $cardSales = 0.0;
-                $digitalSales = 0.0;
-                $cashCount = 0;
-                $cardCount = 0;
-                $digitalCount = 0;
+                $tenderTotals = [];
+                $tenderCounts = [];
 
                 if (!empty($saleIds)) {
                     $spList = Schema::hasTable('sale_payments')
@@ -4456,35 +4450,71 @@ class ReportController extends Controller
                         : collect([]);
                     if ($spList->isNotEmpty()) {
                         foreach ($spList as $sp) {
-                            $pt = strtolower(trim((string)$sp->payment_type));
+                            $rawMethod = (string)($sp->payment_type ?? 'Cash');
+                            $mName = $this->normalizePaymentMethodName($rawMethod);
                             $amt = (float)$sp->amount;
                             $chg = (float)($sp->change_amount ?? 0);
-                            if ($pt === 'cash') {
-                                $cashSales += max(0, $amt - $chg);
-                                $cashCount++;
-                            } elseif (in_array($pt, ['card', 'pos card', 'credit card', 'visa', 'mastercard'])) {
-                                $cardSales += $amt;
-                                $cardCount++;
-                            } else {
-                                $digitalSales += $amt;
-                                $digitalCount++;
+                            $netAmount = ($mName === 'Cash') ? max(0, $amt - $chg) : $amt;
+
+                            $tenderTotals[$mName] = ($tenderTotals[$mName] ?? 0.0) + $netAmount;
+                            $tenderCounts[$mName] = ($tenderCounts[$mName] ?? 0) + 1;
+                        }
+
+                        $paidSaleIds = $spList->pluck('sale_id')->unique()->toArray();
+                        $unpaidSales = $shiftSales->whereNotIn('id', $paidSaleIds);
+                        foreach ($unpaidSales as $s) {
+                            $rawMethod = (string)($s->payment_type ?? 'Cash');
+                            $mName = $this->normalizePaymentMethodName($rawMethod);
+                            $paid = (float)$s->paid_amount;
+                            if ($paid > 0) {
+                                $tenderTotals[$mName] = ($tenderTotals[$mName] ?? 0.0) + $paid;
+                                $tenderCounts[$mName] = ($tenderCounts[$mName] ?? 0) + 1;
                             }
                         }
                     } else {
                         foreach ($shiftSales as $s) {
-                            $pt = strtolower(trim((string)$s->payment_type));
+                            $rawMethod = (string)($s->payment_type ?? 'Cash');
+                            $mName = $this->normalizePaymentMethodName($rawMethod);
                             $paid = (float)$s->paid_amount;
-                            if ($pt === 'cash') {
-                                $cashSales += $paid;
-                                $cashCount++;
-                            } elseif (in_array($pt, ['card', 'pos card', 'credit card', 'visa', 'mastercard'])) {
-                                $cardSales += $paid;
-                                $cardCount++;
-                            } else {
-                                $digitalSales += $paid;
-                                $digitalCount++;
+                            if ($paid > 0) {
+                                $tenderTotals[$mName] = ($tenderTotals[$mName] ?? 0.0) + $paid;
+                                $tenderCounts[$mName] = ($tenderCounts[$mName] ?? 0) + 1;
                             }
                         }
+                    }
+                }
+
+                $cashSales = (float)($tenderTotals['Cash'] ?? 0.0);
+                $cashCount = (int)($tenderCounts['Cash'] ?? 0);
+                $cardSales = 0.0;
+                $cardCount = 0;
+                $digitalSales = 0.0;
+                $digitalCount = 0;
+
+                $paymentBreakdown = [];
+                $paymentBreakdown[] = [
+                    'method' => 'Cash',
+                    'amount' => round($cashSales, 2),
+                    'count' => $cashCount,
+                ];
+
+                foreach ($tenderTotals as $m => $amt) {
+                    $cnt = (int)($tenderCounts[$m] ?? 0);
+                    if ($m !== 'Cash' && ($amt > 0 || $cnt > 0)) {
+                        $paymentBreakdown[] = [
+                            'method' => $m,
+                            'amount' => round($amt, 2),
+                            'count' => $cnt,
+                        ];
+                    }
+                    if ($m === 'Cash') continue;
+                    $mLower = strtolower($m);
+                    if (str_contains($mLower, 'card') || in_array($mLower, ['visa', 'mastercard'])) {
+                        $cardSales += $amt;
+                        $cardCount += $cnt;
+                    } else {
+                        $digitalSales += $amt;
+                        $digitalCount += $cnt;
                     }
                 }
 
@@ -4537,9 +4567,21 @@ class ReportController extends Controller
 
                 // Primary payment type
                 $primaryPayment = 'Cash';
-                if ($digitalSales > $cashSales && $digitalSales > $cardSales) $primaryPayment = 'KBZPay';
-                elseif ($cardSales > $cashSales) $primaryPayment = 'Card';
-                elseif ($cashSales > 0 && ($digitalSales > 0 || $cardSales > 0)) $primaryPayment = 'Split Payment';
+                if ($digitalSales > $cashSales && $digitalSales > $cardSales) {
+                    $maxTender = 'KBZPay';
+                    $maxAmt = 0;
+                    foreach ($tenderTotals as $m => $amt) {
+                        if ($m !== 'Cash' && $amt > $maxAmt) {
+                            $maxAmt = $amt;
+                            $maxTender = $m;
+                        }
+                    }
+                    $primaryPayment = $maxTender;
+                } elseif ($cardSales > $cashSales) {
+                    $primaryPayment = 'Card';
+                } elseif ($cashSales > 0 && ($digitalSales > 0 || $cardSales > 0)) {
+                    $primaryPayment = 'Split Payment';
+                }
 
                 $sessionDate = substr((string)$r->opened_at, 0, 10);
                 $cashierName = trim(explode('(', (string)($r->user_name ?: 'Super Admin'))[0]) ?: 'Super Admin';
@@ -4595,11 +4637,7 @@ class ReportController extends Controller
                     'cashier_name' => $cashierName,
                     'user_name' => $cashierName,
                     'user_role' => $userRole,
-                    'payment_breakdown' => [
-                        ['method' => 'Cash', 'amount' => round($cashSales, 2), 'count' => $cashCount],
-                        ['method' => 'Card', 'amount' => round($cardSales, 2), 'count' => $cardCount],
-                        ['method' => 'Digital', 'amount' => round($digitalSales, 2), 'count' => $digitalCount],
-                    ],
+                    'payment_breakdown' => $paymentBreakdown,
                 ];
             }
         }
@@ -4712,17 +4750,23 @@ class ReportController extends Controller
                 'cashier_name' => $cName,
                 'user_name' => $cName,
                 'user_role' => 'Lead Cashier',
-                'payment_breakdown' => [
+                'payment_breakdown' => array_values(array_filter([
                     ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count],
-                    ['method' => 'Card', 'amount' => round($cdSales, 2), 'count' => $cdSales > 0 ? 1 : 0],
-                    ['method' => 'Digital', 'amount' => round($dgSales, 2), 'count' => $dgSales > 0 ? 1 : 0],
-                ],
+                    $cdSales > 0 ? ['method' => 'Card', 'amount' => round($cdSales, 2), 'count' => 1] : null,
+                    $dgSales > 0 ? ['method' => ($prim !== 'Cash' && $prim !== 'Card' && $prim !== 'Split Payment' ? $prim : 'KPay'), 'amount' => round($dgSales, 2), 'count' => 1] : null,
+                ])),
             ];
         }
 
-        // Sort all items by opened_at descending
+        // Sort all items by opened_at descending, tiebreak by id descending
         usort($items, function ($a, $b) {
-            return strcmp($b['opened_at'] ?? $b['date'], $a['opened_at'] ?? $a['date']);
+            $aKey = (string)($a['opened_at'] ?: ($a['date'] ?? ''));
+            $bKey = (string)($b['opened_at'] ?: ($b['date'] ?? ''));
+            $cmp = strcmp($bKey, $aKey);
+            if ($cmp === 0) {
+                return ((int)($b['id'] ?? 0)) <=> ((int)($a['id'] ?? 0));
+            }
+            return $cmp;
         });
 
         // Calculate summary and drawer flow aggregates
@@ -6979,5 +7023,35 @@ class ReportController extends Controller
             'sales_tax_records'     => $taxableSalesList,
             'purchases_tax_records' => $taxablePurchasesList,
         ]);
+    }
+
+    /**
+     * Normalize payment method names for granular register reports.
+     */
+    private function normalizePaymentMethodName(string $raw): string
+    {
+        $trimmed = trim($raw);
+        if ($trimmed === '') {
+            return 'Other';
+        }
+        $lower = strtolower($trimmed);
+        if ($lower === 'cash') return 'Cash';
+        if (in_array($lower, ['kbzpay', 'kbz pay', 'kbz_pay'])) return 'KBZPay';
+        if (in_array($lower, ['kpay', 'k pay', 'k-pay'])) return 'KPay';
+        if (in_array($lower, ['wave', 'wavepay', 'wave pay', 'wave_pay'])) return 'WavePay';
+        if (in_array($lower, ['aya pay', 'ayapay'])) return 'AYA Pay';
+        if (in_array($lower, ['cb pay', 'cbpay'])) return 'CB Pay';
+        if (in_array($lower, ['one pay', 'onepay'])) return 'OnePay';
+        if (in_array($lower, ['uab pay', 'uabpay'])) return 'UABPay';
+        if (in_array($lower, ['card', 'credit card', 'pos card', 'credit_card'])) return 'Credit Card';
+        if (in_array($lower, ['debit card', 'debit_card'])) return 'Debit Card';
+        if (in_array($lower, ['visa'])) return 'Visa';
+        if (in_array($lower, ['mastercard'])) return 'MasterCard';
+        if (in_array($lower, ['bank transfer', 'bank_transfer', 'wire', 'bank'])) return 'Bank Transfer';
+        if (in_array($lower, ['cheque', 'check'])) return 'Cheque';
+        if (in_array($lower, ['digital', 'digital / mobile', 'mobile money', 'wallet'])) {
+            return 'Mobile Wallet';
+        }
+        return ucwords($trimmed);
     }
 }
