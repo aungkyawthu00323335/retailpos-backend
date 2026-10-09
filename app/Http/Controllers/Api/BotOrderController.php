@@ -826,8 +826,9 @@ class BotOrderController extends Controller
                 'telegram_bot_min_partial_pct' => (float)Setting::get('telegram_bot_min_partial_pct', '30'),
                 'telegram_bot_allow_out_of_stock_orders' => Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1',
                 'telegram_bot_hide_out_of_stock' => Setting::get('telegram_bot_hide_out_of_stock', '0') === '1',
-                'telegram_bot_tma_enabled' => Setting::get('telegram_bot_tma_enabled', '1') === '1',
+                'telegram_bot_tma_enabled' => Setting::get('telegram_bot_tma_enabled', '0') === '1',
                 'telegram_bot_tma_url' => Setting::get('telegram_bot_tma_url', ''),
+                'telegram_bot_menu_button_text' => Setting::get('telegram_bot_menu_button_text', '🛍️ Shop Now'),
                 'telegram_bot_restock_notify_enabled' => Setting::get('telegram_bot_restock_notify_enabled', '1') === '1',
                 'telegram_bot_payment_methods' => $paymentMethods ?: ['Cash on Delivery', 'KBZPay', 'WavePay'],
                 'telegram_bot_payment_info' => Setting::get('telegram_bot_payment_info', ''),
@@ -964,6 +965,7 @@ class BotOrderController extends Controller
             'telegram_bot_hide_out_of_stock' => 'nullable|boolean',
             'telegram_bot_tma_enabled' => 'nullable|boolean',
             'telegram_bot_tma_url' => 'nullable|string|max:500',
+            'telegram_bot_menu_button_text' => 'nullable|string|max:100',
             'telegram_bot_restock_notify_enabled' => 'nullable|boolean',
             'telegram_bot_payment_methods' => 'nullable|array',
             'telegram_bot_payment_info' => 'nullable|string',
@@ -1121,6 +1123,26 @@ class BotOrderController extends Controller
                 Setting::set($key, $val ? '1' : '0');
             } else {
                 Setting::set($key, (string)($val ?? ''));
+            }
+        }
+
+        // 🔄 Sync or Remove [ 🛍️ Shop Now ] Telegram Menu Button based on telegram_bot_tma_enabled
+        if (isset($validated['telegram_bot_tma_enabled'])) {
+            $tmaEnabled = (bool)$validated['telegram_bot_tma_enabled'];
+            $tmaUrl = trim((string)($validated['telegram_bot_tma_url'] ?? Setting::get('telegram_bot_tma_url', '')));
+            $btnText = trim((string)($validated['telegram_bot_menu_button_text'] ?? Setting::get('telegram_bot_menu_button_text', '🛍️ Shop Now')));
+            if (empty($btnText)) {
+                $btnText = '🛍️ Shop Now';
+            }
+
+            try {
+                if ($tmaEnabled && !empty($tmaUrl) && str_starts_with(strtolower($tmaUrl), 'https://')) {
+                    $this->botService->setChatMenuButton($tmaUrl, $btnText);
+                } else {
+                    $this->botService->setChatMenuButton(null);
+                }
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Auto-sync Telegram menu button failed: ' . $e->getMessage());
             }
         }
 
@@ -1389,13 +1411,29 @@ class BotOrderController extends Controller
      */
     public function syncMenuButton(Request $request)
     {
-        $tmaEnabled = Setting::get('telegram_bot_tma_enabled', '1') === '1';
-        $tmaUrl = trim(Setting::get('telegram_bot_tma_url', ''));
+        if ($request->has('url')) {
+            $reqUrl = trim($request->input('url', ''));
+            Setting::set('telegram_bot_tma_url', $reqUrl);
+            $tmaUrl = $reqUrl;
+        } else {
+            $tmaUrl = trim(Setting::get('telegram_bot_tma_url', ''));
+        }
+
+        if ($request->has('tma_enabled')) {
+            $tmaEnabled = $request->boolean('tma_enabled');
+            Setting::set('telegram_bot_tma_enabled', $tmaEnabled ? '1' : '0');
+        } else {
+            $tmaEnabled = Setting::get('telegram_bot_tma_enabled', '1') === '1';
+        }
+
         if (empty($tmaUrl)) {
             $tmaUrl = url('/bot/shop');
         }
 
         if ($tmaEnabled) {
+            if (empty($tmaUrl)) {
+                $tmaUrl = url('/bot/shop');
+            }
             // Telegram Bot API strictly enforces HTTPS for WebApp URLs
             if (!str_starts_with(strtolower($tmaUrl), 'https://')) {
                 return response()->json([
@@ -1403,17 +1441,33 @@ class BotOrderController extends Controller
                     'message' => "Telegram Mini App (TMA) အတွက် HTTPS လင့်ခ်သာ အသုံးပြုနိုင်ပါသည် (လက်ရှိ URL မှာ '{$tmaUrl}' ဖြစ်နေပါသည်)။ Localhost (127.0.0.1) တွင် စမ်းသပ်ပါက Cloudflare Tunnel သို့မဟုတ် Ngrok HTTPS URL (ဥပမာ- https://xxx.trycloudflare.com/bot/shop) အား 'Custom Mini App URL' တွင် ထည့်သွင်းပြီး သိမ်းဆည်းပေးပါရန်။",
                 ], 422);
             }
+
+            if (str_contains(strtolower($tmaUrl), 'developers.cloudflare.com') || str_contains(strtolower($tmaUrl), 'cloudflare.com/website-terms')) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => "ထည့်သွင်းထားသော URL မှာ Cloudflare လမ်းညွှန်စာမျက်နှာ (Documentation) ဖြစ်နေပါသည်။ PowerShell Terminal ဘောင်ကွက်ထဲရှိ https://xxxx.trycloudflare.com/bot/shop လင့်ခ်အစစ်ကို ကူးယူထည့်သွင်းပေးပါရန်။",
+                ], 422);
+            }
+
+            $buttonText = $request->input('text', Setting::get('telegram_bot_menu_button_text', '🛍️ Shop Now'));
+            $res = $this->botService->setChatMenuButton($tmaUrl, $buttonText);
+            return response()->json([
+                'status' => (!empty($res['ok'])) ? 'success' : 'error',
+                'message' => (!empty($res['ok'])) 
+                    ? 'Telegram [ 🛍️ Shop Now ] Menu Button အား အောင်မြင်စွာ ဖွင့်ပြီး ချိတ်ဆက်ပြီးပါပြီ!' 
+                    : ($res['description'] ?? 'Failed to sync menu button with Telegram.'),
+                'data' => $res,
+            ]);
+        } else {
+            // Disabled: Immediately remove the [ 🛍️ Shop Now ] menu button from Telegram
+            $res = $this->botService->setChatMenuButton(null);
+            return response()->json([
+                'status' => (!empty($res['ok'])) ? 'success' : 'error',
+                'message' => (!empty($res['ok'])) 
+                    ? 'Telegram [ 🛍️ Shop Now ] Menu Button အား အောင်မြင်စွာ ပိတ်ပြီး ဖျောက်ထားလိုက်ပါပြီ!' 
+                    : ($res['description'] ?? 'Failed to remove menu button from Telegram.'),
+                'data' => $res,
+            ]);
         }
-
-        $buttonText = $request->input('text', '🛍️ Shop Now');
-        $res = $this->botService->setChatMenuButton($tmaEnabled ? $tmaUrl : null, $buttonText);
-
-        return response()->json([
-            'status' => (!empty($res['ok'])) ? 'success' : 'error',
-            'message' => (!empty($res['ok'])) 
-                ? 'Telegram [ 🛍️ Shop Now ] Menu Button synced successfully.' 
-                : ($res['description'] ?? 'Failed to sync menu button with Telegram.'),
-            'data' => $res,
-        ]);
     }
 }
