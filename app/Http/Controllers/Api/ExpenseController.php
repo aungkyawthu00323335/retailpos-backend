@@ -421,7 +421,7 @@ class ExpenseController extends Controller
             'user_id'         => 'nullable|integer',
         ]);
 
-        $authUser    = $request->user() ?? auth('sanctum')->user();
+        $authUser    = \App\Models\User::resolveFromRequest($request) ?? $request->user();
         $userName    = $request->input('user_name') ?? ($authUser?->name ?? 'Super Admin');
         $userRole    = $request->input('user_role') ?? ($authUser?->role ?? ($authUser?->role_model?->name ?? 'Super Admin'));
         $userId      = $request->input('user_id') ?? $authUser?->id;

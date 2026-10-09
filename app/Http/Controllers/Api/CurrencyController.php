@@ -11,14 +11,6 @@ class CurrencyController extends Controller
 {
     public function index()
     {
-        if (Currency::count() === 0) {
-            Currency::create(['name' => 'Myanmar Kyat', 'code' => 'MMK', 'symbol' => 'Ks', 'rate' => 1.0, 'is_default' => true, 'status' => 'Active']);
-            Currency::create(['name' => 'US Dollar', 'code' => 'USD', 'symbol' => '$', 'rate' => 1.0, 'is_default' => false, 'status' => 'Active']);
-            Currency::create(['name' => 'Euro', 'code' => 'EUR', 'symbol' => '€', 'rate' => 0.92, 'is_default' => false, 'status' => 'Active']);
-            Currency::create(['name' => 'Thai Baht', 'code' => 'THB', 'symbol' => '฿', 'rate' => 36.5, 'is_default' => false, 'status' => 'Active']);
-            Currency::create(['name' => 'Singapore Dollar', 'code' => 'SGD', 'symbol' => 'S$', 'rate' => 1.34, 'is_default' => false, 'status' => 'Active']);
-        }
-
         $currencies = Currency::orderBy('is_default', 'desc')->get();
         return response()->json(['status' => 'success', 'data' => $currencies]);
     }

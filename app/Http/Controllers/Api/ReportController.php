@@ -758,6 +758,13 @@ class ReportController extends Controller
 
         $baseQuery = Sale::query();
 
+        // 🛡️ Exclude unapproved Telegram Bot orders from recognized sales reports
+        $baseQuery->where(function ($q) {
+            $q->whereNull('order_source')
+              ->orWhere('order_source', '!=', 'telegram_bot')
+              ->orWhere('bot_approval_status', 'approved');
+        });
+
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
 

@@ -63,6 +63,7 @@ class SettingController extends Controller
             'expense_prefix' => 'EXP_',
             'quotation_prefix' => 'QUO_',
             'pos_prefix' => 'POS_',
+            'pos_hide_out_of_stock' => '0',
             'delete_security_pin' => '',
             // 🧾 POS Voucher Customization Settings
             'show_voucher_logo' => '1',
@@ -73,6 +74,21 @@ class SettingController extends Controller
             'show_voucher_footer' => '1',
             'voucher_footer_text' => 'ကျေးဇူးတင်ပါသည်၊ နောက်လည်း လာရောက်အားပေးပါရန် ဖိတ်ခေါ်အပ်ပါသည်။',
             'voucher_paper_size' => '80mm',
+            // 🤖 Telegram Bot Commerce Settings
+            'telegram_bot_enabled' => '0',
+            'telegram_bot_token' => '',
+            'telegram_bot_username' => '',
+            'telegram_bot_warehouse_id' => '1',
+            'telegram_bot_warehouse_name' => '',
+            'telegram_bot_auto_approve' => '0',
+            'telegram_bot_allow_unpaid' => '1',
+            'telegram_bot_allow_paid' => '1',
+            'telegram_bot_allow_partial' => '0',
+            'telegram_bot_min_partial_pct' => '30',
+            'telegram_bot_payment_methods' => json_encode(['Cash on Delivery', 'KBZPay', 'WavePay']),
+            'telegram_bot_payment_info' => "KBZPay: 09123456789 (U Tin Win)\nWavePay: 09123456789 (U Tin Win)\nCB Bank: 001234567890 (Ah Linn Thit)",
+            'telegram_bot_welcome_msg' => 'မင်္ဂလာပါရှင်။ အလင်းသစ် (Ah Linn Thit) မှ ကြိုဆိုပါသည်ရှင်။ အောက်ပါ Menu မှတဆင့် ကုန်ပစ္စည်းများအား စိတ်ကြိုက် ရွေးချယ်ဝယ်ယူနိုင်ပါသည်ရှင်။',
+            'telegram_admin_chat_ids' => '',
         ];
 
         $settings = Setting::all()->pluck('value', 'key')->toArray();

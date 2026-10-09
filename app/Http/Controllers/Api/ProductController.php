@@ -42,6 +42,7 @@ class ProductController extends Controller
                 'cost_price', 'selling_price', 'purchase_price', 'retail_price',
                 'retail_prices', 'wholesale_price', 'wholesale_prices', 'stock_quantity',
                 'alert_quantity', 'stock_alert', 'low_qty', 'has_variants',
+                'is_bot_available', 'bot_price',
                 'image_url', 'status', 'is_active', 'added_by',
             ])
             // Only load the primaryImage relation when image_url is empty.
@@ -85,6 +86,8 @@ class ProductController extends Controller
                   ->orWhere('alternative_name', 'like', "%{$search}%")
                   ->orWhere('brand_name', 'like', "%{$search}%")
                   ->orWhere('category_name', 'like', "%{$search}%")
+                  ->orWhere('sub_category_name', 'like', "%{$search}%")
+                  ->orWhere('sub_category_id', is_numeric($search) ? (int)$search : -1)
                   ->orWhereIn('id', function ($sub) use ($search) {
                       $sub->select('product_id')
                           ->from('product_variants')
@@ -106,12 +109,28 @@ class ProductController extends Controller
             $query->where('category_name', $request->input('category'));
         }
 
+        if ($request->filled('category_id') && $request->input('category_id') !== 'All') {
+            $query->where('category_id', (int)$request->input('category_id'));
+        }
+
+        if ($request->filled('sub_category_id') && $request->input('sub_category_id') !== 'All') {
+            $query->where('sub_category_id', (int)$request->input('sub_category_id'));
+        }
+
+        if ($request->filled('sub_category') && $request->input('sub_category') !== 'All') {
+            $query->where('sub_category_name', $request->input('sub_category'));
+        }
+
         if ($request->filled('brand') && $request->input('brand') !== 'All') {
             $query->where('brand_name', $request->input('brand'));
         }
 
         if ($request->filled('status') && $request->input('status') !== 'All') {
             $query->where('status', $request->input('status'));
+        }
+
+        if ($request->has('is_bot_available')) {
+            $query->where('is_bot_available', $request->boolean('is_bot_available'));
         }
 
         $sortBy = $request->input('sort_by', 'id');
@@ -441,7 +460,7 @@ class ProductController extends Controller
     {
         $validated = $request->validate([
             'image' => ['required', 'file', 'image', 'mimes:jpeg,png,jpg,webp,gif', 'max:5120'],
-            'folder' => ['nullable', 'string', 'in:products,brands,categories,company,users,avatars,settings'],
+            'folder' => ['nullable', 'string', 'in:products,brands,categories,company,users,avatars,settings,payment_methods,payments'],
         ]);
 
         $folder = $validated['folder'] ?? 'products';
@@ -614,6 +633,36 @@ class ProductController extends Controller
                 'id' => $product->id,
                 'status' => $newStatus,
                 'is_active' => $product->is_active,
+            ],
+        ]);
+    }
+
+    public function toggleBotStatus(Request $request, $id)
+    {
+        $product = Product::find($id);
+
+        if (!$product) {
+            return response()->json([
+                'success' => false,
+                'status' => 'error',
+                'message' => 'Product not found',
+            ], 404);
+        }
+
+        $product->is_bot_available = !$product->is_bot_available;
+        $product->save();
+
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
+
+        return response()->json([
+            'success' => true,
+            'status' => 'success',
+            'message' => $product->is_bot_available ? 'Product enabled for Telegram Bot' : 'Product disabled for Telegram Bot',
+            'data' => [
+                'id' => $product->id,
+                'is_bot_available' => $product->is_bot_available,
             ],
         ]);
     }

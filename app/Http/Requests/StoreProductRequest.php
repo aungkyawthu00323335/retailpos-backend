@@ -112,6 +112,8 @@ class StoreProductRequest extends FormRequest
             'description' => ['nullable', 'string', 'max:2000'],
             'status' => ['nullable', 'string', 'in:Active,Inactive'],
             'is_active' => ['nullable', 'boolean'],
+            'is_bot_available' => ['nullable', 'boolean'],
+            'bot_price' => ['nullable', 'numeric', 'min:0'],
 
             // HARD EXCLUSIONS (Strictly Prohibited)
             'tax' => ['prohibited'],

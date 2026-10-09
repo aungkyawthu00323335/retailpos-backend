@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class AuthController extends Controller
@@ -17,9 +18,9 @@ class AuthController extends Controller
     public function login(Request $request)
     {
         $validated = $request->validate([
-            'email' => 'nullable|string',
-            'login' => 'nullable|string',
-            'password' => 'required|string',
+            'email' => 'nullable|string|max:191',
+            'login' => 'nullable|string|max:191',
+            'password' => 'required|string|max:255',
         ]);
 
         $identifier = trim($validated['login'] ?? $validated['email'] ?? '');
@@ -47,7 +48,18 @@ class AuthController extends Controller
             })
             ->first();
 
-        if (!$user || !Hash::check($validated['password'], $user->password)) {
+        // Security: Prevent user enumeration and timing attacks
+        if (!$user) {
+            Hash::check($validated['password'], '$2y$10$e8w.x.e/E7gXyS0Z8pC1OecE2V5D6E7F8G9H0I1J2K3L4M5N6O7P8');
+            Log::warning("Failed login attempt for unknown identifier: {$identifier} from IP: {$request->ip()}");
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Invalid credentials. Please verify your login details and password.',
+            ], 401);
+        }
+
+        if (!Hash::check($validated['password'], $user->password)) {
+            Log::warning("Failed login attempt for user ID {$user->id} ({$user->email}) from IP: {$request->ip()}");
             return response()->json([
                 'status' => 'error',
                 'message' => 'Invalid credentials. Please verify your login details and password.',
@@ -55,6 +67,7 @@ class AuthController extends Controller
         }
 
         if ($user->status !== 'Active') {
+            Log::warning("Inactive user attempted login: ID {$user->id} ({$user->email}) from IP: {$request->ip()}");
             return response()->json([
                 'status' => 'error',
                 'message' => 'Your account is currently inactive. Please contact your Super Administrator.',

@@ -15,15 +15,14 @@ class DatabaseSeeder extends Seeder
     public function run(): void
     {
         $this->call([
-            OutletSeeder::class,
+            WarehouseSeeder::class,
+            CurrencySeeder::class,
             RoleAndUserSeeder::class,
-            RetailSeeder::class,
-            Product200Seeder::class,
-            PurchaseSeeder::class,
-            SaleSeeder::class,
-            AdjustmentSeeder::class,
-            ClothingStoreSeeder::class,
-            QuotationSeeder::class,
+            CustomerSeeder::class,
+            SupplierSeeder::class,
+            PaymentMethodSeeder::class,
+            ComprehensiveRetailProductSeeder::class,
+            TelegramBotCatalog100Seeder::class,
         ]);
     }
 }

@@ -43,6 +43,15 @@ class SaleController extends Controller
 
         $query->with($relations);
 
+        // 🛡️ Segregation of Duties & Revenue Recognition:
+        // Exclude pending/rejected Telegram Bot orders from standard POS sales ledger.
+        // Only bot orders that have been formally reviewed and approved count as sales.
+        $query->where(function ($q) {
+            $q->whereNull('order_source')
+              ->orWhere('order_source', '!=', 'telegram_bot')
+              ->orWhere('bot_approval_status', 'approved');
+        });
+
         if ($request->filled('customer_id')) {
             $query->where('customer_id', $request->input('customer_id'));
         }
@@ -609,7 +618,7 @@ class SaleController extends Controller
             'payments.*.created_by' => 'nullable|string|max:255',
         ]);
 
-        $user = $request->user() ?? auth('sanctum')->user() ?? $request->user('sanctum');
+        $user = \App\Models\User::resolveFromRequest($request) ?? $request->user();
         $userName = !empty($validated['user_name'])
             ? trim($validated['user_name'])
             : ($user?->name ?? (!empty($validated['created_by']) ? trim($validated['created_by']) : ($sale->user_name ?: ($sale->created_by ?: 'Super Admin'))));

@@ -280,6 +280,15 @@ class ProductUnitConversionService
         $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
         Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
 
+        // 🔔 Trigger Telegram Restock Notifications if items were replenished
+        if (strtolower($direction) === 'in' && $next > 0) {
+            try {
+                app(\App\Services\TelegramBotService::class)->notifyRestockSubscribers($product->id, $variantId);
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning("Telegram restock alert dispatch error: " . $e->getMessage());
+            }
+        }
+
         return $next;
     }
 }

@@ -32,6 +32,9 @@ use App\Http\Controllers\Api\CurrencyController;
 use App\Http\Controllers\Api\VariationController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\CashRegisterController;
+use App\Http\Controllers\Api\BotOrderController;
+use App\Http\Controllers\Api\DeliveryRegionController;
+use App\Http\Controllers\Api\DeliveryTownshipController;
 
 /*
 |--------------------------------------------------------------------------
@@ -39,8 +42,16 @@ use App\Http\Controllers\Api\CashRegisterController;
 |--------------------------------------------------------------------------
 */
 
+// Health & Connection Heartbeat Probe
+Route::get('ping', function () {
+    return response()->json([
+        'status' => 'ok',
+        'timestamp' => now()->timestamp,
+    ]);
+});
+
 // Authentication & Session
-Route::post('login', [AuthController::class, 'login']);
+Route::post('login', [AuthController::class, 'login'])->middleware('throttle:15,1');
 Route::post('logout', [AuthController::class, 'logout']);
 Route::get('me', [AuthController::class, 'me']);
 Route::post('change-password', [AuthController::class, 'changePassword']);
@@ -83,6 +94,7 @@ Route::post('products/excel-import', [ProductExcelController::class, 'importNewP
 Route::post('products/price-change-import', [ProductExcelController::class, 'importPriceChanges']);
 Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
 Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
+Route::patch('products/{id}/toggle-bot-status', [ProductController::class, 'toggleBotStatus']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
 Route::apiResource('products', ProductController::class);
 
@@ -136,8 +148,17 @@ Route::delete('expenses/payments/{paymentId}', [ExpenseController::class, 'delet
 Route::apiResource('expenses', ExpenseController::class);
 
 // Payment Methods (InfyPOS /app/payment-methods)
+Route::post('payment-methods/upload-image', [PaymentMethodController::class, 'uploadQrImage']);
 Route::patch('payment-methods/{id}/toggle-status', [PaymentMethodController::class, 'toggleStatus']);
+Route::patch('payment-methods/{id}/toggle-bot', [PaymentMethodController::class, 'toggleBot']);
 Route::apiResource('payment-methods', PaymentMethodController::class);
+
+// Delivery Regions & Townships (Delivery Zones)
+Route::patch('delivery-regions/{id}/toggle-status', [DeliveryRegionController::class, 'toggleStatus']);
+Route::apiResource('delivery-regions', DeliveryRegionController::class);
+Route::patch('delivery-townships/{id}/toggle-status', [DeliveryTownshipController::class, 'toggleStatus']);
+Route::patch('delivery-townships/{id}/toggle-cod', [DeliveryTownshipController::class, 'toggleCod']);
+Route::apiResource('delivery-townships', DeliveryTownshipController::class);
 
 // Customers & Customer Groups (CRM)
 Route::get('customers/generate-id', [CustomerController::class, 'generateCustomerId']);
@@ -204,3 +225,31 @@ Route::get('settings', [SettingController::class, 'getSettings'])->middleware('p
 Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update');
 Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault']);
 Route::apiResource('currencies', CurrencyController::class);
+
+// 🤖 Telegram Bot Channel & Mini App (Public)
+Route::prefix('bot')->group(function () {
+    Route::get('config', [BotOrderController::class, 'getBotConfig']);
+    Route::get('products', [BotOrderController::class, 'getProducts']);
+    Route::post('orders', [BotOrderController::class, 'submitOrder']);
+    Route::post('upload-slip', [BotOrderController::class, 'uploadSlip']);
+    Route::post('webhook', [BotOrderController::class, 'handleWebhook']);
+    Route::post('restock-subscribe', [BotOrderController::class, 'subscribeRestock']);
+});
+
+// 🤖 Telegram Bot Orders Management & Settings (Staff / POS)
+Route::get('bot-orders', [BotOrderController::class, 'listBotOrders']);
+Route::get('bot-orders/{id}', [BotOrderController::class, 'getBotOrder']);
+Route::get('bot-orders/{id}/voucher', [BotOrderController::class, 'getVoucherImage']);
+Route::post('bot-orders/{id}/approve', [BotOrderController::class, 'approveOrder']);
+Route::post('bot-orders/{id}/reject', [BotOrderController::class, 'rejectOrder']);
+Route::post('bot-orders/{id}/dispatch', [BotOrderController::class, 'dispatchOrder']);
+Route::get('bot-settings', [BotOrderController::class, 'getBotSettings']);
+Route::post('bot-settings', [BotOrderController::class, 'updateBotSettings']);
+Route::post('bot-settings/test-token', [BotOrderController::class, 'testBotToken']);
+Route::post('bot-settings/sync-commands', [BotOrderController::class, 'syncBotCommands']);
+Route::post('bot-settings/sync-menu-button', [BotOrderController::class, 'syncMenuButton']);
+Route::post('bot-settings/set-webhook', [BotOrderController::class, 'setWebhook']);
+Route::post('bot-settings/delete-webhook', [BotOrderController::class, 'deleteWebhook']);
+Route::get('bot-settings/webhook-info', [BotOrderController::class, 'getWebhookInfo']);
+Route::get('bot-restock-subscribers', [BotOrderController::class, 'listRestockSubscribers']);
+

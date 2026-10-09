@@ -13,21 +13,6 @@ class VariationController extends Controller
      */
     public function index(Request $request)
     {
-        // Default seed if empty
-        if (Variation::count() === 0) {
-            $defaults = [
-                ['name' => 'Size', 'variation_types' => ['S', 'M', 'L', 'XL', 'XXL'], 'status' => 'Active'],
-                ['name' => 'Color', 'variation_types' => ['Red', 'Blue', 'Black', 'White', 'Navy'], 'status' => 'Active'],
-                ['name' => 'Material', 'variation_types' => ['Cotton', 'Polyester', 'Leather', 'Silk'], 'status' => 'Active'],
-                ['name' => 'Storage', 'variation_types' => ['64GB', '128GB', '256GB', '512GB', '1TB'], 'status' => 'Active'],
-                ['name' => 'RAM', 'variation_types' => ['4GB', '8GB', '16GB', '32GB'], 'status' => 'Active'],
-            ];
-
-            foreach ($defaults as $item) {
-                Variation::create($item);
-            }
-        }
-
         $query = Variation::query();
 
         if ($request->filled('search')) {

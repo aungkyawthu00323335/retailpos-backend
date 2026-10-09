@@ -121,6 +121,8 @@ class ProductCreateService
                     'stock_alert' => $stockAlert,
                     'low_qty' => $stockAlert,
                     'has_variants' => $hasVariants,
+                    'is_bot_available' => !empty($data['is_bot_available']),
+                    'bot_price' => (isset($data['bot_price']) && $data['bot_price'] !== '') ? (float)$data['bot_price'] : null,
                     'image_url' => $data['image_url'] ?? '',
                     'description' => $data['note'] ?? $data['description'] ?? '',
                     'note' => $data['note'] ?? $data['description'] ?? '',
@@ -557,9 +559,16 @@ class ProductCreateService
                 'cost_price', 'selling_price', 'purchase_price', 'retail_price',
                 'retail_prices', 'wholesale_price', 'wholesale_prices', 'alert_quantity',
                 'stock_alert', 'low_qty', 'has_variants', 'description', 'note',
-                'image_url', 'status', 'is_active', 'added_by',
+                'image_url', 'status', 'is_active', 'is_bot_available', 'bot_price', 'added_by',
             ];
             $updates = array_intersect_key($data, array_flip($fillable));
+
+            if (array_key_exists('is_bot_available', $data)) {
+                $updates['is_bot_available'] = (bool)$data['is_bot_available'];
+            }
+            if (array_key_exists('bot_price', $data)) {
+                $updates['bot_price'] = ($data['bot_price'] !== null && $data['bot_price'] !== '') ? (float)$data['bot_price'] : null;
+            }
 
             if (array_key_exists('cost_price', $data)) {
                 $updates['cost_price'] = (float)$data['cost_price'];

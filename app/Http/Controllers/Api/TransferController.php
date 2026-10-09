@@ -1277,7 +1277,7 @@ class TransferController extends Controller
             'reference_no'    => 'nullable|string',
         ]);
 
-        $authUser = $request->user() ?? auth('sanctum')->user();
+        $authUser = \App\Models\User::resolveFromRequest($request) ?? $request->user();
         $userName = $request->input('user_name') 
             ?? ($authUser?->name ?? 'Super Admin');
         $userRole = $request->input('user_role') 

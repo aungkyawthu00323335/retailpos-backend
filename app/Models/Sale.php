@@ -32,6 +32,15 @@ class Sale extends Model
         'payment_type', // Cash, Credit Card, Bank Transfer, Cheque, WavePay, KBZPay, etc.
         'notes',
         'pos_flag',
+        'order_source',
+        'telegram_chat_id',
+        'telegram_username',
+        'telegram_order_id',
+        'bot_approval_status',
+        'bot_rejection_reason',
+        'payment_slip_url',
+        'shipping_address',
+        'customer_phone',
         'cash_register_id',
         'created_by',
         'user_id',
@@ -41,6 +50,10 @@ class Sale extends Model
         'void_reason',
         'voided_by',
         'voided_at',
+        'bot_approved_by',
+        'bot_approved_at',
+        'bot_rejected_by',
+        'bot_rejected_at',
     ];
 
     protected $casts = [
@@ -85,5 +98,36 @@ class Sale extends Model
     public function cashRegister()
     {
         return $this->belongsTo(CashRegister::class, 'cash_register_id');
+    }
+
+    public function outlet()
+    {
+        return $this->belongsTo(Outlet::class, 'warehouse_id');
+    }
+
+    public function warehouse()
+    {
+        return $this->belongsTo(Outlet::class, 'warehouse_id');
+    }
+
+    /**
+     * Normalize payment slip URL with correct host and port
+     */
+    public function getPaymentSlipUrlAttribute($value): ?string
+    {
+        if (empty($value)) {
+            return null;
+        }
+
+        // If stored as http://localhost/ or without port 8000, rewrite to port 8000
+        if (preg_match('#^https?://(localhost|127\.0\.0\.1)(/storage/.*)$#', $value, $matches)) {
+            return "http://127.0.0.1:8000{$matches[2]}";
+        }
+
+        if (!str_starts_with($value, 'http://') && !str_starts_with($value, 'https://')) {
+            return "http://127.0.0.1:8000/storage/" . ltrim($value, '/');
+        }
+
+        return $value;
     }
 }
