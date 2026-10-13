@@ -59,6 +59,10 @@ class ExpenseController extends Controller
             $query->where('payment_method', $request->input('payment_method'));
         }
 
+        if ($request->filled('payment_status') && $request->input('payment_status') !== 'All') {
+            $query->where('payment_status', $request->input('payment_status'));
+        }
+
         if ($request->filled('date_from')) {
             $query->where('date', '>=', $request->input('date_from'));
         }
