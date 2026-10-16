@@ -20,7 +20,7 @@ class QuotationController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Quotation::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']);
+        $query = Quotation::with(['items', 'customer']);
 
         // Filter: Warehouse / Outlet
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
@@ -97,15 +97,17 @@ class QuotationController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $items = $query->orderBy($sortBy, $sortOrder)->get();
+            $totalCount = (clone $query)->count();
+            $limit = min(500, max(1, (int)$request->input('limit', 500)));
+            $items = $query->orderBy($sortBy, $sortOrder)->take($limit)->get();
             return response()->json([
                 'status' => 'success',
                 'data' => $items,
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => $items->count(),
-                    'total' => $items->count(),
-                    'last_page' => 1,
+                    'total' => $totalCount,
+                    'last_page' => (int)ceil($totalCount / max(1, $limit)),
                 ],
             ])
             ->header('Cache-Control', 'private, max-age=60');

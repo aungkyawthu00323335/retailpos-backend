@@ -64,6 +64,10 @@ class ProductCreateEnterpriseTest extends TestCase
             ->assertJsonPath('success', true);
         $sku = $skuRes->json('data.sku');
         $this->assertNotEmpty($sku);
+        // Must contain digits only (numbers only requirement)
+        $this->assertMatchesRegularExpression('/^[0-9]+$/', $sku);
+        // Must not duplicate any product code, sku or id
+        $this->assertFalse(Product::withTrashed()->where('code', $sku)->orWhere('sku', $sku)->orWhere('id', (int)$sku)->exists());
 
         // Check availability (should be available)
         $checkRes = $this->getJson("/api/products/check-identifier?sku={$sku}");

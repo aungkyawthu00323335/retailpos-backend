@@ -20,6 +20,8 @@ use App\Models\PaymentMethod;
 use App\Models\DeliveryRegion;
 use App\Models\DeliveryTownship;
 use App\Models\BotRestockSubscriber;
+use App\Models\BotChatMessage;
+use App\Services\TelegramAiAgentService;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
@@ -30,10 +32,12 @@ class TelegramBotService
 {
     protected ?string $token;
     protected string $apiUrl;
+    protected TelegramAiAgentService $aiAgentService;
 
     public function __construct()
     {
         $this->refreshToken();
+        $this->aiAgentService = app(TelegramAiAgentService::class);
     }
 
     /**
@@ -225,11 +229,22 @@ class TelegramBotService
     }
 
     /**
+     * Convert Myanmar Digits (၀-၉) to Western Digits (0-9)
+     */
+    public function convertMyanmarDigits(string $str): string
+    {
+        $myanmarDigits = ['၀', '၁', '၂', '၃', '၄', '၅', '၆', '၇', '၈', '၉'];
+        $arabicDigits  = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+        return str_replace($myanmarDigits, $arabicDigits, $str);
+    }
+
+    /**
      * Normalize Myanmar and International Phone Numbers
      */
     public function normalizePhoneNumber(string $phone): string
     {
-        $clean = preg_replace('/[^\d+]/', '', trim($phone));
+        $converted = $this->convertMyanmarDigits($phone);
+        $clean = preg_replace('/[^\d+]/', '', trim($converted));
         if (str_starts_with($clean, '+959')) {
             return '09' . substr($clean, 4);
         }
@@ -243,6 +258,32 @@ class TelegramBotService
             return '0' . $clean;
         }
         return $clean;
+    }
+
+    /**
+     * Log Outgoing System Bot Message to Live Chat history
+     */
+    public function logOutgoingBotMessage(int|string $chatId, string $text, string $type = 'text', ?array $metadata = null): void
+    {
+        try {
+            $customerName = 'Customer';
+            $cust = BotChatMessage::where('telegram_chat_id', (string)$chatId)->whereNotNull('customer_name')->latest('id')->first();
+            if ($cust && !empty($cust->customer_name)) {
+                $customerName = $cust->customer_name;
+            }
+
+            BotChatMessage::create([
+                'telegram_chat_id' => (string)$chatId,
+                'customer_name' => $customerName,
+                'sender_type' => 'bot',
+                'message_type' => $type,
+                'message_text' => $text,
+                'metadata' => $metadata,
+                'is_read' => true,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('logOutgoingBotMessage error: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -396,8 +437,6 @@ class TelegramBotService
         }
 
         try {
-            $this->sendChatAction($chatId, 'upload_photo');
-
             $payload = [
                 'chat_id' => (string)$chatId,
             ];
@@ -709,19 +748,26 @@ class TelegramBotService
     /**
      * Display Shopping Cart view to customer with breakdown and actions
      */
-    public function sendCartView(int|string $chatId, string $userName = '', ?int $messageIdToEdit = null): void
-    {
+    public function sendCartView(
+        int|string $chatId,
+        string $userName = '',
+        ?int $messageIdToEdit = null,
+        bool $isEditMode = false,
+        ?string $flashNotice = null,
+        ?string $callbackQueryId = null,
+        ?string $toastText = null
+    ): void {
         $cartSummary = $this->getCartSummary($chatId);
         $cart = $cartSummary['cart'];
 
-        $btnAll = Setting::get('telegram_bot_btn_all_products', '📦 ပစ္စည်းအားလုံး ကြည့်မည်');
+        $btnAll = Setting::get('telegram_bot_btn_all_products', '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်');
         $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
 
         if (empty($cart)) {
             $cartEmptyTpl = Setting::get('telegram_bot_cart_empty_msg', '');
             $emptyMsg = !empty(trim($cartEmptyTpl))
                 ? $this->replacePlaceholders($cartEmptyTpl, ['customer_name' => $userName, 'user_name' => $userName])
-                : "🛒 *သင်၏ ခြင်းတောင်း (Shopping Cart) ထဲတွင် ပစ္စည်းမရှိသေးပါရှင်*\n\n"
+                : "🛒 *သင်၏ ခြင်းတောင်းထဲတွင် ပစ္စည်းမရှိသေးပါရှင်*\n\n"
                 . "ကျွန်မတို့ဆိုင်၏ အရည်အသွေးမြင့် ကုန်ပစ္စည်းများကို '🛍️ ကုန်ပစ္စည်းများ' မှတဆင့် စိတ်ကြိုက် ရွေးချယ်မှာယူနိုင်ပါသည်ရှင်။ 🙏";
 
             $emptyButtons = [
@@ -732,71 +778,198 @@ class TelegramBotService
             ];
 
             if ($messageIdToEdit) {
-                $res = $this->editMessageText($chatId, $messageIdToEdit, $emptyMsg, $emptyButtons);
-                if (!empty($res['ok'])) return;
+                if ($callbackQueryId) {
+                    $apiUrl = $this->getApiUrl();
+                    $ansPayload = ['callback_query_id' => $callbackQueryId];
+                    if ($toastText) {
+                        $ansPayload['text'] = $toastText;
+                        $ansPayload['show_alert'] = false;
+                    }
+                    try {
+                        Http::pool(fn (\Illuminate\Http\Client\Pool $pool) => [
+                            $pool->as('answer')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/answerCallbackQuery", $ansPayload),
+                            $pool->as('edit')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", [
+                                'chat_id' => (string)$chatId,
+                                'message_id' => $messageIdToEdit,
+                                'text' => $emptyMsg,
+                                'parse_mode' => 'Markdown',
+                                'reply_markup' => json_encode($emptyButtons),
+                            ]),
+                        ]);
+                        return;
+                    } catch (\Throwable $e) {
+                        Log::warning('Parallel sendCartView empty error: ' . $e->getMessage());
+                    }
+                } else {
+                    $res = $this->editMessageText($chatId, $messageIdToEdit, $emptyMsg, $emptyButtons);
+                    if (!empty($res['ok'])) return;
+                }
             }
             $this->sendMessage($chatId, $emptyMsg, $emptyButtons);
             return;
         }
 
-        $totalQDisplay = (floor($cartSummary['total_qty']) == $cartSummary['total_qty']) ? (int)$cartSummary['total_qty'] : $cartSummary['total_qty'];
-        $text = "🛒 *သင်၏ ခြင်းတောင်း (Shopping Cart)* [{$totalQDisplay} ခု | {$cartSummary['items_count']} မျိုး]\n"
-              . "━━━━━━━━━━━━━━━━━━━━━\n\n";
+        // Customizable Header, Totals, and Buttons
+        $showHeader = Setting::get('telegram_bot_cart_show_header', '1') === '1';
+        $headerTitle = Setting::get('telegram_bot_cart_header_title', '🛒 ယူထားတဲ့ စာရင်း');
+        $showTotal = Setting::get('telegram_bot_cart_show_total', '1') === '1';
+        $totalLabel = Setting::get('telegram_bot_cart_total_label', '💰 စုစုပေါင်း:');
+        $showUnitPrice = Setting::get('telegram_bot_cart_show_unit_price', '1') === '1';
+
+        $showBtnDec = Setting::get('telegram_bot_cart_show_btn_dec', '1') === '1';
+        $showItemName = Setting::get('telegram_bot_cart_show_item_name', '1') === '1';
+        $showBtnInc = Setting::get('telegram_bot_cart_show_btn_inc', '1') === '1';
+        $showBtnDel = Setting::get('telegram_bot_cart_show_btn_del', '1') === '1';
+
+        $btnIncRaw = Setting::get('telegram_bot_cart_btn_inc', '➕');
+        $btnDecRaw = Setting::get('telegram_bot_cart_btn_dec', '➖');
+        $btnDelRaw = Setting::get('telegram_bot_cart_btn_del', '🗑️');
+
+        $btnInc = !empty(trim((string)$btnIncRaw)) ? trim((string)$btnIncRaw) : '➕';
+        $btnDec = !empty(trim((string)$btnDecRaw)) ? trim((string)$btnDecRaw) : '➖';
+        $btnDel = !empty(trim((string)$btnDelRaw)) ? trim((string)$btnDelRaw) : '🗑️';
+        $showEditor = Setting::get('telegram_bot_cart_show_editor', '1') === '1';
+
+        $btnDone = Setting::get('telegram_bot_cart_btn_done', '✅ Done');
+        $showDoneBtn = Setting::get('telegram_bot_cart_show_done_btn', '1') === '1';
+
+        $btnCheckout = Setting::get('telegram_bot_cart_btn_checkout_inline', Setting::get('telegram_bot_btn_checkout', '📦 မှာမည့်ပစ္စည်းများ Order တင်မည်'));
+        $showCheckoutBtn = Setting::get('telegram_bot_cart_show_checkout_btn', '1') === '1';
+
+        $btnEdit = Setting::get('telegram_bot_btn_edit_cart', '✏️ စာရင်း ပြင်မယ်');
+        $showEditBtn = Setting::get('telegram_bot_cart_show_edit_btn', '1') === '1';
+
+        $btnContinue = Setting::get('telegram_bot_btn_continue_shopping', 'တခြားပစ္စည်းကြည့်ဦးမယ်');
+        $showContinueBtn = Setting::get('telegram_bot_cart_show_continue_btn', '1') === '1';
+
+        $text = '';
+        if (!empty($flashNotice)) {
+            $text .= "{$flashNotice}\n\n";
+        }
+        if ($showHeader) {
+            $hdr = !empty(trim($headerTitle)) ? trim($headerTitle) : '🛒 ယူထားတဲ့ စာရင်း';
+            $text .= "*{$hdr}*\n\n";
+        }
 
         $idx = 1;
-        $removeRows = [];
+        $editRows = [];
+        $indexIcons = [1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣', 6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟'];
 
         foreach ($cart as $key => $item) {
             $title = !empty($item['variant_name']) ? "{$item['product_name']} ({$item['variant_name']})" : $item['product_name'];
             $priceFmt = number_format($item['price']);
             $subFmt = number_format($item['subtotal']);
-            $unit = $item['unit_name'] ?? 'ခု';
+            $qtyDisplay = (floor($item['quantity']) == $item['quantity']) ? (int)$item['quantity'] : $item['quantity'];
+            $unitName = !empty($item['unit_name']) ? $item['unit_name'] : 'ခု';
 
-            $text .= "{$idx}. *{$title}*\n"
-                   . "   • အရေအတွက်: {$item['quantity']} {$unit} × {$priceFmt} MMK\n"
-                   . "   • ကျသင့်ငွေ: *{$subFmt} MMK*\n\n";
+            $badge = $indexIcons[$idx] ?? "{$idx}.";
 
-            $shortTitle = mb_strimwidth($title, 0, 24, '...');
-            $removeRows[] = [['text' => "❌ {$shortTitle}", 'callback_data' => "cart_rem_{$key}"]];
+            // Tree-structured alignment: Title on line 1, clean calculation indented on line 2
+            if ($showUnitPrice) {
+                $text .= "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} × {$priceFmt} = *{$subFmt} ကျပ်*\n\n";
+            } else {
+                $text .= "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} — *{$subFmt} ကျပ်*\n\n";
+            }
+
+            if ($showEditor) {
+                $shortTitle = mb_strimwidth($item['product_name'], 0, 14, '..');
+                $row = [];
+                if ($showBtnDec) {
+                    $row[] = ['text' => $btnDec, 'callback_data' => "cart_dec_{$key}"];
+                }
+                if ($showItemName) {
+                    $row[] = ['text' => "{$shortTitle} ×{$qtyDisplay}", 'callback_data' => 'noop'];
+                }
+                if ($showBtnInc) {
+                    $row[] = ['text' => $btnInc, 'callback_data' => "cart_inc_{$key}"];
+                }
+                if ($showBtnDel) {
+                    $row[] = ['text' => $btnDel, 'callback_data' => "cart_del_{$key}"];
+                }
+                if (!empty($row)) {
+                    $editRows[] = $row;
+                }
+            }
             $idx++;
         }
 
-        $grandTotalFmt = number_format($cartSummary['grand_total']);
-        $text .= "━━━━━━━━━━━━━━━━━━━━━\n"
-              . "🛍️ ပစ္စည်း စုစုပေါင်း: *{$cartSummary['total_qty']} ခု* ({$cartSummary['items_count']} မျိုး)\n"
-              . "💰 *စုစုပေါင်း ကျသင့်ငွေ:* *{$grandTotalFmt} MMK*\n\n"
-              . "မှာယူလိုပါက '💳 အော်ဒါတင်မည်' ခလုတ်ကို နှိပ်ပါရှင်-";
-
-        $btnCheckout = Setting::get('telegram_bot_btn_checkout', '💳 အော်ဒါတင်မည်');
-        $btnContinue = Setting::get('telegram_bot_btn_continue_shopping', '➕ ပစ္စည်း ဆက်ဝယ်မည်');
-        $btnClear = Setting::get('telegram_bot_btn_clear_cart', '🗑️ ခြင်းတောင်း ရှင်းမည်');
-
-        $buttons = [
-            [
-                ['text' => (!empty($btnCheckout) ? $btnCheckout : '💳 အော်ဒါတင်မည်') . " ({$grandTotalFmt} MMK)", 'callback_data' => 'cart_checkout'],
-            ],
-            [
-                ['text' => !empty($btnContinue) ? $btnContinue : '➕ ပစ္စည်း ဆက်ဝယ်မည်', 'callback_data' => 'nav_all_products'],
-            ],
-            [
-                ['text' => !empty($btnClear) ? $btnClear : '🗑️ ခြင်းတောင်း ရှင်းမည်', 'callback_data' => 'cart_clear'],
-            ],
-        ];
-
-        // Attach item remove buttons
-        foreach ($removeRows as $r) {
-            $buttons[] = $r;
+        if ($showTotal) {
+            $grandTotalFmt = number_format($cartSummary['grand_total']);
+            $totLabel = !empty(trim($totalLabel)) ? trim($totalLabel) : '💰 စုစုပေါင်း:';
+            $text .= "{$totLabel} *{$grandTotalFmt} ကျပ်*";
         }
 
-        $buttons[] = [
-            ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-        ];
+        $footerMsg = Setting::get('telegram_bot_cart_footer_msg', '');
+        if (!empty(trim((string)$footerMsg))) {
+            $text .= "\n\n" . trim((string)$footerMsg);
+        }
 
-        $markup = ['inline_keyboard' => $buttons];
+        if ($isEditMode) {
+            if ($showDoneBtn) {
+                $editRows[] = [
+                    ['text' => !empty($btnDone) ? $btnDone : '✅ Done', 'callback_data' => 'cart_done'],
+                ];
+            }
+            $markup = ['inline_keyboard' => $editRows];
+        } else {
+            $reviewRows = [];
+            $actionRow = [];
+            if ($showCheckoutBtn) {
+                $actionRow[] = ['text' => !empty($btnCheckout) ? $btnCheckout : '📦 မှာမည့်ပစ္စည်းများ Order တင်မည်', 'callback_data' => 'cart_checkout'];
+            }
+            if ($showEditBtn && $showEditor) {
+                $actionRow[] = ['text' => !empty($btnEdit) ? $btnEdit : '✏️ စာရင်း ပြင်မယ်', 'callback_data' => 'cart_edit'];
+            }
+            if (!empty($actionRow)) {
+                $reviewRows[] = $actionRow;
+            }
+            if ($showContinueBtn) {
+                $reviewRows[] = [['text' => !empty($btnContinue) ? $btnContinue : 'တခြားပစ္စည်းကြည့်ဦးမယ်', 'callback_data' => 'nav_all_products']];
+            }
+            $markup = ['inline_keyboard' => $reviewRows];
+        }
 
         if ($messageIdToEdit) {
-            $res = $this->editMessageText($chatId, $messageIdToEdit, $text, $markup);
-            if (!empty($res['ok'])) return;
+            if ($callbackQueryId) {
+                $apiUrl = $this->getApiUrl();
+                $editPayload = [
+                    'chat_id' => (string)$chatId,
+                    'message_id' => $messageIdToEdit,
+                    'text' => $text,
+                    'parse_mode' => 'Markdown',
+                ];
+                if ($markup) {
+                    $editPayload['reply_markup'] = json_encode($markup);
+                }
+
+                $ansPayload = ['callback_query_id' => $callbackQueryId];
+                if ($toastText) {
+                    $ansPayload['text'] = $toastText;
+                    $ansPayload['show_alert'] = false;
+                }
+
+                try {
+                    $responses = Http::pool(fn (\Illuminate\Http\Client\Pool $pool) => [
+                        $pool->as('answer')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/answerCallbackQuery", $ansPayload),
+                        $pool->as('edit')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", $editPayload),
+                    ]);
+
+                    $editRes = $responses['edit']->json() ?? ['ok' => false];
+                    if (!empty($editRes['ok']) || str_contains($editRes['description'] ?? '', 'message is not modified')) {
+                        return;
+                    }
+                    if (str_contains($editRes['description'] ?? '', "can't parse entities")) {
+                        unset($editPayload['parse_mode']);
+                        Http::connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", $editPayload);
+                        return;
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning('Parallel sendCartView pool error: ' . $e->getMessage());
+                }
+            } else {
+                $res = $this->editMessageText($chatId, $messageIdToEdit, $text, $markup);
+                if (!empty($res['ok'])) return;
+            }
         }
 
         $this->sendMessage($chatId, $text, $markup);
@@ -811,24 +984,39 @@ class TelegramBotService
         $cart = $cartSummary['cart'];
 
         if (empty($cart)) {
-            $this->sendCartView($chatId, $userName);
+            $cartEmptyTpl = Setting::get('telegram_bot_cart_empty_msg', '');
+            $emptyMsg = !empty(trim($cartEmptyTpl))
+                ? $this->replacePlaceholders($cartEmptyTpl, ['customer_name' => $userName, 'user_name' => $userName])
+                : "🛒 *သင်၏ ခြင်းတောင်းထဲတွင် ပစ္စည်းမရှိသေးပါရှင်*\n\nကျွန်မတို့ဆိုင်၏ အရည်အသွေးမြင့် ကုန်ပစ္စည်းများကို ရွေးချယ်ပြီးမှ Order တင်ပေးပါရှင်။ 🙏";
+
+            $btnAll = Setting::get('telegram_bot_btn_all_products', '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်');
+            $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
+            $this->sendMessage($chatId, $emptyMsg, [
+                'inline_keyboard' => [
+                    [['text' => !empty($btnAll) ? $btnAll : '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်', 'callback_data' => 'nav_all_products']],
+                    [['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main']],
+                ],
+            ]);
             return;
         }
 
         $warehouseId = (int)Setting::get('telegram_bot_warehouse_id', 1);
+        $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
 
         // Inventory Stock verification
         $outOfStockList = [];
-        foreach ($cart as $item) {
-            $stockQuery = StockBalance::where('warehouse_id', $warehouseId)
-                ->where('product_id', $item['product_id']);
-            if (!empty($item['variant_id'])) {
-                $stockQuery->where('product_variant_id', $item['variant_id']);
-            }
-            $stock = (float)$stockQuery->sum('quantity');
-            if ($stock < (float)$item['quantity']) {
-                $title = !empty($item['variant_name']) ? "{$item['product_name']} ({$item['variant_name']})" : $item['product_name'];
-                $outOfStockList[] = "• {$title} (လက်ကျန်: {$stock} " . ($item['unit_name'] ?? 'ခု') . " သာရှိပါသည်)";
+        if (!$allowOutOfStock) {
+            foreach ($cart as $item) {
+                $stockQuery = StockBalance::where('warehouse_id', $warehouseId)
+                    ->where('product_id', $item['product_id']);
+                if (!empty($item['variant_id'])) {
+                    $stockQuery->where('product_variant_id', $item['variant_id']);
+                }
+                $stock = (float)$stockQuery->sum('quantity');
+                if ($stock < (float)$item['quantity']) {
+                    $title = !empty($item['variant_name']) ? "{$item['product_name']} ({$item['variant_name']})" : $item['product_name'];
+                    $outOfStockList[] = "• {$title} (လက်ကျန်: {$stock} " . ($item['unit_name'] ?? 'ခု') . " သာရှိပါသည်)";
+                }
             }
         }
 
@@ -859,10 +1047,17 @@ class TelegramBotService
         Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
 
         $totalFormatted = number_format($cartSummary['grand_total']);
-        $itemsList = collect($cart)->map(function ($it) {
+        $indexIcons = [1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣', 6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟'];
+        $itemsList = collect($cart)->values()->map(function ($it, $idx) use ($indexIcons) {
+            $num = $idx + 1;
+            $badge = $indexIcons[$num] ?? "{$num}.";
             $title = !empty($it['variant_name']) ? "{$it['product_name']} ({$it['variant_name']})" : $it['product_name'];
-            return "• {$title} x {$it['quantity']} " . ($it['unit_name'] ?? 'ခု') . " = " . number_format($it['subtotal']) . " MMK";
-        })->implode("\n");
+            $qty = (floor($it['quantity']) == $it['quantity']) ? (int)$it['quantity'] : $it['quantity'];
+            $unit = !empty($it['unit_name']) ? $it['unit_name'] : 'ခု';
+            $price = number_format($it['price'] ?? 0);
+            $sub = number_format($it['subtotal'] ?? 0);
+            return "{$badge} *{$title}*\n   ▫️ {$qty} {$unit} × {$price}  =  *{$sub} MMK*";
+        })->implode("\n\n");
 
         $tpl = Setting::get('telegram_bot_ask_phone_msg', '');
         $askPrompt = !empty(trim($tpl))
@@ -881,23 +1076,38 @@ class TelegramBotService
              . "━━━━━━━━━━━━━━━━━━━━━\n"
              . "{$itemsList}\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
-             . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n\n"
+             . "💰 စုစုပေါင်း ကျသင့်ငွေ:  *{$totalFormatted} MMK*\n\n"
              . "{$askPrompt}";
 
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
         $btnSharePhone = Setting::get('telegram_bot_btn_share_phone', '📱 ကျွန်ုပ်၏ ဖုန်းနံပါတ် ပေးပို့မည် (Share Phone)');
         $btnCart = Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်');
-        $phoneKeyboard = [
-            'keyboard' => [
-                [['text' => !empty($btnSharePhone) ? $btnSharePhone : '📱 ကျွန်ုပ်၏ ဖုန်းနံပါတ် ပေးပို့မည် (Share Phone)', 'request_contact' => true]],
-                [['text' => !empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်']],
-                [['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)']],
-            ],
-            'resize_keyboard' => true,
-            'one_time_keyboard' => true,
-        ];
+
+        $showSharePhone = Setting::get('telegram_bot_show_btn_share_phone', '1') === '1';
+        $showBtnCart = Setting::get('telegram_bot_show_btn_cart', '1') === '1';
+        $showBtnCancel = Setting::get('telegram_bot_show_catalog_btn_cancel', '1') === '1';
+
+        $keyboardRows = [];
+        if ($showSharePhone) {
+            $keyboardRows[] = [['text' => !empty($btnSharePhone) ? $btnSharePhone : '📱 ကျွန်ုပ်၏ ဖုန်းနံပါတ် ပေးပို့မည် (Share Phone)', 'request_contact' => true]];
+        }
+        if ($showBtnCart) {
+            $keyboardRows[] = [['text' => !empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်']];
+        }
+        if ($showBtnCancel) {
+            $keyboardRows[] = [['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)']];
+        }
+
+        $phoneKeyboard = !empty($keyboardRows)
+            ? [
+                'keyboard' => $keyboardRows,
+                'resize_keyboard' => true,
+                'one_time_keyboard' => true,
+            ]
+            : ['remove_keyboard' => true];
 
         $this->sendMessage($chatId, $msg, $phoneKeyboard);
+        $this->logOutgoingBotMessage($chatId, $msg);
     }
 
     /**
@@ -913,7 +1123,7 @@ class TelegramBotService
                 $payload['text'] = $text;
                 $payload['show_alert'] = $showAlert;
             }
-            $res = Http::timeout(10)->withoutVerifying()->post("{$this->getApiUrl()}/answerCallbackQuery", $payload);
+            $res = Http::connectTimeout(3)->timeout(5)->withoutVerifying()->post("{$this->getApiUrl()}/answerCallbackQuery", $payload);
             return $res->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('answerCallbackQuery error: ' . $e->getMessage());
@@ -953,6 +1163,9 @@ class TelegramBotService
             return [
                 'url' => "{$baseUrl}/storage/{$storagePath}",
                 'hash' => $hash,
+                'contents' => $fileContents,
+                'mime' => 'image/' . ($ext === 'jpg' ? 'jpeg' : $ext),
+                'storage_path' => $storagePath,
             ];
         } catch (\Throwable $e) {
             Log::error('downloadTelegramFileWithHash failed: ' . $e->getMessage());
@@ -1024,21 +1237,76 @@ class TelegramBotService
         $chatId = $message['chat']['id'] ?? null;
         if (!$chatId) return;
 
-        $this->sendChatAction($chatId, 'typing');
-
         $userName = trim(($message['from']['first_name'] ?? '') . ' ' . ($message['from']['last_name'] ?? ''));
         $usernameTag = !empty($message['from']['username']) ? '@' . $message['from']['username'] : '';
+        $caption = trim($message['caption'] ?? '');
         $text = trim($message['text'] ?? '');
+        if (empty($text) && !empty($caption)) {
+            $text = $caption;
+        }
 
-        // 1. Photo message (Payment Slip)
+        // 0. Log incoming text customer message for Live Chat & Audit (photos/docs logged after download with image_url)
+        if (empty($message['photo']) && empty($message['document'])) {
+            try {
+                $msgType = 'text';
+                $msgContent = $text;
+                if (empty($msgContent)) {
+                    if (!empty($message['contact'])) $msgContent = '[ဖုန်းနံပါတ်: ' . ($message['contact']['phone_number'] ?? '') . ']';
+                    elseif (!empty($message['location'])) $msgContent = '[GPS တည်နေရာ ပေးပို့ခဲ့သည်]';
+                    else $msgContent = '[မက်ဆေ့ချ်]';
+                }
+
+                BotChatMessage::create([
+                    'telegram_chat_id' => (string)$chatId,
+                    'customer_name' => $userName,
+                    'telegram_username' => $usernameTag,
+                    'sender_type' => 'customer',
+                    'message_type' => $msgType,
+                    'message_text' => $msgContent,
+                    'is_read' => false,
+                ]);
+            } catch (\Throwable $e) {
+                Log::warning('Log BotChatMessage error: ' . $e->getMessage());
+            }
+        }
+
+        // 0b. Admin Mobile Telegram Reply-Relay: Check if Admin is replying to a forwarded customer alert
+        $adminChatIdsRaw = Setting::get('telegram_admin_chat_ids', '');
+        if (!empty($adminChatIdsRaw)) {
+            $adminIds = array_map('trim', explode(',', $adminChatIdsRaw));
+            if (in_array((string)$chatId, $adminIds, true) && !empty($message['reply_to_message'])) {
+                $repliedText = $message['reply_to_message']['text'] ?? ($message['reply_to_message']['caption'] ?? '');
+                if (preg_match('/(?:#CHAT_|Customer ID:\s*)([A-Za-z0-9_-]+)/i', $repliedText, $matches)) {
+                    $targetCustomerChatId = $matches[1];
+                    $adminReplyText = trim($text);
+                    if (!empty($adminReplyText)) {
+                        $this->sendMessage($targetCustomerChatId, "👨‍💼 *ဆိုင်တာဝန်ခံမှ စာပြန်ကြားချက်:*\n\n{$adminReplyText}");
+
+                        BotChatMessage::create([
+                            'telegram_chat_id' => (string)$targetCustomerChatId,
+                            'customer_name' => $userName,
+                            'sender_type' => 'staff',
+                            'message_type' => 'text',
+                            'message_text' => $adminReplyText,
+                            'is_read' => true,
+                        ]);
+
+                        $this->sendMessage($chatId, "✅ Customer (`{$targetCustomerChatId}`) သို့ စာပြန်ကြားချက် အောင်မြင်စွာ ပို့ဆောင်ပြီးပါပြီ။");
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 1. Photo message (Product inquiry or Payment Slip)
         if (!empty($message['photo'])) {
-            $this->handlePhotoMessage($chatId, $message['photo'], $userName, $usernameTag);
+            $this->handlePhotoMessage($chatId, $message['photo'], $userName, $usernameTag, $caption);
             return;
         }
 
-        // 2. Document message (Payment Slip sent as file / uncompressed image)
+        // 2. Document message (Payment Slip or image sent as file / uncompressed)
         if (!empty($message['document'])) {
-            $this->handleDocumentMessage($chatId, $message['document'], $userName, $usernameTag);
+            $this->handleDocumentMessage($chatId, $message['document'], $userName, $usernameTag, $caption);
             return;
         }
 
@@ -1050,12 +1318,41 @@ class TelegramBotService
 
         // 4. Location shared (1-Tap GPS Location)
         if (!empty($message['location'])) {
-            $this->handleLocationMessage($chatId, (float)$message['location']['latitude'], (float)$message['location']['longitude'], $userName);
+            $this->handleLocationMessage($chatId, (float)$message['location']['latitude'], (float)$message['location']['longitude'], $userName, $usernameTag);
             return;
         }
 
-        // 3. Command & Menu Handling
-        if (str_starts_with($text, '/start') || strcasecmp($text, 'hi') === 0 || strcasecmp($text, 'hello') === 0 || strcasecmp($text, 'menu') === 0) {
+        // 3. AI Direct Control Commands
+        if (strcasecmp($text, '/ai') === 0 || strcasecmp($text, '/bot') === 0) {
+            if ($this->aiAgentService->getOperatingMode() === 'standard') {
+                $this->sendMessage(
+                    $chatId,
+                    "📱 *ဤဘော့တ်သည် ရိုးရိုး မီနူးခလုတ်စနစ် (Standard Mode) ဖြင့် လည်ပတ်နေပါသည်ရှင်။*\n\nအောက်ပါ မီနူးခလုတ်များမှတဆင့် ကုန်ပစ္စည်းများကို အဆင်ပြေစွာ ရွေးချယ်ကြည့်ရှုမှာယူနိုင်ပါသည်ရှင်။ 🙏",
+                    $this->getMainKeyboard($chatId)
+                );
+                return;
+            }
+            $this->aiAgentService->resumeAiForChat($chatId);
+            $this->sendMessage($chatId, "🤖 *AI အရောင်းလက်ထောက် စနစ်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီရှင်။*\n\nကုန်ပစ္စည်းများနှင့် စျေးနှုန်းများကို စိတ်ကြိုက် မေးမြန်းနိုင်ပါပြီရှင် 🙏");
+            return;
+        }
+
+        if (strcasecmp($text, '/human') === 0 || strcasecmp($text, '/staff') === 0) {
+            $this->aiAgentService->pauseAiForChat($chatId, 60);
+            BotChatMessage::where('telegram_chat_id', (string)$chatId)->latest('id')->update(['needs_human' => true]);
+            $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, "Customer requested staff assistance via /human");
+            $staffNotice = ($this->aiAgentService->getOperatingMode() === 'standard')
+                ? "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ လူကိုယ်တိုင် ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။ 🙏"
+                : "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ လူကိုယ်တိုင် ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။\n(AI လက်ထောက်နှင့် ပြန်ပြောလိုပါက /ai ဟု ရိုက်ပို့နိုင်ပါသည်)";
+            $this->sendMessage($chatId, $staffNotice);
+            return;
+        }
+
+        // 4. Command & Menu Handling
+        $isStartCmd = str_starts_with($text, '/start');
+        $isAiActive = $this->aiAgentService->isEnabled() && !$this->aiAgentService->isAiPausedForChat($chatId);
+
+        if ($isStartCmd || (!$isAiActive && (strcasecmp($text, 'hi') === 0 || strcasecmp($text, 'hello') === 0 || strcasecmp($text, 'menu') === 0))) {
             // Check for deep link payload e.g. /start p_12 or /start cat_5 or /start ref_SALE-1234
             $parts = explode(' ', $text, 2);
             $payload = isset($parts[1]) ? trim($parts[1]) : '';
@@ -1191,52 +1488,101 @@ class TelegramBotService
         }
 
         $btnCatalog = trim((string)Setting::get('telegram_bot_btn_catalog', '🛍️ ကုန်ပစ္စည်းများ'));
-        $btnCart = trim((string)Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်'));
-        $btnOrders = trim((string)Setting::get('telegram_bot_btn_orders', '📦 အော်ဒါများ'));
+        $btnCart = trim((string)Setting::get('telegram_bot_btn_cart', '🛒 ဝယ်မည့်ပစ္စည်းများ'));
+        $btnOrders = trim((string)Setting::get('telegram_bot_btn_orders', '📦 တင်ထားသော Order များ'));
+        $btnCheckout = trim((string)Setting::get('telegram_bot_btn_checkout', '📦 မှာမည့်ပစ္စည်းများ Order တင်မည်'));
+        $btnCheckoutInline = trim((string)Setting::get('telegram_bot_cart_btn_checkout_inline', ''));
         $btnPayment = trim((string)Setting::get('telegram_bot_btn_payment', 'ℹ️ ငွေလွှဲရန် အချက်အလက်'));
         $btnContact = trim((string)Setting::get('telegram_bot_btn_contact', '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်'));
         $btnCancel = trim((string)Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)'));
 
-        if (($btnCatalog !== '' && ($text === $btnCatalog || str_contains($text, 'ကုန်ပစ္စည်းများ')))
-            || $text === '🛍️ ကုန်ပစ္စည်းများ'
-            || $text === '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်'
-            || $text === 'ကုန်ပစ္စည်းများ'
-            || str_starts_with($text, '/catalog')) {
-            $this->sendCatalogMenu($chatId);
+        $normalizeText = function (string $str): string {
+            return preg_replace('/[^\p{L}\p{M}\p{N}]+/u', '', mb_strtolower($str));
+        };
+
+        $cleanText = $normalizeText($text);
+        $cleanBtnCatalog = $normalizeText($btnCatalog);
+        $cleanBtnCart = $normalizeText($btnCart);
+        $cleanBtnOrders = $normalizeText($btnOrders);
+        $cleanBtnCheckout = $normalizeText($btnCheckout);
+        $cleanBtnCheckoutInline = $normalizeText($btnCheckoutInline);
+        $cleanBtnPayment = $normalizeText($btnPayment);
+        $cleanBtnContact = $normalizeText($btnContact);
+
+        // 1. Catalog Command
+        if (($cleanBtnCatalog !== '' && ($cleanText === $cleanBtnCatalog || str_starts_with($cleanText, $cleanBtnCatalog)))
+            || ($btnCatalog !== '' && (str_starts_with($text, $btnCatalog) || $text === $btnCatalog))
+            || (mb_strlen($cleanText) <= 20 && str_contains($cleanText, 'ကုန်ပစ္စည်း'))
+            || $cleanText === 'ပစ္စည်းများ'
+            || strcasecmp($text, '/catalog') === 0
+            || strcasecmp($text, 'catalog') === 0) {
+            if (Setting::get('telegram_bot_direct_categories', '0') === '1') {
+                $this->sendCategoryFilterMenu($chatId);
+            } else {
+                $this->sendCatalogMenu($chatId);
+            }
             return;
         }
 
-        $isCartCommand = ($btnCart !== '' && (str_starts_with($text, $btnCart) || $text === $btnCart))
-            || str_starts_with($text, '🛒 ခြင်းတောင်း')
-            || str_contains($text, 'ခြင်းတောင်း')
-            || str_starts_with($text, '/cart');
+        // 2. Checkout Command (Direct Order Placement Flow)
+        // High priority: Evaluated BEFORE Cart Command so that "📦 မှာမည့်ပစ္စည်းများ Order တင်မည်" immediately begins checkout (asks for phone number & address) without showing the Cart Review list again.
+        $isCheckoutTrigger = ($cleanBtnCheckout !== '' && ($cleanText === $cleanBtnCheckout || str_starts_with($cleanText, $cleanBtnCheckout)))
+            || ($cleanBtnCheckoutInline !== '' && ($cleanText === $cleanBtnCheckoutInline || str_starts_with($cleanText, $cleanBtnCheckoutInline)))
+            || ($btnCheckout !== '' && (str_starts_with($text, $btnCheckout) || $text === $btnCheckout))
+            || ($btnCheckoutInline !== '' && (str_starts_with($text, $btnCheckoutInline) || $text === $btnCheckoutInline))
+            || str_contains($cleanText, 'orderတင်')
+            || str_contains($cleanText, 'အော်ဒါတင်')
+            || strcasecmp($text, '/checkout') === 0
+            || strcasecmp($text, 'checkout') === 0;
+
+        if ($isCheckoutTrigger) {
+            $this->initiateCartCheckout($chatId, $userName);
+            return;
+        }
+
+        // 3. Cart View Command (Matches '🛒 မှာမည့်ပစ္စည်းများ', 'ဝယ်မည့်ပစ္စည်းများ', 'ခြင်းတောင်း', '/cart', etc.)
+        $isCartCommand = ($cleanBtnCart !== '' && ($cleanText === $cleanBtnCart || str_starts_with($cleanText, $cleanBtnCart)))
+            || ($btnCart !== '' && (str_starts_with($text, $btnCart) || $text === $btnCart))
+            || str_contains($cleanText, 'မှာမည့်ပစ္စည်း')
+            || str_contains($cleanText, 'ဝယ်မည့်ပစ္စည်း')
+            || str_contains($cleanText, 'ခြင်းတောင်း')
+            || str_contains($cleanText, 'ယူထားတဲ့စာရင်း')
+            || strcasecmp($text, '/cart') === 0
+            || strcasecmp($text, 'cart') === 0;
 
         if ($isCartCommand) {
             $this->sendCartView($chatId, $userName);
             return;
         }
 
-        if (($btnOrders !== '' && ($text === $btnOrders || str_contains($text, 'အော်ဒါများ')))
-            || $text === '📦 အော်ဒါများ'
-            || $text === '📦 ကျွန်ုပ်၏ အော်ဒါများ'
-            || $text === '🚚 အော်ဒါများ'
-            || str_starts_with($text, '/orders')) {
+        // 3. Customer Orders Command (Matches 'တင်ထားသော Order များ', 'အော်ဒါများ', etc.)
+        if (($cleanBtnOrders !== '' && ($cleanText === $cleanBtnOrders || str_contains($cleanText, $cleanBtnOrders)))
+            || ($btnOrders !== '' && (str_starts_with($text, $btnOrders) || $text === $btnOrders))
+            || str_contains($cleanText, 'တင်ထားသော')
+            || str_contains($cleanText, 'အော်ဒါများ')
+            || str_contains($cleanText, 'orderများ')
+            || strcasecmp($text, '/orders') === 0
+            || strcasecmp($text, 'orders') === 0) {
             $this->sendCustomerOrders($chatId);
             return;
         }
 
-        if (($btnPayment !== '' && ($text === $btnPayment || str_contains($text, 'ငွေလွှဲ')))
-            || $text === 'ℹ️ ငွေလွှဲရန် အချက်အလက်'
-            || $text === '💳 ငွေလွှဲရန်'
-            || str_starts_with($text, '/payment')) {
+        // 4. Payment Info Command (Matches 'ငွေလွှဲရန် အချက်အလက်', etc.)
+        if (($cleanBtnPayment !== '' && ($cleanText === $cleanBtnPayment || str_contains($cleanText, $cleanBtnPayment)))
+            || ($btnPayment !== '' && (str_starts_with($text, $btnPayment) || $text === $btnPayment))
+            || str_contains($cleanText, 'ငွေလွှဲ')
+            || strcasecmp($text, '/payment') === 0
+            || strcasecmp($text, 'payment') === 0) {
             $this->sendPaymentInfo($chatId);
             return;
         }
 
-        if (($btnContact !== '' && ($text === $btnContact || str_contains($text, 'ဆက်သွယ်ရန်')))
-            || $text === '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်'
-            || $text === '✉️ ဆိုင်ကိုဆက်သွယ်ရန်'
-            || str_starts_with($text, '/contact')) {
+        // 5. Contact Shop Command (Matches 'ဆိုင်နှင့် ဆက်သွယ်ရန်', etc.)
+        if (($cleanBtnContact !== '' && ($cleanText === $cleanBtnContact || str_contains($cleanText, $cleanBtnContact)))
+            || ($btnContact !== '' && (str_starts_with($text, $btnContact) || $text === $btnContact))
+            || str_contains($cleanText, 'ဆက်သွယ်ရန်')
+            || strcasecmp($text, '/contact') === 0
+            || strcasecmp($text, 'contact') === 0) {
             $this->sendContactInfo($chatId);
             return;
         }
@@ -1360,8 +1706,647 @@ class TelegramBotService
             }
         }
 
-        // Default greeting / welcome menu
+        // 🤖 Smart AI Sales Agent Interception (Natural Language / Product & Policy Inquiries)
+        $operatingMode = $this->aiAgentService->getOperatingMode();
+        if ($operatingMode !== 'standard' && !empty($text) && $this->aiAgentService->isEnabled() && !$this->aiAgentService->isAiPausedForChat($chatId)) {
+            $this->sendChatAction($chatId, 'typing');
+            $aiRes = $this->handleCustomerQuery($chatId, $userName, $text, $usernameTag);
+            if ($aiRes && !empty($aiRes['reply'])) {
+                return;
+            }
+        }
+
+        // If AI is paused due to Human Staff Takeover
+        if ($this->aiAgentService->isEnabled() && $this->aiAgentService->isAiPausedForChat($chatId)) {
+            $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, $text);
+            $this->sendMessage($chatId, "👨‍💼 *ဆိုင်တာဝန်ခံ/ဝန်ထမ်းထံသို့ စာပေးပို့ထားပါသည်ရှင်။* ခေတ္တစောင့်ဆိုင်းပေးပါခင်ဗျာ။\n\n💡 _AI လက်ထောက်နှင့် ချက်ချင်း စကားဆက်ပြောလိုပါက အောက်ပါခလုတ်ကို နှိပ်ပါ သို့မဟုတ်_ /ai _ဟု ရိုက်ပို့ပါရှင်။_", [
+                'inline_keyboard' => [
+                    [
+                        ['text' => '🤖 AI ဖြင့် ဆက်ပြောမည်', 'callback_data' => 'resume_ai_mode'],
+                        ['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'catalog_main'],
+                    ]
+                ]
+            ]);
+            return;
+        }
+
+        // If AI is enabled but was temporarily unable to generate a response (e.g. LLM timeout or temporary rate limit):
+        if ($this->aiAgentService->isEnabled()) {
+            $fallbackMsg = "မင်္ဂလာပါရှင် 🙏 လူကြီးမင်း မေးမြန်းထားသော ကုန်ပစ္စည်းများနှင့် အချက်အလက်များကို အောက်ပါ ခလုတ်များမှတဆင့် အလွယ်တကူ ရွေးချယ်ကြည့်ရှုနိုင်ပါသည်ရှင်။\n\n💬 ဆိုင်ဝန်ထမ်းနှင့် တိုက်ရိုက်ပြောဆိုလိုပါက /human ဟု ရိုက်ပို့နိုင်ပါသည်ရှင်။";
+            $this->sendMessage($chatId, $fallbackMsg, [
+                'inline_keyboard' => [
+                    [
+                        ['text' => '🛍️ ကုန်ပစ္စည်းများ အားလုံးကြည့်မည်', 'callback_data' => 'nav_all_products'],
+                        ['text' => '📂 အမျိုးအစားအလိုက်', 'callback_data' => 'nav_categories'],
+                    ],
+                    [
+                        ['text' => '👨‍💼 ဆိုင်ဝန်ထမ်းနှင့် စကားပြောမည်', 'callback_data' => 'ask_human'],
+                        ['text' => '🛒 ခြင်းတောင်း ကြည့်မည်', 'callback_data' => 'cart_view'],
+                    ]
+                ]
+            ]);
+            return;
+        }
+
+        // Default greeting / welcome menu (only when AI is disabled)
         $this->sendWelcomeMenu($chatId, $userName);
+    }
+
+    /**
+     * 🧠 Main Entry: Process Customer Natural Language Query with AI Agent
+     * Executes Conversational Autonomous Commerce (Auto Add to Cart & Auto Order Finalize)
+     */
+    public function handleCustomerQuery(
+        int|string $chatId,
+        string $userName,
+        string $text,
+        ?string $usernameTag = ''
+    ): ?array {
+        $aiRes = $this->aiAgentService->handleCustomerQuery($chatId, $userName, $text, $usernameTag);
+
+        if (!$aiRes || empty($aiRes['reply'])) {
+            return null;
+        }
+
+        $this->executeAiAutonomousActions($chatId, $userName, $text, $usernameTag ?: '', $aiRes);
+
+        return $aiRes;
+    }
+
+    /**
+     * 🛒 Auto-Recover Cart from Chat History if customer is checking out but cart is empty
+     */
+    public function recoverCartFromChatHistory(int|string $chatId): array
+    {
+        $cart = $this->getCart($chatId);
+        if (!empty($cart)) {
+            return $cart;
+        }
+
+        $recentMessages = BotChatMessage::where('telegram_chat_id', (string)$chatId)
+            ->latest('id')
+            ->take(10)
+            ->get();
+
+        $candidateProductId = null;
+        $candidateVariantId = null;
+
+        // 1. First, search recent message texts for specific bot-available products (newest messages first)
+        $botProducts = Product::with(['variants' => fn($vq) => $vq->where('is_active', true)])
+            ->where('is_bot_available', true)
+            ->where(fn($q) => $q->where('is_active', true)->orWhere('status', 'Active'))
+            ->get();
+
+        foreach ($recentMessages as $msg) {
+            $txt = mb_strtolower($msg->message_text);
+            foreach ($botProducts as $prod) {
+                $pName = mb_strtolower($prod->name);
+                $words = array_filter(explode(' ', $pName), fn($w) => mb_strlen($w) >= 4);
+                $matchCount = 0;
+                foreach ($words as $w) {
+                    if (str_contains($txt, $w)) {
+                        $matchCount++;
+                    }
+                }
+                if ($matchCount >= 2 || (count($words) === 1 && $matchCount === 1)) {
+                    $candidateProductId = $prod->id;
+                    if ($prod->has_variants && $prod->variants->isNotEmpty()) {
+                        foreach ($prod->variants as $var) {
+                            $vName = mb_strtolower($var->name);
+                            if (str_contains($txt, 'အသားလတ်') && (str_contains($vName, 'အသားလတ်') || str_contains($vName, 'no.2') || str_contains($vName, 'beige'))) {
+                                $candidateVariantId = $var->id;
+                                break;
+                            }
+                            if (str_contains($txt, 'အသားဖြူ') && (str_contains($vName, 'အသားဖြူ') || str_contains($vName, 'no.1') || str_contains($vName, 'light'))) {
+                                $candidateVariantId = $var->id;
+                                break;
+                            }
+                        }
+                        if (!$candidateVariantId) {
+                            $candidateVariantId = $prod->variants->first()->id;
+                        }
+                    }
+                    break 2;
+                }
+            }
+        }
+
+        // 2. If not found in text, look at message metadata
+        if (!$candidateProductId) {
+            foreach ($recentMessages as $msg) {
+                $meta = is_array($msg->metadata) ? $msg->metadata : (json_decode($msg->metadata ?? '[]', true) ?: []);
+                if (!empty($meta['cart_action']['items'])) {
+                    foreach ($meta['cart_action']['items'] as $it) {
+                        if (!empty($it['product_id'])) {
+                            $candidateProductId = (int)$it['product_id'];
+                            $candidateVariantId = !empty($it['variant_id']) ? (int)$it['variant_id'] : null;
+                            break 2;
+                        }
+                    }
+                }
+                if (!empty($meta['recommended_product_ids'])) {
+                    $candidateProductId = (int)$meta['recommended_product_ids'][0];
+                    break;
+                }
+            }
+        }
+
+        if ($candidateProductId) {
+            $product = Product::find($candidateProductId);
+            if ($product && $product->is_bot_available) {
+                $variant = $candidateVariantId ? ProductVariant::find($candidateVariantId) : ($product->has_variants ? $product->variants()->where('is_active', true)->first() : null);
+                $this->addToCart($chatId, $product, $variant, 1);
+                Log::info("Cart auto-recovered for chat {$chatId}: Product {$product->name} (Variant: " . ($variant?->name ?? 'none') . ")");
+                return $this->getCart($chatId);
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * 🔎 Detect Customer Purchase Intent & Product in text (Deterministic Safety Net)
+     */
+    public function detectBuyIntentAndProduct(string $text, int|string $chatId): ?array
+    {
+        $lowerText = mb_strtolower($text);
+        $buyKeywords = [
+            'ယူမယ်', 'ဝယ်မယ်', 'မှာမယ်', 'ဒါယူ', 'ဒါဝယ်', 'ဒါလေးယူ', 'ဒါလေးဝယ်',
+            'အဲ့တာယူ', 'အဲ့ဒါယူ', 'အဲ့တာလေးယူ', 'အဲ့ဒါလေးယူ', 'အဲ့တာလေးဝယ်', 'အဲ့တာလေးယူမယ်နော်',
+            'ခြင်းတောင်းထဲထည့်', 'ခြင်းတောင်းထဲ', 'ဝယ်ချင်', 'မှာချင်', 'ယူချင်',
+            'buy', 'order', 'purchase', 'add to cart'
+        ];
+
+        $hasBuyIntent = false;
+        foreach ($buyKeywords as $kw) {
+            if (str_contains($lowerText, $kw)) {
+                $hasBuyIntent = true;
+                break;
+            }
+        }
+
+        if (!$hasBuyIntent) {
+            return null;
+        }
+
+        $products = Product::with(['variants' => fn($vq) => $vq->where('is_active', true)])
+            ->where('is_bot_available', true)
+            ->where(fn($q) => $q->where('is_active', true)->orWhere('status', 'Active'))
+            ->get();
+
+        $matchedProduct = null;
+        $matchedVariant = null;
+
+        foreach ($products as $p) {
+            $pName = mb_strtolower($p->name);
+            $pCode = mb_strtolower((string)$p->code);
+            $pSku = mb_strtolower((string)$p->sku);
+
+            if (($pCode && str_contains($lowerText, $pCode)) || ($pSku && str_contains($lowerText, $pSku))) {
+                $matchedProduct = $p;
+                break;
+            }
+
+            $words = array_filter(explode(' ', $pName), fn($w) => mb_strlen($w) >= 4);
+            $matchCount = 0;
+            foreach ($words as $w) {
+                if (str_contains($lowerText, $w)) {
+                    $matchCount++;
+                }
+            }
+            if ($matchCount >= 2 || (count($words) === 1 && $matchCount === 1)) {
+                $matchedProduct = $p;
+                break;
+            }
+        }
+
+        // If product not explicitly named, check recent recommendations
+        if (!$matchedProduct) {
+            $recent = BotChatMessage::where('telegram_chat_id', (string)$chatId)
+                ->latest('id')
+                ->take(6)
+                ->get();
+
+            foreach ($recent as $msg) {
+                $meta = is_array($msg->metadata) ? $msg->metadata : (json_decode($msg->metadata ?? '[]', true) ?: []);
+                if (!empty($meta['recommended_product_ids'])) {
+                    $matchedProduct = Product::find($meta['recommended_product_ids'][0]);
+                    if ($matchedProduct) break;
+                }
+            }
+        }
+
+        if ($matchedProduct) {
+            if ($matchedProduct->has_variants && $matchedProduct->variants->isNotEmpty()) {
+                foreach ($matchedProduct->variants as $v) {
+                    $vName = mb_strtolower($v->name);
+                    $vSku = mb_strtolower((string)$v->sku);
+                    if ($vSku && str_contains($lowerText, $vSku)) {
+                        $matchedVariant = $v;
+                        break;
+                    }
+                    if (str_contains($lowerText, 'အသားလတ်') && (str_contains($vName, 'အသားလတ်') || str_contains($vName, 'no.2') || str_contains($vName, 'natural') || str_contains($vName, 'beige'))) {
+                        $matchedVariant = $v;
+                        break;
+                    }
+                    if (str_contains($lowerText, 'အသားဖြူ') && (str_contains($vName, 'အသားဖြူ') || str_contains($vName, 'no.1') || str_contains($vName, 'light') || str_contains($vName, 'fair'))) {
+                        $matchedVariant = $v;
+                        break;
+                    }
+                    if (str_contains($lowerText, mb_strtolower($v->name))) {
+                        $matchedVariant = $v;
+                        break;
+                    }
+                }
+                if (!$matchedVariant) {
+                    $matchedVariant = $matchedProduct->variants->first();
+                }
+            }
+
+            $qty = 1;
+            if (preg_match('/([0-9၀-၉]+)\s*(?:ခု|ဘူး|ထည်|လုံး|တွဲ|pack|pcs)/u', $lowerText, $qMatch)) {
+                $bDigits = ['၀','၁','၂','၃','၄','၅','၆','၇','၈','၉'];
+                $eDigits = ['0','1','2','3','4','5','6','7','8','9'];
+                $cleanQ = str_replace($bDigits, $eDigits, $qMatch[1]);
+                $qty = max(1, (int)$cleanQ);
+            }
+
+            return [
+                'product' => $matchedProduct,
+                'variant' => $matchedVariant,
+                'quantity' => $qty,
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * 📞 Extract Phone & Township from text if customer provided delivery info
+     */
+    public function detectDeliveryInfoFromText(string $text): array
+    {
+        $bDigits = ['၀','၁','၂','၃','၄','၅','၆','၇','၈','၉'];
+        $eDigits = ['0','1','2','3','4','5','6','7','8','9'];
+        $cleanText = str_replace($bDigits, $eDigits, $text);
+
+        $phone = null;
+        if (preg_match('/(?:09|\+?959)[\d\s\-]{7,11}/', $cleanText, $pm)) {
+            $phone = preg_replace('/\D/', '', $pm[0]);
+        }
+
+        $township = null;
+        $activeTownships = DeliveryTownship::where('is_active', true)->get(['id', 'name', 'name_mm', 'code']);
+        foreach ($activeTownships as $t) {
+            if ($t->name_mm && str_contains($text, $t->name_mm)) {
+                $township = $t->name_mm;
+                break;
+            }
+            if ($t->name && str_contains(mb_strtolower($text), mb_strtolower($t->name))) {
+                $township = $t->name;
+                break;
+            }
+        }
+
+        return [
+            'phone' => $phone,
+            'township' => $township,
+        ];
+    }
+
+    /**
+     * ⚡ Execute Structured AI Actions:
+     * - Auto Add to Cart / Remove / Clear
+     * - Auto POS Order Finalization
+     * - Smart Hybrid conversational flow with product cards
+     */
+    public function executeAiAutonomousActions(
+        int|string $chatId,
+        string $userName,
+        string $text,
+        string $usernameTag,
+        array $aiRes
+    ): array {
+        $operatingMode = $this->aiAgentService->getOperatingMode();
+        $cartAction = $aiRes['cart_action'] ?? ['type' => 'none', 'items' => []];
+        $orderAction = $aiRes['order_action'] ?? ['type' => 'none'];
+
+        $cartActionType = $cartAction['type'] ?? 'none';
+        $orderActionType = $orderAction['type'] ?? 'none';
+
+        $cartUpdated = false;
+        $orderCreated = false;
+
+        // 🛡️ Deterministic Safety Net 1: Fallback Cart Auto-Detection
+        if ($cartActionType !== 'add_to_cart' || empty($cartAction['items'])) {
+            $detectedBuy = $this->detectBuyIntentAndProduct($text, $chatId);
+            if ($detectedBuy) {
+                $p = $detectedBuy['product'];
+                $v = $detectedBuy['variant'];
+                $q = $detectedBuy['quantity'];
+                $this->addToCart($chatId, $p, $v, $q);
+                $cartUpdated = true;
+                $cartAction = [
+                    'type' => 'add_to_cart',
+                    'items' => [
+                        [
+                            'product_id' => $p->id,
+                            'variant_id' => $v?->id,
+                            'quantity' => $q,
+                        ]
+                    ]
+                ];
+                $cartActionType = 'add_to_cart';
+                Log::info("Deterministic Cart Added: Product {$p->name} (Variant: " . ($v?->name ?? 'none') . ") for chat {$chatId}");
+            }
+        }
+
+        // 1. Process cart_action
+        if ($cartActionType === 'add_to_cart' && !empty($cartAction['items']) && !$cartUpdated) {
+            $warehouseId = (int)Setting::get('telegram_bot_warehouse_id', 1);
+            $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
+
+            foreach ($cartAction['items'] as $it) {
+                $product = Product::find($it['product_id'] ?? 0);
+                if (!$product || !$product->is_bot_available) continue;
+
+                $variant = !empty($it['variant_id']) ? ProductVariant::find($it['variant_id']) : null;
+                $qty = max(1, (float)($it['quantity'] ?? 1));
+
+                if (!$allowOutOfStock) {
+                    $stockQuery = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $product->id);
+                    if ($variant) {
+                        $stockQuery->where('product_variant_id', $variant->id);
+                    }
+                    $availStock = (float)$stockQuery->sum('quantity');
+                    if ($availStock < $qty && $availStock <= 0) {
+                        continue;
+                    }
+                }
+
+                $this->addToCart($chatId, $product, $variant, $qty);
+                $cartUpdated = true;
+            }
+        } elseif ($cartActionType === 'remove_from_cart') {
+            if (!empty($cartAction['items'])) {
+                foreach ($cartAction['items'] as $it) {
+                    $pId = (int)($it['product_id'] ?? 0);
+                    $vId = !empty($it['variant_id']) ? (int)$it['variant_id'] : null;
+                    $itemKey = $vId ? "p_{$pId}_v_{$vId}" : "p_{$pId}";
+                    $this->removeFromCart($chatId, $itemKey);
+                    $cartUpdated = true;
+                }
+            }
+        } elseif ($cartActionType === 'clear_cart') {
+            $this->clearCart($chatId);
+            $cartUpdated = true;
+        }
+
+        // 🛡️ Deterministic Safety Net 2: Fallback Delivery & Phone Auto-Detection
+        $deliveryInfo = $this->detectDeliveryInfoFromText($text);
+        if ($orderActionType !== 'create_order' && !empty($deliveryInfo['phone'])) {
+            $orderActionType = 'create_order';
+            $orderAction['type'] = 'create_order';
+            $orderAction['phone'] = $deliveryInfo['phone'];
+            if (!empty($deliveryInfo['township'])) {
+                $orderAction['township_name'] = $deliveryInfo['township'];
+            }
+            $orderAction['address'] = $text;
+        }
+
+        // 2. Process order_action (Autonomous POS Order Finalization)
+        if ($orderActionType === 'create_order') {
+            $cart = $this->getCart($chatId);
+
+            // If cart is empty but cart action had items, populate cart first
+            if (empty($cart) && !empty($cartAction['items'])) {
+                foreach ($cartAction['items'] as $it) {
+                    $product = Product::find($it['product_id'] ?? 0);
+                    if (!$product || !$product->is_bot_available) continue;
+                    $variant = !empty($it['variant_id']) ? ProductVariant::find($it['variant_id']) : null;
+                    $qty = max(1, (float)($it['quantity'] ?? 1));
+                    $this->addToCart($chatId, $product, $variant, $qty);
+                }
+                $cart = $this->getCart($chatId);
+            }
+
+            // 🛡️ Deterministic Safety Net 3: Auto-Recover Cart from Chat History!
+            if (empty($cart)) {
+                $cart = $this->recoverCartFromChatHistory($chatId);
+            }
+
+            // Fallback: If cart is empty but recommended products exist and user wanted to buy
+            if (empty($cart) && !empty($aiRes['recommended_product_ids'])) {
+                $firstRecId = (int)($aiRes['recommended_product_ids'][0] ?? 0);
+                $product = Product::find($firstRecId);
+                if ($product && $product->is_bot_available) {
+                    $variant = $product->has_variants ? $product->variants()->where('is_active', true)->first() : null;
+                    $this->addToCart($chatId, $product, $variant, 1);
+                    $cart = $this->getCart($chatId);
+                }
+            }
+
+            // Phone normalization and validation
+            $rawPhone = (string)($orderAction['phone'] ?? $deliveryInfo['phone'] ?? '');
+            $burmeseDigits = ['၀','၁','၂','၃','၄','၅','၆','၇','၈','၉'];
+            $englishDigits = ['0','1','2','3','4','5','6','7','8','9'];
+            $cleanPhone = str_replace($burmeseDigits, $englishDigits, $rawPhone);
+            $normalizedPhone = $this->normalizePhoneNumber($cleanPhone);
+            $digitsOnly = preg_replace('/\D/', '', $normalizedPhone);
+            $isValidPhone = strlen($digitsOnly) >= 8;
+
+            if (!empty($cart) && $isValidPhone) {
+                $townshipInput = trim((string)($orderAction['township_name'] ?? $deliveryInfo['township'] ?? ''));
+                $deliveryType = $orderAction['delivery_type'] ?? 'city';
+
+                $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 2500);
+                $expressFee = (float)Setting::get('telegram_bot_delivery_express_fee', 3000);
+                $pickupFee = (float)Setting::get('telegram_bot_delivery_store_pickup_fee', 0);
+
+                $shippingFee = $cityFee;
+                $townshipId = null;
+                $regionId = null;
+                $resolvedTownshipDisplay = !empty($townshipInput) ? $townshipInput : 'City Delivery';
+                $deliveryMethod = "City Delivery ({$resolvedTownshipDisplay})";
+
+                if ($deliveryType === 'store_pickup' || str_contains($townshipInput, 'ဆိုင်လာယူ') || str_contains($townshipInput, 'pickup')) {
+                    $shippingFee = $pickupFee;
+                    $resolvedTownshipDisplay = 'ဆိုင်တွင် လာယူမည် (Store Pickup)';
+                    $deliveryMethod = 'Store Pickup (ဆိုင်လာယူ)';
+                } elseif ($deliveryType === 'express') {
+                    $shippingFee = $expressFee;
+                    $resolvedTownshipDisplay = !empty($townshipInput) ? $townshipInput : 'Express / Highway Bus';
+                    $deliveryMethod = "Express Delivery (ကားဂိတ်/အမြန်ချော) - {$resolvedTownshipDisplay}";
+                } else {
+                    $matchedTownship = null;
+                    if (!empty($townshipInput)) {
+                        $matchedTownship = DeliveryTownship::where('is_active', true)
+                            ->where(function ($q) use ($townshipInput) {
+                                $q->where('name', 'like', "%{$townshipInput}%")
+                                  ->orWhere('name_mm', 'like', "%{$townshipInput}%")
+                                  ->orWhere('code', 'like', "%{$townshipInput}%");
+                            })
+                            ->first();
+                    }
+
+                    if ($matchedTownship) {
+                        $townshipId = $matchedTownship->id;
+                        $regionId = $matchedTownship->delivery_region_id;
+                        $shippingFee = (float)$matchedTownship->delivery_fee;
+                        $itemsTotal = (float)collect($cart)->sum('subtotal');
+                        if ($matchedTownship->free_delivery_threshold && $itemsTotal >= (float)$matchedTownship->free_delivery_threshold) {
+                            $shippingFee = 0.0;
+                        }
+                        $resolvedTownshipDisplay = $matchedTownship->name_mm ?: $matchedTownship->name;
+                        $deliveryMethod = "City Delivery ({$resolvedTownshipDisplay})";
+                    }
+                }
+
+                $cartSummary = $this->getCartSummary($chatId);
+                $custName = !empty($orderAction['customer_name']) ? $orderAction['customer_name'] : ($userName ?: 'Telegram Customer');
+                $rawAddr = !empty($orderAction['address']) ? $orderAction['address'] : $resolvedTownshipDisplay;
+                $paymentMethod = !empty($orderAction['payment_method']) ? $orderAction['payment_method'] : 'Cash on Delivery';
+
+                $session = [
+                    'is_cart' => true,
+                    'items' => array_values($cart),
+                    'grand_total' => $cartSummary['grand_total'],
+                    'total_qty' => $cartSummary['total_qty'],
+                    'customer_name' => $custName,
+                    'phone' => $normalizedPhone,
+                    'delivery_method' => $deliveryMethod,
+                    'delivery_township' => $resolvedTownshipDisplay,
+                    'delivery_township_id' => $townshipId,
+                    'delivery_region_id' => $regionId,
+                    'shipping_fee' => $shippingFee,
+                    'address' => $rawAddr,
+                    'payment_type' => $paymentMethod,
+                    'payment_status' => 'Unpaid',
+                    'step' => 'completed',
+                    'ai_autonomous_order' => true,
+                ];
+
+                // 1. Send conversational AI reply message first
+                $this->sendMessage($chatId, $aiRes['reply']);
+
+                // 2. Finalize order (creates POS Sale, clears cart, prints voucher in chat)
+                $this->finalizeOrder($chatId, $session, $custName, $usernameTag);
+                $orderCreated = true;
+            }
+        }
+
+        // 🔒 Anti-Hallucination Gatekeeper (Accounting & Business Integrity Guardrail)
+        if (!$orderCreated) {
+            $rawReply = $aiRes['reply'] ?? '';
+            $hallucinationPatterns = [
+                'အောင်မြင်စွာ တင်ပေးလိုက်ပါပြီ',
+                'အော်ဒါလေးကို အောင်မြင်စွာ တင်ပေး',
+                'အော်ဒါလေးကို တင်ပေးလိုက်ပါပြီ',
+                'အော်ဒါတင်ပေးလိုက်ပါပြီ',
+                'မှာယူမှု အောင်မြင်',
+                'အော်ဒါလေး တင်ပေးပြီး',
+                'order has been placed',
+                'order confirmed'
+            ];
+            $isHallucinating = false;
+            foreach ($hallucinationPatterns as $hp) {
+                if (str_contains($rawReply, $hp)) {
+                    $isHallucinating = true;
+                    break;
+                }
+            }
+
+            if ($isHallucinating) {
+                $cleanPhone = $deliveryInfo['phone'] ?? null;
+                if ($cleanPhone) {
+                    $aiRes['reply'] = "မင်္ဂလာပါရှင် 🙏 လူကြီးမင်း ပေးပို့ထားသော လိပ်စာနှင့် ဖုန်းနံပါတ် ({$cleanPhone}) ကို လက်ခံရရှိထားပါသည်ရှင်။\n\nမှာယူလိုသည့် ကုန်ပစ္စည်းကို အတည်ပြုရန် လိုအပ်နေပါသဖြင့် မှာယူလိုသော ပစ္စည်းအမည် (သို့မဟုတ်) အရောင်/ဆိုဒ် လေးကို ပြောပြပေးပါဦးရှင့်။ စုစုက POS စနစ်တွင် အော်ဒါ ချက်ချင်း တင်ပေးပါမည်ရှင်။";
+                } else {
+                    $aiRes['reply'] = "ဟုတ်ကဲ့ပါရှင် 🙏 အော်ဒါ အောင်မြင်စွာ တင်နိုင်ရန်အတွက် ပို့ဆောင်ရမည့် မြို့နယ်၊ လိပ်စာ နှင့် ဖုန်းနံပါတ်လေးကို ပြောပြပေးပါဦးရှင့်။";
+                }
+            }
+        }
+
+        // 3. Log AI reply in database
+        BotChatMessage::create([
+            'telegram_chat_id' => (string)$chatId,
+            'customer_name' => $userName,
+            'telegram_username' => $usernameTag,
+            'sender_type' => 'ai',
+            'message_type' => 'text',
+            'message_text' => $aiRes['reply'],
+            'metadata' => [
+                'recommended_product_ids' => $aiRes['recommended_product_ids'] ?? [],
+                'suggested_action' => $aiRes['suggested_action'] ?? 'none',
+                'cart_action' => $cartAction,
+                'order_action' => $orderAction,
+                'order_created' => $orderCreated,
+            ],
+            'is_read' => true,
+            'needs_human' => !empty($aiRes['needs_human']),
+        ]);
+
+        // If order was already finalized above, voucher & reply already sent!
+        if ($orderCreated) {
+            if (!empty($aiRes['needs_human'])) {
+                $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, $text);
+            }
+            return $aiRes;
+        }
+
+        // 4. Send AI dialogue response (if not already sent during order creation)
+        $this->sendMessage($chatId, $aiRes['reply']);
+
+        // 5. Handle Interactive Buttons & Product Cards in Hybrid Mode
+        $recIds = (array)($aiRes['recommended_product_ids'] ?? []);
+        if (empty($recIds)) {
+            $lastProdId = Cache::get("tg_last_visual_product_{$chatId}");
+            $lowerText = mb_strtolower($text);
+            $isBuyIntent = str_contains($lowerText, 'ဝယ်') 
+                || str_contains($lowerText, 'မှာ') 
+                || str_contains($lowerText, 'ယူ') 
+                || str_contains($lowerText, 'buy') 
+                || str_contains($lowerText, 'order');
+            if ($lastProdId && $isBuyIntent) {
+                $recIds = [(int)$lastProdId];
+            }
+        }
+
+        $recProducts = collect();
+        if (!empty($recIds)) {
+            $recProducts = Product::whereIn('id', $recIds)
+                ->where('is_bot_available', true)
+                ->where(function ($q) {
+                    $q->whereNull('is_active')->orWhere('is_active', true)->orWhere('status', 'Active');
+                })
+                ->take(3)
+                ->get();
+        }
+
+        if ($recProducts->isNotEmpty()) {
+            $cIdx = 1;
+            foreach ($recProducts as $rp) {
+                $this->sendProductCardItem($chatId, $rp, $cIdx++);
+            }
+        }
+
+        $tmaUrl = Setting::get('telegram_bot_tma_url', '');
+        $tmaEnabled = Setting::get('telegram_bot_tma_enabled', '1') === '1';
+        $navRow = [];
+        if ($tmaEnabled && !empty($tmaUrl)) {
+            $navRow[] = ['text' => '🛍️ Shop Now', 'web_app' => ['url' => $tmaUrl]];
+        }
+        $navRow[] = ['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'catalog_main'];
+        $navRow[] = ['text' => '👨‍💼 ဝန်ထမ်းနှင့် စကားပြောမည်', 'callback_data' => 'ask_human'];
+
+        $this->sendMessage($chatId, "👇 _အထက်ပါ ကုန်ပစ္စည်းများမှ မှာယူလိုပါက ခလုတ်ကို နှိပ်နိုင်ပါသည်ရှင်_", [
+            'inline_keyboard' => [$navRow]
+        ]);
+
+        if (!empty($aiRes['needs_human'])) {
+            $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, $text);
+        }
+
+        return $aiRes;
     }
 
     /**
@@ -1494,40 +2479,93 @@ class TelegramBotService
     }
 
     /**
+     * Format Welcome Message String
+     */
+    public function formatWelcomeMessage(string $userName, ?string $chatId = null): string
+    {
+        $shopName = Setting::get('company_name', 'အလင်းသစ် (Ah Linn Thit)');
+        $welcomeTemplate = Setting::get('telegram_bot_welcome_msg', '');
+        $displayName = !empty($userName) ? $userName : 'ဖောက်သည်';
+
+        if (!empty(trim($welcomeTemplate))) {
+            return $this->replacePlaceholders($welcomeTemplate, [
+                'customer_name' => $displayName,
+                'user_name' => $displayName,
+                'shop_name' => $shopName,
+            ]);
+        }
+
+        return "👋 *မင်္ဂလာပါ {$displayName}!* \n"
+             . "🏬 *{$shopName}* မှ လှိုက်လှဲစွာ ကြိုဆိုပါသည်ရှင်။\n\n"
+             . "ကျွန်မတို့ဆိုင်မှ ကုန်ပစ္စည်းများကို အောက်ပါခလုတ်များမှတဆင့် အလွယ်တကူ ရွေးချယ်မှာယူနိုင်ပါပြီရှင်။";
+    }
+
+    /**
      * Catalog Navigation Hub: Options to view all, by category, by brand, or search
      */
     public function sendCatalogMenu(int|string $chatId, ?int $messageIdToEdit = null): void
     {
         $tpl = Setting::get('telegram_bot_catalog_menu_msg', '');
         $text = !empty(trim($tpl))
-            ? $this->replacePlaceholders($tpl, [])
-            : "🛍️ *ကုန်ပစ္စည်းများ ကြည့်ရှု/မှာယူရန် ရွေးချယ်ပါ*\n\n"
-            . "အောက်ပါ ခလုတ်များမှတဆင့် အမျိုးအစားအလိုက်၊ တံဆိပ်အလိုက် (သို့မဟုတ်) ရှာဖွေ၍ လွယ်ကူစွာ မှာယူနိုင်ပါသည်-";
+            ? $this->replacePlaceholders($tpl, ['chat_id' => $chatId])
+            : "🛍️ *ကျွန်မတို့ဆိုင်၏ ကုန်ပစ္စည်း ကတ်တလောက်*\n"
+            . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            . "လူကြီးမင်း လိုအပ်သော ကုန်ပစ္စည်းများကို အောက်ပါ အမျိုးအစားများမှတဆင့် အဆင်ပြေစွာ ရှာဖွေရွေးချယ် ဝယ်ယူနိုင်ပါသည်ရှင်။\n\n"
+            . "ရွေးချယ်လိုသည့် ကဏ္ဍကို နှိပ်ပေးပါ-";
 
         $btnAll = Setting::get('telegram_bot_btn_all_products', '📦 ပစ္စည်းအားလုံး ကြည့်မည် (All Products)');
         $btnCats = Setting::get('telegram_bot_btn_categories', '📂 အမျိုးအစားအလိုက် (Categories)');
         $btnBrands = Setting::get('telegram_bot_btn_brands', '🏷️ တံဆိပ်အလိုက် (Brands)');
         $btnSearch = Setting::get('telegram_bot_btn_search', '🔎 အမည် / ကုတ်နံပါတ်ဖြင့် ရှာမည် (Search)');
+        $btnHome = Setting::get('telegram_bot_btn_home', '🏠 ပင်မ မီနူး (Home)');
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
-        $buttons = [
-            [
+        $showAll = Setting::get('telegram_bot_show_catalog_btn_all', '1') === '1';
+        $showCats = Setting::get('telegram_bot_show_catalog_btn_categories', '1') === '1';
+        $showBrands = Setting::get('telegram_bot_show_catalog_btn_brands', '1') === '1';
+        $showSearch = Setting::get('telegram_bot_show_catalog_btn_search', '1') === '1';
+        $showHome = Setting::get('telegram_bot_show_catalog_btn_home', '1') === '1';
+        $showCancel = Setting::get('telegram_bot_show_catalog_btn_cancel', '1') === '1';
+
+        $buttons = [];
+        if ($showAll) {
+            $buttons[] = [
                 ['text' => !empty($btnAll) ? $btnAll : '📦 ပစ္စည်းအားလုံး ကြည့်မည် (All Products)', 'callback_data' => 'nav_all_products'],
-            ],
-            [
+            ];
+        }
+        if ($showCats) {
+            $buttons[] = [
                 ['text' => !empty($btnCats) ? $btnCats : '📂 အမျိုးအစားအလိုက် (Categories)', 'callback_data' => 'nav_categories'],
-            ],
-            [
+            ];
+        }
+        if ($showBrands) {
+            $buttons[] = [
                 ['text' => !empty($btnBrands) ? $btnBrands : '🏷️ တံဆိပ်အလိုက် (Brands)', 'callback_data' => 'nav_brands'],
-            ],
-            [
+            ];
+        }
+        if ($showSearch) {
+            $buttons[] = [
                 ['text' => !empty($btnSearch) ? $btnSearch : '🔎 အမည် / ကုတ်နံပါတ်ဖြင့် ရှာမည် (Search)', 'callback_data' => 'nav_search'],
-            ],
-            [
-                ['text' => '🏠 ပင်မ မီနူး (Home)', 'callback_data' => 'nav_home'],
+            ];
+        }
+
+        if ($showHome) {
+            $buttons[] = [
+                ['text' => !empty($btnHome) ? $btnHome : '🏠 ပင်မ မီနူး (Home)', 'callback_data' => 'nav_home'],
+            ];
+        }
+        if ($showCancel) {
+            $buttons[] = [
                 ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-            ],
-        ];
+            ];
+        }
+
+        // Safety fallback: If all buttons are disabled by merchant, provide at least Home button so customer is never stuck
+        if (empty($buttons)) {
+            $buttons[] = [
+                ['text' => !empty($btnHome) ? $btnHome : '🏠 ပင်မ မီနူး (Home)', 'callback_data' => 'nav_home'],
+            ];
+        }
 
         // Telegram Mini App (TMA) Touch Storefront
         if (Setting::get('telegram_bot_tma_enabled', '1') === '1') {
@@ -1548,46 +2586,101 @@ class TelegramBotService
      */
     public function sendCategoryFilterMenu(int|string $chatId, ?int $messageIdToEdit = null): void
     {
-        $categories = Cache::remember('tg_bot_active_categories', 300, function () {
-            return ProductCategory::whereHas('products', function ($q) {
+        try {
+            $categories = Cache::remember('tg_bot_active_categories_v2', 300, function () {
+                return ProductCategory::whereHas('products', function ($q) {
+                    $q->where('is_bot_available', true)
+                      ->where(function ($sub) {
+                          $sub->where('is_active', true)->orWhere('status', 'Active');
+                      });
+                })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+            });
+
+            if ($categories instanceof \__PHP_Incomplete_Class || (!is_array($categories) && !($categories instanceof \Illuminate\Support\Collection))) {
+                Cache::forget('tg_bot_active_categories_v2');
+                Cache::forget('tg_bot_active_categories');
+                $categories = ProductCategory::whereHas('products', function ($q) {
+                    $q->where('is_bot_available', true)
+                      ->where(function ($sub) {
+                          $sub->where('is_active', true)->orWhere('status', 'Active');
+                      });
+                })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+            }
+        } catch (\Throwable $e) {
+            $categories = ProductCategory::whereHas('products', function ($q) {
                 $q->where('is_bot_available', true)
                   ->where(function ($sub) {
                       $sub->where('is_active', true)->orWhere('status', 'Active');
                   });
-            })->get();
-        });
+            })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+        }
 
         $btnAll = Setting::get('telegram_bot_btn_all_products', '📦 ပစ္စည်းအားလုံး ကြည့်မည်');
         $btnBack = Setting::get('telegram_bot_btn_back', '🔙 နောက်သို့');
         $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
+        $btnSearch = Setting::get('telegram_bot_btn_search', '🔎 ရှာဖွေမည်');
+        $isDirect = Setting::get('telegram_bot_direct_categories', '0') === '1';
 
-        if ($categories->isEmpty()) {
+        $isCatsEmpty = is_array($categories) ? empty($categories) : (method_exists($categories, 'isEmpty') ? $categories->isEmpty() : empty($categories));
+        if ($isCatsEmpty) {
             $noCatsTpl = Setting::get('telegram_bot_no_categories_msg', '');
             $noCatsMsg = !empty(trim($noCatsTpl))
                 ? $this->replacePlaceholders($noCatsTpl, [])
                 : "ℹ️ လက်ရှိတွင် အမျိုးအစား ခွဲခြားထားသော Bot ပစ္စည်းများ မရှိသေးပါရှင်။";
 
+            $emptyButtons = [
+                [['text' => !empty($btnAll) ? $btnAll : '📦 ပစ္စည်းအားလုံး ကြည့်မည်', 'callback_data' => 'nav_all_products']],
+            ];
+            if ($isDirect) {
+                $emptyButtons[] = [['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'nav_home']];
+            } else {
+                $emptyButtons[] = [['text' => !empty($btnBack) ? $btnBack : '🔙 နောက်သို့', 'callback_data' => 'catalog_main']];
+            }
+
             $this->editOrSendMessage($chatId, $messageIdToEdit, $noCatsMsg, [
-                'inline_keyboard' => [
-                    [['text' => !empty($btnAll) ? $btnAll : '📦 ပစ္စည်းအားလုံး ကြည့်မည်', 'callback_data' => 'nav_all_products']],
-                    [['text' => !empty($btnBack) ? $btnBack : '🔙 နောက်သို့', 'callback_data' => 'catalog_main']],
-                ],
+                'inline_keyboard' => $emptyButtons,
             ]);
             return;
         }
 
-        $text = "📂 *အမျိုးအစား (Category) ရွေးချယ်ပါ-*";
+        $text = $isDirect
+            ? "📂 *ကုန်ပစ္စည်း အမျိုးအစားများ (Categories)*\n\nလိုချင်သော အမျိုးအစားကို ရွေးချယ်ပါ (သို့မဟုတ် ပစ္စည်းအားလုံး ကြည့်ရှုပါ)-"
+            : "📂 *အမျိုးအစား (Category) ရွေးချယ်ပါ-*";
+
         $buttons = [];
 
         foreach ($categories as $cat) {
+            $catId = is_array($cat) ? $cat['id'] : $cat->id;
+            $catName = is_array($cat) ? $cat['name'] : $cat->name;
             $buttons[] = [
-                ['text' => "📁 {$cat->name}", 'callback_data' => "f_cat_{$cat->id}"],
+                ['text' => "📁 {$catName}", 'callback_data' => "f_cat_{$catId}"],
             ];
         }
 
-        $buttons[] = [
-            ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-        ];
+        // 📦 All Products & 🔎 Search placed right ABOVE Home / Main Menu
+        $showAll = Setting::get('telegram_bot_show_catalog_btn_all', '1') === '1';
+        $showSearch = Setting::get('telegram_bot_show_catalog_btn_search', '1') === '1';
+        $subRow = [];
+        if ($showAll) {
+            $subRow[] = ['text' => !empty($btnAll) ? $btnAll : '📦 ပစ္စည်းအားလုံး ကြည့်မည်', 'callback_data' => 'nav_all_products'];
+        }
+        if ($showSearch) {
+            $subRow[] = ['text' => !empty($btnSearch) ? $btnSearch : '🔎 ရှာဖွေမည်', 'callback_data' => 'nav_search'];
+        }
+        if (!empty($subRow)) {
+            $buttons[] = $subRow;
+        }
+
+        // Bottom navigation
+        if ($isDirect) {
+            $buttons[] = [
+                ['text' => '🏠 ပင်မ မီနူး (Home)', 'callback_data' => 'nav_home'],
+            ];
+        } else {
+            $buttons[] = [
+                ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
+            ];
+        }
 
         $this->editOrSendMessage($chatId, $messageIdToEdit, $text, ['inline_keyboard' => $buttons]);
     }
@@ -1597,20 +2690,41 @@ class TelegramBotService
      */
     public function sendBrandFilterMenu(int|string $chatId, ?int $messageIdToEdit = null): void
     {
-        $brands = Cache::remember('tg_bot_active_brands', 300, function () {
-            return Brand::whereHas('products', function ($q) {
+        try {
+            $brands = Cache::remember('tg_bot_active_brands_v2', 300, function () {
+                return Brand::whereHas('products', function ($q) {
+                    $q->where('is_bot_available', true)
+                      ->where(function ($sub) {
+                          $sub->where('is_active', true)->orWhere('status', 'Active');
+                      });
+                })->select('id', 'name')->get()->map(fn($b) => ['id' => $b->id, 'name' => $b->name])->all();
+            });
+
+            if ($brands instanceof \__PHP_Incomplete_Class || (!is_array($brands) && !($brands instanceof \Illuminate\Support\Collection))) {
+                Cache::forget('tg_bot_active_brands_v2');
+                Cache::forget('tg_bot_active_brands');
+                $brands = Brand::whereHas('products', function ($q) {
+                    $q->where('is_bot_available', true)
+                      ->where(function ($sub) {
+                          $sub->where('is_active', true)->orWhere('status', 'Active');
+                      });
+                })->select('id', 'name')->get()->map(fn($b) => ['id' => $b->id, 'name' => $b->name])->all();
+            }
+        } catch (\Throwable $e) {
+            $brands = Brand::whereHas('products', function ($q) {
                 $q->where('is_bot_available', true)
                   ->where(function ($sub) {
                       $sub->where('is_active', true)->orWhere('status', 'Active');
                   });
-            })->get();
-        });
+            })->select('id', 'name')->get()->map(fn($b) => ['id' => $b->id, 'name' => $b->name])->all();
+        }
 
         $btnAll = Setting::get('telegram_bot_btn_all_products', '📦 ပစ္စည်းအားလုံး ကြည့်မည်');
         $btnBack = Setting::get('telegram_bot_btn_back', '🔙 နောက်သို့');
         $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
 
-        if ($brands->isEmpty()) {
+        $isBrandsEmpty = is_array($brands) ? empty($brands) : (method_exists($brands, 'isEmpty') ? $brands->isEmpty() : empty($brands));
+        if ($isBrandsEmpty) {
             $noBrandsTpl = Setting::get('telegram_bot_no_brands_msg', '');
             $noBrandsMsg = !empty(trim($noBrandsTpl))
                 ? $this->replacePlaceholders($noBrandsTpl, [])
@@ -1629,11 +2743,19 @@ class TelegramBotService
         $buttons = [];
 
         foreach ($brands as $brand) {
+            $bId = is_array($brand) ? $brand['id'] : $brand->id;
+            $bName = is_array($brand) ? $brand['name'] : $brand->name;
             $buttons[] = [
-                ['text' => "🏷️ {$brand->name}", 'callback_data' => "f_brand_{$brand->id}"],
+                ['text' => "🏷️ {$bName}", 'callback_data' => "f_brand_{$bId}"],
             ];
         }
 
+        $showAll = Setting::get('telegram_bot_show_catalog_btn_all', '1') === '1';
+        if ($showAll) {
+            $buttons[] = [
+                ['text' => !empty($btnAll) ? $btnAll : '📦 ပစ္စည်းအားလုံး ကြည့်မည်', 'callback_data' => 'nav_all_products'],
+            ];
+        }
         $buttons[] = [
             ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
         ];
@@ -1644,6 +2766,155 @@ class TelegramBotService
     /**
      * Send Paginated Catalog of Products (Filtered or All) with Fast Navigation Buttons
      */
+    /**
+     * Send a single rich product card with photo, badges, details, stock and order button
+     */
+    public function sendProductCardItem(string|int $chatId, Product $p, int $index = 1, bool $withButtons = true): bool
+    {
+        $warehouseId = (int)Setting::get('telegram_bot_warehouse_id', 3);
+        $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
+
+        $showCode = Setting::get('telegram_bot_show_product_code', '1') === '1';
+        $showCat = Setting::get('telegram_bot_show_product_category', '1') === '1';
+        $showBrand = Setting::get('telegram_bot_show_product_brand', '1') === '1';
+        $showPrice = Setting::get('telegram_bot_show_product_price', '1') === '1';
+        $showStock = Setting::get('telegram_bot_show_product_stock', '1') === '1';
+        $showDetails = Setting::get('telegram_bot_show_product_details', '1') === '1';
+        $showVariants = Setting::get('telegram_bot_show_product_variants', '1') === '1';
+
+        if (!$p->relationLoaded('variants') || !$p->relationLoaded('category') || !$p->relationLoaded('brand')) {
+            $p->load(['variants' => fn($vq) => $vq->where('is_active', true), 'category', 'brand', 'primaryImage', 'images']);
+        }
+
+        $effectivePrice = (float)($p->retail_price ?: $p->selling_price);
+        $stock = (float)StockBalance::where('warehouse_id', $warehouseId)
+            ->where('product_id', $p->id)
+            ->sum('quantity');
+
+        // 1. Classification Badges
+        $badges = [];
+        $catName = $p->category?->name ?? $p->category_name ?? '';
+        $brandName = $p->brand?->name ?? $p->brand_name ?? '';
+        if (!empty($catName)) $badges[] = "📁 {$catName}";
+        if (!empty($brandName)) $badges[] = "🏷️ {$brandName}";
+        $metaStr = !empty($badges) ? "\n" . implode(' • ', $badges) : "";
+
+        $cardLines = [];
+        $numEmoji = match($index) {
+            1 => '1️⃣',
+            2 => '2️⃣',
+            3 => '3️⃣',
+            4 => '4️⃣',
+            5 => '5️⃣',
+            default => "{$index}️⃣",
+        };
+        $cardLines[] = "{$numEmoji} *{$p->name}*{$metaStr}";
+
+        // 2. Product Code
+        if ($showCode && !empty($p->code ?: $p->sku)) {
+            $code = $p->code ?: $p->sku;
+            $cardLines[] = "📌 ကုတ်နံပါတ်:  `{$code}`";
+        }
+
+        // 3. Price
+        if ($showPrice) {
+            $priceFormatted = number_format($effectivePrice);
+            $cardLines[] = "💰 ဈေးနှုန်း:    *{$priceFormatted} MMK*";
+        }
+
+        // 4. Stock Badge & Out of Stock Policy
+        if ($showStock) {
+            if ($stock <= 0) {
+                $stockText = $allowOutOfStock
+                    ? "⚠️ *လက်ကျန်ပြတ်လပ် (Pre-Order ရရှိနိုင်သည်)*"
+                    : "❌ *လက်ကျန်ပြတ်လပ် (Sold Out)*";
+            } elseif ($stock <= 5) {
+                $stockText = "⚡ *လက်ကျန်:* `{$stock}` " . ($p->unit_name ?: 'ခု') . " *သာ ကျန်ပါတော့သည် (Low Stock)*";
+            } else {
+                $stockText = "✅ *လက်ကျန်:* `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
+            }
+            $cardLines[] = "📦 လက်ကျန်:   {$stockText}";
+        }
+
+        // 5. Details / Description snippet
+        if (!empty($p->description)) {
+            $cleanDesc = trim(strip_tags($p->description));
+            if (!empty($cleanDesc)) {
+                $snippet = mb_substr($cleanDesc, 0, 95) . (mb_strlen($cleanDesc) > 95 ? '...' : '');
+                $cardLines[] = "📝 အသေးစိတ်:  _{$snippet}_";
+            }
+        }
+
+        // 6. Variants
+        $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
+        if ($showVariants && $hasActiveVariants) {
+            $vNames = $p->variants->pluck('name')->implode(', ');
+            $cardLines[] = "🎨 ဆိုဒ်များ:   {$vNames}";
+        }
+
+        $markup = null;
+        if ($withButtons) {
+            // 7. Action Button
+            if ($hasActiveVariants) {
+                $buyBtnText = Setting::get('telegram_bot_btn_select_variant_catalog', Setting::get('telegram_bot_btn_select_variant', '🎨 ဆိုဒ်ရွေးမည်'));
+                if (empty($buyBtnText)) {
+                    $buyBtnText = '🎨 ဆိုဒ်ရွေးမည်';
+                }
+                $buyCallback = "buy_{$p->id}";
+            } else {
+                if ($stock <= 0) {
+                    if ($allowOutOfStock) {
+                        $buyBtnText = Setting::get('telegram_bot_btn_preorder_catalog', '⏳ ကြိုတင်မှာမည်');
+                        if (empty($buyBtnText)) {
+                            $buyBtnText = '⏳ ကြိုတင်မှာမည်';
+                        }
+                        $buyCallback = "buy_{$p->id}";
+                    } else {
+                        $buyBtnText = "⚠️ ပစ္စည်းပြတ် (Sold Out)";
+                        $buyCallback = "stock_out_{$p->id}";
+                    }
+                } else {
+                    $buyBtnText = Setting::get('telegram_bot_btn_buy_catalog', Setting::get('telegram_bot_btn_buy', '🛒 မှာမည်'));
+                    if (empty($buyBtnText)) {
+                        $buyBtnText = '🛒 မှာမည်';
+                    }
+                    $buyCallback = "buy_{$p->id}";
+                }
+            }
+
+            $cardButtons = [
+                [
+                    ['text' => $buyBtnText, 'callback_data' => $buyCallback],
+                ]
+            ];
+            $markup = ['inline_keyboard' => $cardButtons];
+        } else {
+            $cardLines[] = "💡 မှာယူလိုပါက 'ဒီဟာ ယူမယ်' (သို့မဟုတ်) အရောင်/ဆိုဒ်လေး ပြောပြပေးပါရှင်။";
+        }
+
+        $caption = implode("\n", $cardLines);
+
+        $showPhotos = Setting::get('telegram_bot_ai_show_photos', '1') === '1';
+        $imagePath = $showPhotos 
+            ? ($p->image_url ?: ($p->primaryImage?->path ?: ($p->images->first()?->path ?? null)))
+            : null;
+
+        $sent = false;
+        if (!empty($imagePath)) {
+            $res = $this->sendPhoto($chatId, $imagePath, $caption, $markup);
+            if (!empty($res['ok'])) {
+                $sent = true;
+            }
+        }
+
+        if (!$sent) {
+            $res = $this->sendMessage($chatId, $caption, $markup);
+            return !empty($res['ok']);
+        }
+
+        return true;
+    }
+
     public function sendCatalog(
         int|string $chatId,
         int $page = 1,
@@ -1703,8 +2974,16 @@ class TelegramBotService
 
         $catalogStyle = Setting::get('telegram_bot_catalog_style', 'card_feed');
 
-        $perPage = (int)Setting::get('telegram_bot_catalog_per_page', 3);
-        $perPage = max(1, min(15, $perPage));
+        $rawPerPage = (int)Setting::get('telegram_bot_catalog_per_page', 3);
+        if ($rawPerPage < 1) $rawPerPage = 3;
+
+        // 🛡️ Intelligent Safety Clamping based on Telegram Bot API Limits:
+        // Enforce strict Max 10 products per page ceiling for both Card Feed and Single Summary styles.
+        // - Single Summary: 10 items totals ~3,100 to 3,600 chars (< 4,096 chars limit) & 26 buttons (< 100 limit).
+        // - Card Feed: Allows merchant to display up to 10 photo cards per page without crashing or flood wait.
+        // Guarantees fitting in Telegram limits, zero dropped messages, and 100% sequential product numbering.
+        $perPage = max(1, min(10, $rawPerPage));
+
 
         $totalCount = $query->count();
 
@@ -1816,13 +3095,13 @@ class TelegramBotService
 
                 // 2. Product Code
                 if ($showCode && !empty($p->code)) {
-                    $cardLines[] = "📌 ကုတ်: `{$p->code}`";
+                    $cardLines[] = "📌 ကုတ်နံပါတ်:  `{$p->code}`";
                 }
 
                 // 3. Price
                 if ($showPrice) {
                     $priceFormatted = number_format($effectivePrice);
-                    $cardLines[] = "💰 ဈေးနှုန်း: *{$priceFormatted} MMK*";
+                    $cardLines[] = "💰 ဈေးနှုန်း:    *{$priceFormatted} MMK*";
                 }
 
                 // 4. Stock Badge & Out of Stock Policy
@@ -1836,7 +3115,7 @@ class TelegramBotService
                     } else {
                         $stockText = "✅ *လက်ကျန်:* `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
                     }
-                    $cardLines[] = "📦 {$stockText}";
+                    $cardLines[] = "📦 လက်ကျန်:   {$stockText}";
                 }
 
                 // 5. Details / Description snippet
@@ -1844,7 +3123,7 @@ class TelegramBotService
                     $cleanDesc = trim(strip_tags($p->description));
                     if (!empty($cleanDesc)) {
                         $snippet = mb_substr($cleanDesc, 0, 95) . (mb_strlen($cleanDesc) > 95 ? '...' : '');
-                        $cardLines[] = "📝 *အသေးစိတ်:* _{$snippet}_";
+                        $cardLines[] = "📝 အသေးစိတ်:  _{$snippet}_";
                     }
                 }
 
@@ -1852,38 +3131,47 @@ class TelegramBotService
                 $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
                 if ($showVariants && $hasActiveVariants) {
                     $vNames = $p->variants->pluck('name')->implode(', ');
-                    $cardLines[] = "🎨 ဆိုဒ်များ: {$vNames}";
+                    $cardLines[] = "🎨 ဆိုဒ်များ:   {$vNames}";
                 }
 
                 // 7. Action Button attached DIRECTLY to this product!
+                $showBtnBuyCatalog = Setting::get('telegram_bot_show_btn_buy_catalog', '1') === '1';
+                $showBtnSelectVarCatalog = Setting::get('telegram_bot_show_btn_select_variant_catalog', '1') === '1';
+
+                $cardButtons = [];
                 if ($hasActiveVariants) {
-                    $buyBtnText = !empty($customSelectVar) ? $customSelectVar : '🎨 ဆိုဒ်ရွေးမည် (Select Size)';
-                    $buyCallback = "buy_{$p->id}";
+                    if ($showBtnSelectVarCatalog) {
+                        $buyBtnText = !empty($customSelectVar) ? $customSelectVar : '🎨 ဆိုဒ်ရွေးမည် (Select Size)';
+                        $cardButtons[] = [
+                            ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"],
+                        ];
+                    }
                 } else {
                     if ($stock <= 0) {
                         if ($allowOutOfStock) {
                             $buyBtnText = !empty($customPreorder) ? $customPreorder : '⏳ ကြိုတင်မှာမည် (Pre-Order)';
-                            $buyCallback = "buy_{$p->id}";
+                            $cardButtons[] = [
+                                ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"],
+                            ];
                         } else {
-                            $buyBtnText = "⚠️ ပစ္စည်းပြတ် (Sold Out)";
-                            $buyCallback = "stock_out_{$p->id}";
+                            $cardButtons[] = [
+                                ['text' => "⚠️ ပစ္စည်းပြတ် (Sold Out)", 'callback_data' => "stock_out_{$p->id}"],
+                            ];
                         }
-                    } else {
+                    } elseif ($showBtnBuyCatalog) {
                         $buyBtnText = !empty($customBuy) ? $customBuy : '🛒 မှာယူမည် (Order Now)';
-                        $buyCallback = "buy_{$p->id}";
+                        $cardButtons[] = [
+                            ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"],
+                        ];
                     }
                 }
 
-                $cardButtons = [
-                    [
-                        ['text' => $buyBtnText, 'callback_data' => $buyCallback],
-                    ]
-                ];
-
                 if (!$hasActiveVariants && $stock <= 0 && !$allowOutOfStock) {
-                    $cardButtons[] = [
-                        ['text' => '🔔 ရောက်လျှင် သတိပေးပါ (Notify Me)', 'callback_data' => "stock_notify_{$p->id}"],
-                    ];
+                    if (Setting::get('telegram_bot_restock_notify_enabled', '0') === '1') {
+                        $cardButtons[] = [
+                            ['text' => '🔔 ရောက်လျှင် သတိပေးပါ (Notify Me)', 'callback_data' => "stock_notify_{$p->id}"],
+                        ];
+                    }
                 }
 
                 $caption = implode("\n", $cardLines);
@@ -1891,16 +3179,17 @@ class TelegramBotService
                 $imagePath = $p->image_url 
                     ?: ($p->primaryImage?->path ?: ($p->images->first()?->path ?? null));
 
+                $cardReplyMarkup = !empty($cardButtons) ? ['inline_keyboard' => $cardButtons] : null;
                 $sent = false;
                 if (!empty($imagePath)) {
-                    $res = $this->sendPhoto($chatId, $imagePath, $caption, ['inline_keyboard' => $cardButtons]);
+                    $res = $this->sendPhoto($chatId, $imagePath, $caption, $cardReplyMarkup);
                     if (!empty($res['ok'])) {
                         $sent = true;
                     }
                 }
 
                 if (!$sent) {
-                    $this->sendMessage($chatId, $caption, ['inline_keyboard' => $cardButtons]);
+                    $this->sendMessage($chatId, $caption, $cardReplyMarkup);
                 }
 
                 $index++;
@@ -1919,20 +3208,31 @@ class TelegramBotService
             $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
             $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
+            $showBtnPrev = Setting::get('telegram_bot_show_btn_prev', '1') === '1';
+            $showBtnNext = Setting::get('telegram_bot_show_btn_next', '1') === '1';
+            $showNavCats = Setting::get('telegram_bot_show_catalog_nav_categories', Setting::get('telegram_bot_show_catalog_btn_categories', '1')) === '1';
+            $showNavBrands = Setting::get('telegram_bot_show_catalog_nav_brands', Setting::get('telegram_bot_show_catalog_btn_brands', '1')) === '1';
+            $showNavMainMenu = Setting::get('telegram_bot_show_catalog_nav_main_menu', Setting::get('telegram_bot_show_catalog_btn_home', '1')) === '1';
+            $showNavCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
+
             $navButtons = [];
 
             if ($totalPages > 1) {
                 $paginationRow = [];
-                if ($page > 1) {
+                if ($page > 1 && $showBtnPrev) {
                     $prevPage = $page - 1;
                     $paginationRow[] = ['text' => !empty($btnPrev) ? $btnPrev : '◀️ ရှေ့သို့', 'callback_data' => "cat_p_{$prevPage}_{$filterToken}"];
                 }
-                $paginationRow[] = ['text' => "📄 {$page}/{$totalPages}", 'callback_data' => 'noop'];
-                if ($page < $totalPages) {
+                if ($showBtnPrev || $showBtnNext) {
+                    $paginationRow[] = ['text' => "📄 {$page}/{$totalPages}", 'callback_data' => 'noop'];
+                }
+                if ($page < $totalPages && $showBtnNext) {
                     $nextPage = $page + 1;
                     $paginationRow[] = ['text' => !empty($btnNext) ? $btnNext : 'နောက်သို့ ▶️', 'callback_data' => "cat_p_{$nextPage}_{$filterToken}"];
                 }
-                $navButtons[] = $paginationRow;
+                if (!empty($paginationRow)) {
+                    $navButtons[] = $paginationRow;
+                }
             }
 
             // Dynamic Cart Bar if items exist in cart
@@ -1940,32 +3240,53 @@ class TelegramBotService
             if (($cartSummary['items_count'] ?? 0) > 0) {
                 $totalQ = (floor($cartSummary['total_qty']) == $cartSummary['total_qty']) ? (int)$cartSummary['total_qty'] : $cartSummary['total_qty'];
                 $grandT = number_format($cartSummary['grand_total']);
-                $navButtons[] = [
-                    ['text' => "💳 အော်ဒါတင်မည် ({$grandT} MMK)", 'callback_data' => 'cart_checkout'],
-                ];
-                $navButtons[] = [
-                    ['text' => "🛒 ခြင်းတောင်း ကြည့်မည် ({$totalQ} ခု)", 'callback_data' => 'cart_view'],
-                ];
+
+                $showNavCheckout = in_array(Setting::get('telegram_bot_show_catalog_nav_checkout', '1'), ['1', 1, true, 'true'], true);
+                $showNavCart = in_array(Setting::get('telegram_bot_show_catalog_nav_cart', '1'), ['1', 1, true, 'true'], true);
+                $btnNavCheckout = Setting::get('telegram_bot_btn_catalog_nav_checkout', Setting::get('telegram_bot_btn_checkout', '💳 အော်ဒါတင်မည်'));
+                $btnNavCart = Setting::get('telegram_bot_btn_catalog_nav_cart', Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်'));
+
+                if ($showNavCheckout) {
+                    $chkLabel = !empty($btnNavCheckout) ? $btnNavCheckout : '💳 အော်ဒါတင်မည်';
+                    $navButtons[] = [
+                        ['text' => $chkLabel, 'callback_data' => 'cart_checkout'],
+                    ];
+                }
+                if ($showNavCart) {
+                    $cartLabel = !empty($btnNavCart) ? $btnNavCart : '🛒 ခြင်းတောင်း ကြည့်မည်';
+                    $navButtons[] = [
+                        ['text' => $cartLabel, 'callback_data' => 'cart_view'],
+                    ];
+                }
             }
 
-            $navButtons[] = [
-                ['text' => !empty($btnCats) ? $btnCats : '📂 အမျိုးအစားများ', 'callback_data' => 'nav_categories'],
-            ];
-            $navButtons[] = [
-                ['text' => !empty($btnBrands) ? $btnBrands : '🏷️ တံဆိပ်များ', 'callback_data' => 'nav_brands'],
-            ];
-            $navButtons[] = [
-                ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-            ];
-            $navButtons[] = [
-                ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-            ];
+            if ($showNavCats) {
+                $navButtons[] = [
+                    ['text' => !empty($btnCats) ? $btnCats : '📂 အမျိုးအစားများ', 'callback_data' => 'nav_categories'],
+                ];
+            }
+            if ($showNavBrands) {
+                $navButtons[] = [
+                    ['text' => !empty($btnBrands) ? $btnBrands : '🏷️ တံဆိပ်များ', 'callback_data' => 'nav_brands'],
+                ];
+            }
+            if ($showNavMainMenu) {
+                $navButtons[] = [
+                    ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
+                ];
+            }
+            if ($showNavCancel) {
+                $navButtons[] = [
+                    ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
+                ];
+            }
 
             $navMsg = "━━━━━━━━━━━━━━━━━━━━━\n"
                     . "📄 *စာမျက်နှာ:* {$page} / {$totalPages} (စုစုပေါင်း {$totalCount} မျိုး)\n\n"
                     . "💡 မိမိမှာယူလိုသော ပစ္စည်းအောက်ရှိ '{$customBuy}' ကို နှိပ်၍ တိုက်ရိုက်မှာယူနိုင်ပါသည်ရှင်-";
 
-            $this->sendMessage($chatId, $navMsg, ['inline_keyboard' => $navButtons]);
+            $replyMarkup = !empty($navButtons) ? ['inline_keyboard' => $navButtons] : null;
+            $this->sendMessage($chatId, $navMsg, $replyMarkup);
             return;
         }
 
@@ -1977,6 +3298,9 @@ class TelegramBotService
 
         $buttons = [];
         $index = 1;
+
+        $showBtnBuyCatalog = Setting::get('telegram_bot_show_btn_buy_catalog', '1') === '1';
+        $showBtnSelectVarCatalog = Setting::get('telegram_bot_show_btn_select_variant_catalog', '1') === '1';
 
         foreach ($products as $p) {
             $effectivePrice = (float)($p->retail_price ?: $p->selling_price);
@@ -1995,27 +3319,27 @@ class TelegramBotService
 
             // 2. Product Code
             if ($showCode && !empty($p->code)) {
-                $cardLines[] = "   📌 ကုတ်: `{$p->code}`";
+                $cardLines[] = "   ▫️ ကုတ်နံပါတ်:  `{$p->code}`";
             }
 
             // 3. Price
             if ($showPrice) {
                 $priceFormatted = number_format($effectivePrice);
-                $cardLines[] = "   💰 ဈေးနှုန်း: *{$priceFormatted} MMK*";
+                $cardLines[] = "   ▫️ ဈေးနှုန်း:    *{$priceFormatted} MMK*";
             }
 
             // 4. Stock Badge & Out of Stock Policy
             if ($showStock) {
                 if ($stock <= 0) {
                     $stockText = $allowOutOfStock
-                        ? "⚠️ *လက်ကျန်ပြတ်လပ် (Pre-Order ရရှိနိုင်သည်)*"
-                        : "❌ *လက်ကျန်ပြတ်လပ် (Sold Out)*";
+                        ? "⚠️ လက်ကျန်ပြတ်လပ် (Pre-Order ရရှိနိုင်)"
+                        : "❌ လက်ကျန်ပြတ်လပ် (Sold Out)";
                 } elseif ($stock <= 5) {
-                    $stockText = "⚡ *လက်ကျန်:* `{$stock}` " . ($p->unit_name ?: 'ခု') . " *သာ ကျန်ပါတော့သည် (Low Stock)*";
+                    $stockText = "⚡ `{$stock}` " . ($p->unit_name ?: 'ခု') . " သာ ကျန်ပါတော့သည်";
                 } else {
-                    $stockText = "✅ *လက်ကျန်:* `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
+                    $stockText = "✅ `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
                 }
-                $cardLines[] = "   📦 {$stockText}";
+                $cardLines[] = "   ▫️ လက်ကျန်:   {$stockText}";
             }
 
             // 5. Details / Description snippet
@@ -2023,7 +3347,7 @@ class TelegramBotService
                 $cleanDesc = trim(strip_tags($p->description));
                 if (!empty($cleanDesc)) {
                     $snippet = mb_substr($cleanDesc, 0, 75) . (mb_strlen($cleanDesc) > 75 ? '...' : '');
-                    $cardLines[] = "   📝 *အသေးစိတ်:* _{$snippet}_";
+                    $cardLines[] = "   ▫️ အသေးစိတ်:  _{$snippet}_";
                 }
             }
 
@@ -2031,38 +3355,42 @@ class TelegramBotService
             $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
             if ($showVariants && $hasActiveVariants) {
                 $vNames = $p->variants->pluck('name')->implode(', ');
-                $cardLines[] = "   🎨 ဆိုဒ်များ: {$vNames}";
+                $cardLines[] = "   ▫️ ဆိုဒ်များ:   {$vNames}";
             }
 
             // Card Divider
             $text .= implode("\n", $cardLines) . "\n───────────────────\n\n";
 
             // 7. Action Buttons
-            if ($hasActiveVariants) {
-                $buyBtnText = "{$itemNum}. " . (!empty($customSelectVar) ? $customSelectVar : '🎨 ဆိုဒ်ရွေးမည်');
-                $buyCallback = "buy_{$p->id}";
-            } else {
-                if ($stock <= 0) {
-                    if ($allowOutOfStock) {
-                        $buyBtnText = "{$itemNum}. " . (!empty($customPreorder) ? $customPreorder : '⏳ ကြိုတင်မှာမည်');
-                        $buyCallback = "buy_{$p->id}";
-                    } else {
-                        $buyBtnText = "{$itemNum}. ⚠️ ပစ္စည်းပြတ်";
-                        $buyCallback = "stock_out_{$p->id}";
-                    }
-                } else {
-                    $buyBtnText = "{$itemNum}. " . (!empty($customBuy) ? $customBuy : '🛒 မှာမည်');
-                    $buyCallback = "buy_{$p->id}";
-                }
-            }
-
             $rowButtons = [];
             if ($showImageBtn) {
                 $viewBtnText = "{$itemNum}. " . (!empty($customView) ? $customView : '🔍 အသေးစိတ်/ပုံ');
                 $rowButtons[] = ['text' => $viewBtnText, 'callback_data' => "view_{$p->id}"];
             }
-            $rowButtons[] = ['text' => $buyBtnText, 'callback_data' => $buyCallback];
-            $buttons[] = $rowButtons;
+
+            if ($hasActiveVariants) {
+                if ($showBtnSelectVarCatalog) {
+                    $buyBtnText = "{$itemNum}. " . (!empty($customSelectVar) ? $customSelectVar : '🎨 ဆိုဒ်ရွေးမည်');
+                    $rowButtons[] = ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"];
+                }
+            } else {
+                if ($stock <= 0) {
+                    if ($allowOutOfStock) {
+                        $buyBtnText = "{$itemNum}. " . (!empty($customPreorder) ? $customPreorder : '⏳ ကြိုတင်မှာမည်');
+                        $rowButtons[] = ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"];
+                    } else {
+                        $buyBtnText = "{$itemNum}. ⚠️ ပစ္စည်းပြတ်";
+                        $rowButtons[] = ['text' => $buyBtnText, 'callback_data' => "stock_out_{$p->id}"];
+                    }
+                } elseif ($showBtnBuyCatalog) {
+                    $buyBtnText = "{$itemNum}. " . (!empty($customBuy) ? $customBuy : '🛒 မှာမည်');
+                    $rowButtons[] = ['text' => $buyBtnText, 'callback_data' => "buy_{$p->id}"];
+                }
+            }
+
+            if (!empty($rowButtons)) {
+                $buttons[] = $rowButtons;
+            }
             $index++;
         }
 
@@ -2079,15 +3407,24 @@ class TelegramBotService
         $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
+        $showBtnPrev = Setting::get('telegram_bot_show_btn_prev', '1') === '1';
+        $showBtnNext = Setting::get('telegram_bot_show_btn_next', '1') === '1';
+        $showNavCats = Setting::get('telegram_bot_show_catalog_nav_categories', Setting::get('telegram_bot_show_catalog_btn_categories', '1')) === '1';
+        $showNavBrands = Setting::get('telegram_bot_show_catalog_nav_brands', Setting::get('telegram_bot_show_catalog_btn_brands', '1')) === '1';
+        $showNavMainMenu = Setting::get('telegram_bot_show_catalog_nav_main_menu', Setting::get('telegram_bot_show_catalog_btn_home', '1')) === '1';
+        $showNavCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
+
         $paginationRow = [];
-        if ($page > 1) {
+        if ($page > 1 && $showBtnPrev) {
             $prevPage = $page - 1;
             $paginationRow[] = ['text' => !empty($btnPrev) ? $btnPrev : '◀️ ရှေ့သို့', 'callback_data' => "cat_p_{$prevPage}_{$filterToken}"];
         }
 
-        $paginationRow[] = ['text' => "📄 {$page}/{$totalPages}", 'callback_data' => 'noop'];
+        if ($showBtnPrev || $showBtnNext) {
+            $paginationRow[] = ['text' => "📄 {$page}/{$totalPages}", 'callback_data' => 'noop'];
+        }
 
-        if ($page < $totalPages) {
+        if ($page < $totalPages && $showBtnNext) {
             $nextPage = $page + 1;
             $paginationRow[] = ['text' => !empty($btnNext) ? $btnNext : 'နောက်သို့ ▶️', 'callback_data' => "cat_p_{$nextPage}_{$filterToken}"];
         }
@@ -2101,35 +3438,132 @@ class TelegramBotService
         if (($cartSummary['items_count'] ?? 0) > 0) {
             $totalQ = (floor($cartSummary['total_qty']) == $cartSummary['total_qty']) ? (int)$cartSummary['total_qty'] : $cartSummary['total_qty'];
             $grandT = number_format($cartSummary['grand_total']);
-            $buttons[] = [
-                ['text' => "💳 အော်ဒါတင်မည် ({$grandT} MMK)", 'callback_data' => 'cart_checkout'],
-            ];
-            $buttons[] = [
-                ['text' => "🛒 ခြင်းတောင်း ({$totalQ} ခု)", 'callback_data' => 'cart_view'],
-            ];
-        }
 
-        $buttons[] = [
-            ['text' => !empty($btnCats) ? $btnCats : '📂 အမျိုးအစားများ', 'callback_data' => 'nav_categories'],
-        ];
-        $buttons[] = [
-            ['text' => !empty($btnBrands) ? $btnBrands : '🏷️ တံဆိပ်များ', 'callback_data' => 'nav_brands'],
-        ];
-        $buttons[] = [
-            ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-        ];
-        $buttons[] = [
-            ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-        ];
+            $showNavCheckout = in_array(Setting::get('telegram_bot_show_catalog_nav_checkout', '1'), ['1', 1, true, 'true'], true);
+            $showNavCart = in_array(Setting::get('telegram_bot_show_catalog_nav_cart', '1'), ['1', 1, true, 'true'], true);
+            $btnNavCheckout = Setting::get('telegram_bot_btn_catalog_nav_checkout', Setting::get('telegram_bot_btn_checkout', '💳 အော်ဒါတင်မည်'));
+            $btnNavCart = Setting::get('telegram_bot_btn_catalog_nav_cart', Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း'));
 
-        if ($messageIdToEdit) {
-            $res = $this->editMessageText($chatId, $messageIdToEdit, $text, ['inline_keyboard' => $buttons]);
-            if (!empty($res['ok'])) {
-                return;
+            if ($showNavCheckout) {
+                $chkLabel = !empty($btnNavCheckout) ? $btnNavCheckout : '💳 အော်ဒါတင်မည်';
+                $buttons[] = [
+                    ['text' => $chkLabel, 'callback_data' => 'cart_checkout'],
+                ];
+            }
+            if ($showNavCart) {
+                $cartLabel = !empty($btnNavCart) ? $btnNavCart : '🛒 ခြင်းတောင်း';
+                $buttons[] = [
+                    ['text' => $cartLabel, 'callback_data' => 'cart_view'],
+                ];
             }
         }
 
-        $this->sendMessage($chatId, $text, ['inline_keyboard' => $buttons]);
+        if ($showNavCats) {
+            $buttons[] = [
+                ['text' => !empty($btnCats) ? $btnCats : '📂 အမျိုးအစားများ', 'callback_data' => 'nav_categories'],
+            ];
+        }
+        if ($showNavBrands) {
+            $buttons[] = [
+                ['text' => !empty($btnBrands) ? $btnBrands : '🏷️ တံဆိပ်များ', 'callback_data' => 'nav_brands'],
+            ];
+        }
+        if ($showNavMainMenu) {
+            $buttons[] = [
+                ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
+            ];
+        }
+        if ($showNavCancel) {
+            $buttons[] = [
+                ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
+            ];
+        }
+
+        // 🛡️ Telegram Inline Buttons Guard (Telegram API strict limit: Max 100 buttons total on an inline keyboard)
+        $totalFlatButtons = 0;
+        foreach ($buttons as $btnRow) {
+            $totalFlatButtons += count($btnRow);
+        }
+
+        if ($totalFlatButtons > 95) {
+            // Preserve bottom navigation rows (pagination, cart, categories, brands, menu, cancel)
+            $navRowCount = 0;
+            if (!empty($paginationRow)) $navRowCount++;
+            if (($cartSummary['items_count'] ?? 0) > 0) $navRowCount += 2;
+            if ($showNavCats) $navRowCount++;
+            if ($showNavBrands) $navRowCount++;
+            if ($showNavMainMenu) $navRowCount++;
+            if ($showNavCancel) $navRowCount++;
+
+            $totalRows = count($buttons);
+            $productRows = array_slice($buttons, 0, max(0, $totalRows - $navRowCount));
+            $navRows = array_slice($buttons, max(0, $totalRows - $navRowCount));
+
+            $safeProductRows = [];
+            $currCount = 0;
+            foreach ($navRows as $nr) {
+                $currCount += count($nr);
+            }
+            foreach ($productRows as $pr) {
+                if ($currCount + count($pr) <= 95) {
+                    $safeProductRows[] = $pr;
+                    $currCount += count($pr);
+                } else {
+                    break;
+                }
+            }
+            $buttons = array_merge($safeProductRows, $navRows);
+        }
+
+        // 🛡️ Telegram Message Length Guard (Strict limit: 4096 UTF-8 characters per message)
+        $chunks = [];
+        if (mb_strlen($text, 'UTF-8') > 3900) {
+            $lines = explode("\n", $text);
+            $currentChunk = '';
+            foreach ($lines as $line) {
+                if (mb_strlen($currentChunk . "\n" . $line, 'UTF-8') > 3800) {
+                    if (!empty($currentChunk)) {
+                        $chunks[] = $currentChunk;
+                        $currentChunk = $line;
+                    } else {
+                        // In the rare event that a single line is > 3800 chars, slice safely with mb_substr
+                        $chunks[] = mb_substr($line, 0, 3800, 'UTF-8');
+                        $currentChunk = mb_substr($line, 3800, null, 'UTF-8');
+                    }
+                } else {
+                    $currentChunk = empty($currentChunk) ? $line : $currentChunk . "\n" . $line;
+                }
+            }
+            if (!empty($currentChunk)) {
+                $chunks[] = $currentChunk;
+            }
+        } else {
+            $chunks = [$text];
+        }
+
+        // If multiple chunks exist and $messageIdToEdit was provided, delete old message first
+        // because editMessageText cannot edit multiple messages.
+        if (count($chunks) > 1 && $messageIdToEdit) {
+            $this->deleteMessage($chatId, $messageIdToEdit);
+            $messageIdToEdit = null;
+        }
+
+        for ($c = 0; $c < count($chunks) - 1; $c++) {
+            $this->sendMessage($chatId, $chunks[$c]);
+        }
+
+        $finalChunk = end($chunks);
+        $replyMarkup = !empty($buttons) ? ['inline_keyboard' => $buttons] : null;
+
+        if ($messageIdToEdit) {
+            $res = $this->editMessageText($chatId, $messageIdToEdit, $finalChunk, $replyMarkup);
+            if (!empty($res['ok'])) {
+                return;
+            }
+            $this->deleteMessage($chatId, $messageIdToEdit);
+        }
+
+        $this->sendMessage($chatId, $finalChunk, $replyMarkup);
     }
 
     /**
@@ -2156,15 +3590,15 @@ class TelegramBotService
 
         $caption = "🏷️ *{$product->name}*\n"
                  . "━━━━━━━━━━━━━━━━━━━━━\n"
-                 . "📌 *ကုတ်နံပါတ်:* `{$product->code}`\n"
-                 . ($product->category_name ? "📂 *အမျိုးအစား:* {$product->category_name}\n" : "")
-                 . ($product->brand_name ? "🏷️ *တံဆိပ်:* {$product->brand_name}\n" : "")
-                 . "💰 *ဈေးနှုန်း:* {$priceText}\n"
-                 . "📦 *လက်ကျန်အခြေအနေ:* {$stockBadge}\n";
+                 . "📌 *ကုတ်နံပါတ်:*   `{$product->code}`\n"
+                 . ($product->category_name ? "📂 *အမျိုးအစား:*   {$product->category_name}\n" : "")
+                 . ($product->brand_name ? "🏷️ *တံဆိပ်:*       {$product->brand_name}\n" : "")
+                 . "💰 *ဈေးနှုန်း:*     {$priceText}\n"
+                 . "📦 *လက်ကျန်:*     {$stockBadge}\n";
 
         if ($hasActiveVariants) {
             $vNames = $activeVariants->pluck('name')->implode(', ');
-            $caption .= "🎨 *ရွေးချယ်နိုင်သော ဆိုဒ်များ:* {$vNames}\n";
+            $caption .= "🎨 *ဆိုဒ်များ:*     {$vNames}\n";
         }
         $caption .= "\n";
 
@@ -2179,51 +3613,78 @@ class TelegramBotService
         $btnBackCatalog = Setting::get('telegram_bot_btn_back_to_catalog', '🔙 ကတ်တလောက်သို့ ပြန်သွားမည်');
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
-        $buyBtnText = $hasActiveVariants
-            ? (!empty($btnSelectVar) ? $btnSelectVar : '🎨 ဆိုဒ်ရွေး၍ မှာယူမည်')
-            : (!empty($btnOrderNow) ? $btnOrderNow : '🛒 မှာယူမည် (Order Now)');
+        $showBtnOrderNow = Setting::get('telegram_bot_show_btn_order_now', '1') === '1';
+        $showBtnSelectVar = Setting::get('telegram_bot_show_btn_select_variant', '1') === '1';
+        $showBtnBackCatalog = Setting::get('telegram_bot_show_btn_back_to_catalog', '1') === '1';
+        $showBtnCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
 
-        $buttons = [
-            [
+        $buttons = [];
+        if ($hasActiveVariants) {
+            if ($showBtnSelectVar) {
+                $buyBtnText = !empty($btnSelectVar) ? $btnSelectVar : '🎨 ဆိုဒ်ရွေး၍ မှာယူမည်';
+                $buttons[] = [
+                    ['text' => $buyBtnText, 'callback_data' => "buy_{$product->id}"],
+                ];
+            }
+        } elseif ($showBtnOrderNow) {
+            $buyBtnText = !empty($btnOrderNow) ? $btnOrderNow : '🛒 မှာယူမည် (Order Now)';
+            $buttons[] = [
                 ['text' => $buyBtnText, 'callback_data' => "buy_{$product->id}"],
-            ],
-        ];
+            ];
+        }
 
         $cartSummary = $this->getCartSummary($chatId);
         if (($cartSummary['items_count'] ?? 0) > 0) {
             $totalQ = (floor($cartSummary['total_qty']) == $cartSummary['total_qty']) ? (int)$cartSummary['total_qty'] : $cartSummary['total_qty'];
             $grandT = number_format($cartSummary['grand_total']);
+
+            $showNavCheckout = in_array(Setting::get('telegram_bot_show_catalog_nav_checkout', '1'), ['1', 1, true, 'true'], true);
+            $showNavCart = in_array(Setting::get('telegram_bot_show_catalog_nav_cart', '1'), ['1', 1, true, 'true'], true);
+            $btnNavCheckout = Setting::get('telegram_bot_btn_catalog_nav_checkout', Setting::get('telegram_bot_btn_checkout', '💳 အော်ဒါတင်မည်'));
+            $btnNavCart = Setting::get('telegram_bot_btn_catalog_nav_cart', Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်'));
+
+            if ($showNavCheckout) {
+                $chkLabel = !empty($btnNavCheckout) ? $btnNavCheckout : '💳 အော်ဒါတင်မည်';
+                $buttons[] = [
+                    ['text' => $chkLabel, 'callback_data' => 'cart_checkout'],
+                ];
+            }
+            if ($showNavCart) {
+                $cartLabel = !empty($btnNavCart) ? $btnNavCart : '🛒 ခြင်းတောင်း ကြည့်မည်';
+                $buttons[] = [
+                    ['text' => $cartLabel, 'callback_data' => 'cart_view'],
+                ];
+            }
+        }
+
+        if ($showBtnBackCatalog) {
             $buttons[] = [
-                ['text' => "💳 အော်ဒါတင်မည် ({$grandT} MMK)", 'callback_data' => 'cart_checkout'],
+                ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ကတ်တလောက်သို့ ပြန်သွားမည်', 'callback_data' => $backCallback ?: 'nav_all_products'],
             ];
+        }
+        if ($showBtnCancel) {
             $buttons[] = [
-                ['text' => "🛒 ခြင်းတောင်း ကြည့်မည် ({$totalQ} ခု)", 'callback_data' => 'cart_view'],
+                ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
             ];
         }
 
-        $buttons[] = [
-            ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ကတ်တလောက်သို့ ပြန်သွားမည်', 'callback_data' => $backCallback ?: 'nav_all_products'],
-        ];
-        $buttons[] = [
-            ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-        ];
-
         // Resolve Image Source
-        $imagePath = $product->image_url 
-            ?: ($product->primaryImage?->path ?: ($product->images->first()?->path ?? null));
+        $showProductImage = Setting::get('telegram_bot_show_product_image', '1') === '1';
+        $imagePath = $showProductImage
+            ? ($product->image_url ?: ($product->primaryImage?->path ?: ($product->images->first()?->path ?? null)))
+            : null;
 
         $photoSent = false;
         if (!empty($imagePath)) {
-            $res = $this->sendPhoto($chatId, $imagePath, $caption, ['inline_keyboard' => $buttons]);
+            $res = $this->sendPhoto($chatId, $imagePath, $caption, !empty($buttons) ? ['inline_keyboard' => $buttons] : null);
             if (!empty($res['ok'])) {
                 $photoSent = true;
             }
         }
 
-        // If photo sending failed or product has no photo, fallback to formatted message card
+        // If photo sending failed, disabled, or product has no photo, fallback to formatted message card
         if (!$photoSent) {
-            $fallbackMsg = "🖼️ [ဓာတ်ပုံ မရှိပါ]\n\n" . $caption;
-            $this->sendMessage($chatId, $fallbackMsg, ['inline_keyboard' => $buttons]);
+            $this->sendMessage($chatId, $caption, !empty($buttons) ? ['inline_keyboard' => $buttons] : null);
         }
     }
 
@@ -2286,12 +3747,19 @@ class TelegramBotService
         $btnBackCatalog = Setting::get('telegram_bot_btn_back_to_catalog', '🔙 ပစ္စည်းစာရင်းသို့');
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
-        $buttons[] = [
-            ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ပစ္စည်းစာရင်းသို့', 'callback_data' => 'nav_all_products'],
-        ];
-        $buttons[] = [
-            ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-        ];
+        $showBtnBackCatalog = Setting::get('telegram_bot_show_btn_back_to_catalog', '1') === '1';
+        $showBtnCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
+
+        if ($showBtnBackCatalog) {
+            $buttons[] = [
+                ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ပစ္စည်းစာရင်းသို့', 'callback_data' => 'nav_all_products'],
+            ];
+        }
+        if ($showBtnCancel) {
+            $buttons[] = [
+                ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
+            ];
+        }
 
         if ($messageIdToEdit) {
             $res = $this->editOrSendMessage($chatId, $messageIdToEdit, $msg, ['inline_keyboard' => $buttons]);
@@ -2359,15 +3827,41 @@ class TelegramBotService
         $totalQtyDisplay = (floor($totalQty) == $totalQty) ? (int)$totalQty : $totalQty;
         $itemsCount = $cartRes['items_count'] ?? count($cart);
 
-        $baseHeader = "🛒 *ခြင်းတောင်း အပ်ဒိတ် လုပ်လိုက်ပါပြီရှင်!*\n"
+        $customHeader = trim(Setting::get('telegram_bot_cart_updated_header', '🛒 *ခြင်းတောင်း အပ်ဒိတ် လုပ်လိုက်ပါပြီရှင်!*'));
+        if (empty($customHeader)) {
+            $customHeader = "🛒 *ခြင်းတောင်း အပ်ဒိတ် လုပ်လိုက်ပါပြီရှင်!*";
+        }
+
+        $itemAddedTpl = trim(Setting::get('telegram_bot_cart_item_added_tpl', '✅ *{product_name}* x {quantity} {unit} အား ခြင်းတောင်းထဲသို့ ထည့်သွင်းပြီးပါပြီ။'));
+        if (empty($itemAddedTpl)) {
+            $itemAddedTpl = "✅ *{product_name}* x {quantity} {unit} အား ခြင်းတောင်းထဲသို့ ထည့်သွင်းပြီးပါပြီ။";
+        }
+        $itemAddedNotice = str_replace(
+            ['{product_name}', '{item_title}', '{quantity}', '{qty}', '{unit}'],
+            [$addedItemTitle, $addedItemTitle, $addedQty, $addedQty, $unitName],
+            $itemAddedTpl
+        );
+
+        $cartItemsHeading = trim(Setting::get('telegram_bot_cart_items_heading', '🛍️ *လူကြီးမင်း ခြင်းတောင်းထဲရှိ ပစ္စည်းများ:*'));
+        if (empty($cartItemsHeading)) {
+            $cartItemsHeading = "🛍️ *လူကြီးမင်း ခြင်းတောင်းထဲရှိ ပစ္စည်းများ:*";
+        }
+
+        $footerPrompt = trim(Setting::get('telegram_bot_cart_updated_footer_prompt', "အော်ဒါတင်လိုပါက '💳 အော်ဒါတင်မည်' ကို နှိပ်ပါ (သို့မဟုတ်) အခြားပစ္စည်းများ ဆက်လက်ရွေးချယ်နိုင်ပါသည်-"));
+
+        $baseHeader = "{$customHeader}\n"
                     . "━━━━━━━━━━━━━━━━━━━━━\n"
-                    . "✅ *{$addedItemTitle}* x {$addedQty} {$unitName} အား ခြင်းတောင်းထဲသို့ ထည့်သွင်းပြီးပါပြီ။\n\n"
-                    . "🛍️ *လူကြီးမင်း ခြင်းတောင်းထဲရှိ ပစ္စည်းများ:*\n\n";
+                    . "{$itemAddedNotice}\n\n"
+                    . "{$cartItemsHeading}\n\n";
 
         $baseFooter = "\n━━━━━━━━━━━━━━━━━━━━━\n"
-                    . "📦 ပစ္စည်း စုစုပေါင်း: *{$totalQtyDisplay} ခု* ({$itemsCount} မျိုး)\n"
-                    . "💰 *စုစုပေါင်း ကျသင့်ငွေ:* *{$totalFormatted} MMK*\n\n"
-                    . "အော်ဒါတင်လိုပါက '💳 အော်ဒါတင်မည်' ကို နှိပ်ပါ (သို့မဟုတ်) အခြားပစ္စည်းများ ဆက်လက်ရွေးချယ်နိုင်ပါသည်-";
+                    . "📦 ပစ္စည်း စုစုပေါင်း:   *{$totalQtyDisplay} ခု* ({$itemsCount} မျိုး)\n"
+                    . "💰 စုစုပေါင်း ကျသင့်ငွေ:  *{$totalFormatted} MMK*\n"
+                    . "━━━━━━━━━━━━━━━━━━━━━\n\n";
+
+        if (!empty($footerPrompt)) {
+            $baseFooter .= "{$footerPrompt}";
+        }
 
         $maxAllowedCaptionLen = 1000;
         $availableForItems = $maxAllowedCaptionLen - mb_strlen($baseHeader) - mb_strlen($baseFooter);
@@ -2384,7 +3878,7 @@ class TelegramBotService
             $sub = number_format($it['subtotal'] ?? 0);
 
             $line = "{$idx}️⃣ *{$title}*\n"
-                  . "   • အရေအတွက်: `{$q}` {$u} × `{$p}` MMK = *{$sub} MMK*";
+                  . "   ▫️ {$q} {$u} × {$p}  =  *{$sub} MMK*";
 
             $lineLen = mb_strlen($line) + 2;
             if (($currentLen + $lineLen + 60) > $availableForItems && $idx < count($cart)) {
@@ -2441,12 +3935,23 @@ class TelegramBotService
         ];
         Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
 
-        $msg = "🛍️ *{$displayName}*\n"
-             . "━━━━━━━━━━━━━━━━━━━━━\n"
-             . "💰 ဈေးနှုန်း: *" . number_format($effectivePrice) . " MMK*\n"
-             . "📦 လက်ကျန်: `{$stock}` " . ($product->unit_name ?: 'ခု') . "\n\n"
-             . "👇 မှာယူလိုသော အရေအတွက်ကို အောက်ပါခလုတ်များမှ ရွေးချယ်ပါ (သို့မဟုတ်) လိုချင်သော အရေအတွက်ကို ကိန်းဂဏန်း တိုက်ရိုက် စာရိုက်ပို့ပေးနိုင်ပါသည်ရှင်-\n"
-             . "(💡 ဥပမာ- `10` သို့မဟုတ် `၁၀`)";
+        $qtyPromptTpl = Setting::get('telegram_bot_select_qty_msg', '');
+        if (!empty(trim($qtyPromptTpl))) {
+            $msg = $this->replacePlaceholders($qtyPromptTpl, [
+                'product_name' => $displayName,
+                'price' => number_format($effectivePrice),
+                'stock' => (string)$stock,
+                'unit' => $product->unit_name ?: 'ခု',
+            ]);
+        } else {
+            $msg = "🛍️ *{$displayName}*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "💰 *ဈေးနှုန်း:*  *" . number_format($effectivePrice) . " MMK*\n"
+                 . "📦 *လက်ကျန်:*  `{$stock}` " . ($product->unit_name ?: 'ခု') . "\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 . "👇 မှာယူလိုသော အရေအတွက်ကို အောက်ပါခလုတ်များမှ ရွေးချယ်ပါ (သို့မဟုတ်) လိုချင်သော အရေအတွက်ကို ကိန်းဂဏန်း တိုက်ရိုက် စာရိုက်ပို့ပေးနိုင်ပါသည်ရှင်-\n"
+                 . "(💡 ဥပမာ- `10` သို့မဟုတ် `၁၀`)";
+        }
 
         $btnBackVar = Setting::get('telegram_bot_btn_back_variant', '🔙 အခြားဆိုဒ် ပြန်ရွေးမည်');
         $btnBackCatalog = Setting::get('telegram_bot_btn_back_to_catalog', '🔙 ပစ္စည်းစာရင်းသို့');
@@ -2456,25 +3961,59 @@ class TelegramBotService
         $btnQty2 = Setting::get('telegram_bot_btn_qty_2', '2 ခု');
         $btnQty3 = Setting::get('telegram_bot_btn_qty_3', '3 ခု');
         $btnQty5 = Setting::get('telegram_bot_btn_qty_5', '5 ခု');
+        $btnCustomQty = Setting::get('telegram_bot_btn_custom_qty', '🔢 အခြားအရေအတွက်');
 
-        $backButton = ($variant || $product->has_variants)
-            ? ['text' => !empty($btnBackVar) ? $btnBackVar : '🔙 အခြားဆိုဒ် ပြန်ရွေးမည်', 'callback_data' => "buy_{$product->id}"]
-            : ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ပစ္စည်းစာရင်းသို့', 'callback_data' => 'nav_all_products'];
+        $showQty1 = Setting::get('telegram_bot_show_btn_qty_1', '1') === '1';
+        $showQty2 = Setting::get('telegram_bot_show_btn_qty_2', '1') === '1';
+        $showQty3 = Setting::get('telegram_bot_show_btn_qty_3', '1') === '1';
+        $showQty5 = Setting::get('telegram_bot_show_btn_qty_5', '1') === '1';
+        $showCustomQty = Setting::get('telegram_bot_show_btn_custom_qty', '1') === '1';
+        $showBackVar = Setting::get('telegram_bot_show_btn_back_variant', '1') === '1';
+        $showBackCatalog = Setting::get('telegram_bot_show_btn_back_to_catalog', '1') === '1';
+        $showCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
 
-        $inlineKeyboard = [
-            [
-                ['text' => !empty($btnQty1) ? $btnQty1 : '1 ခု', 'callback_data' => "qty_{$product->id}_1"],
-                ['text' => !empty($btnQty2) ? $btnQty2 : '2 ခု', 'callback_data' => "qty_{$product->id}_2"],
-                ['text' => !empty($btnQty3) ? $btnQty3 : '3 ခု', 'callback_data' => "qty_{$product->id}_3"],
-                ['text' => !empty($btnQty5) ? $btnQty5 : '5 ခု', 'callback_data' => "qty_{$product->id}_5"],
-            ],
-            [
-                $backButton,
-            ],
-            [
+        $inlineKeyboard = [];
+
+        $qtyRow = [];
+        if ($showQty1) {
+            $qtyRow[] = ['text' => !empty($btnQty1) ? $btnQty1 : '1 ခု', 'callback_data' => "qty_{$product->id}_1"];
+        }
+        if ($showQty2) {
+            $qtyRow[] = ['text' => !empty($btnQty2) ? $btnQty2 : '2 ခု', 'callback_data' => "qty_{$product->id}_2"];
+        }
+        if ($showQty3) {
+            $qtyRow[] = ['text' => !empty($btnQty3) ? $btnQty3 : '3 ခု', 'callback_data' => "qty_{$product->id}_3"];
+        }
+        if ($showQty5) {
+            $qtyRow[] = ['text' => !empty($btnQty5) ? $btnQty5 : '5 ခု', 'callback_data' => "qty_{$product->id}_5"];
+        }
+        if (!empty($qtyRow)) {
+            $inlineKeyboard[] = $qtyRow;
+        }
+
+        if ($showCustomQty) {
+            $inlineKeyboard[] = [
+                ['text' => !empty($btnCustomQty) ? $btnCustomQty : '🔢 အခြားအရေအတွက်', 'callback_data' => "ask_qty_{$product->id}" . ($variant ? "_{$variant->id}" : "")],
+            ];
+        }
+
+        if ($variant || $product->has_variants) {
+            if ($showBackVar) {
+                $inlineKeyboard[] = [
+                    ['text' => !empty($btnBackVar) ? $btnBackVar : '🔙 အခြားဆိုဒ် ပြန်ရွေးမည်', 'callback_data' => "buy_{$product->id}"],
+                ];
+            }
+        } elseif ($showBackCatalog) {
+            $inlineKeyboard[] = [
+                ['text' => !empty($btnBackCatalog) ? $btnBackCatalog : '🔙 ပစ္စည်းစာရင်းသို့', 'callback_data' => 'nav_all_products'],
+            ];
+        }
+
+        if ($showCancel) {
+            $inlineKeyboard[] = [
                 ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-            ],
-        ];
+            ];
+        }
 
         // Resolve Image Source (Variant specific -> Product main -> Primary image -> First image)
         $imagePath = null;
@@ -2548,15 +4087,39 @@ class TelegramBotService
             $this->answerCallbackQuery($id);
         }
 
-        // 💬 Real-time "typing..." indicator in customer chat header
-        $this->sendChatAction($chatId, 'typing');
-
         // 🏠 Breadcrumb: Universal Home Menu Handler
         if ($data === 'nav_home') {
             Cache::forget("tg_session_{$chatId}");
-            $this->answerCallbackQuery($id);
-            $welcomeMsg = $this->formatWelcomeMessage($userName, (string)$chatId);
-            $this->sendMessage($chatId, $welcomeMsg, $this->getMainKeyboard($chatId));
+            if (!$isInstantNav) {
+                $this->answerCallbackQuery($id);
+            }
+            $this->sendWelcomeMenu($chatId, $userName);
+            return;
+        }
+
+        // 🤖 Resume AI Mode via Callback
+        if ($data === 'resume_ai_mode') {
+            if ($this->aiAgentService->getOperatingMode() === 'standard') {
+                $this->answerCallbackQuery($id, 'ရိုးရိုး မီနူးစနစ် အသုံးပြုထားပါသည်');
+                $this->sendMessage($chatId, "📱 *ဤဘော့တ်သည် ရိုးရိုး မီနူးခလုတ်စနစ် (Standard Mode) ဖြင့် လည်ပတ်နေပါသည်ရှင်။*\n\nအောက်ပါ မီနူးခလုတ်များမှတဆင့် ကုန်ပစ္စည်းများကို အဆင်ပြေစွာ ရွေးချယ်မှာယူနိုင်ပါသည်ရှင်။ 🙏", $this->getMainKeyboard($chatId));
+                return;
+            }
+            $this->aiAgentService->resumeAiForChat($chatId);
+            $this->answerCallbackQuery($id, 'AI အရောင်းလက်ထောက်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီ');
+            $this->sendMessage($chatId, "🤖 *AI အရောင်းလက်ထောက် စနစ်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီရှင်။*\n\nမေးမြန်းလိုသည့် ပစ္စည်းအမည်၊ စျေးနှုန်း သို့မဟုတ် သိရှိလိုသည်များကို စာရိုက်၍ မေးမြန်းနိုင်ပါပြီရှင် 🙏");
+            return;
+        }
+
+        // 👨‍💼 Contact Human Staff Callback
+        if ($data === 'ask_human' || $data === 'contact_human_support') {
+            $this->aiAgentService->pauseAiForChat($chatId, 120);
+            BotChatMessage::where('telegram_chat_id', (string)$chatId)->latest('id')->update(['needs_human' => true]);
+            $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, "Customer clicked 'Talk to Human Staff'");
+            $this->answerCallbackQuery($id, 'ဆိုင်ဝန်ထမ်းထံ အကြောင်းကြားထားပါသည်');
+            $staffNotice = ($this->aiAgentService->getOperatingMode() === 'standard')
+                ? "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ ဝန်ထမ်းမှ ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။ 🙏"
+                : "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ ဝန်ထမ်းမှ ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။\n(AI လက်ထောက်နှင့် ပြန်ပြောလိုပါက /ai ဟု ရိုက်ပို့နိုင်ပါသည်)";
+            $this->sendMessage($chatId, $staffNotice);
             return;
         }
 
@@ -2575,7 +4138,11 @@ class TelegramBotService
         if ($data === 'catalog_main') {
             $this->answerCallbackQuery($id);
             $messageId = $callbackQuery['message']['message_id'] ?? null;
-            $this->sendCatalogMenu($chatId, $messageId);
+            if (Setting::get('telegram_bot_direct_categories', '0') === '1') {
+                $this->sendCategoryFilterMenu($chatId, $messageId);
+            } else {
+                $this->sendCatalogMenu($chatId, $messageId);
+            }
             return;
         }
 
@@ -2584,37 +4151,16 @@ class TelegramBotService
             return;
         }
 
-        // 🔄 1-Click Reorder Action (Loads past items into active cart)
+        // 🔄 1-Click Reorder Action (Disabled)
         if (str_starts_with($data, 'reorder_')) {
-            $saleId = (int)str_replace('reorder_', '', $data);
-            $sale = Sale::with('items')->find($saleId);
-            if ($sale && $sale->items && $sale->items->isNotEmpty()) {
-                $this->answerCallbackQuery($id, 'ပစ္စည်းများကို ခြင်းတောင်းထဲ ထည့်သွင်းပေးနေပါသည်...');
-                $addedCount = 0;
-                foreach ($sale->items as $it) {
-                    $prod = Product::find($it->product_id);
-                    if ($prod && $prod->is_bot_available) {
-                        $variant = $it->product_variant_id ? ProductVariant::find($it->product_variant_id) : null;
-                        $this->addToCart($chatId, $prod, $variant, (float)$it->quantity);
-                        $addedCount++;
-                    }
-                }
-                if ($addedCount > 0) {
-                    $this->sendCartView($chatId, $userName);
-                } else {
-                    $this->sendMessage($chatId, "⚠️ ယခင်မှာယူခဲ့သော ပစ္စည်းများသည် လက်ရှိတွင် ရောင်းချခြင်း မရှိတော့ပါသဖြင့် ပြန်လည်မမှာယူနိုင်သေးပါရှင်။", $this->getMainKeyboard($chatId));
-                }
-            } else {
-                $this->answerCallbackQuery($id, 'အော်ဒါ ရှာမတွေ့ပါ');
-            }
+            $this->answerCallbackQuery($id, 'ဤလုပ်ဆောင်ချက်ကို ပိတ်ထားပါသည်');
             return;
         }
 
         // 🛒 Cart Actions
-        if ($data === 'cart_view') {
-            $this->answerCallbackQuery($id);
+        if ($data === 'cart_view' || $data === 'view_cart') {
             $messageId = $callbackQuery['message']['message_id'] ?? null;
-            $this->sendCartView($chatId, $userName, $messageId);
+            $this->sendCartView($chatId, $userName, $messageId, false, null, $id);
             return;
         }
 
@@ -2640,12 +4186,109 @@ class TelegramBotService
             return;
         }
 
-        if (str_starts_with($data, 'cart_rem_')) {
-            $itemKey = str_replace('cart_rem_', '', $data);
-            $this->removeFromCart($chatId, $itemKey);
-            $this->answerCallbackQuery($id, 'ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားပြီးပါပြီ');
+        if ($data === 'cart_edit') {
             $messageId = $callbackQuery['message']['message_id'] ?? null;
-            $this->sendCartView($chatId, $userName, $messageId);
+            $this->sendCartView($chatId, $userName, $messageId, true, null, $id);
+            return;
+        }
+
+        if ($data === 'cart_done') {
+            $messageId = $callbackQuery['message']['message_id'] ?? null;
+            $this->sendCartView($chatId, $userName, $messageId, false, null, $id);
+            return;
+        }
+
+        if (str_starts_with($data, 'cart_inc_')) {
+            $itemKey = str_replace('cart_inc_', '', $data);
+            $cart = $this->getCart($chatId);
+            if (isset($cart[$itemKey])) {
+                $item = $cart[$itemKey];
+                $prodId = (int)$item['product_id'];
+                $varId = !empty($item['variant_id']) ? (int)$item['variant_id'] : null;
+                $warehouseId = (int)Setting::get('telegram_bot_warehouse_id', 1);
+                $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
+
+                $currentQty = (float)$item['quantity'];
+                $newQty = $currentQty + 1;
+
+                if (!$allowOutOfStock) {
+                    $cacheKey = "stock_bal_{$warehouseId}_{$prodId}_" . ($varId ?: '0');
+                    $availableStock = (float)Cache::remember($cacheKey, 15, function () use ($warehouseId, $prodId, $varId) {
+                        $stockQ = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $prodId);
+                        if ($varId) {
+                            $stockQ->where('product_variant_id', $varId);
+                        }
+                        return $stockQ->sum('quantity');
+                    });
+                    if ($newQty > $availableStock) {
+                        $this->answerCallbackQuery($id, '⚠️ လက်ကျန်ပစ္စည်း ထပ်မံမရရှိနိုင်တော့ပါရှင်', true);
+                        return;
+                    }
+                }
+
+                $cart[$itemKey]['quantity'] = $newQty;
+                $cart[$itemKey]['subtotal'] = $newQty * (float)$item['price'];
+                $this->saveCart($chatId, $cart);
+
+                // Instant In-App Top Toast Banner (Disabled)
+                $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
+                $toastInc = Setting::get('telegram_bot_cart_toast_inc', 'အရေအတွက် တိုးလိုက်ပါသည် (+1)');
+                $toastText = $showToast ? $toastInc : null;
+
+                $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
+                $flashNotice = ($showFlash && $showToast) ? "⚡ *{$toastInc}*" : null;
+
+                $messageId = $callbackQuery['message']['message_id'] ?? null;
+                $this->sendCartView($chatId, $userName, $messageId, true, $flashNotice, $id, $toastText);
+                return;
+            }
+            $this->answerCallbackQuery($id);
+            return;
+        }
+
+        if (str_starts_with($data, 'cart_dec_')) {
+            $itemKey = str_replace('cart_dec_', '', $data);
+            $cart = $this->getCart($chatId);
+            if (isset($cart[$itemKey])) {
+                $currentQty = (float)$cart[$itemKey]['quantity'];
+                $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
+                $toastDec = Setting::get('telegram_bot_cart_toast_dec', 'အရေအတွက် လျှော့ချလိုက်ပါသည် (-1)');
+                $toastDel = Setting::get('telegram_bot_cart_toast_del', 'ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားလိုက်ပါပြီ');
+                $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
+
+                if ($currentQty > 1) {
+                    $newQty = $currentQty - 1;
+                    $cart[$itemKey]['quantity'] = $newQty;
+                    $cart[$itemKey]['subtotal'] = $newQty * (float)$cart[$itemKey]['price'];
+                    $this->saveCart($chatId, $cart);
+                    $toastText = $showToast ? $toastDec : null;
+                    $flashNotice = ($showFlash && $showToast) ? "⚡ *{$toastDec}*" : null;
+                } else {
+                    unset($cart[$itemKey]);
+                    $this->saveCart($chatId, $cart);
+                    $toastText = $showToast ? $toastDel : null;
+                    $flashNotice = ($showFlash && $showToast) ? "🗑️ *{$toastDel}*" : null;
+                }
+                $messageId = $callbackQuery['message']['message_id'] ?? null;
+                $this->sendCartView($chatId, $userName, $messageId, true, $flashNotice, $id, $toastText);
+                return;
+            }
+            $this->answerCallbackQuery($id);
+            return;
+        }
+
+        if (str_starts_with($data, 'cart_del_') || str_starts_with($data, 'cart_rem_')) {
+            $itemKey = str_starts_with($data, 'cart_del_')
+                ? str_replace('cart_del_', '', $data)
+                : str_replace('cart_rem_', '', $data);
+            $this->removeFromCart($chatId, $itemKey);
+            $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
+            $toastDel = Setting::get('telegram_bot_cart_toast_del', 'ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားလိုက်ပါပြီ');
+            $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
+            $toastText = $showToast ? $toastDel : null;
+            $flashNotice = ($showFlash && $showToast) ? "🗑️ *{$toastDel}*" : null;
+            $messageId = $callbackQuery['message']['message_id'] ?? null;
+            $this->sendCartView($chatId, $userName, $messageId, true, $flashNotice, $id, $toastText);
             return;
         }
 
@@ -2856,13 +4499,27 @@ class TelegramBotService
 
             if ($catDrilldown && $category) {
                 // Check if subcategories exist with bot-available products
-                $subcategories = Cache::remember("tg_bot_subcats_cat_{$catId}", 300, function () use ($catId) {
-                    return SubCategory::where('parent_category_id', $catId)->whereHas('products', function ($q) {
+                try {
+                    $subcategories = Cache::remember("tg_bot_subcats_cat_{$catId}_v2", 300, function () use ($catId) {
+                        return SubCategory::where('parent_category_id', $catId)->whereHas('products', function ($q) {
+                            $q->where('is_bot_available', true)->where('is_active', true);
+                        })->select('id', 'name')->get()->map(fn($s) => ['id' => $s->id, 'name' => $s->name])->all();
+                    });
+                    if ($subcategories instanceof \__PHP_Incomplete_Class || (!is_array($subcategories) && !($subcategories instanceof \Illuminate\Support\Collection))) {
+                        Cache::forget("tg_bot_subcats_cat_{$catId}_v2");
+                        Cache::forget("tg_bot_subcats_cat_{$catId}");
+                        $subcategories = SubCategory::where('parent_category_id', $catId)->whereHas('products', function ($q) {
+                            $q->where('is_bot_available', true)->where('is_active', true);
+                        })->select('id', 'name')->get()->map(fn($s) => ['id' => $s->id, 'name' => $s->name])->all();
+                    }
+                } catch (\Throwable $e) {
+                    $subcategories = SubCategory::where('parent_category_id', $catId)->whereHas('products', function ($q) {
                         $q->where('is_bot_available', true)->where('is_active', true);
-                    })->get();
-                });
+                    })->select('id', 'name')->get()->map(fn($s) => ['id' => $s->id, 'name' => $s->name])->all();
+                }
 
-                if ($subcategories->isNotEmpty()) {
+                $hasSubs = is_array($subcategories) ? !empty($subcategories) : (method_exists($subcategories, 'isNotEmpty') ? $subcategories->isNotEmpty() : !empty($subcategories));
+                if ($hasSubs) {
                     $text = "📂 *{$category->name}* အတွင်းရှိ အမျိုးအစားခွဲများ-\n"
                           . "━━━━━━━━━━━━━━━━━━━━━\n"
                           . "ကြည့်ရှုလိုသည့် အမျိုးအစားခွဲကို ရွေးချယ်ပေးပါရှင်-";
@@ -2871,8 +4528,10 @@ class TelegramBotService
                     ];
                     // 1 button per row for clean, thumb-friendly mobile layout
                     foreach ($subcategories as $sub) {
+                        $sId = is_array($sub) ? $sub['id'] : $sub->id;
+                        $sName = is_array($sub) ? $sub['name'] : $sub->name;
                         $buttons[] = [
-                            ['text' => "🔹 {$sub->name}", 'callback_data' => "f_subcat_{$sub->id}"],
+                            ['text' => "🔹 {$sName}", 'callback_data' => "f_subcat_{$sId}"],
                         ];
                     }
                     $buttons[] = [['text' => '🔙 အမျိုးအစားများသို့', 'callback_data' => 'nav_categories']];
@@ -2920,17 +4579,39 @@ class TelegramBotService
 
             if ($brandDrilldown && $brand) {
                 // Find categories that have active bot products under this brand
-                $brandCategories = Cache::remember("tg_bot_brand_cats_{$brandId}", 300, function () use ($brandId) {
-                    return ProductCategory::whereHas('products', function ($q) use ($brandId) {
+                try {
+                    $brandCategories = Cache::remember("tg_bot_brand_cats_{$brandId}_v2", 300, function () use ($brandId) {
+                        return ProductCategory::whereHas('products', function ($q) use ($brandId) {
+                            $q->where('brand_id', $brandId)
+                              ->where('is_bot_available', true)
+                              ->where(function ($sub) {
+                                  $sub->where('is_active', true)->orWhere('status', 'Active');
+                              });
+                        })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+                    });
+                    if ($brandCategories instanceof \__PHP_Incomplete_Class || (!is_array($brandCategories) && !($brandCategories instanceof \Illuminate\Support\Collection))) {
+                        Cache::forget("tg_bot_brand_cats_{$brandId}_v2");
+                        Cache::forget("tg_bot_brand_cats_{$brandId}");
+                        $brandCategories = ProductCategory::whereHas('products', function ($q) use ($brandId) {
+                            $q->where('brand_id', $brandId)
+                              ->where('is_bot_available', true)
+                              ->where(function ($sub) {
+                                  $sub->where('is_active', true)->orWhere('status', 'Active');
+                              });
+                        })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+                    }
+                } catch (\Throwable $e) {
+                    $brandCategories = ProductCategory::whereHas('products', function ($q) use ($brandId) {
                         $q->where('brand_id', $brandId)
                           ->where('is_bot_available', true)
                           ->where(function ($sub) {
                               $sub->where('is_active', true)->orWhere('status', 'Active');
                           });
-                    })->get();
-                });
+                    })->select('id', 'name')->get()->map(fn($c) => ['id' => $c->id, 'name' => $c->name])->all();
+                }
 
-                if ($brandCategories->count() > 1) {
+                $bCatCount = is_array($brandCategories) ? count($brandCategories) : (method_exists($brandCategories, 'count') ? $brandCategories->count() : count((array)$brandCategories));
+                if ($bCatCount > 1) {
                     $text = "🏷️ *{$brand->name}* တံဆိပ်အတွင်းရှိ အမျိုးအစားများ-\n"
                           . "━━━━━━━━━━━━━━━━━━━━━\n"
                           . "ကြည့်ရှုလိုသည့် ကုန်ပစ္စည်း အမျိုးအစားကို ရွေးချယ်ပေးပါရှင်-";
@@ -2939,8 +4620,10 @@ class TelegramBotService
                     ];
                     // 1 button per row for clean, thumb-friendly mobile layout
                     foreach ($brandCategories as $bCat) {
+                        $bCatId = is_array($bCat) ? $bCat['id'] : $bCat->id;
+                        $bCatName = is_array($bCat) ? $bCat['name'] : $bCat->name;
                         $buttons[] = [
-                            ['text' => "📂 {$bCat->name}", 'callback_data' => "f_bc_{$brandId}_{$bCat->id}"],
+                            ['text' => "📂 {$bCatName}", 'callback_data' => "f_bc_{$brandId}_{$bCatId}"],
                         ];
                     }
                     $buttons[] = [['text' => '🔙 တံဆိပ်များသို့', 'callback_data' => 'nav_brands']];
@@ -3190,7 +4873,11 @@ class TelegramBotService
 
             $cartRes = $this->addToCart($chatId, $product, $variant, $qty);
             Cache::forget("tg_session_{$chatId}");
-            $this->answerCallbackQuery($id, "✅ ခြင်းတောင်းထဲသို့ {$qty} ခု ထည့်ပြီးပါပြီ (စုစုပေါင်း {$cartRes['total_qty']} ခု)");
+            if (Setting::get('telegram_bot_cart_show_toast', '0') === '1') {
+                $this->answerCallbackQuery($id, "✅ ခြင်းတောင်းထဲသို့ {$qty} ခု ထည့်ပြီးပါပြီ");
+            } else {
+                $this->answerCallbackQuery($id);
+            }
 
             $addedItem = $cartRes['added_item'];
             $itemTitle = !empty($addedItem['variant_name'])
@@ -3207,23 +4894,38 @@ class TelegramBotService
             $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
             $btnClear = Setting::get('telegram_bot_btn_clear_cart', '🗑️ ခြင်းတောင်း ရှင်းမည်');
 
-            $cartButtons = [
-                [
-                    ['text' => (!empty($btnCheckout) ? $btnCheckout : '💳 အော်ဒါတင်မည်') . " ({$totalFormatted} MMK)", 'callback_data' => 'cart_checkout'],
-                ],
-                [
-                    ['text' => (!empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်') . " ({$cartRes['total_qty']} ခု)", 'callback_data' => 'cart_view'],
-                ],
-                [
+            $showBtnCheckout = Setting::get('telegram_bot_show_cart_updated_btn_checkout', '1') === '1';
+            $showBtnCart = Setting::get('telegram_bot_show_cart_updated_btn_view', '1') === '1';
+            $showBtnContinue = Setting::get('telegram_bot_show_cart_updated_btn_continue', '1') === '1';
+            $showBtnClear = Setting::get('telegram_bot_show_cart_updated_btn_clear', '1') === '1';
+            $showBtnMainMenu = Setting::get('telegram_bot_show_cart_updated_btn_menu', '1') === '1';
+
+            $cartButtons = [];
+            if ($showBtnCheckout) {
+                $cartButtons[] = [
+                    ['text' => (!empty($btnCheckout) ? $btnCheckout : '💳 အော်ဒါတင်မည်'), 'callback_data' => 'cart_checkout'],
+                ];
+            }
+            if ($showBtnCart) {
+                $cartButtons[] = [
+                    ['text' => (!empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်'), 'callback_data' => 'cart_view'],
+                ];
+            }
+            if ($showBtnContinue) {
+                $cartButtons[] = [
                     ['text' => !empty($btnContinue) ? $btnContinue : '➕ ပစ္စည်း ဆက်ဝယ်မည်', 'callback_data' => 'nav_all_products'],
-                ],
-                [
+                ];
+            }
+            if ($showBtnClear) {
+                $cartButtons[] = [
                     ['text' => !empty($btnClear) ? $btnClear : '🗑️ ခြင်းတောင်း ရှင်းမည်', 'callback_data' => 'cart_clear'],
-                ],
-                [
+                ];
+            }
+            if ($showBtnMainMenu) {
+                $cartButtons[] = [
                     ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-                ],
-            ];
+                ];
+            }
 
             // Resolve Image Source of the newly added product
             $imagePath = null;
@@ -3237,9 +4939,11 @@ class TelegramBotService
 
             $messageId = $callbackQuery['message']['message_id'] ?? null;
             $res = null;
+            $replyMarkup = !empty($cartButtons) ? ['inline_keyboard' => $cartButtons] : null;
+
             if ($messageId && !empty($imagePath)) {
                 // Instant caption edit on the existing photo card
-                $res = $this->editMessageCaption($chatId, $messageId, $cartMsg, ['inline_keyboard' => $cartButtons]);
+                $res = $this->editMessageCaption($chatId, $messageId, $cartMsg, $replyMarkup);
             }
 
             if (empty($res['ok'])) {
@@ -3247,10 +4951,10 @@ class TelegramBotService
                     $this->deleteMessage($chatId, $messageId);
                 }
                 if (!empty($imagePath)) {
-                    $res = $this->sendPhoto($chatId, $imagePath, $cartMsg, ['inline_keyboard' => $cartButtons]);
+                    $res = $this->sendPhoto($chatId, $imagePath, $cartMsg, $replyMarkup);
                 }
                 if (empty($res['ok'])) {
-                    $this->sendMessage($chatId, $cartMsg, ['inline_keyboard' => $cartButtons]);
+                    $this->sendMessage($chatId, $cartMsg, $replyMarkup);
                 }
             }
             return;
@@ -3282,6 +4986,13 @@ class TelegramBotService
             if ($methodData === 'cod') {
                 $session['payment_type'] = 'Cash on Delivery';
                 $session['payment_status'] = 'Unpaid';
+                $this->finalizeOrder($chatId, $session, $userName, $usernameTag);
+                return;
+            }
+
+            if ($methodData === 'confirm_no_slip') {
+                $session['payment_status'] = 'Pending Review';
+                $session['notes_extra'] = 'Mobile Banking (Slip verification skipped by setting)';
                 $this->finalizeOrder($chatId, $session, $userName, $usernameTag);
                 return;
             }
@@ -3336,13 +5047,13 @@ class TelegramBotService
 
         $details = [];
         if (!empty($pm->account_name)) {
-            $details[] = "👤 *အကောင့်အမည်:* `{$pm->account_name}`";
+            $details[] = "👤 အကောင့်အမည်:   `{$pm->account_name}`";
         }
         if (!empty($pm->account_number)) {
-            $details[] = "🔢 *အကောင့်နံပါတ်:* `{$pm->account_number}` _(နှိပ်၍ ကူးယူပါ)_";
+            $details[] = "🔢 အကောင့်နံပါတ်:  `{$pm->account_number}` _(နှိပ်၍ ကူးယူပါ)_";
         }
         if (!empty($pm->description)) {
-            $details[] = "📝 *မှတ်ချက်:* {$pm->description}";
+            $details[] = "📝 မှတ်ချက်:      {$pm->description}";
         }
 
         $accountDetailsText = !empty($details)
@@ -3351,21 +5062,30 @@ class TelegramBotService
 
         $caption = "💳 *{$pm->name} ဖြင့် ငွေလွှဲရန် အချက်အလက်*\n"
                  . "━━━━━━━━━━━━━━━━━━━━━\n"
-                 . "{$accountDetailsText}\n\n"
-                 . "💰 *လွှဲရမည့် စုစုပေါင်း ပမာဏ:* `{$totalFormatted} MMK`\n"
-                 . "🔖 *အော်ဒါအမှတ်:* `{$orderRef}`\n\n"
-                 . "⚠️ _ငွေလွှဲမှတ်ချက် (Note) တွင် အော်ဒါအမှတ် ရိုက်ထည့်ပေးပါရန် မေတ္တာရပ်ခံပါသည်ရှင်။_\n"
+                 . "{$accountDetailsText}\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "💰 လွှဲရမည့် ပမာဏ:  *{$totalFormatted} MMK*\n"
+                 . "🔖 အော်ဒါအမှတ်:    `{$orderRef}`\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 . "⚠️ _ငွေလွှဲမှတ်ချက် (Note) တွင် အော်ဒါအမှတ် ထည့်ပေးပါရန် မေတ္တာရပ်ခံပါသည်ရှင်။_\n"
                  . "📸 _ငွေလွှဲပြီးပါက **ငွေလွှဲပြေစာ (Slip) ဓာတ်ပုံ** အား ဤနေရာသို့ ပေးပို့ပေးပါရှင်။_ 🙏";
 
+        $requireSlip = Setting::get('telegram_bot_require_payment_slip', '1') === '1';
+        $inlineButtons = [];
+        if (!$requireSlip) {
+            $inlineButtons[] = [
+                ['text' => '✅ ငွေလွှဲပြီးပါပြီ (Order အတည်ပြုမည်)', 'callback_data' => 'pay_confirm_no_slip']
+            ];
+        }
+        $inlineButtons[] = [
+            ['text' => '🔄 အခြား ငွေချေနည်းလမ်း ရွေးမည်', 'callback_data' => 'pay_change_method']
+        ];
+        $inlineButtons[] = [
+            ['text' => '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel']
+        ];
+
         $actionButtons = [
-            'inline_keyboard' => [
-                [
-                    ['text' => '🔄 အခြား ငွေချေနည်းလမ်း ရွေးမည်', 'callback_data' => 'pay_change_method'],
-                ],
-                [
-                    ['text' => '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-                ],
-            ],
+            'inline_keyboard' => $inlineButtons,
         ];
 
         // Clean up previous selection message for zero clutter
@@ -3461,9 +5181,11 @@ class TelegramBotService
         }
 
         return "📝 *အော်ဒါ အနှစ်ချုပ်*\n"
-             . "• ပစ္စည်း: {$itemTitle}\n"
-             . "• အရေအတွက်: {$qty} ခု\n"
-             . "• စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n"
+             . "📦 ပစ္စည်း:          *{$itemTitle}*\n"
+             . "🔢 အရေအတွက်:       *{$qty} ခု*\n"
+             . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n\n"
              . "{$askPrompt}";
     }
 
@@ -3599,15 +5321,22 @@ class TelegramBotService
         $bankDetails = $this->getDedicatedPaymentInfo($paymentTypeName);
 
         $msg = $this->formatPaymentInstructionsMessage($paymentTypeName, $bankDetails, $totalFormatted);
+        $requireSlip = Setting::get('telegram_bot_require_payment_slip', '1') === '1';
+        $inlineButtons = [];
+        if (!$requireSlip) {
+            $inlineButtons[] = [
+                ['text' => '✅ ငွေလွှဲပြီးပါပြီ (Order အတည်ပြုမည်)', 'callback_data' => 'pay_confirm_no_slip']
+            ];
+        }
+        $inlineButtons[] = [
+            ['text' => '🔄 အခြား ငွေချေနည်းလမ်း ရွေးမည်', 'callback_data' => 'pay_change_method']
+        ];
+        $inlineButtons[] = [
+            ['text' => '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel']
+        ];
+
         $actionButtons = [
-            'inline_keyboard' => [
-                [
-                    ['text' => '🔄 အခြား ငွေချေနည်းလမ်း ရွေးမည်', 'callback_data' => 'pay_change_method'],
-                ],
-                [
-                    ['text' => '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-                ],
-            ],
+            'inline_keyboard' => $inlineButtons,
         ];
         $this->sendMessage($chatId, $msg, $actionButtons);
     }
@@ -3796,23 +5525,38 @@ class TelegramBotService
             $btnMainMenu = Setting::get('telegram_bot_btn_main_menu', '🔙 ပင်မ မီနူးသို့');
             $btnClear = Setting::get('telegram_bot_btn_clear_cart', '🗑️ ခြင်းတောင်း ရှင်းမည်');
 
-            $cartButtons = [
-                [
-                    ['text' => (!empty($btnCheckout) ? $btnCheckout : '💳 အော်ဒါတင်မည်') . " ({$totalFormatted} MMK)", 'callback_data' => 'cart_checkout'],
-                ],
-                [
-                    ['text' => (!empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်') . " ({$cartRes['total_qty']} ခု)", 'callback_data' => 'cart_view'],
-                ],
-                [
+            $showBtnCheckout = Setting::get('telegram_bot_show_cart_updated_btn_checkout', '1') === '1';
+            $showBtnCart = Setting::get('telegram_bot_show_cart_updated_btn_view', '1') === '1';
+            $showBtnContinue = Setting::get('telegram_bot_show_cart_updated_btn_continue', '1') === '1';
+            $showBtnClear = Setting::get('telegram_bot_show_cart_updated_btn_clear', '1') === '1';
+            $showBtnMainMenu = Setting::get('telegram_bot_show_cart_updated_btn_menu', '1') === '1';
+
+            $cartButtons = [];
+            if ($showBtnCheckout) {
+                $cartButtons[] = [
+                    ['text' => (!empty($btnCheckout) ? $btnCheckout : '💳 အော်ဒါတင်မည်'), 'callback_data' => 'cart_checkout'],
+                ];
+            }
+            if ($showBtnCart) {
+                $cartButtons[] = [
+                    ['text' => (!empty($btnCart) ? $btnCart : '🛒 ခြင်းတောင်း ကြည့်မည်'), 'callback_data' => 'cart_view'],
+                ];
+            }
+            if ($showBtnContinue) {
+                $cartButtons[] = [
                     ['text' => !empty($btnContinue) ? $btnContinue : '➕ ပစ္စည်း ဆက်ဝယ်မည်', 'callback_data' => 'nav_all_products'],
-                ],
-                [
+                ];
+            }
+            if ($showBtnClear) {
+                $cartButtons[] = [
                     ['text' => !empty($btnClear) ? $btnClear : '🗑️ ခြင်းတောင်း ရှင်းမည်', 'callback_data' => 'cart_clear'],
-                ],
-                [
+                ];
+            }
+            if ($showBtnMainMenu) {
+                $cartButtons[] = [
                     ['text' => !empty($btnMainMenu) ? $btnMainMenu : '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
-                ],
-            ];
+                ];
+            }
 
             // Resolve Image Source of the newly added product
             $imagePath = null;
@@ -3825,26 +5569,29 @@ class TelegramBotService
             }
 
             $res = null;
+            $replyMarkup = !empty($cartButtons) ? ['inline_keyboard' => $cartButtons] : null;
+
             if (!empty($imagePath)) {
-                $res = $this->sendPhoto($chatId, $imagePath, $cartMsg, ['inline_keyboard' => $cartButtons]);
+                $res = $this->sendPhoto($chatId, $imagePath, $cartMsg, $replyMarkup);
             }
             if (empty($res['ok'])) {
-                $this->sendMessage($chatId, $cartMsg, ['inline_keyboard' => $cartButtons]);
+                $this->sendMessage($chatId, $cartMsg, $replyMarkup);
             }
             return;
         }
 
         if ($step === 'waiting_phone') {
-            $cleanPhone = preg_replace('/[^0-9+]/', '', $text);
+            $convertedPhone = $this->convertMyanmarDigits($text);
+            $cleanPhone = preg_replace('/[^0-9+]/', '', $convertedPhone);
             if (strlen($cleanPhone) < 7) {
                 $errTpl = Setting::get('telegram_bot_invalid_phone_msg', '');
                 $errMsg = !empty(trim($errTpl))
                     ? $this->replacePlaceholders($errTpl, ['customer_name' => $userName, 'user_name' => $userName])
-                    : "⚠️ မှန်ကန်သော ဖုန်းနံပါတ် ရိုက်ထည့်ပေးပါရှင် (ဥပမာ- 09123456789) -";
+                    : "⚠️ မှန်ကန်သော ဖုန်းနံပါတ် ရိုက်ထည့်ပေးပါရှင် (ဥပမာ- 09123456789 သို့မဟုတ် ၀၉၁၂၃၄၅၆၇၈၉) -";
                 $this->sendMessage($chatId, $errMsg);
                 return;
             }
-            $normalizedPhone = $this->normalizePhoneNumber($text);
+            $normalizedPhone = $this->normalizePhoneNumber($convertedPhone);
             $session['phone'] = $normalizedPhone;
             $session['step'] = 'waiting_address';
             Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
@@ -3857,6 +5604,7 @@ class TelegramBotService
             $askAddr = "{$phoneSavedMsg}\n\n"
                      . $this->formatAskAddressMessage($userName, $session);
             $this->sendMessage($chatId, $askAddr, $this->getAddressKeyboard());
+            $this->logOutgoingBotMessage($chatId, $askAddr);
             return;
         }
 
@@ -3871,6 +5619,40 @@ class TelegramBotService
                 : "📍 လိပ်စာ အောင်မြင်စွာ မှတ်သားပြီးပါပြီရှင်။";
 
             $this->sendMessage($chatId, $addrSavedMsg, ['remove_keyboard' => true]);
+            $this->logOutgoingBotMessage($chatId, $addrSavedMsg);
+
+            $isQuickCod = Setting::get('telegram_bot_checkout_quick_cod', '1') === '1';
+            $isSkipTownship = Setting::get('telegram_bot_checkout_skip_township', '1') === '1';
+
+            if ($isQuickCod) {
+                $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
+                $session['delivery_method'] = 'အိမ်အရောက်ပို့ (Cash on Delivery)';
+                $session['shipping_fee'] = $cityFee;
+                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
+                    ? (float)collect($session['items'])->sum('subtotal')
+                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
+                $session['grand_total'] = $itemsTotal + $cityFee;
+                $session['payment_type'] = 'Cash on Delivery';
+                $session['payment_status'] = 'Unpaid';
+                $session['step'] = 'completed';
+                $this->finalizeOrder($chatId, $session, $userName, $usernameTag);
+                return;
+            }
+
+            if ($isSkipTownship) {
+                $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
+                $session['delivery_method'] = 'အိမ်အရောက်ပို့ (Standard Delivery)';
+                $session['shipping_fee'] = $cityFee;
+                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
+                    ? (float)collect($session['items'])->sum('subtotal')
+                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
+                $session['grand_total'] = $itemsTotal + $cityFee;
+                $session['step'] = 'waiting_payment';
+                Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
+                $this->sendPaymentSelection($chatId, $session);
+                return;
+            }
+
             $this->sendDeliveryMethodSelection($chatId, $session);
             return;
         }
@@ -3903,9 +5685,21 @@ class TelegramBotService
      */
     public function sendDeliveryMethodSelection(int|string $chatId, array $session, ?int $messageIdToEdit = null): void
     {
-        $allowPickup = Setting::get('telegram_bot_allow_store_pickup', '1') === '1';
+        $allowPickup = Setting::get('telegram_bot_allow_store_pickup', '1') === '1'
+            && Setting::get('telegram_bot_show_delivery_pickup', '1') === '1';
+        $showCity = Setting::get('telegram_bot_show_delivery_city', '1') === '1';
+        $showExpress = Setting::get('telegram_bot_show_delivery_express', '1') === '1';
+
         $pickupFee = (float)Setting::get('telegram_bot_delivery_store_pickup_fee', 0);
         $pickupFeeStr = $pickupFee > 0 ? number_format($pickupFee) . " MMK" : "အခမဲ့ (Free)";
+        $expressFee = (float)Setting::get('telegram_bot_delivery_express_fee', 3000);
+        $expressFeeStr = $expressFee > 0 ? number_format($expressFee) . " MMK" : "အခမဲ့ (Free)";
+
+        $pickupLabel = trim((string)Setting::get('telegram_bot_delivery_store_pickup_label', '🏢 ဆိုင်တွင် ကိုယ်တိုင်လာယူမည် (Store Pickup)'));
+        $cityLabel = trim((string)Setting::get('telegram_bot_delivery_city_label', '🚚 မြို့တွင်း အိမ်အရောက်ပို့ (City Delivery)'));
+        $expressLabel = trim((string)Setting::get('telegram_bot_delivery_express_label', '📦 နယ်ဝေး ကားဂိတ်ပို့ဆောင် (Highway Bus Gate)'));
+        $btnCancel = trim((string)Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)'));
+        $showCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
 
         $activeRegions = DeliveryRegion::where('is_active', true)
             ->withCount('activeTownships')
@@ -3914,8 +5708,8 @@ class TelegramBotService
             ->get();
         $totalTownships = DeliveryTownship::where('is_active', true)->count();
 
-        // If Store Pickup is disabled or no pickup allowed, route directly to Region/Township Selection
-        if (!$allowPickup) {
+        // If Store Pickup and Express are disabled and only City Delivery is active, route directly to Region/Township Selection
+        if (!$allowPickup && !$showExpress && $showCity) {
             if ($activeRegions->count() === 1) {
                 $this->sendTownshipSelection($chatId, $session, $messageIdToEdit, $activeRegions->first()->id);
             } else {
@@ -3926,23 +5720,45 @@ class TelegramBotService
 
         $msg = "🚚 *ပို့ဆောင်မှု နည်းလမ်း ရွေးချယ်ပေးပါရှင်*\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
-             . "လူကြီးမင်း၏ အော်ဒါအား ပို့ဆောင်ပေးရမည့် ပုံစံကို ရွေးချယ်ပေးပါ-\n\n"
-             . "၁။ 🚚 *ဒေသနှင့် မြို့နယ်အလိုက် အိမ်အရောက်ပို့* (Home Delivery)\n"
-             . "   • သတ်မှတ်ထားသော မြို့နယ် ({$totalTownships}) ခုသို့ သတ်မှတ်ပို့ဆောင်ခနှုန်းထားများအတိုင်း ပို့ဆောင်ပေးပါသည်\n\n"
-             . "၂။ 🏢 *ဆိုင်တွင် ကိုယ်တိုင်လာယူမည်* (Store Pickup) - {$pickupFeeStr}\n\n"
-             . "ရွေးချယ်လိုသည့် နည်းလမ်းခလုတ်ကို နှိပ်ပေးပါ-";
+             . "လူကြီးမင်း၏ အော်ဒါအား ပို့ဆောင်ပေးရမည့် နည်းလမ်းကို ရွေးချယ်ပေးပါ-\n\n";
 
-        $buttons = [
-            [
-                ['text' => "🚚 ဒေသအလိုက် အိမ်အရောက်ပို့ ({$totalTownships} မြို့နယ်)", 'callback_data' => 'deliv_city'],
-            ],
-            [
-                ['text' => "🏢 ဆိုင်တွင် လာယူမည် ({$pickupFeeStr})", 'callback_data' => 'deliv_pickup'],
-            ],
-            [
-                ['text' => '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
-            ],
-        ];
+        if ($showCity) {
+            $msg .= "▫️ *{$cityLabel}*\n"
+                  . "   မြို့နယ် ({$totalTownships}) ခုသို့ သတ်မှတ်နှုန်းထားများအတိုင်း ပို့ဆောင်ပေးပါသည်\n\n";
+        }
+        if ($allowPickup) {
+            $msg .= "▫️ *{$pickupLabel}*\n"
+                  . "   ကျသင့်ငွေ: {$pickupFeeStr}\n\n";
+        }
+        if ($showExpress) {
+            $msg .= "▫️ *{$expressLabel}*\n"
+                  . "   ကျသင့်ငွေ: {$expressFeeStr}\n\n";
+        }
+
+        $msg .= "━━━━━━━━━━━━━━━━━━━━━\n\n"
+              . "ရွေးချယ်လိုသည့် နည်းလမ်းခလုတ်ကို နှိပ်ပေးပါ-";
+
+        $buttons = [];
+        if ($showCity) {
+            $buttons[] = [
+                ['text' => (!empty($cityLabel) ? $cityLabel : "🚚 ဒေသအလိုက် အိမ်အရောက်ပို့") . " ({$totalTownships} မြို့နယ်)", 'callback_data' => 'deliv_city'],
+            ];
+        }
+        if ($allowPickup) {
+            $buttons[] = [
+                ['text' => (!empty($pickupLabel) ? $pickupLabel : "🏢 ဆိုင်တွင် လာယူမည်") . " ({$pickupFeeStr})", 'callback_data' => 'deliv_pickup'],
+            ];
+        }
+        if ($showExpress) {
+            $buttons[] = [
+                ['text' => (!empty($expressLabel) ? $expressLabel : "📦 နယ်ဝေး ကားဂိတ်ပို့ဆောင်") . " ({$expressFeeStr})", 'callback_data' => 'deliv_express'],
+            ];
+        }
+        if ($showCancel) {
+            $buttons[] = [
+                ['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel'],
+            ];
+        }
 
         $this->editOrSendMessage($chatId, $messageIdToEdit, $msg, ['inline_keyboard' => $buttons]);
     }
@@ -4090,24 +5906,33 @@ class TelegramBotService
         $addressDisplay = !empty($session['address']) ? $session['address'] : 'ဆိုင်တွင် လာယူမည်';
 
         if ($isCart) {
-            $itemsList = collect($session['items'])->map(function ($it) {
+            $indexIcons = [1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣', 6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟'];
+            $itemsList = collect($session['items'])->values()->map(function ($it, $idx) use ($indexIcons) {
+                $num = $idx + 1;
+                $badge = $indexIcons[$num] ?? "{$num}.";
                 $name = !empty($it['variant_name']) ? "{$it['product_name']} ({$it['variant_name']})" : $it['product_name'];
-                return "   • {$name} x {$it['quantity']} " . ($it['unit_name'] ?? 'ခု');
-            })->implode("\n");
+                $qty = (floor($it['quantity']) == $it['quantity']) ? (int)$it['quantity'] : $it['quantity'];
+                $unit = !empty($it['unit_name']) ? $it['unit_name'] : 'ခု';
+                $price = number_format($it['price'] ?? 0);
+                $sub = number_format($it['subtotal'] ?? 0);
+                return "{$badge} *{$name}*\n   ▫️ {$qty} {$unit} × {$price}  =  *{$sub} MMK*";
+            })->implode("\n\n");
 
-            $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n\n"
-                 . "📦 *မှာယူသော ပစ္စည်းများ (" . count($session['items']) . " မျိုး):*\n"
+            $shipLine = $shippingFee > 0
+                ? "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *+" . number_format($shippingFee) . " MMK*\n"
+                : "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *အခမဲ့ (0 MMK)*\n";
+
+            $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "📦 *မှာယူသော ပစ္စည်းများ (" . count($session['items']) . " မျိုး):*\n\n"
                  . "{$itemsList}\n"
                  . "━━━━━━━━━━━━━━━━━━━━━\n"
-                 . "💵 ပစ္စည်းကျသင့်ငွေ: *{$itemsTotalFormatted} MMK*\n";
-            if ($shippingFee > 0) {
-                $msg .= "🚚 ပို့ဆောင်ခ ({$delivMethod}): *+" . number_format($shippingFee) . " MMK*\n";
-            } else {
-                $msg .= "🚚 ပို့ဆောင်ခ ({$delivMethod}): *အခမဲ့ (0 MMK)*\n";
-            }
-            $msg .= "💰 *စုစုပေါင်း ကျသင့်ငွေ:* *{$totalFormatted} MMK*\n"
-                 . "📞 ဖုန်း: {$phoneDisplay}\n"
-                 . "📍 လိပ်စာ: {$addressDisplay}\n\n"
+                 . "💵 ပစ္စည်းကျသင့်ငွေ:  *{$itemsTotalFormatted} MMK*\n"
+                 . $shipLine
+                 . "💰 စုစုပေါင်း ကျသင့်ငွေ:  *{$totalFormatted} MMK*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "📞 ဖုန်းနံပါတ်:  `{$phoneDisplay}`\n"
+                 . "📍 ပို့ဆောင်ရန်:  {$addressDisplay}\n\n"
                  . "ငွေပေးချေလိုသည့် ပုံစံကို ရွေးချယ်ပါ-";
         } else {
             $itemTitle = !empty($session['variant_name'])
@@ -4127,17 +5952,21 @@ class TelegramBotService
                 ]);
             } else {
                 $shipLine = $shippingFee > 0
-                    ? "🚚 ပို့ဆောင်ခ ({$delivMethod}): *+" . number_format($shippingFee) . " MMK*\n"
-                    : "🚚 ပို့ဆောင်ခ ({$delivMethod}): *အခမဲ့ (0 MMK)*\n";
+                    ? "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *+" . number_format($shippingFee) . " MMK*\n"
+                    : "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *အခမဲ့ (0 MMK)*\n";
 
-                $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n\n"
-                     . "🔖 ပစ္စည်း: {$itemTitle}\n"
-                     . "📦 အရေအတွက်: " . ($session['quantity'] ?? 1) . " ခု\n"
-                     . "💵 ပစ္စည်းကျသင့်ငွေ: *{$itemsTotalFormatted} MMK*\n"
+                $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
+                     . "━━━━━━━━━━━━━━━━━━━━━\n"
+                     . "📦 *မှာယူသော ပစ္စည်း:*\n"
+                     . "1️⃣ *{$itemTitle}*\n"
+                     . "   ▫️ " . ($session['quantity'] ?? 1) . " ခု × " . number_format((float)($session['price'] ?? 0)) . "  =  *{$itemsTotalFormatted} MMK*\n"
+                     . "━━━━━━━━━━━━━━━━━━━━━\n"
+                     . "💵 ပစ္စည်းကျသင့်ငွေ:  *{$itemsTotalFormatted} MMK*\n"
                      . $shipLine
-                     . "💰 *စုစုပေါင်း: *{$totalFormatted} MMK*\n"
-                     . "📞 ဖုန်း: {$phoneDisplay}\n"
-                     . "📍 လိပ်စာ: {$addressDisplay}\n\n"
+                     . "💰 စုစုပေါင်း ကျသင့်ငွေ:  *{$totalFormatted} MMK*\n"
+                     . "━━━━━━━━━━━━━━━━━━━━━\n"
+                     . "📞 ဖုန်းနံပါတ်:       `{$phoneDisplay}`\n"
+                     . "📍 ပို့ဆောင်ရန်:       {$addressDisplay}\n\n"
                      . "ငွေပေးချေလိုသည့် ပုံစံကို ရွေးချယ်ပါ-";
             }
         }
@@ -4145,6 +5974,9 @@ class TelegramBotService
         $buttons = [];
         $allowUnpaid = Setting::get('telegram_bot_allow_unpaid', '1') === '1';
         $allowPaid = Setting::get('telegram_bot_allow_paid', '1') === '1';
+        $showBtnKpay = Setting::get('telegram_bot_show_btn_kpay', '1') === '1';
+        $showBtnWave = Setting::get('telegram_bot_show_btn_wave', '1') === '1';
+        $showCancel = Setting::get('telegram_bot_show_catalog_nav_cancel', Setting::get('telegram_bot_show_catalog_btn_cancel', '1')) === '1';
 
         // Fetch active payment methods configured for Telegram Bot from Database
         $activeMethods = PaymentMethod::where('is_active', true)
@@ -4185,9 +6017,16 @@ class TelegramBotService
         // 2. Paid / Mobile Banking buttons
         if ($allowPaid) {
             if ($paidMethods->isNotEmpty()) {
-                $row = [];
                 foreach ($paidMethods as $pm) {
-                    $icon = match (strtolower($pm->code ?? '')) {
+                    $codeLower = strtolower($pm->code ?? '');
+                    $nameLower = strtolower($pm->name ?? '');
+                    if (($codeLower === 'kpay' || str_contains($nameLower, 'kpay') || str_contains($nameLower, 'kbzpay')) && !$showBtnKpay) {
+                        continue;
+                    }
+                    if (($codeLower === 'wavepay' || str_contains($nameLower, 'wave')) && !$showBtnWave) {
+                        continue;
+                    }
+                    $icon = match ($codeLower) {
                         'kpay' => '📱',
                         'wavepay' => '📱',
                         'ayapay' => '📱',
@@ -4200,16 +6039,22 @@ class TelegramBotService
                 }
             } else {
                 // Fallback default buttons if DB has no specific mobile methods
-                $buttons[] = [
-                    ['text' => !empty($btnKpay) ? $btnKpay : '📱 KBZPay ဖြင့်လွှဲမည်', 'callback_data' => 'pay_kbzpay'],
-                ];
-                $buttons[] = [
-                    ['text' => !empty($btnWave) ? $btnWave : '📱 WavePay ဖြင့်လွှဲမည်', 'callback_data' => 'pay_wavepay'],
-                ];
+                if ($showBtnKpay) {
+                    $buttons[] = [
+                        ['text' => !empty($btnKpay) ? $btnKpay : '📱 KBZPay ဖြင့်လွှဲမည်', 'callback_data' => 'pay_kbzpay'],
+                    ];
+                }
+                if ($showBtnWave) {
+                    $buttons[] = [
+                        ['text' => !empty($btnWave) ? $btnWave : '📱 WavePay ဖြင့်လွှဲမည်', 'callback_data' => 'pay_wavepay'],
+                    ];
+                }
             }
         }
 
-        $buttons[] = [['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel']];
+        if ($showCancel) {
+            $buttons[] = [['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)', 'callback_data' => 'cancel']];
+        }
 
         $this->editOrSendMessage($chatId, $messageIdToEdit, $msg, [
             'inline_keyboard' => $buttons,
@@ -4217,10 +6062,15 @@ class TelegramBotService
     }
 
     /**
-     * Handle Photo message (Payment Slip)
+     * 📸 Intelligent Photo Handler (Product Visual Search vs Payment Slip vs Prescription)
      */
-    protected function handlePhotoMessage(int|string $chatId, array $photoArray, string $userName, string $usernameTag): void
-    {
+    protected function handlePhotoMessage(
+        int|string $chatId,
+        array $photoArray,
+        string $userName,
+        string $usernameTag,
+        string $caption = ''
+    ): void {
         $highestRes = end($photoArray);
         $fileId = $highestRes['file_id'] ?? null;
         $fileUniqueId = $highestRes['file_unique_id'] ?? null;
@@ -4233,14 +6083,229 @@ class TelegramBotService
             return;
         }
 
-        $this->processPaymentSlipUpload($chatId, $fileId, $userName, $usernameTag, $fileUniqueId);
+        // Show uploading photo indicator while fetching and processing
+        $this->sendChatAction($chatId, 'upload_photo');
+
+        $download = $this->downloadTelegramFileWithHash($fileId);
+        if (!$download || empty($download['url'])) {
+            $photoErrTpl = Setting::get('telegram_bot_photo_error_msg', '');
+            $photoErrMsg = !empty(trim($photoErrTpl))
+                ? $this->replacePlaceholders($photoErrTpl, ['customer_name' => $userName, 'user_name' => $userName])
+                : "⚠️ ဓာတ်ပုံ ရယူ၍ မရပါရှင်။ ကျေးဇူးပြု၍ ပြန်လည် ပေးပို့ပေးပါရှင်။";
+            $this->sendMessage($chatId, $photoErrMsg);
+            return;
+        }
+
+        $photoUrl = $download['url'];
+
+        // 1. Record incoming customer photo message in Live Chat
+        try {
+            $custMsgText = !empty($caption) ? $caption : '[ဓာတ်ပုံ ပေးပို့ခဲ့သည်]';
+            BotChatMessage::create([
+                'telegram_chat_id' => (string)$chatId,
+                'customer_name' => $userName,
+                'telegram_username' => $usernameTag,
+                'sender_type' => 'customer',
+                'message_type' => 'photo',
+                'message_text' => $custMsgText,
+                'metadata' => [
+                    'image_url' => $photoUrl,
+                    'file_id' => $fileId,
+                    'caption' => $caption,
+                ],
+                'is_read' => false,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Log BotChatMessage photo error: ' . $e->getMessage());
+        }
+
+        // 2. CONTEXT 1: Active Checkout Session in Progress
+        $session = Cache::get("tg_session_{$chatId}");
+        $isInCheckout = $session && (!empty($session['product_id']) || (!empty($session['is_cart']) && !empty($session['items'])));
+
+        $captionLower = mb_strtolower($caption);
+        $isExplicitSlipCaption = str_contains($captionLower, 'slip') 
+            || str_contains($captionLower, 'စလစ်') 
+            || str_contains($captionLower, 'ပြေစာ') 
+            || str_contains($captionLower, 'ငွေလွှဲ') 
+            || str_contains($captionLower, 'kpay') 
+            || str_contains($captionLower, 'wave') 
+            || str_contains($captionLower, 'kbzpay');
+
+        if ($isInCheckout || $isExplicitSlipCaption) {
+            $this->processPaymentSlipUpload($chatId, $fileId, $userName, $usernameTag, $fileUniqueId, $download);
+            return;
+        }
+
+        // Operating Mode: Standard Mode Check (zero AI Vision API calls)
+        $operatingMode = $this->aiAgentService->getOperatingMode();
+        if ($operatingMode === 'standard') {
+            $this->notifyAdminCustomerNeedsHelp(
+                $chatId,
+                $userName,
+                $usernameTag,
+                "Customer sent photo in Standard Mode: " . ($caption ?: "Please review photo")
+            );
+
+            $stdPhotoMsg = "📷 *ဓာတ်ပုံ လက်ခံရရှိပါသည်ရှင်။*\n\nဆိုင်တာဝန်ခံ/ဝန်ထမ်းထံသို့ ပေးပို့ထားပြီး မကြာမီ စစ်ဆေးအကြောင်းပြန်ပေးပါမည်ရှင်။ 🙏\n\n💡 _ငွေလွှဲစလစ် ပေးပို့လိုပါက ပစ္စည်းမှာယူပြီးမှ ပေးပို့ပေးပါရန် မေတ္တာရပ်ခံအပ်ပါသည်ရှင်။_";
+            $this->sendMessage($chatId, $stdPhotoMsg, [
+                'inline_keyboard' => [
+                    [
+                        ['text' => '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်', 'callback_data' => 'nav_all_products'],
+                        ['text' => '🛒 ခြင်းတောင်း ကြည့်မည်', 'callback_data' => 'cart_view'],
+                    ],
+                    [
+                        ['text' => '👨‍💼 ဆိုင်ဝန်ထမ်းနှင့် စကားပြောမည်', 'callback_data' => 'ask_human'],
+                        ['text' => '🏠 မူလစာမျက်နှာ', 'callback_data' => 'catalog_main'],
+                    ]
+                ]
+            ]);
+            return;
+        }
+
+        // 3. CONTEXT 2: AI Agent Enabled -> Multimodal Visual Search
+        if ($this->aiAgentService->isEnabled() && !$this->aiAgentService->isAiPausedForChat($chatId)) {
+            $this->sendChatAction($chatId, 'typing');
+
+            $aiRes = $this->aiAgentService->handleCustomerImageQuery(
+                $chatId,
+                $userName,
+                $download['contents'] ?? '',
+                $download['mime'] ?? 'image/jpeg',
+                $caption,
+                $usernameTag
+            );
+
+            if ($aiRes) {
+                $intent = $aiRes['image_intent'] ?? 'product_inquiry';
+
+                // Case A: AI detected it IS a bank transfer slip
+                if ($intent === 'payment_slip') {
+                    $this->processPaymentSlipUpload($chatId, $fileId, $userName, $usernameTag, $fileUniqueId, $download);
+                    return;
+                }
+
+                // Case B: AI detected a doctor's medical prescription
+                if ($intent === 'prescription') {
+                    BotChatMessage::create([
+                        'telegram_chat_id' => (string)$chatId,
+                        'customer_name' => $userName,
+                        'telegram_username' => $usernameTag,
+                        'sender_type' => 'ai',
+                        'message_type' => 'text',
+                        'message_text' => $aiRes['reply'],
+                        'metadata' => [
+                            'prescription_detected' => true,
+                            'image_url' => $photoUrl,
+                        ],
+                        'is_read' => true,
+                        'needs_human' => true,
+                    ]);
+
+                    $this->aiAgentService->pauseAiForChat($chatId, 120);
+                    $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, "Customer sent prescription photo: " . ($caption ?: "Please review prescription"));
+
+                    $keyboard = [
+                        'inline_keyboard' => [
+                            [
+                                ['text' => '👨‍💼 ဆိုင်တာဝန်ခံနှင့် တိုက်ရိုက်ပြောမည်', 'callback_data' => 'ask_human'],
+                                ['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'catalog_main'],
+                            ],
+                        ],
+                    ];
+                    $this->sendMessage($chatId, $aiRes['reply'], $keyboard);
+                    return;
+                }
+
+                // Case C: AI detected a product / item inquiry ("ဒါလေးရှိလား")
+                if ($intent === 'product_inquiry' || !empty($aiRes['matched_product_ids'])) {
+                    $matchedIds = $aiRes['matched_product_ids'] ?? [];
+
+                    BotChatMessage::create([
+                        'telegram_chat_id' => (string)$chatId,
+                        'customer_name' => $userName,
+                        'telegram_username' => $usernameTag,
+                        'sender_type' => 'ai',
+                        'message_type' => 'text',
+                        'message_text' => $aiRes['reply'],
+                        'metadata' => [
+                            'recommended_product_ids' => $matchedIds,
+                            'detected_item' => $aiRes['detected_item'] ?? null,
+                            'visual_match' => true,
+                            'customer_image_url' => $photoUrl,
+                            'suggested_action' => $aiRes['suggested_action'] ?? 'order',
+                        ],
+                        'is_read' => true,
+                        'needs_human' => !empty($aiRes['needs_human']),
+                    ]);
+
+                    // 1. Send AI vision recognition text
+                    $this->sendMessage($chatId, $aiRes['reply']);
+
+                    // 2. Send the matched product card(s)
+                    if (!empty($matchedIds)) {
+                        Cache::put("tg_last_visual_product_{$chatId}", $matchedIds[0], now()->addMinutes(30));
+
+                        $recProducts = Product::whereIn('id', (array)$matchedIds)
+                            ->where('is_bot_available', true)
+                            ->where(function ($q) {
+                                $q->whereNull('is_active')->orWhere('is_active', true)->orWhere('status', 'Active');
+                            })
+                            ->take(3)
+                            ->get();
+
+                        $vIdx = 1;
+                        foreach ($recProducts as $rp) {
+                            $this->sendProductCardItem($chatId, $rp, $vIdx++, true);
+                        }
+                    }
+
+                    $navRow = [
+                        ['text' => '👨‍💼 ဝန်ထမ်းနှင့် စကားပြောမည်', 'callback_data' => 'ask_human'],
+                        ['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'catalog_main'],
+                    ];
+                    $this->sendMessage($chatId, "👇 _အခြား အကူအညီ လိုအပ်ပါက ရွေးချယ်နိုင်ပါသည်ရှင်_", [
+                        'inline_keyboard' => [$navRow]
+                    ]);
+                    return;
+                }
+
+                // Case D: Other image intent with AI reply
+                if (!empty($aiRes['reply'])) {
+                    BotChatMessage::create([
+                        'telegram_chat_id' => (string)$chatId,
+                        'customer_name' => $userName,
+                        'telegram_username' => $usernameTag,
+                        'sender_type' => 'ai',
+                        'message_type' => 'text',
+                        'message_text' => $aiRes['reply'],
+                        'metadata' => [
+                            'customer_image_url' => $photoUrl,
+                        ],
+                        'is_read' => true,
+                        'needs_human' => !empty($aiRes['needs_human']),
+                    ]);
+
+                    $this->sendMessage($chatId, $aiRes['reply'], $this->getMainKeyboard($chatId));
+                    return;
+                }
+            }
+        }
+
+        // 4. FALLBACK: Process payment slip logic
+        $this->processPaymentSlipUpload($chatId, $fileId, $userName, $usernameTag, $fileUniqueId, $download);
     }
 
     /**
-     * Handle Document message (Payment Slip sent as file / uncompressed image)
+     * Handle Document message (Payment Slip or uncompressed image)
      */
-    protected function handleDocumentMessage(int|string $chatId, array $document, string $userName, string $usernameTag): void
-    {
+    protected function handleDocumentMessage(
+        int|string $chatId,
+        array $document,
+        string $userName,
+        string $usernameTag,
+        string $caption = ''
+    ): void {
         $mime = $document['mime_type'] ?? '';
         $fileName = strtolower($document['file_name'] ?? '');
         $isImage = str_starts_with($mime, 'image/') || preg_match('/\.(jpg|jpeg|png|webp|bmp)$/i', $fileName);
@@ -4249,7 +6314,7 @@ class TelegramBotService
             $invalidDocTpl = Setting::get('telegram_bot_invalid_slip_doc_msg', '');
             $invalidDocMsg = !empty(trim($invalidDocTpl))
                 ? $this->replacePlaceholders($invalidDocTpl, ['customer_name' => $userName, 'user_name' => $userName])
-                : "⚠️ ကျေးဇူးပြု၍ ငွေလွှဲပြေစာ ဓာတ်ပုံ (Image) သာ ပေးပို့ပေးပါရှင်။ 🙏";
+                : "⚠️ ကျေးဇူးပြု၍ ကုန်ပစ္စည်း သို့မဟုတ် ငွေလွှဲပြေစာ ဓာတ်ပုံ (Image) သာ ပေးပို့ပေးပါရှင်။ 🙏";
             $this->sendMessage($chatId, $invalidDocMsg, $this->getMainKeyboard($chatId));
             return;
         }
@@ -4265,7 +6330,10 @@ class TelegramBotService
             return;
         }
 
-        $this->processPaymentSlipUpload($chatId, $fileId, $userName, $usernameTag, $fileUniqueId);
+        $fakePhotoArray = [
+            ['file_id' => $fileId, 'file_unique_id' => $fileUniqueId]
+        ];
+        $this->handlePhotoMessage($chatId, $fakePhotoArray, $userName, $usernameTag, $caption);
     }
 
     /**
@@ -4276,9 +6344,10 @@ class TelegramBotService
         string $fileId,
         string $userName,
         string $usernameTag,
-        ?string $fileUniqueId = null
+        ?string $fileUniqueId = null,
+        ?array $preloadedDownload = null
     ): void {
-        $download = $this->downloadTelegramFileWithHash($fileId);
+        $download = $preloadedDownload ?: $this->downloadTelegramFileWithHash($fileId);
         if (!$download || empty($download['url'])) {
             $photoErrTpl = Setting::get('telegram_bot_photo_error_msg', '');
             $photoErrMsg = !empty(trim($photoErrTpl))
@@ -4415,7 +6484,7 @@ class TelegramBotService
     /**
      * Handle 1-Tap GPS Location Message
      */
-    protected function handleLocationMessage(int|string $chatId, float $lat, float $lng, string $userName): void
+    protected function handleLocationMessage(int|string $chatId, float $lat, float $lng, string $userName, string $usernameTag = ''): void
     {
         $session = Cache::get("tg_session_{$chatId}");
         if ($session && $session['step'] === 'waiting_address') {
@@ -4439,6 +6508,39 @@ class TelegramBotService
                 $ackMsg = "📍 တည်နေရာ အောင်မြင်စွာ လက်ခံရရှိပါသည်ရှင်!\n🗺️ {$mapsUrl}";
             }
             $this->sendMessage($chatId, $ackMsg, ['remove_keyboard' => true]);
+
+            $isQuickCod = Setting::get('telegram_bot_checkout_quick_cod', '1') === '1';
+            $isSkipTownship = Setting::get('telegram_bot_checkout_skip_township', '1') === '1';
+
+            if ($isQuickCod) {
+                $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
+                $session['delivery_method'] = 'အိမ်အရောက်ပို့ (City Delivery - GPS)';
+                $session['shipping_fee'] = $cityFee;
+                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
+                    ? (float)collect($session['items'])->sum('subtotal')
+                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
+                $session['grand_total'] = $itemsTotal + $cityFee;
+                $session['payment_type'] = 'Cash on Delivery';
+                $session['payment_status'] = 'Unpaid';
+                $session['step'] = 'completed';
+                $this->finalizeOrder($chatId, $session, $userName, $usernameTag);
+                return;
+            }
+
+            if ($isSkipTownship) {
+                $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
+                $session['delivery_method'] = 'အိမ်အရောက်ပို့ (City Delivery - GPS)';
+                $session['shipping_fee'] = $cityFee;
+                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
+                    ? (float)collect($session['items'])->sum('subtotal')
+                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
+                $session['grand_total'] = $itemsTotal + $cityFee;
+                $session['step'] = 'waiting_payment';
+                Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
+                $this->sendPaymentSelection($chatId, $session);
+                return;
+            }
+
             $this->sendDeliveryMethodSelection($chatId, $session);
             return;
         }
@@ -4554,6 +6656,7 @@ class TelegramBotService
                 }
             }
             $preorderMeta = $hasPreorderItem ? " [⚠️ Pre-order / Backorder Item]" : "";
+            $aiMeta = !empty($session['ai_autonomous_order']) ? " [⚡ AI Autonomous Zero-Click Order]" : "";
 
             $sale = Sale::create([
                 'reference_no' => $refNo,
@@ -4574,7 +6677,7 @@ class TelegramBotService
                 'change_amount' => 0.0,
                 'payment_status' => $paymentStatus,
                 'payment_type' => $paymentType,
-                'notes' => 'Telegram Bot Order by ' . $userName . ' (' . ($usernameTag ?: $chatId) . ')' . (!empty($session['delivery_method']) ? ' | ပို့ဆောင်မှု: ' . $session['delivery_method'] : '') . (!empty($session['delivery_township']) ? ' | မြို့နယ်: ' . $session['delivery_township'] : '') . $slipMeta . $preorderMeta,
+                'notes' => 'Telegram Bot Order by ' . $userName . ' (' . ($usernameTag ?: $chatId) . ')' . (!empty($session['delivery_method']) ? ' | ပို့ဆောင်မှု: ' . $session['delivery_method'] : '') . (!empty($session['delivery_township']) ? ' | မြို့နယ်: ' . $session['delivery_township'] : '') . $slipMeta . $preorderMeta . $aiMeta,
                 'pos_flag' => false,
                 'order_source' => 'telegram_bot',
                 'telegram_chat_id' => (string)$chatId,
@@ -4632,7 +6735,17 @@ class TelegramBotService
                 ]);
 
                 $nameForReceipt = $vName ? "{$product->name} ({$vName})" : $product->name;
-                $itemsSummaryLines[] = "• {$nameForReceipt} x {$iQty} " . ($product->unit_name ?: 'ခု') . " = " . number_format($iSubtotal) . " MMK";
+                $cleanQty = (floor($iQty) == $iQty) ? (int)$iQty : $iQty;
+                $unitStr = $product->unit_name ?: 'ခု';
+                $priceFmt = number_format($iPrice);
+                $subFmt = number_format($iSubtotal);
+                $numBadge = (count($itemsSummaryLines) + 1);
+                $badge = match ($numBadge) {
+                    1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣',
+                    6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟',
+                    default => "{$numBadge}."
+                };
+                $itemsSummaryLines[] = "{$badge} *{$nameForReceipt}*\n   ▫️ {$cleanQty} {$unitStr} × {$priceFmt}  =  *{$subFmt} MMK*";
 
                 if ($autoApprove && $fifoService) {
                     $unitService->applyStock(
@@ -4701,9 +6814,11 @@ class TelegramBotService
             Cache::forget("tg_session_{$chatId}");
 
             $totalFormatted = number_format($grandTotal);
+            $itemsTotalFmt = number_format($subtotal);
+            $shipFmt = $shippingFee > 0 ? "+" . number_format($shippingFee) . " MMK" : "အခမဲ့ (0 MMK)";
             $statusText = $autoApprove ? "✅ အတည်ပြုပြီးပါပြီ (Approved)" : "⏳ ဆိုင်မှ စစ်ဆေးအတည်ပြုရန် စောင့်ဆိုင်းနေပါသည် (Pending Review)";
             $firstItemName = $itemsSummaryLines[0] ?? 'ကုန်ပစ္စည်းများ';
-            $allItemsFormatted = implode("\n", $itemsSummaryLines);
+            $allItemsFormatted = implode("\n\n", $itemsSummaryLines);
 
             // Custom Order Success Message Template
             $customSuccessTemplate = Setting::get('telegram_bot_order_success_msg', '');
@@ -4737,14 +6852,18 @@ class TelegramBotService
             } else {
                 $receiptMsg = "🎉 *အော်ဒါတင်ခြင်း အောင်မြင်ပါသည်ရှင်!*\n\n"
                             . "🔖 *အော်ဒါအမှတ်:* `{$sale->reference_no}`\n"
-                            . "📦 *မှာယူသော ပစ္စည်းများ (" . count($cartItems) . " မျိုး / {$totalQuantity} ခု):*\n"
+                            . "━━━━━━━━━━━━━━━━━━━━━\n"
+                            . "📦 *မှာယူသော ပစ္စည်းများ (" . count($cartItems) . " မျိုး / {$totalQuantity} ခု):*\n\n"
                             . "{$allItemsFormatted}\n"
                             . "━━━━━━━━━━━━━━━━━━━━━\n"
-                            . "💰 *စုစုပေါင်း ကျသင့်ငွေ:* *{$totalFormatted} MMK*\n"
-                            . "💳 *ငွေပေးချေမှု:* {$paymentType} ({$paymentStatus})\n"
-                            . "📞 *ဖုန်းနံပါတ်:* {$customerPhone}\n"
-                            . "📍 *ပို့ဆောင်ရမည့် လိပ်စာ:* {$shippingAddress}\n"
-                            . "📌 *အခြေအနေ:* {$statusText}\n\n"
+                            . "💵 ကုန်ပစ္စည်းတန်ဖိုး:   *{$itemsTotalFmt} MMK*\n"
+                            . "🚚 ပို့ဆောင်ခ:         *{$shipFmt}*\n"
+                            . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n"
+                            . "━━━━━━━━━━━━━━━━━━━━━\n"
+                            . "💳 ငွေပေးချေမှု:      *{$paymentType}* ({$paymentStatus})\n"
+                            . "📞 ဖုန်းနံပါတ်:        `{$customerPhone}`\n"
+                            . "📍 ပို့ဆောင်ရမည့်လိပ်စာ:  {$shippingAddress}\n"
+                            . "📌 အခြေအနေ:         {$statusText}\n\n"
                             . "📊 *တိုးတက်မှု (Live Status Tracker):*\n"
                             . "┏━━━━━━━━━━━━━━━━━━━━┓\n"
                             . ($autoApprove
@@ -4803,37 +6922,30 @@ class TelegramBotService
                 'rejected' => '❌ ပယ်ဖျက်ထား (Rejected)',
                 default => '⏳ စစ်ဆေးရန်ကျန် (Pending Review)',
             };
-            $msg .= "🔖 အော်ဒါအမှတ်: `{$s->reference_no}`\n"
-                 . "📅 ရက်စွဲ: {$s->date}\n";
+            $grandTotalFmt = number_format($s->grand_total);
+            $msg .= "🔖 အော်ဒါအမှတ်:      `{$s->reference_no}`\n"
+                 . "📅 ရက်စွဲ:           {$s->date}\n";
 
             if ($s->items && $s->items->isNotEmpty()) {
-                $itemsStr = $s->items->map(function ($it) {
+                $itemsStr = $s->items->map(function ($it, $i) {
                     $name = $it->variant_name ? "{$it->product_name} ({$it->variant_name})" : $it->product_name;
-                    return "   • {$name} (x{$it->quantity})";
+                    $qty = (floor($it->quantity) == $it->quantity) ? (int)$it->quantity : $it->quantity;
+                    return "   ▫️ {$name} (x{$qty})";
                 })->implode("\n");
                 $msg .= "{$itemsStr}\n";
             }
 
-            $msg .= "💰 စုစုပေါင်း: *" . number_format($s->grand_total) . " MMK* ({$s->payment_type})\n"
-                 . "📌 အခြေအနေ: {$statusBadge}\n"
+            $msg .= "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$grandTotalFmt} MMK* ({$s->payment_type})\n"
+                 . "📌 အခြေအနေ:        {$statusBadge}\n"
                  . "─────────────────────\n\n";
         }
 
-        $reorderButtons = [];
-        foreach ($sales as $s) {
-            $shortRef = substr($s->reference_no, -8);
-            $reorderButtons[] = [
-                ['text' => "🔄 အော်ဒါ #{$shortRef} ပြန်လည်မှာယူမည် (Reorder)", 'callback_data' => "reorder_{$s->id}"]
-            ];
-        }
-        $reorderButtons[] = [
-            ['text' => '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်', 'callback_data' => 'nav_all_products'],
-        ];
-        $reorderButtons[] = [
-            ['text' => '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main'],
+        $navButtons = [
+            [['text' => '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်', 'callback_data' => 'nav_all_products']],
+            [['text' => '🔙 ပင်မ မီနူးသို့', 'callback_data' => 'catalog_main']],
         ];
 
-        $this->sendMessage($chatId, $msg, ['inline_keyboard' => $reorderButtons]);
+        $this->sendMessage($chatId, $msg, ['inline_keyboard' => $navButtons]);
     }
 
     /**
@@ -4859,27 +6971,31 @@ class TelegramBotService
 
         $itemsStr = "";
         if ($sale->items && $sale->items->isNotEmpty()) {
-            $itemsStr = $sale->items->map(function ($it) {
+            $itemsList = $sale->items->map(function ($it, $i) {
+                $num = $i + 1;
                 $name = $it->variant_name ? "{$it->product_name} ({$it->variant_name})" : $it->product_name;
-                return "   • {$name} (x{$it->quantity})";
+                $qty = (floor($it->quantity) == $it->quantity) ? (int)$it->quantity : $it->quantity;
+                $sub = number_format($it->subtotal);
+                return "   {$num}. *{$name}*\n      ▫️ {$qty} ခု — *{$sub} MMK*";
             })->implode("\n");
+            $itemsStr = "📦 *မှာယူထားသော ပစ္စည်းများ:*\n{$itemsList}\n";
         }
+
+        $grandTotalFmt = number_format($sale->grand_total);
+        $shipLine = $sale->shipping > 0
+            ? "🚚 ပို့ဆောင်ခ:        *+" . number_format($sale->shipping) . " MMK*\n"
+            : "🚚 ပို့ဆောင်ခ:        *အခမဲ့ (0 MMK)*\n";
 
         $msg = "📦 *အော်ဒါ အချက်အလက်နှင့် အခြေအနေ စစ်ဆေးခြင်း*\n"
-             . "━━━━━━━━━━━━━━━━━━━━━\n\n"
-             . "🔖 အော်ဒါအမှတ်: `{$sale->reference_no}`\n"
-             . "📅 ရက်စွဲ: {$sale->date}\n";
-
-        if ($itemsStr) {
-            $msg .= "{$itemsStr}\n";
-        }
-
-        if ($sale->shipping > 0) {
-            $msg .= "🚚 ပို့ဆောင်ခ: " . number_format($sale->shipping) . " MMK\n";
-        }
-
-        $msg .= "💰 စုစုပေါင်း: *" . number_format($sale->grand_total) . " MMK* ({$sale->payment_type})\n"
-             . "📌 အခြေအနေ: {$statusBadge}\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n"
+             . "🔖 အော်ဒါအမှတ်:      `{$sale->reference_no}`\n"
+             . "📅 ရက်စွဲ:           {$sale->date}\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n"
+             . ($itemsStr ? "{$itemsStr}━━━━━━━━━━━━━━━━━━━━━\n" : "")
+             . $shipLine
+             . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$grandTotalFmt} MMK*\n"
+             . "💳 ငွေပေးချေမှု:     *{$sale->payment_type}*\n"
+             . "📌 အခြေအနေ:        {$statusBadge}\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n\n"
              . "မေးမြန်းလိုသည်များ ရှိပါက '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်' မှတဆင့် တိုက်ရိုက် မေးမြန်းနိုင်ပါသည်ရှင်။ 🙏";
 
@@ -4908,9 +7024,9 @@ class TelegramBotService
 
                 if ($isCash) {
                     $msg .= "💵 *{$pm->name}*\n"
-                          . "   • ပစ္စည်းရောက်မှ ငွေချေစနစ် (Cash on Delivery)\n";
+                          . "   ▫️ အမျိုးအစား:     ပစ္စည်းရောက်မှ ငွေချေစနစ် (Cash on Delivery)\n";
                     if (!empty($pm->description)) {
-                        $msg .= "   • {$pm->description}\n";
+                        $msg .= "   ▫️ အသေးစိတ်:     {$pm->description}\n";
                     }
                     $msg .= "\n";
                     continue;
@@ -4926,13 +7042,13 @@ class TelegramBotService
 
                 $msg .= "{$icon} *{$pm->name}*\n";
                 if (!empty($pm->account_name)) {
-                    $msg .= "   👤 အမည်: `{$pm->account_name}`\n";
+                    $msg .= "   ▫️ အကောင့်အမည်:   `{$pm->account_name}`\n";
                 }
                 if (!empty($pm->account_number)) {
-                    $msg .= "   🔢 နံပါတ်: `{$pm->account_number}` (1-Tap Copy)\n";
+                    $msg .= "   ▫️ အကောင့်နံပါတ်:  `{$pm->account_number}` _(နှိပ်၍ ကူးယူပါ)_\n";
                 }
                 if (!empty($pm->description)) {
-                    $msg .= "   📝 ညွှန်ကြားချက်: {$pm->description}\n";
+                    $msg .= "   ▫️ မှတ်ချက်:      {$pm->description}\n";
                 }
                 $msg .= "\n";
             }
@@ -4980,53 +7096,22 @@ class TelegramBotService
             ]);
         } else {
             $msg = "📞 *{$shopName} နှင့် ဆက်သွယ်ရန် အချက်အလက်များ*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "🏬 ဆိုင်အမည်:   *{$shopName}*\n"
+                 . "📍 ဆိုင်လိပ်စာ:  {$address}\n"
+                 . "☎️ ဖုန်းနံပါတ်:  `{$phone}`\n"
                  . "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                 . "🏬 ဆိုင်အမည်: {$shopName}\n"
-                 . "📍 ဆိုင်လိပ်စာ: {$address}\n"
-                 . "☎️ ဖုန်းနံပါတ်: {$phone}\n\n"
                  . "မေးမြန်းလိုသည်များ ရှိပါက ဆိုင်သို့ တိုက်ရိုက် ဆက်သွယ်စုံစမ်းနိုင်ပါသည်ရှင်။ 🙏";
         }
         $this->sendMessage($chatId, $msg, $this->getMainKeyboard($chatId));
     }
 
     /**
-     * Format Dynamic Cart Button Text with Count / Amount Badges
+     * Format Dynamic Cart Button Text (Always Clean without badges)
      */
     public function formatCartButtonText(int|string|null $chatId = null, string $baseBtnCart = ''): string
     {
-        $baseText = !empty(trim($baseBtnCart)) ? trim($baseBtnCart) : '🛒 ခြင်းတောင်း ကြည့်မည်';
-        if (empty($chatId)) {
-            return $baseText;
-        }
-
-        try {
-            $badgeStyle = Setting::get('telegram_bot_cart_badge_style', 'none');
-            if ($badgeStyle === 'none' || $badgeStyle === 'disabled') {
-                return $baseText;
-            }
-
-            $summary = $this->getCartSummary($chatId);
-            $totalQty = (float)($summary['total_qty'] ?? 0);
-            $itemsCount = (int)($summary['items_count'] ?? 0);
-            $grandTotal = (float)($summary['grand_total'] ?? 0);
-
-            $hideWhenEmpty = filter_var(Setting::get('telegram_bot_cart_badge_hide_when_empty', false), FILTER_VALIDATE_BOOLEAN);
-            if ($hideWhenEmpty && ($itemsCount <= 0 || $totalQty <= 0)) {
-                return $baseText;
-            }
-
-            $qtyDisplay = (floor($totalQty) == $totalQty) ? (int)$totalQty : number_format($totalQty, 1);
-            $amountFormatted = number_format($grandTotal);
-
-            return match ($badgeStyle) {
-                'count_unit' => "{$baseText} ({$qtyDisplay} ခု)",
-                'count_price' => "{$baseText} ({$qtyDisplay} ခု • {$amountFormatted} MMK)",
-                'types_and_count' => "{$baseText} ({$itemsCount} မျိုး / {$qtyDisplay} ခု)",
-                default => "{$baseText} ({$qtyDisplay})",
-            };
-        } catch (\Throwable $e) {
-            return $baseText;
-        }
+        return !empty(trim($baseBtnCart)) ? trim($baseBtnCart) : '🛒 ဝယ်မည့်ပစ္စည်းများ';
     }
 
     /**
@@ -5046,27 +7131,55 @@ class TelegramBotService
     public function getMainKeyboard(int|string|null $chatId = null): array
     {
         $btnCatalog = trim((string)Setting::get('telegram_bot_btn_catalog', '🛍️ ကုန်ပစ္စည်းများ'));
-        $btnCart = trim((string)Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်'));
-        $btnOrders = trim((string)Setting::get('telegram_bot_btn_orders', '📦 အော်ဒါများ'));
+        $btnCart = trim((string)Setting::get('telegram_bot_btn_cart', '🛒 ဝယ်မည့်ပစ္စည်းများ'));
+        $btnOrders = trim((string)Setting::get('telegram_bot_btn_orders', '📦 တင်ထားသော Order များ'));
+        $btnCheckout = trim((string)Setting::get('telegram_bot_btn_checkout', '📦 မှာမည့်ပစ္စည်းများ Order တင်မည်'));
         $btnPayment = trim((string)Setting::get('telegram_bot_btn_payment', 'ℹ️ ငွေလွှဲရန် အချက်အလက်'));
         $btnContact = trim((string)Setting::get('telegram_bot_btn_contact', '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်'));
+        $btnReorder = trim((string)Setting::get('telegram_bot_btn_reorder', '🔄 ယခင်အော်ဒါ ပြန်မှာမည်'));
+
+        $showCatalog = Setting::get('telegram_bot_show_btn_catalog', '1') === '1';
+        $showCart = Setting::get('telegram_bot_show_btn_cart', '1') === '1';
+        $showOrders = Setting::get('telegram_bot_show_btn_orders', '1') === '1';
+        $showCheckout = Setting::get('telegram_bot_show_btn_checkout', '1') === '1';
+        $showPayment = Setting::get('telegram_bot_show_btn_payment', '1') === '1';
+        $showContact = Setting::get('telegram_bot_show_btn_contact', '1') === '1';
+        $enableReorder = Setting::get('telegram_bot_enable_reorder', '0') === '1';
+        $showReorder = $enableReorder && Setting::get('telegram_bot_show_btn_reorder', '1') === '1';
 
         $btnCartText = $this->formatCartButtonText($chatId, $btnCart);
 
+        $visibleButtons = [];
+        if ($showCatalog) {
+            $visibleButtons[] = ['text' => !empty($btnCatalog) ? $btnCatalog : '🛍️ ကုန်ပစ္စည်းများ'];
+        }
+        if ($showCart) {
+            $visibleButtons[] = ['text' => $btnCartText];
+        }
+        if ($showOrders) {
+            $visibleButtons[] = ['text' => !empty($btnOrders) ? $btnOrders : '📦 တင်ထားသော Order များ'];
+        }
+        if ($showCheckout) {
+            $visibleButtons[] = ['text' => !empty($btnCheckout) ? $btnCheckout : '📦 မှာမည့်ပစ္စည်းများ Order တင်မည်'];
+        }
+        if ($showPayment) {
+            $visibleButtons[] = ['text' => !empty($btnPayment) ? $btnPayment : 'ℹ️ ငွေလွှဲရန် အချက်အလက်'];
+        }
+        if ($showContact) {
+            $visibleButtons[] = ['text' => !empty($btnContact) ? $btnContact : '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်'];
+        }
+        if ($showReorder) {
+            $visibleButtons[] = ['text' => !empty($btnReorder) ? $btnReorder : '🔄 ယခင်အော်ဒါ ပြန်မှာမည်'];
+        }
+
+        if (empty($visibleButtons)) {
+            return [
+                'remove_keyboard' => true,
+            ];
+        }
+
         return [
-            'keyboard' => [
-                [
-                    ['text' => !empty($btnCatalog) ? $btnCatalog : '🛍️ ကုန်ပစ္စည်းများ'],
-                    ['text' => $btnCartText],
-                ],
-                [
-                    ['text' => !empty($btnOrders) ? $btnOrders : '📦 အော်ဒါများ'],
-                    ['text' => !empty($btnPayment) ? $btnPayment : 'ℹ️ ငွေလွှဲရန် အချက်အလက်'],
-                ],
-                [
-                    ['text' => !empty($btnContact) ? $btnContact : '📞 ဆိုင်နှင့် ဆက်သွယ်ရန်'],
-                ],
-            ],
+            'keyboard' => array_chunk($visibleButtons, 2),
             'resize_keyboard' => true,
         ];
     }
@@ -5126,21 +7239,24 @@ class TelegramBotService
                 'shipping_address' => $addressText,
             ]);
         } else {
-            $msg = "🔔 *အော်ဒါအသစ် ရောက်ရှိပါသည်!*\n\n"
-                 . "🔖 *အော်ဒါအမှတ်:* `{$sale->reference_no}`\n"
-                 . "👤 *ဖောက်သည်:* {$sale->customer_name}\n"
-                 . "📞 *ဖုန်းနံပါတ်:* " . ($sale->customer_phone ?: 'မပါရှိ') . "\n"
-                 . "🏢 *ဂိုဒေါင်:* {$sale->warehouse_name}\n"
-                 . ($itemsText ? "{$itemsText}" : "")
-                 . "💰 *စုစုပေါင်းငွေ:* {$totalFormatted} MMK\n"
-                 . "💳 *ငွေပေးချေမှု:* {$sale->payment_status} ({$sale->payment_type})\n"
-                 . "📌 *အခြေအနေ:* {$statusIcon}\n";
+            $msg = "🔔 *အော်ဒါအသစ် ရောက်ရှိပါသည်!*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "🔖 အော်ဒါအမှတ်:      `{$sale->reference_no}`\n"
+                 . "👤 ဖောက်သည်:         {$sale->customer_name}\n"
+                 . "📞 ဖုန်းနံပါတ်:       `" . ($sale->customer_phone ?: 'မပါရှိ') . "`\n"
+                 . "🏢 ဂိုဒေါင်:         {$sale->warehouse_name}\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . ($itemsText ? "{$itemsText}━━━━━━━━━━━━━━━━━━━━━\n" : "")
+                 . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n"
+                 . "💳 ငွေပေးချေမှု:     {$sale->payment_status} ({$sale->payment_type})\n"
+                 . "📌 အခြေအနေ:        {$statusIcon}\n";
 
             if ($sale->shipping_address) {
-                $msg .= "📍 *ပို့ဆောင်ရမည့်လိပ်စာ:* {$sale->shipping_address}\n";
+                $msg .= "📍 ပို့ဆောင်ရမည့်လိပ်စာ: {$sale->shipping_address}\n";
             }
 
-            $msg .= "\n_အောက်ပါ ခလုတ်များမှတဆင့် အတည်ပြု/ပယ်ဖျက်နိုင်ပါသည်-_\n";
+            $msg .= "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "\n_အောက်ပါ ခလုတ်များမှတဆင့် အတည်ပြု/ပယ်ဖျက်နိုင်ပါသည်-_\n";
         }
 
         $adminButtons = [];
@@ -5204,13 +7320,15 @@ class TelegramBotService
         $totalFormatted = number_format($sale->grand_total);
         $statusIcon = $sale->bot_approval_status === 'approved' ? '✅ အတည်ပြုပြီး' : '⏳ စစ်ဆေးရန်ကျန် (Pending Review)';
 
-        $caption = "📸 *ငွေလွှဲပြေစာ (Payment Slip) အသစ် ရောက်ရှိပါသည်!*\n\n"
-                 . "🔖 *အော်ဒါအမှတ်:* `{$sale->reference_no}`\n"
-                 . "👤 *ဖောက်သည်:* {$sale->customer_name}\n"
-                 . "📞 *ဖုန်းနံပါတ်:* " . ($sale->customer_phone ?: 'မပါရှိ') . "\n"
-                 . "💰 *ကျသင့်ငွေ:* {$totalFormatted} MMK\n"
-                 . "💳 *ငွေပေးချေမှု:* {$sale->payment_status} ({$sale->payment_type})\n"
-                 . "📌 *အခြေအနေ:* {$statusIcon}\n\n"
+        $caption = "📸 *ငွေလွှဲပြေစာ (Payment Slip) အသစ် ရောက်ရှိပါသည်!*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "🔖 အော်ဒါအမှတ်:      `{$sale->reference_no}`\n"
+                 . "👤 ဖောက်သည်:         {$sale->customer_name}\n"
+                 . "📞 ဖုန်းနံပါတ်:       `" . ($sale->customer_phone ?: 'မပါရှိ') . "`\n"
+                 . "💰 ကျသင့်ငွေ:        *{$totalFormatted} MMK*\n"
+                 . "💳 ငွေပေးချေမှု:     {$sale->payment_status} ({$sale->payment_type})\n"
+                 . "📌 အခြေအနေ:        {$statusIcon}\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n\n"
                  . "အောက်ပါ ခလုတ်များမှတဆင့် တိုက်ရိုက် စစ်ဆေးအတည်ပြုနိုင်ပါသည်-";
 
         $sale->loadMissing(['items', 'customer']);
@@ -5769,9 +7887,7 @@ class TelegramBotService
         }
 
         $currency = Setting::get('currency_symbol', 'MMK');
-        $effectivePrice = ($product->bot_price && (float)$product->bot_price > 0)
-            ? (float)$product->bot_price
-            : (float)($product->selling_price ?: $product->retail_price);
+        $effectivePrice = (float)($product->retail_price ?: $product->selling_price);
         $formattedPrice = number_format($effectivePrice) . ' ' . $currency;
         $sku = $product->code ?: ($product->sku ?: "PROD-{$product->id}");
 
@@ -5842,6 +7958,99 @@ class TelegramBotService
         }
 
         return $sentCount;
+    }
+
+    /**
+     * 🚨 Notify Admins that a customer needs human staff assistance
+     */
+    public function notifyAdminCustomerNeedsHelp(string|int $customerChatId, string $userName, string $usernameTag, string $query): void
+    {
+        $adminChatIds = Setting::get('telegram_admin_chat_ids', '');
+        if (empty($adminChatIds)) return;
+        $ids = array_map('trim', explode(',', $adminChatIds));
+
+        $msg = "🚨 *Customer အကူအညီ လိုအပ်နေပါသည် (Needs Staff Attention)*\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n"
+             . "👤 Customer:  *{$userName}* ({$usernameTag})\n"
+             . "🆔 Chat ID:   `#CHAT_{$customerChatId}`\n"
+             . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+             . "💬 *မေးမြန်းထားသော စာ:*\n\"{$query}\"\n\n"
+             . "👉 *ဤစာကို တိုက်ရိုက် Reply ပြန်၍ စာဖြေကြားနိုင်ပါသည်* သို့မဟုတ် POS Live Chat မှတစ်ဆင့် ဝင်ရောက်စကားပြောနိုင်ပါသည်။";
+
+        foreach ($ids as $aid) {
+            if (!empty($aid)) {
+                $this->sendMessage($aid, $msg);
+            }
+        }
+    }
+
+    /**
+     * 👨‍💼 Send Staff Message or Product Card to Customer from POS Live Chat
+     */
+    public function sendStaffMessageToCustomer(
+        string|int $customerChatId,
+        string $messageText,
+        ?int $staffUserId = null,
+        ?Product $productToSend = null
+    ): array {
+        if ($productToSend) {
+            $prefix = "👨‍💼 *ဆိုင်ဝန်ထမ်းမှ ပေးပို့သော ပစ္စည်း အချက်အလက်:*\n\n";
+            $priceFmt = number_format((float)($productToSend->retail_price ?: $productToSend->selling_price));
+            $caption = "{$prefix}📦 *{$productToSend->name}*\n"
+                     . "━━━━━━━━━━━━━━━━━━━━━\n"
+                     . "💰 ဈေးနှုန်း:   *{$priceFmt} MMK*\n"
+                     . "📌 ကုတ်နံပါတ်: `{$productToSend->code}`\n"
+                     . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                     . (!empty($messageText) ? "💬 *မှတ်ချက်:* {$messageText}\n\n" : "")
+                     . "မှာယူလိုပါက အောက်ပါခလုတ်ကို နှိပ်ပါရှင်-";
+
+            $markup = [
+                'inline_keyboard' => [
+                    [
+                        ['text' => "🔍 အသေးစိတ်/ဆိုဒ်ရွေးမည်", 'callback_data' => "prod_{$productToSend->id}"],
+                        ['text' => "🛒 ခြင်းတောင်းထဲထည့်မည်", 'callback_data' => "buy_{$productToSend->id}"],
+                    ]
+                ]
+            ];
+
+            $res = null;
+            if ($productToSend->image) {
+                $res = $this->sendPhoto($customerChatId, $productToSend->image, $caption, $markup);
+            }
+            if (empty($res['ok'])) {
+                $res = $this->sendMessage($customerChatId, $caption, $markup);
+            }
+
+            BotChatMessage::create([
+                'telegram_chat_id' => (string)$customerChatId,
+                'sender_type' => 'staff',
+                'staff_user_id' => $staffUserId,
+                'message_type' => 'product_card',
+                'message_text' => $caption,
+                'metadata' => ['product_id' => $productToSend->id],
+                'is_read' => true,
+            ]);
+
+            return $res ?? ['ok' => false];
+        }
+
+        // Standard Text Message
+        $prefix = "👨‍💼 *ဆိုင်ဝန်ထမ်းမှ စာပြန်ကြားချက်:*\n\n";
+        $fullText = $prefix . $messageText;
+        $res = $this->sendMessage($customerChatId, $fullText);
+
+        if (!empty($res['ok'])) {
+            BotChatMessage::create([
+                'telegram_chat_id' => (string)$customerChatId,
+                'sender_type' => 'staff',
+                'staff_user_id' => $staffUserId,
+                'message_type' => 'text',
+                'message_text' => $messageText,
+                'is_read' => true,
+            ]);
+        }
+
+        return $res;
     }
 }
 

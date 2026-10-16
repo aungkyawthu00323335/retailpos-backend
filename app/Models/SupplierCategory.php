@@ -16,29 +16,26 @@ class SupplierCategory extends Model
         'status',
     ];
 
-    protected $appends = [
-        'suppliers_count',
-        'total_due',
-    ];
+    protected $appends = [];
 
     public function suppliers()
     {
         return $this->hasMany(Supplier::class, 'category', 'name');
     }
 
-    public function getSuppliersCountAttribute()
+    public function getSuppliersCountAttribute(): int
     {
         if (array_key_exists('suppliers_count', $this->attributes)) {
             return (int) $this->attributes['suppliers_count'];
         }
-        return $this->suppliers()->count();
+        return 0;
     }
 
-    public function getTotalDueAttribute()
+    public function getTotalDueAttribute(): float
     {
         if (array_key_exists('total_due', $this->attributes)) {
             return (float) $this->attributes['total_due'];
         }
-        return (float) ($this->suppliers()->sum('balance_due') ?? 0.00);
+        return 0.0;
     }
 }

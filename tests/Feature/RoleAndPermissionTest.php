@@ -281,4 +281,255 @@ class RoleAndPermissionTest extends TestCase
         $adminStatus->assertStatus(200);
         $this->assertEquals(100000.0, (float)$adminStatus->json('register.expected_cash'));
     }
+
+    public function test_get_available_permissions_catalog_returns_all_modules(): void
+    {
+        $res = $this->withToken($this->superAdmin->api_token)->getJson('/api/roles/permissions');
+        $res->assertStatus(200)
+            ->assertJsonPath('status', 'success');
+
+        $catalog = $res->json('data');
+        $this->assertIsArray($catalog);
+        $this->assertNotEmpty($catalog);
+
+        // Verify key ERP modules are represented
+        $moduleIds = array_column($catalog, 'id');
+        $this->assertContains('products', $moduleIds);
+        $this->assertContains('sales', $moduleIds);
+        $this->assertContains('purchases', $moduleIds);
+        $this->assertContains('adjustments', $moduleIds);
+        $this->assertContains('transfers', $moduleIds);
+        $this->assertContains('processings', $moduleIds);
+        $this->assertContains('expenses', $moduleIds);
+        $this->assertContains('customers', $moduleIds);
+        $this->assertContains('suppliers', $moduleIds);
+        $this->assertContains('roles', $moduleIds);
+        $this->assertContains('dashboard', $moduleIds);
+    }
+
+    public function test_create_and_update_role_with_granular_module_permissions(): void
+    {
+        $permissions = [
+            'products.view',
+            'products.create',
+            'sales.view',
+            'sales.create',
+            'customers.view',
+        ];
+
+        // 1. Create Role
+        $createRes = $this->withToken($this->superAdmin->api_token)->postJson('/api/roles', [
+            'name' => 'Junior Sales Associate',
+            'description' => 'Store front sales associate with limited catalog access',
+            'permissions' => $permissions,
+            'status' => 'Active',
+        ]);
+
+        $createRes->assertStatus(201)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('data.name', 'Junior Sales Associate');
+
+        $roleId = $createRes->json('data.id');
+        $this->assertNotNull($roleId);
+
+        // 2. Verify stored permissions
+        $role = Role::find($roleId);
+        $this->assertEquals($permissions, $role->permissions);
+
+        // 3. Update permissions to add more modules
+        $updatedPermissions = array_merge($permissions, ['quotations.view', 'quotations.create']);
+        $updateRes = $this->withToken($this->superAdmin->api_token)->putJson("/api/roles/{$roleId}", [
+            'permissions' => $updatedPermissions,
+        ]);
+
+        $updateRes->assertStatus(200)
+            ->assertJsonPath('status', 'success');
+
+        $role->refresh();
+        $this->assertEquals($updatedPermissions, $role->permissions);
+    }
+
+    public function test_non_super_admin_cannot_grant_unpossessed_permissions(): void
+    {
+        // Manager only has 'users.view' and 'roles.create'
+        $limitedRole = Role::create([
+            'name' => 'Limited Role Admin',
+            'slug' => 'limited_role_admin',
+            'permissions' => ['roles.view', 'roles.create', 'products.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+
+        $limitedUser = User::create([
+            'user_id' => 'USR-LIM-01',
+            'name' => 'Limited User',
+            'email' => 'limited@retailpos.test',
+            'role' => 'Limited Role Admin',
+            'role_id' => $limitedRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'limited_user_token_abc123',
+        ]);
+
+        // Attempt to create a role with 'sales.delete' which limitedUser does NOT possess
+        $res = $this->withToken($limitedUser->api_token)->postJson('/api/roles', [
+            'name' => 'Privilege Escalation Role',
+            'permissions' => ['products.view', 'sales.delete'],
+        ]);
+
+        $res->assertStatus(403)
+            ->assertJsonPath('status', 'error')
+            ->assertSee('Unauthorized. You cannot grant permission');
+    }
+
+    public function test_user_with_only_roles_view_cannot_delete_or_create_roles(): void
+    {
+        $viewerRole = Role::create([
+            'name' => 'Auditor',
+            'slug' => 'auditor',
+            'permissions' => ['roles.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+        $viewerUser = User::create([
+            'user_id' => 'USR-AUD-01',
+            'name' => 'Auditor User',
+            'email' => 'auditor@retailpos.test',
+            'role' => 'Auditor',
+            'role_id' => $viewerRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'auditor_token_xyz',
+        ]);
+        $targetRole = Role::create([
+            'name' => 'Deletable Role',
+            'slug' => 'deletable_role',
+            'permissions' => ['products.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+
+        // 1. Cannot delete role
+        $resDelete = $this->withToken($viewerUser->api_token)->deleteJson("/api/roles/{$targetRole->id}");
+        $resDelete->assertStatus(403);
+
+        // 2. Cannot create role
+        $resCreate = $this->withToken($viewerUser->api_token)->postJson('/api/roles', [
+            'name' => 'Rogue Role',
+            'permissions' => ['roles.view'],
+        ]);
+        $resCreate->assertStatus(403);
+
+        // 3. Cannot update role
+        $resUpdate = $this->withToken($viewerUser->api_token)->putJson("/api/roles/{$targetRole->id}", [
+            'name' => 'Renamed Role',
+        ]);
+        $resUpdate->assertStatus(403);
+    }
+
+    public function test_cannot_delete_role_assigned_to_active_users(): void
+    {
+        $customRole = Role::create([
+            'name' => 'Assigned Custom Role',
+            'slug' => 'assigned_custom_role',
+            'permissions' => ['products.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+
+        $assignedUser = User::create([
+            'user_id' => 'USR-ASSIGN-01',
+            'name' => 'Assigned User',
+            'email' => 'assigned@retailpos.test',
+            'role' => 'Assigned Custom Role',
+            'role_id' => $customRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+        ]);
+
+        // Super Admin attempts to delete role that still has an assigned user
+        $res = $this->withToken($this->superAdmin->api_token)->deleteJson("/api/roles/{$customRole->id}");
+        $res->assertStatus(422)
+            ->assertJsonPath('status', 'error')
+            ->assertSee('currently assigned');
+
+        $this->assertDatabaseHas('roles', ['id' => $customRole->id]);
+    }
+
+    public function test_non_super_admin_cannot_spoof_super_admin_role_creation(): void
+    {
+        $creatorRole = Role::create([
+            'name' => 'Role Creator',
+            'slug' => 'role_creator',
+            'permissions' => ['roles.create', 'roles.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+
+        $creatorUser = User::create([
+            'user_id' => 'USR-CREATE-01',
+            'name' => 'Role Creator User',
+            'email' => 'creator@retailpos.test',
+            'role' => 'Role Creator',
+            'role_id' => $creatorRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'creator_token_abc',
+        ]);
+
+        $res = $this->withToken($creatorUser->api_token)->postJson('/api/roles', [
+            'name' => 'Super Admin',
+            'permissions' => ['roles.view'],
+        ]);
+
+        $res->assertStatus(403)
+            ->assertJsonPath('status', 'error')
+            ->assertSee('Unauthorized. Cannot create role with name Super Admin.');
+    }
+
+    public function test_duplicate_role_name_returns_422(): void
+    {
+        $res = $this->withToken($this->superAdmin->api_token)->postJson('/api/roles', [
+            'name' => 'Cashier',
+            'permissions' => ['pos.view'],
+        ]);
+
+        $res->assertStatus(422)
+            ->assertJsonPath('status', 'error')
+            ->assertSee('already exists');
+    }
+
+    public function test_view_only_report_user_cannot_view_confidential_profit_loss(): void
+    {
+        $reportViewerRole = Role::create([
+            'name' => 'Basic Report Viewer',
+            'slug' => 'basic_report_viewer',
+            'permissions' => ['reports.view'],
+            'is_default' => false,
+            'status' => 'active',
+        ]);
+
+        $reportViewer = User::create([
+            'user_id' => 'USR-REP-01',
+            'name' => 'Report Viewer User',
+            'email' => 'repview@retailpos.test',
+            'role' => 'Basic Report Viewer',
+            'role_id' => $reportViewerRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'report_viewer_token_777',
+        ]);
+
+        // Regular report view passes
+        $resGeneral = $this->withToken($reportViewer->api_token)->getJson('/api/reports/dashboard-summary');
+        $resGeneral->assertStatus(200);
+
+        // Confidential Profit & Loss is strictly forbidden
+        $resPl = $this->withToken($reportViewer->api_token)->getJson('/api/reports/profit-loss');
+        $resPl->assertStatus(403);
+
+        // Commercial Tax is strictly forbidden
+        $resTax = $this->withToken($reportViewer->api_token)->getJson('/api/reports/commercial-tax');
+        $resTax->assertStatus(403);
+    }
 }

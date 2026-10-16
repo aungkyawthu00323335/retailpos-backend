@@ -149,11 +149,58 @@ class ProductUnitConversionService
             if ($unitId !== null && (int)$link->unit_id === $unitId) {
                 return true;
             }
-            return $unitId === null && $unitName !== null && strcasecmp($link->unit_name, trim($unitName)) === 0;
+            return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
         });
 
-        if (($unitId !== null || ($unitName !== null && trim($unitName) !== '')) && $links->isNotEmpty() && !$match) {
-            throw new InvalidArgumentException('The selected unit is not linked to this product.');
+        // If not found in the requested unit_type, search other active unit links for this product
+        if (!$match && ($unitId !== null || ($unitName !== null && trim($unitName) !== ''))) {
+            $crossLinks = ProductUnitLink::where('product_id', $product->id)
+                ->where('is_active', true)
+                ->when(
+                    $variantId === null,
+                    fn($q) => $q->whereNull('product_variant_id'),
+                    function ($q) use ($variantId) {
+                        $q->where(function ($variantQuery) use ($variantId) {
+                            $variantQuery->where('product_variant_id', $variantId)->orWhereNull('product_variant_id');
+                        });
+                    }
+                )
+                ->orderByRaw('CASE WHEN product_variant_id IS NULL THEN 1 ELSE 0 END')
+                ->orderByDesc('is_default')
+                ->orderBy('id')
+                ->get();
+
+            $match = $crossLinks->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
+                if ($unitId !== null && (int)$link->unit_id === $unitId) {
+                    return true;
+                }
+                return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
+            });
+        }
+
+        if (($unitId !== null || ($unitName !== null && trim($unitName) !== '')) && !$match) {
+            $trimmedName = $unitName !== null ? trim($unitName) : '';
+            if (
+                ($unitId !== null && $product->base_unit_id !== null && (int)$product->base_unit_id === $unitId) ||
+                ($unitId !== null && $product->unit_id !== null && (int)$product->unit_id === $unitId) ||
+                ($trimmedName !== '' && (
+                    strcasecmp(trim((string)$product->unit_name), $trimmedName) === 0 ||
+                    strcasecmp(trim((string)$product->purchase_unit), $trimmedName) === 0 ||
+                    strcasecmp(trim((string)$product->sale_unit), $trimmedName) === 0
+                ))
+            ) {
+                return [
+                    'id' => null,
+                    'unit_id' => $product->base_unit_id ?: $product->unit_id,
+                    'unit_name' => $trimmedName !== '' ? $trimmedName : ($product->unit_name ?: 'Piece'),
+                    'conversion_rate' => 1.0,
+                    'unit_type' => 'base',
+                    'product_variant_id' => $variantId,
+                ];
+            }
+            if ($links->isNotEmpty()) {
+                throw new InvalidArgumentException('The selected unit is not linked to this product.');
+            }
         }
 
         if (!$match) {
@@ -166,7 +213,7 @@ class ProductUnitConversionService
                 'unit_id' => $match->unit_id,
                 'unit_name' => $match->unit_name,
                 'conversion_rate' => (float)$match->conversion_rate,
-                'unit_type' => $type,
+                'unit_type' => $match->unit_type,
                 'product_variant_id' => $match->product_variant_id,
             ];
         }

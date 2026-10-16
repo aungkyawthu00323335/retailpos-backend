@@ -20,12 +20,10 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         try {
-            if (\Illuminate\Support\Facades\Schema::hasTable('settings')) {
-                $tz = \App\Models\Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
-                if (!empty($tz) && in_array($tz, timezone_identifiers_list(), true)) {
-                    date_default_timezone_set($tz);
-                    config(['app.timezone' => $tz]);
-                }
+            $tz = \App\Models\Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
+            if (!empty($tz) && in_array($tz, timezone_identifiers_list(), true)) {
+                date_default_timezone_set($tz);
+                config(['app.timezone' => $tz]);
             }
         } catch (\Throwable $e) {
             // Silently fall back during initial setup/migration

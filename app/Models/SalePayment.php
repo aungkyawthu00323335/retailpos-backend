@@ -31,10 +31,7 @@ class SalePayment extends Model
         'user_id' => 'integer',
     ];
 
-    protected $appends = [
-        'user_name',
-        'user_role',
-    ];
+    protected $appends = [];
 
     public function sale()
     {
@@ -50,16 +47,12 @@ class SalePayment extends Model
     {
         return $this->attributes['user_name'] 
             ?? $this->attributes['created_by'] 
-            ?? $this->user?->name 
-            ?? $this->sale?->user_name 
-            ?? $this->sale?->created_by;
+            ?? null;
     }
 
     public function getUserRoleAttribute(): ?string
     {
         return $this->attributes['user_role'] 
-            ?? $this->user?->role 
-            ?? $this->sale?->user_role 
             ?? 'Cashier';
     }
 }

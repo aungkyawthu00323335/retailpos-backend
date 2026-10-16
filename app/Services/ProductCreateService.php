@@ -121,7 +121,7 @@ class ProductCreateService
                     'stock_alert' => $stockAlert,
                     'low_qty' => $stockAlert,
                     'has_variants' => $hasVariants,
-                    'is_bot_available' => !empty($data['is_bot_available']),
+                    'is_bot_available' => array_key_exists('is_bot_available', $data) ? (bool)$data['is_bot_available'] : true,
                     'bot_price' => (isset($data['bot_price']) && $data['bot_price'] !== '') ? (float)$data['bot_price'] : null,
                     'image_url' => $data['image_url'] ?? '',
                     'description' => $data['note'] ?? $data['description'] ?? '',
@@ -843,13 +843,56 @@ class ProductCreateService
 
     public function generateNextSku(): string
     {
-        $last = Product::withTrashed()->orderBy('id', 'desc')->first();
-        $nextId = ($last ? $last->id : 0) + 1;
-        $candidate = 10000 + $nextId;
+        $lastProduct = Product::withTrashed()->orderBy('id', 'desc')->first();
+        $nextBase = ($lastProduct ? $lastProduct->id : 0) + 10000;
+        $candidate = max($nextBase + 1, 10001);
+
+        try {
+            $driver = DB::connection()->getDriverName();
+            if ($driver === 'sqlite') {
+                $maxCode = Product::withTrashed()
+                    ->whereRaw("code GLOB '[0-9]*' AND code NOT GLOB '*[^0-9]*'")
+                    ->selectRaw("MAX(CAST(code AS INTEGER)) as max_val")
+                    ->value('max_val');
+                $maxVariantSku = ProductVariant::withTrashed()
+                    ->whereRaw("sku GLOB '[0-9]*' AND sku NOT GLOB '*[^0-9]*'")
+                    ->selectRaw("MAX(CAST(sku AS INTEGER)) as max_val")
+                    ->value('max_val');
+            } else {
+                $maxCode = Product::withTrashed()
+                    ->whereRaw("code REGEXP '^[0-9]+$'")
+                    ->selectRaw("MAX(CAST(code AS UNSIGNED)) as max_val")
+                    ->value('max_val');
+                $maxVariantSku = ProductVariant::withTrashed()
+                    ->whereRaw("sku REGEXP '^[0-9]+$'")
+                    ->selectRaw("MAX(CAST(sku AS UNSIGNED)) as max_val")
+                    ->value('max_val');
+            }
+
+            if ($maxCode) {
+                $candidate = max($candidate, (int)$maxCode + 1);
+            }
+            if ($maxVariantSku) {
+                $candidate = max($candidate, (int)$maxVariantSku + 1);
+            }
+        } catch (\Throwable $e) {
+            // Gracefully fall back to candidate
+        }
+
         $sku = (string)$candidate;
 
-        while (Product::withTrashed()->where('code', $sku)->orWhere('sku', $sku)->exists() ||
-               ProductVariant::withTrashed()->where('sku', $sku)->exists()) {
+        while (
+            Product::withTrashed()
+                ->where('code', $sku)
+                ->orWhere('sku', $sku)
+                ->orWhere('barcode', $sku)
+                ->orWhere('id', (int)$sku)
+                ->exists() ||
+            ProductVariant::withTrashed()
+                ->where('sku', $sku)
+                ->orWhere('barcode', $sku)
+                ->exists()
+        ) {
             $candidate++;
             $sku = (string)$candidate;
         }

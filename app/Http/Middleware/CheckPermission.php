@@ -101,12 +101,17 @@ class CheckPermission
 
     private function hasPermission(array $userPermissions, string $required): bool
     {
-        // Direct match
+        // 1. Direct match
         if (in_array($required, $userPermissions, true)) {
             return true;
         }
 
-        // Wildcard match, e.g. 'products.*' matches 'products.view'
+        // 2. Global wildcard
+        if (in_array('*', $userPermissions, true)) {
+            return true;
+        }
+
+        // 3. Dot format and wildcard matching, e.g. 'products.*' matches 'products.view'
         $parts = explode('.', $required);
         if (count($parts) === 2) {
             $wildcard = $parts[0] . '.*';
@@ -117,6 +122,53 @@ class CheckPermission
             $colonFormat = $parts[0] . ':' . $parts[1];
             if (in_array($colonFormat, $userPermissions, true)) {
                 return true;
+            }
+
+            // Singular/plural alias support
+            $altModule = match ($parts[0]) {
+                'processing' => 'processings',
+                'processings' => 'processing',
+                'outlet' => 'outlets',
+                'outlets' => 'outlet',
+                'currency' => 'currencies',
+                'currencies' => 'currency',
+                'delivery_zone' => 'delivery_zones',
+                'delivery_zones' => 'delivery_zone',
+                'voucher_setting' => 'voucher_settings',
+                'voucher_settings' => 'voucher_setting',
+                'bot_order' => 'bot_orders',
+                'bot_orders' => 'bot_order',
+                'bot_chat' => 'bot_chats',
+                'bot_chats' => 'bot_chat',
+                'sale_return' => 'sale_returns',
+                'sale_returns' => 'sale_return',
+                'purchase_return' => 'purchase_returns',
+                'purchase_returns' => 'purchase_return',
+                default => null,
+            };
+            if ($altModule) {
+                if (in_array("{$altModule}.{$parts[1]}", $userPermissions, true) ||
+                    in_array("{$altModule}:{$parts[1]}", $userPermissions, true) ||
+                    in_array("{$altModule}.*", $userPermissions, true)) {
+                    return true;
+                }
+            }
+
+            // Report permissions fallback: e.g. reports.view covers reports.sales
+            if ($parts[0] === 'reports') {
+                $sensitiveReports = ['profit_loss', 'commercial_tax'];
+                if (!in_array($parts[1], $sensitiveReports, true)) {
+                    if (in_array('reports.view', $userPermissions, true) || in_array('reports:view', $userPermissions, true)) {
+                        return true;
+                    }
+                }
+                // Specific report screen format: report_sales.view matches reports.sales
+                $reportScreen = "report_{$parts[1]}";
+                if (in_array("{$reportScreen}.view", $userPermissions, true) ||
+                    in_array("{$reportScreen}:view", $userPermissions, true) ||
+                    in_array("{$reportScreen}.*", $userPermissions, true)) {
+                    return true;
+                }
             }
         }
 

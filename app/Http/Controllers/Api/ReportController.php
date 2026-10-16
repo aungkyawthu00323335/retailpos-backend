@@ -1286,6 +1286,11 @@ class ReportController extends Controller
             DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
         )->groupBy(DB::raw('COALESCE(customer_id, 1)'));
 
+        $driver = DB::connection()->getDriverName();
+        $codeExpr = $driver === 'sqlite'
+            ? "COALESCE(customers.customer_id, 'CUST-' || printf('%03d', customers.id)) as code"
+            : 'COALESCE(customers.customer_id, CONCAT("CUST-", LPAD(customers.id, 3, "0"))) as code';
+
         $baseQuery = Customer::leftJoinSub($salesAgg, 'sa', function ($join) {
             $join->on('customers.id', '=', 'sa.customer_id');
         })
@@ -1294,7 +1299,7 @@ class ReportController extends Controller
         })
         ->select(
             'customers.id',
-            DB::raw('COALESCE(customers.customer_id, CONCAT("CUST-", LPAD(customers.id, 3, "0"))) as code'),
+            DB::raw($codeExpr),
             'customers.name',
             'customers.phone',
             'customers.email',
@@ -5357,8 +5362,49 @@ class ReportController extends Controller
 
         $totalInflows = $salesCashReceived + $supplierRefundsReceived;
 
+        // Calculate Opening Cash Balance (prior to startDate under IAS 7)
+        $openingBalance = 0.0;
+        if (!empty($startDate)) {
+            $priorStartDateTime = $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : '');
+
+            $priorSalesQ = DB::table('sales')->where('date', '<', $priorStartDateTime);
+            $priorPrQ = DB::table('purchase_returns')->where('date', '<', $priorStartDateTime);
+            $priorPurchQ = DB::table('purchases')
+                ->where('payment_type', '!=', 'Opening Stock')
+                ->where(function ($q) {
+                    $q->whereNull('notes')->orWhere('notes', 'NOT LIKE', '%Opening Stock%');
+                })
+                ->where('date', '<', $priorStartDateTime);
+            $priorExpQ = DB::table('expenses')
+                ->where('date', '<', $priorStartDateTime)
+                ->where(function ($q) {
+                    $q->whereNull('payment_status')->orWhere('payment_status', '!=', 'Pending');
+                });
+            $priorRetQ = DB::table('sale_returns')->where('date', '<', $priorStartDateTime);
+
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $priorSalesQ->where('warehouse_name', $warehouse);
+                $priorPrQ->where('warehouse_name', $warehouse);
+                $priorPurchQ->where('warehouse_name', $warehouse);
+                $priorExpQ->where('warehouse_name', $warehouse);
+                $priorRetQ->where('warehouse_name', $warehouse);
+            }
+
+            $priorIn = (float)$priorSalesQ->sum('paid_amount') + (float)$priorPrQ->sum('paid_amount');
+            $priorOut = (float)$priorPurchQ->sum('paid_amount')
+                + (float)$priorExpQ->sum(DB::raw('COALESCE(NULLIF(paid_amount, 0), amount)'))
+                + (float)$priorRetQ->sum('paid_amount');
+
+            $openingBalance = $priorIn - $priorOut;
+        }
+
         // 2. Cash Outflows: Purchases Paid + Expenses Paid + Sale Return Refunds Paid
-        $purchQuery = DB::table('purchases');
+        // Exclude Non-Cash Opening Stock adjustments from Cash Flow
+        $purchQuery = DB::table('purchases')
+            ->where('payment_type', '!=', 'Opening Stock')
+            ->where(function ($q) {
+                $q->whereNull('notes')->orWhere('notes', 'NOT LIKE', '%Opening Stock%');
+            });
         if (!empty($startDate)) {
             $purchQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
         }
@@ -5370,7 +5416,10 @@ class ReportController extends Controller
         }
         $purchCashPaid = (float)$purchQuery->sum('paid_amount');
 
-        $expQuery = DB::table('expenses');
+        $expQuery = DB::table('expenses')
+            ->where(function ($q) {
+                $q->whereNull('payment_status')->orWhere('payment_status', '!=', 'Pending');
+            });
         if (!empty($startDate)) {
             $expQuery->where('date', '>=', $startDate . (strlen($startDate) <= 10 ? ' 00:00:00' : ''));
         }
@@ -5380,7 +5429,7 @@ class ReportController extends Controller
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $expQuery->where('warehouse_name', $warehouse);
         }
-        $totalExpenses = (float)$expQuery->sum('amount');
+        $totalExpenses = (float)$expQuery->sum(DB::raw('COALESCE(NULLIF(paid_amount, 0), amount)'));
 
         $expenseCategories = (clone $expQuery)
             ->selectRaw("COALESCE(expense_category_name, 'General Expenses') as category, SUM(amount) as amount, COUNT(*) as count")
@@ -5446,7 +5495,7 @@ class ReportController extends Controller
         sort($allDates);
 
         $timeline = [];
-        $runningBalance = 0.0;
+        $runningBalance = $openingBalance;
         foreach ($allDates as $d) {
             $in = (float)($dailyInflows[$d] ?? 0.0) + (float)($dailySupplierRefunds[$d] ?? 0.0);
             $out = (float)($dailyPurch[$d] ?? 0.0) + (float)($dailyExp[$d] ?? 0.0) + (float)($dailyRefunds[$d] ?? 0.0);
@@ -5505,7 +5554,7 @@ class ReportController extends Controller
             ->get();
 
         $expTxns = (clone $expQuery)
-            ->where('amount', '>', 0)
+            ->where(DB::raw('COALESCE(NULLIF(paid_amount, 0), amount)'), '>', 0)
             ->select([
                 'id',
                 'reference_no',
@@ -5517,7 +5566,7 @@ class ReportController extends Controller
                 'warehouse_name',
                 DB::raw("COALESCE(payment_method, 'Cash') as payment_method"),
                 DB::raw('0 as amount_in'),
-                'amount as amount_out',
+                DB::raw('COALESCE(NULLIF(paid_amount, 0), amount) as amount_out'),
                 DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
                 DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
                 DB::raw("'Completed' as status"),
@@ -5573,10 +5622,14 @@ class ReportController extends Controller
             ->concat($purchTxns)
             ->concat($expTxns)
             ->concat($retTxns)
-            ->sortBy('date')
+            ->sort(function ($a, $b) {
+                $dComp = strcmp((string)$a->date, (string)$b->date);
+                if ($dComp !== 0) return $dComp;
+                return ((int)$a->id) <=> ((int)$b->id);
+            })
             ->values();
 
-        $runningTxnBal = 0.0;
+        $runningTxnBal = $openingBalance;
         $transactions = [];
         foreach ($mergedTxns as $t) {
             $in = (float)($t->amount_in ?? 0);
@@ -5606,9 +5659,12 @@ class ReportController extends Controller
         // Reverse for newest first in table
         $transactions = array_reverse($transactions);
 
+        $closingBalance = $openingBalance + $netCashFlow;
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
+                'opening_balance' => round($openingBalance, 2),
                 'total_inflow' => round($totalInflows, 2),
                 'total_outflow' => round($totalOutflows, 2),
                 'net_cash_flow' => round($netCashFlow, 2),
@@ -5617,7 +5673,7 @@ class ReportController extends Controller
                 'purchases_cash_paid' => round($purchCashPaid, 2),
                 'operating_expenses_paid' => round($totalExpenses, 2),
                 'refunds_paid' => round($refundsPaid, 2),
-                'closing_balance' => round($netCashFlow, 2),
+                'closing_balance' => round($closingBalance, 2),
                 'total_transactions' => count($transactions),
                 'start_date' => $startDate,
                 'end_date' => $endDate,

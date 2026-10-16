@@ -15,41 +15,94 @@ class RoleAndUserSeeder extends Seeder
      */
     public function run(): void
     {
-        // 1. All system permission keys
+        // 1. All system permission keys organized by the 12 ERP business modules
         $allPermissions = [
-            'dashboard.view', 'pos.view', 'pos.checkout',
-            'products.view', 'products.create', 'products.update', 'products.delete', 'products.view_cost', 'products.export',
+            // 1. Dashboard
+            'dashboard.view',
+
+            // 2. Products
+            'products.view', 'products.create', 'products.update', 'products.delete', 'products.view_cost', 'products.export', 'products.import',
+            'barcode.view', 'barcode.create',
             'product_categories.view', 'product_categories.create', 'product_categories.update', 'product_categories.delete',
             'sub_categories.view', 'sub_categories.create', 'sub_categories.update', 'sub_categories.delete',
             'variations.view', 'variations.create', 'variations.update', 'variations.delete',
             'brands.view', 'brands.create', 'brands.update', 'brands.delete',
             'units.view', 'units.create', 'units.update', 'units.delete',
-            'barcode.view', 'barcode.create',
-            'adjustments.view', 'adjustments.create', 'adjustments.update', 'adjustments.delete', 'adjustments.approve',
-            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive',
-            'sales.view', 'sales.create', 'sales.update', 'sales.delete', 'sales.void', 'sales.refund',
-            'purchases.view', 'purchases.create', 'purchases.update', 'purchases.delete', 'purchases.pay',
-            'purchase_returns.view', 'purchase_returns.create', 'purchase_returns.update', 'purchase_returns.delete',
-            'quotations.view', 'quotations.create', 'quotations.update', 'quotations.delete',
-            'expenses.view', 'expenses.create', 'expenses.update', 'expenses.delete',
-            'expense_categories.view', 'expense_categories.create', 'expense_categories.update', 'expense_categories.delete',
-            'customers.view', 'customers.create', 'customers.update', 'customers.delete', 'customers.export',
-            'customer_groups.view', 'customer_groups.create', 'customer_groups.update', 'customer_groups.delete',
-            'suppliers.view', 'suppliers.create', 'suppliers.update', 'suppliers.delete', 'suppliers.export',
-            'supplier_categories.view', 'supplier_categories.create', 'supplier_categories.update', 'supplier_categories.delete',
-            'payment_methods.view', 'payment_methods.manage',
-            'currencies.view', 'currencies.manage',
-            'reports.view', 'reports.profit_loss', 'reports.commercial_tax', 'reports.export',
+
+            // 3. Adjustments
+            'adjustments.view', 'adjustments.create', 'adjustments.update', 'adjustments.delete', 'adjustments.approve', 'adjustments.export',
+
+            // 4. Quotations
+            'quotations.view', 'quotations.create', 'quotations.update', 'quotations.delete', 'quotations.convert_sale', 'quotations.export',
+
+            // 5. Purchases
+            'purchases.view', 'purchases.create', 'purchases.update', 'purchases.delete', 'purchases.pay', 'purchases.export',
+            'purchase_returns.view', 'purchase_returns.create', 'purchase_returns.update', 'purchase_returns.delete', 'purchase_returns.pay', 'purchase_returns.export',
+
+            // 6. Sales & POS
+            'sales.view', 'sales.create', 'sales.update', 'sales.delete', 'sales.void', 'sales.refund', 'sales.pay', 'sales.export',
+            'pos.view', 'pos.create', 'pos.checkout',
             'cash_register.view', 'cash_register.open_close', 'cash_register.safe_drop', 'cash_register.view_expected',
-            'outlets.view', 'outlets.manage',
-            'general_settings.view', 'general_settings.update',
-            'prefix_settings.view', 'prefix_settings.update',
+            'sale_returns.view', 'sale_returns.create', 'sale_returns.update', 'sale_returns.delete', 'sale_returns.pay', 'sale_returns.export',
+            'bot_orders.view', 'bot_orders.update', 'bot_orders.delete', 'bot_orders.approve', 'bot_orders.dispatch',
+            'bot_chat.view', 'bot_chat.create',
+
+            // 7. Transfers
+            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.export',
+
+            // 8. Expenses
+            'expenses.view', 'expenses.create', 'expenses.update', 'expenses.delete', 'expenses.pay', 'expenses.export',
+            'expense_categories.view', 'expense_categories.create', 'expense_categories.update', 'expense_categories.delete',
+
+            // 9. Processing
+            'processings.view', 'processings.create', 'processings.update', 'processings.delete', 'processings.export',
+
+            // 10. Peoples
+            'customers.view', 'customers.create', 'customers.update', 'customers.delete', 'customers.export', 'customers.import',
+            'customer_groups.view', 'customer_groups.create', 'customer_groups.update', 'customer_groups.delete',
+            'suppliers.view', 'suppliers.create', 'suppliers.update', 'suppliers.delete', 'suppliers.export', 'suppliers.import',
+            'supplier_categories.view', 'supplier_categories.create', 'supplier_categories.update', 'supplier_categories.delete',
             'users.view', 'users.create', 'users.update', 'users.delete',
             'roles.view', 'roles.create', 'roles.update', 'roles.delete',
+
+            // 11. Reports
+            'reports.view', 'reports.export',
+            'report_sales.view', 'report_sales.export', 'reports.sales',
+            'report_purchases.view', 'report_purchases.export', 'reports.purchases',
+            'report_stock.view', 'report_stock.export', 'reports.stock',
+            'report_stock_alert.view', 'report_stock_alert.export', 'reports.stock_alert',
+            'report_stock_ledger.view', 'report_stock_ledger.export', 'reports.stock_ledger',
+            'report_profit_loss.view', 'report_profit_loss.export', 'reports.profit_loss',
+            'report_cashier_audit.view', 'report_cashier_audit.export', 'reports.cashier_audit',
+            'report_expense.view', 'report_expense.export', 'reports.expense',
+            'report_top_selling.view', 'report_top_selling.export', 'reports.top_selling',
+            'report_dead_stock.view', 'report_dead_stock.export', 'reports.dead_stock',
+            'report_cash_flow.view', 'report_cash_flow.export', 'reports.cash_flow',
+            'report_register.view', 'report_register.export', 'reports.register',
+            'report_z_report.view', 'report_z_report.export', 'reports.z_report',
+            'report_ar_aging.view', 'report_ar_aging.export', 'reports.ar_aging',
+            'report_ap_aging.view', 'report_ap_aging.export', 'reports.ap_aging',
+            'report_product_margins.view', 'report_product_margins.export', 'reports.product_margins',
+            'report_sales_return.view', 'report_sales_return.export', 'reports.sales_return',
+            'report_purchase_return.view', 'report_purchase_return.export', 'reports.purchase_return',
+            'report_commercial_tax.view', 'report_commercial_tax.export', 'reports.commercial_tax',
+            'report_customer.view', 'report_customer.export', 'reports.customer',
+            'report_supplier.view', 'report_supplier.export', 'reports.supplier',
+
+            // 12. Settings / System
+            'outlets.view', 'outlets.create', 'outlets.update', 'outlets.delete', 'outlets.manage',
+            'currencies.view', 'currencies.create', 'currencies.update', 'currencies.delete', 'currencies.manage',
+            'delivery_zones.view', 'delivery_zones.create', 'delivery_zones.update', 'delivery_zones.delete',
+            'payment_methods.view', 'payment_methods.create', 'payment_methods.update', 'payment_methods.delete', 'payment_methods.manage',
+            'prefix_settings.view', 'prefix_settings.update',
+            'voucher_settings.view', 'voucher_settings.update',
+            'general_settings.view', 'general_settings.update',
+            'telegram_bot.view', 'telegram_bot.create', 'telegram_bot.update', 'telegram_bot.delete',
         ];
 
         // Legacy compatibility aliases for Super Admin
         $legacySuperAdmin = [
+            '*',
             'Dashboard', 'POS Terminal', 'Product List', 'Create Product', 'Product Details',
             'Print Barcode', 'Product Categories', 'Sub Categories', 'Variations', 'Brands',
             'Base Units', 'Sale Units', 'Purchase Units', 'Stock Adjustments', 'Create Adjustment',
@@ -58,8 +111,8 @@ class RoleAndUserSeeder extends Seeder
             'Create Purchase Return', 'Quotations List', 'Create Quotation', 'Expenses List',
             'Expense Categories', 'Customers List', 'Customer Groups', 'Suppliers List',
             'Supplier Categories', 'Payment Methods', 'Currencies', 'Executive Reports',
-            'Warehouses & Outlets', 'General Settings', 'Prefix Settings', 'Users & Staff',
-            'Roles & Permissions',
+            'Warehouses & Outlets', 'General Settings', 'Prefix Settings', 'Voucher Settings',
+            'Telegram Bot Settings', 'Delivery Fees', 'Users & Staff', 'Roles & Permissions',
         ];
 
         // 1. Super Admin Role (Fully Access)

@@ -96,24 +96,42 @@ class TransferController extends Controller
 
         $attachExpensePayments = function($items) {
             if ($items->isEmpty()) return $items;
-            $refs = $items->pluck('reference_no')->filter()->values()->all();
+
+            $shippingItems = $items->filter(function($t) {
+                return (float)($t->shipping_charge ?? 0) > 0;
+            });
+
+            if ($shippingItems->isEmpty()) {
+                return $items->map(function($t) {
+                    $arr = $t->toArray();
+                    $arr['payments'] = [];
+                    $arr['shipping_paid'] = 0.0;
+                    $arr['shipping_due'] = (float)$t->shipping_charge;
+                    $arr['shipping_payment_status'] = $t->shipping_charge <= 0 ? 'Free' : 'Unpaid';
+                    $arr['payment_method'] = 'Cash';
+                    return $arr;
+                });
+            }
+
+            $refs = $shippingItems->pluck('reference_no')->filter()->values()->all();
             if (empty($refs)) return $items;
 
-            // Senior Backend Performance: Scoped fetch strictly for the current paginated page references
+            // Senior Backend Performance: Scoped batch lookups replacing 2,500 LIKE conditions
+            $candidateExpenseRefs = [];
+            foreach ($refs as $r) {
+                $clean = preg_replace('/^(?:TR_|TR-)/', '', $r);
+                $candidateExpenseRefs[] = $r;
+                $candidateExpenseRefs[] = 'EXP_TRF-' . $r;
+                $candidateExpenseRefs[] = 'EXP-TRF-' . $r;
+                $candidateExpenseRefs[] = 'TRF-' . $r;
+                $candidateExpenseRefs[] = $clean;
+                $candidateExpenseRefs[] = 'EXP_TRF-' . $clean;
+                $candidateExpenseRefs[] = 'TRF-' . $clean;
+            }
+            $candidateExpenseRefs = array_values(array_unique(array_filter($candidateExpenseRefs)));
+
             $expenses = Expense::with('payments')
-                ->where('expense_category_name', 'Transfer Shipping')
-                ->where(function($q) use ($refs) {
-                    foreach ($refs as $r) {
-                        $clean = preg_replace('/^(?:TR_|TR-)/', '', $r);
-                        $q->orWhere('reference_no', 'like', "%{$r}%")
-                          ->orWhere('details', 'like', "%#{$r}%")
-                          ->orWhere('title', 'like', "%#{$r}%");
-                        if ($clean !== $r) {
-                            $q->orWhere('reference_no', 'like', "%{$clean}%")
-                              ->orWhere('details', 'like', "%#{$clean}%");
-                        }
-                    }
-                })
+                ->whereIn('reference_no', $candidateExpenseRefs)
                 ->get();
 
             $expenseMap = [];
@@ -143,7 +161,7 @@ class TransferController extends Controller
                 $arr = $t->toArray();
                 $ref = $t->reference_no;
                 $clean = preg_replace('/^(?:TR_|TR-)/', '', $ref);
-                $exp = $expenseMap[$ref] ?? ($expenseMap[$clean] ?? null);
+                $exp = $expenseMap[$ref] ?? ($expenseMap[$clean] ?? ($expenseMap['EXP_TRF-' . $ref] ?? null));
 
                 $arr['payments'] = $exp ? ($exp->payments ?? []) : [];
                 $arr['shipping_paid'] = $exp ? (float)$exp->paid_amount : 0.0;
@@ -168,7 +186,8 @@ class TransferController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $limit = min((int)$request->input('limit', 1000), 2000);
+            $totalCount = (clone $query)->count();
+            $limit = min((int)$request->input('limit', 500), 500);
             $items = $orderedQuery->take($limit)->get();
             $dataWithPayments = $attachExpensePayments($items);
             return response()->json([
@@ -177,8 +196,8 @@ class TransferController extends Controller
                 'pagination' => [
                     'current_page' => 1,
                     'per_page'     => $items->count(),
-                    'total'        => $items->count(),
-                    'last_page'    => 1,
+                    'total'        => $totalCount,
+                    'last_page'    => (int)ceil($totalCount / max(1, $limit)),
                 ],
             ]);
         }

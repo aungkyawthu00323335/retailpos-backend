@@ -99,14 +99,16 @@ class ExpenseController extends Controller
         }
 
         // Aggregate total spend for filtered result
-        $totalAmount = (clone $query)->sum('amount');
+        $baseQuery = (clone $query)->without(['category', 'payments']);
+        $totalAmount = (float)(clone $baseQuery)->sum('amount');
+        $totalRecords = (int)(clone $baseQuery)->count();
 
-        // ── Cash vs Non-Cash Breakdown ────────────────────────────────────────
-        $matchedExpenseIds = (clone $query)->pluck('id');
-        $cashTotal    = (float)ExpensePayment::whereIn('expense_id', $matchedExpenseIds)
+        // ── Cash vs Non-Cash Breakdown (Ultra-fast SQL Subquery without PHP memory overhead) ──
+        $expenseIdSubquery = (clone $baseQuery)->select('id');
+        $cashTotal    = (float)ExpensePayment::whereIn('expense_id', $expenseIdSubquery)
             ->where('payment_type', 'Cash')
             ->sum('amount');
-        $digitalTotal = (float)ExpensePayment::whereIn('expense_id', $matchedExpenseIds)
+        $digitalTotal = (float)ExpensePayment::whereIn('expense_id', $expenseIdSubquery)
             ->whereIn('payment_type', ['KBZPay', 'WavePay', 'Bank Transfer', 'Credit Card'])
             ->sum('amount');
 
@@ -122,7 +124,8 @@ class ExpenseController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $items = $query->get();
+            $limit = min(500, max(1, (int)$request->input('limit', 500)));
+            $items = $query->take($limit)->get();
             return response()->json([
                 'status' => 'success',
                 'data'   => $items,
@@ -130,13 +133,13 @@ class ExpenseController extends Controller
                     'total_amount'   => (float)$totalAmount,
                     'cash_total'     => (float)$cashTotal,
                     'digital_total'  => (float)$digitalTotal,
-                    'total_records'  => $items->count(),
+                    'total_records'  => $totalRecords,
                 ],
                 'pagination' => [
                     'current_page' => 1,
                     'per_page'     => $items->count(),
-                    'total'        => $items->count(),
-                    'last_page'    => 1,
+                    'total'        => $totalRecords,
+                    'last_page'    => (int)ceil($totalRecords / max(1, $limit)),
                 ],
             ]);
         }

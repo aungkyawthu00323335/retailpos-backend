@@ -65,6 +65,8 @@ class SettingController extends Controller
             'pos_prefix' => 'POS_',
             'pos_hide_out_of_stock' => '0',
             'delete_security_pin' => '',
+            'product_image_compression_mode' => 'hd',
+            'pricing_mode' => 'retail_and_wholesale',
             // 🧾 POS Voucher Customization Settings
             'show_voucher_logo' => '1',
             'show_voucher_shop_name' => '1',
@@ -123,10 +125,7 @@ class SettingController extends Controller
                 $strVal = in_array(strtolower($strVal), ['my', 'en'], true) ? strtolower($strVal) : 'my';
             }
 
-            Setting::updateOrCreate(
-                ['key' => $key],
-                ['value' => $strVal]
-            );
+            Setting::set($key, $strVal);
 
             // If a prefix changed, cascade the new prefix to existing transaction records
             if (isset($prefixModelMap[$key]) && !empty($strVal)) {

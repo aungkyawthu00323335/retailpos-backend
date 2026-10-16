@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\PurchaseUnitController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\ProductExcelController;
 use App\Http\Controllers\Api\AdjustmentController;
+use App\Http\Controllers\Api\ProcessingController;
 use App\Http\Controllers\Api\TransferController;
 use App\Http\Controllers\Api\PurchaseController;
 use App\Http\Controllers\Api\PurchaseReturnController;
@@ -108,6 +109,10 @@ Route::post('transfers/{id}/payments', [TransferController::class, 'addPayment']
 Route::delete('transfers/{id}/payments/{paymentId}', [TransferController::class, 'deletePayment']);
 Route::apiResource('transfers', TransferController::class);
 
+// Stock Processing / Repackaging (ထုတ်လုပ်/ခွဲထုတ်ပြုပြင်ခြင်း)
+Route::get('processings/generate-code', [ProcessingController::class, 'generateCode']);
+Route::apiResource('processings', ProcessingController::class);
+
 // Purchases & Purchase Returns
 Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']);
 Route::delete('purchases/{id}/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
@@ -180,14 +185,27 @@ Route::patch('supplier-categories/{id}/toggle-status', [SupplierCategoryControll
 Route::apiResource('supplier-categories', SupplierCategoryController::class);
 
 // Users & RBAC Roles
-Route::get('users/generate-id', [UserController::class, 'generateUserId']);
-Route::patch('users/{id}/toggle-status', [UserController::class, 'toggleStatus']);
-Route::apiResource('users', UserController::class)->middleware('permission:users.view,users.create,users.update,users.delete');
-Route::apiResource('roles', RoleController::class)->middleware('permission:roles.view,roles.create,roles.update,roles.delete');
+Route::get('users/generate-id', [UserController::class, 'generateUserId'])->middleware('permission:users.create,users.view');
+Route::patch('users/{id}/toggle-status', [UserController::class, 'toggleStatus'])->middleware('permission:users.update');
+Route::get('users', [UserController::class, 'index'])->middleware('permission:users.view');
+Route::post('users', [UserController::class, 'store'])->middleware('permission:users.create');
+Route::get('users/{id}', [UserController::class, 'show'])->middleware('permission:users.view');
+Route::put('users/{id}', [UserController::class, 'update'])->middleware('permission:users.update');
+Route::patch('users/{id}', [UserController::class, 'update'])->middleware('permission:users.update');
+Route::delete('users/{id}', [UserController::class, 'destroy'])->middleware('permission:users.delete');
+
+Route::get('roles/permissions', [RoleController::class, 'getAvailablePermissions'])->middleware('permission:roles.view,roles.create,roles.update');
+Route::get('permissions', [RoleController::class, 'getAvailablePermissions'])->middleware('permission:roles.view,roles.create,roles.update');
+Route::get('roles', [RoleController::class, 'index'])->middleware('permission:roles.view');
+Route::post('roles', [RoleController::class, 'store'])->middleware('permission:roles.create');
+Route::get('roles/{id}', [RoleController::class, 'show'])->middleware('permission:roles.view');
+Route::put('roles/{id}', [RoleController::class, 'update'])->middleware('permission:roles.update');
+Route::patch('roles/{id}', [RoleController::class, 'update'])->middleware('permission:roles.update');
+Route::delete('roles/{id}', [RoleController::class, 'destroy'])->middleware('permission:roles.delete');
 
 // Reports & Executive Analytics (InfyPOS Reports Suite)
-Route::get('reports/profit-loss', [ReportController::class, 'profitLoss'])->middleware('permission:reports.profit_loss,reports.view');
-Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport'])->middleware('permission:reports.commercial_tax,reports.view');
+Route::get('reports/profit-loss', [ReportController::class, 'profitLoss'])->middleware('permission:reports.profit_loss');
+Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport'])->middleware('permission:reports.commercial_tax');
 Route::get('reports/dashboard-summary', [ReportController::class, 'dashboardSummary']);
 Route::get('reports/stock', [ReportController::class, 'stockReport']);
 Route::get('reports/stock/export', [ReportController::class, 'exportStock']);
@@ -252,4 +270,16 @@ Route::post('bot-settings/set-webhook', [BotOrderController::class, 'setWebhook'
 Route::post('bot-settings/delete-webhook', [BotOrderController::class, 'deleteWebhook']);
 Route::get('bot-settings/webhook-info', [BotOrderController::class, 'getWebhookInfo']);
 Route::get('bot-restock-subscribers', [BotOrderController::class, 'listRestockSubscribers']);
+
+// 🤖 AI Agent & POS Live Customer Chat Routes
+Route::post('bot-settings/test-ai', [BotOrderController::class, 'testAiAgent']);
+Route::post('bot-settings/simulate-ai', [BotOrderController::class, 'simulateAiChat']);
+Route::get('bot-chats', [BotOrderController::class, 'listBotChats']);
+Route::get('bot-chats/{chatId}/messages', [BotOrderController::class, 'getChatMessages']);
+Route::post('bot-chats/{chatId}/send', [BotOrderController::class, 'sendStaffChatMessage']);
+Route::post('bot-chats/{chatId}/toggle-mode', [BotOrderController::class, 'toggleChatAiMode']);
+Route::post('bot-chats/{chatId}/mark-read', [BotOrderController::class, 'markChatAsRead']);
+Route::post('bot-chats/{chatId}/mark-unread', [BotOrderController::class, 'markChatAsUnread']);
+Route::post('bot-chats/{chatId}/toggle-needs-human', [BotOrderController::class, 'toggleChatNeedsHuman']);
+
 

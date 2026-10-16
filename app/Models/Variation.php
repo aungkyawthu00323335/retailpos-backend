@@ -19,18 +19,13 @@ class Variation extends Model
         'variation_types' => 'array',
     ];
 
-    protected $appends = [
-        'products_count',
-    ];
+    protected $appends = [];
 
-    public function getProductsCountAttribute()
+    public function getProductsCountAttribute(): int
     {
-        if (!$this->name) {
-            return 0;
+        if (array_key_exists('products_count', $this->attributes)) {
+            return (int)$this->attributes['products_count'];
         }
-        return ProductVariantValue::where('attribute_name', $this->name)
-            ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
-            ->distinct('product_variants.product_id')
-            ->count('product_variants.product_id');
+        return 0;
     }
 }

@@ -17,10 +17,7 @@ class PurchaseUnit extends Model
         'status',
     ];
 
-    protected $appends = [
-        'products_count',
-        'purchases_count',
-    ];
+    protected $appends = [];
 
     public function baseUnit()
     {
@@ -47,9 +44,7 @@ class PurchaseUnit extends Model
         if (array_key_exists('products_count', $this->attributes)) {
             return (int) $this->attributes['products_count'];
         }
-        $direct = $this->products()->count();
-        $links = $this->productUnitLinks()->count();
-        return max($direct, $links);
+        return 0;
     }
 
     public function getPurchasesCountAttribute(): int
@@ -57,6 +52,6 @@ class PurchaseUnit extends Model
         if (array_key_exists('purchases_count', $this->attributes)) {
             return (int) $this->attributes['purchases_count'];
         }
-        return $this->purchaseItems()->count();
+        return 0;
     }
 }

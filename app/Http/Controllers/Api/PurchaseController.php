@@ -80,15 +80,17 @@ class PurchaseController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $purchases = $query->orderBy('id', 'desc')->get();
+            $totalCount = (clone $query)->count();
+            $limit = min(500, max(1, (int)$request->input('limit', 500)));
+            $purchases = $query->orderBy('id', 'desc')->take($limit)->get();
             return response()->json([
                 'status' => 'success',
                 'data' => $purchases,
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => $purchases->count(),
-                    'total' => $purchases->count(),
-                    'last_page' => 1,
+                    'total' => $totalCount,
+                    'last_page' => (int)ceil($totalCount / max(1, $limit)),
                 ],
             ]);
         }
@@ -303,7 +305,15 @@ class PurchaseController extends Controller
                             (string)$purchase->id,
                             'Purchase received in ' . $linkedUnit['unit_name']
                         );
-                        $product->update(['purchase_price' => (float)$item['unit_cost']]);
+                        $product->update([
+                            'purchase_price' => (float)$baseUnitCost,
+                            'cost_price'     => (float)$baseUnitCost,
+                        ]);
+                        if ($variantId) {
+                            \App\Models\ProductVariant::where('id', $variantId)->update([
+                                'cost_price' => (float)$baseUnitCost,
+                            ]);
+                        }
 
                         // Register into FIFO Inventory Batches
                         app(\App\Services\FifoInventoryService::class)->recordBatch(

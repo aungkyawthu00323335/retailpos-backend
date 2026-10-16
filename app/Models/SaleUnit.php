@@ -17,10 +17,7 @@ class SaleUnit extends Model
         'status',
     ];
 
-    protected $appends = [
-        'products_count',
-        'sales_count',
-    ];
+    protected $appends = [];
 
     public function baseUnit()
     {
@@ -47,9 +44,7 @@ class SaleUnit extends Model
         if (array_key_exists('products_count', $this->attributes)) {
             return (int) $this->attributes['products_count'];
         }
-        $direct = $this->products()->count();
-        $links = $this->productUnitLinks()->count();
-        return max($direct, $links);
+        return 0;
     }
 
     public function getSalesCountAttribute(): int
@@ -57,6 +52,6 @@ class SaleUnit extends Model
         if (array_key_exists('sales_count', $this->attributes)) {
             return (int) $this->attributes['sales_count'];
         }
-        return $this->saleItems()->count();
+        return 0;
     }
 }

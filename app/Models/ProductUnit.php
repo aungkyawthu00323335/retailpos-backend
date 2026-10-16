@@ -15,11 +15,7 @@ class ProductUnit extends Model
         'status',
     ];
 
-    protected $appends = [
-        'products_count',
-        'sale_units_count',
-        'purchase_units_count',
-    ];
+    protected $appends = [];
 
     public function products()
     {
@@ -41,7 +37,7 @@ class ProductUnit extends Model
         if (array_key_exists('products_count', $this->attributes)) {
             return (int) $this->attributes['products_count'];
         }
-        return $this->products()->count();
+        return 0;
     }
 
     public function getSaleUnitsCountAttribute(): int
@@ -49,7 +45,7 @@ class ProductUnit extends Model
         if (array_key_exists('sale_units_count', $this->attributes)) {
             return (int) $this->attributes['sale_units_count'];
         }
-        return $this->saleUnits()->count();
+        return 0;
     }
 
     public function getPurchaseUnitsCountAttribute(): int
@@ -57,6 +53,6 @@ class ProductUnit extends Model
         if (array_key_exists('purchase_units_count', $this->attributes)) {
             return (int) $this->attributes['purchase_units_count'];
         }
-        return $this->purchaseUnits()->count();
+        return 0;
     }
 }

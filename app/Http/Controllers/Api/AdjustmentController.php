@@ -118,7 +118,9 @@ class AdjustmentController extends Controller
             $orderedQuery->orderBy('id', $sortOrder);
         }
         if ($isAll) {
-            $adjustments = $orderedQuery->get();
+            $totalCount = (clone $query)->count();
+            $limit = min(500, max(1, (int)$request->input('limit', 500)));
+            $adjustments = $orderedQuery->take($limit)->get();
             $data = $adjustments->map(function ($adj) {
                 if ($adj->user) {
                     $adj->created_by = $adj->user->name;
@@ -135,8 +137,8 @@ class AdjustmentController extends Controller
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => $adjustments->count(),
-                    'total' => $adjustments->count(),
-                    'last_page' => 1,
+                    'total' => $totalCount,
+                    'last_page' => (int)ceil($totalCount / max(1, $limit)),
                 ],
             ]);
         }
@@ -238,7 +240,13 @@ class AdjustmentController extends Controller
                 } else {
                     $balQuery->whereNull('product_variant_id');
                 }
-                $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+                $hasExistingBalances = StockBalance::where('product_id', $pid)->exists();
+                if (!$hasExistingBalances) {
+                    $prod = Product::find($pid);
+                    $curBal = ($vid === null && $prod) ? (float)$prod->stock_quantity : 0.0;
+                } else {
+                    $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+                }
 
                 if ($needed > $curBal + 0.0001) {
                     $pName = $sub['product_name'];
@@ -511,7 +519,13 @@ class AdjustmentController extends Controller
                     } else {
                         $balQuery->whereNull('product_variant_id');
                     }
-                    $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+                    $hasExistingBalances = StockBalance::where('product_id', $pid)->exists();
+                    if (!$hasExistingBalances) {
+                        $prod = Product::find($pid);
+                        $curBal = ($vid === null && $prod) ? (float)$prod->stock_quantity : 0.0;
+                    } else {
+                        $curBal = (float)($balQuery->value('quantity') ?? 0.0);
+                    }
 
                     if ($needed > $curBal + 0.0001) {
                         $pName = $sub['product_name'];
@@ -722,11 +736,13 @@ class AdjustmentController extends Controller
         $balance = $balanceQuery->first();
 
         if (!$balance) {
+            $hasExistingBalances = StockBalance::where('product_id', $productId)->exists();
+            $initial = ($variantId === null && !$hasExistingBalances) ? (float)$prod->stock_quantity : 0.0;
             $balance = StockBalance::create([
                 'warehouse_id' => $warehouseId,
                 'product_id' => $productId,
                 'product_variant_id' => ($variantId && $variantId > 0) ? $variantId : null,
-                'quantity' => 0,
+                'quantity' => $initial,
             ]);
         }
 

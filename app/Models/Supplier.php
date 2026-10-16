@@ -28,10 +28,7 @@ class Supplier extends Model
         'balance_due' => 'decimal:2',
     ];
 
-    protected $appends = [
-        'purchases_count',
-        'total_due',
-    ];
+    protected $appends = [];
 
     public function purchases()
     {
@@ -43,15 +40,15 @@ class Supplier extends Model
         return $this->hasMany(PurchaseReturn::class, 'supplier_id');
     }
 
-    public function getPurchasesCountAttribute()
+    public function getPurchasesCountAttribute(): int
     {
         if (array_key_exists('purchases_count', $this->attributes)) {
             return (int)$this->attributes['purchases_count'];
         }
-        return $this->purchases()->count();
+        return 0;
     }
 
-    public function getTotalDueAttribute()
+    public function getTotalDueAttribute(): float
     {
         if (array_key_exists('total_due', $this->attributes)) {
             return (float)$this->attributes['total_due'];

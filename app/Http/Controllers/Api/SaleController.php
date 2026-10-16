@@ -84,15 +84,17 @@ class SaleController extends Controller
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $sales = $query->orderBy('id', 'desc')->get();
+            $total = (clone $query)->count();
+            $limit = min(500, max(1, (int)$request->input('limit', 500)));
+            $sales = $query->orderBy('id', 'desc')->take($limit)->get();
             return response()->json([
                 'status' => 'success',
                 'data' => $sales,
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => $sales->count(),
-                    'total' => $sales->count(),
-                    'last_page' => 1,
+                    'total' => $total,
+                    'last_page' => (int)ceil($total / max(1, $limit)),
                 ],
             ]);
         }
@@ -411,10 +413,14 @@ class SaleController extends Controller
                         $variantId
                     )
                     : [
+                        'id' => null,
                         'unit_id' => $item['unit_id'] ?? null,
                         'unit_name' => $item['unit_name'] ?? '',
                         'conversion_rate' => (float)($item['conversion_rate'] ?? 1),
                     ];
+                if (!empty($item['conversion_rate']) && (float)$item['conversion_rate'] > 0 && ($linkedUnit['id'] ?? null) === null) {
+                    $linkedUnit['conversion_rate'] = (float)$item['conversion_rate'];
+                }
                 $quantity = (float)$item['quantity'];
                 $baseQuantity = $unitService->baseQuantity($quantity, (float)$linkedUnit['conversion_rate']);
                 $baseUnitPrice = $unitService->basePrice((float)$item['unit_price'], (float)$linkedUnit['conversion_rate']);
@@ -542,15 +548,21 @@ class SaleController extends Controller
                 ]);
             }
 
-            // Update customer total spend and visit count (Customer Group/Tier remains manual; Points decommissioned)
+            // Update customer total spend and visit count (and reward points if redeemed)
             if ($sale->status === 'Completed' && !empty($validated['customer_id'])) {
                 $cust = Customer::find($validated['customer_id']);
                 if ($cust) {
                     $newTotalSpent = (float)$cust->total_spent + $grandTotal;
-                    $cust->update([
+                    $updatePayload = [
                         'total_spent' => $newTotalSpent,
                         'total_visits' => (int)$cust->total_visits + 1,
-                    ]);
+                    ];
+                    $redeemed = (int)($validated['redeemed_points'] ?? 0);
+                    if ($redeemed > 0) {
+                        $earned = (int)floor($grandTotal / 1000);
+                        $updatePayload['reward_points'] = max(0, (int)$cust->reward_points - $redeemed + $earned);
+                    }
+                    $cust->update($updatePayload);
                 }
             }
 
@@ -1020,6 +1032,13 @@ class SaleController extends Controller
         $sale = Sale::with('items')->find($id) ?? Sale::with('items')->where('reference_no', $id)->first();
         if (!$sale) {
             return response()->json(['status' => 'error', 'message' => 'Sale not found'], 404);
+        }
+
+        if ($sale->status === 'Completed') {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Completed sales cannot be deleted directly. Please use Void Sale with manager authorization.',
+            ], 422);
         }
 
         DB::beginTransaction();

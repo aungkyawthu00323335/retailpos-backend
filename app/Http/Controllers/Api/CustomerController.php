@@ -14,7 +14,10 @@ class CustomerController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Customer::withCount(['sales']);
+        $query = Customer::withCount(['sales'])
+            ->withSum(['sales as receivable_due_sum' => function ($q) {
+                Customer::applyReceivableScope($q);
+            }], 'due_amount');
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -49,6 +52,10 @@ class CustomerController extends Controller
         if ($perPage > 100) $perPage = 100;
 
         $paginated = $query->paginate($perPage);
+        $paginated->getCollection()->transform(function ($customer) {
+            $customer->total_due = $customer->total_due;
+            return $customer;
+        });
 
         $summaryData = Customer::selectRaw("
             COUNT(*) as total_customers,
@@ -178,6 +185,8 @@ class CustomerController extends Controller
                 'message' => 'Customer not found',
             ], 404);
         }
+
+        $customer->total_due = $customer->total_due;
 
         return response()->json([
             'status' => 'success',

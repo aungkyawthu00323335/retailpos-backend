@@ -78,9 +78,7 @@ class Product extends Model
         'is_bot_available' => 'boolean',
     ];
 
-    protected $appends = [
-        'total_dependencies',
-    ];
+    protected $appends = [];
 
     protected static function booted()
     {
@@ -187,9 +185,9 @@ class Product extends Model
     public function getTotalDependenciesAttribute(): int
     {
         return (int) (
-            ($this->sale_items_count ?? $this->saleItems()->count()) +
-            ($this->purchase_items_count ?? $this->purchaseItems()->count()) +
-            ($this->stock_adjustment_items_count ?? $this->stockAdjustmentItems()->count())
+            ($this->sale_items_count ?? 0) +
+            ($this->purchase_items_count ?? 0) +
+            ($this->stock_adjustment_items_count ?? 0)
         );
     }
 }

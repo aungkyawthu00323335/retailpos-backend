@@ -29,9 +29,10 @@ class Customer extends Model
         'total_visits' => 'integer',
     ];
 
-    protected $appends = [
-        'sales_count',
-        'total_due',
+    protected $appends = [];
+
+    protected $hidden = [
+        'receivable_due_sum',
     ];
 
     public function sales()
@@ -49,16 +50,38 @@ class Customer extends Model
         return $this->hasMany(Quotation::class, 'customer_id');
     }
 
-    public function getSalesCountAttribute()
+    public function getSalesCountAttribute(): int
     {
         if (array_key_exists('sales_count', $this->attributes)) {
             return (int)$this->attributes['sales_count'];
         }
-        return $this->sales()->count();
+        return 0;
     }
 
-    public function getTotalDueAttribute()
+    public function getTotalDueAttribute(): float
     {
-        return (float)($this->sales()->sum('due_amount') ?? 0.0);
+        if (array_key_exists('total_due', $this->attributes)) {
+            return (float)$this->attributes['total_due'];
+        }
+        if (array_key_exists('receivable_due_sum', $this->attributes)) {
+            return (float)($this->attributes['receivable_due_sum'] ?? 0.0);
+        }
+        return 0.0;
+    }
+
+    /**
+     * Restricts a sales query to genuine Accounts Receivable:
+     * excludes voided / cancelled / draft sales and Telegram bot orders
+     * that are still awaiting approval or were rejected (no revenue recognised yet).
+     */
+    public static function applyReceivableScope($query)
+    {
+        return $query
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhereNotIn('status', ['Voided', 'Cancelled', 'Draft']);
+            })
+            ->where(function ($q) {
+                $q->whereNull('bot_approval_status')->orWhereNotIn('bot_approval_status', ['pending', 'rejected']);
+            });
     }
 }

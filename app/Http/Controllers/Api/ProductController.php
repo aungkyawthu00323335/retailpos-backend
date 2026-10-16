@@ -65,6 +65,7 @@ class ProductController extends Controller
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
+                'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
             ]);
 
         if ($warehouseId !== null) {

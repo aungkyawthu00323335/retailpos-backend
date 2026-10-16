@@ -21,20 +21,58 @@ class Setting extends Model
      * @var array<string, array{value: mixed, time: float}>
      */
     protected static array $runtimeCache = [];
+    protected static ?array $allSettingsCache = null;
+    protected static float $allSettingsLoadedAt = 0.0;
+    protected static ?string $settingsVersion = null;
 
     public static function get(string $key, $default = null)
     {
+        if (app()->runningUnitTests()) {
+            $setting = static::where('key', $key)->first();
+            return $setting !== null ? $setting->value : $default;
+        }
+
         $now = microtime(true);
-        // Fast in-memory hit (valid for 5 seconds in long-running processes)
+
+        if (static::$allSettingsCache !== null && ($now - static::$allSettingsLoadedAt) < 10.0) {
+            if (array_key_exists($key, static::$allSettingsCache)) {
+                $val = static::$allSettingsCache[$key];
+                return $val !== null ? $val : $default;
+            }
+            return $default;
+        }
+
+        // Fast version check to instantly sync cross-process changes (e.g. POS admin saved settings)
+        $currentVersion = Cache::get('sys_settings_version');
+        $isVersionStale = ($currentVersion !== null && $currentVersion !== static::$settingsVersion);
+        $isTimeExpired = (static::$allSettingsCache === null || ($now - static::$allSettingsLoadedAt) > 10.0);
+
+        if ($isVersionStale || $isTimeExpired) {
+            try {
+                static::$allSettingsCache = static::pluck('value', 'key')->toArray();
+                static::$allSettingsLoadedAt = $now;
+                static::$settingsVersion = $currentVersion;
+                static::$runtimeCache = [];
+            } catch (\Throwable $e) {
+                // Database might be unavailable during early bootstrap
+            }
+        }
+
+        if (static::$allSettingsCache !== null && array_key_exists($key, static::$allSettingsCache)) {
+            $val = static::$allSettingsCache[$key];
+            return $val !== null ? $val : $default;
+        }
+
+        // 2. Fast single in-memory hit
         if (isset(static::$runtimeCache[$key])) {
             $cached = static::$runtimeCache[$key];
-            if (($now - $cached['time']) < 5.0) {
+            if (($now - $cached['time']) < 10.0) {
                 return $cached['value'];
             }
         }
 
-        // Cache layer (30 seconds TTL)
-        $value = Cache::remember("sys_setting_{$key}", 30, function () use ($key) {
+        // 3. Fallback database query
+        $value = Cache::remember("sys_setting_{$key}", 10, function () use ($key) {
             $setting = static::where('key', $key)->first();
             return $setting ? $setting->value : null;
         });
@@ -44,6 +82,9 @@ class Setting extends Model
             'value' => $final,
             'time' => $now,
         ];
+        if (static::$allSettingsCache !== null) {
+            static::$allSettingsCache[$key] = $final;
+        }
 
         return $final;
     }
@@ -52,9 +93,24 @@ class Setting extends Model
     {
         $encoded = is_array($value) ? json_encode($value) : (string) $value;
 
-        // Invalidate both in-memory and Laravel cache
+        // Invalidate in-memory and Laravel cache
+        if (static::$allSettingsCache !== null) {
+            static::$allSettingsCache[$key] = $encoded;
+        }
         unset(static::$runtimeCache[$key]);
         Cache::forget("sys_setting_{$key}");
+        if (str_starts_with($key, 'telegram_') || str_starts_with($key, 'tg_')) {
+            Cache::forget('tg_bot_api_settings_data');
+            Cache::forget('tg_bot_active_categories_v2');
+            Cache::forget('tg_bot_active_categories');
+            Cache::forget('tg_bot_active_brands_v2');
+            Cache::forget('tg_bot_active_brands');
+        }
+
+        // Bump global settings version to instantly notify background daemons (telegram:poll, queue workers)
+        $newVersion = uniqid('set_', true);
+        static::$settingsVersion = $newVersion;
+        Cache::forever('sys_settings_version', $newVersion);
 
         return static::updateOrCreate(
             ['key' => $key],
@@ -62,8 +118,23 @@ class Setting extends Model
         );
     }
 
+    public static function forget(string $key): void
+    {
+        if (static::$allSettingsCache !== null) {
+            unset(static::$allSettingsCache[$key]);
+        }
+        unset(static::$runtimeCache[$key]);
+        Cache::forget("sys_setting_{$key}");
+        if (str_starts_with($key, 'telegram_') || str_starts_with($key, 'tg_')) {
+            Cache::forget('tg_bot_api_settings_data');
+        }
+        static::where('key', $key)->delete();
+    }
+
     public static function clearRuntimeCache(): void
     {
+        static::$allSettingsCache = null;
+        static::$allSettingsLoadedAt = 0.0;
         static::$runtimeCache = [];
     }
 }
