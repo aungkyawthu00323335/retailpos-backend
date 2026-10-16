@@ -261,6 +261,338 @@ class TelegramBotService
     }
 
     /**
+     * Escape Markdown special characters for Telegram Legacy Markdown (F08)
+     */
+    public function escapeMarkdown(?string $text): string
+    {
+        if ($text === null || $text === '') {
+            return '';
+        }
+        return preg_replace('/([_*`\[])/', '\\\\$1', $text);
+    }
+
+    /**
+     * Render Multi-Step Visual Progress Indicator Header (F11)
+     * [1. Cart] ➔ [2. Delivery] ➔ [3. Payment] ➔ [4. Receipt]
+     */
+    public function renderStepIndicator(int $step): string
+    {
+        if (Setting::get('telegram_bot_show_step_indicator', '1') !== '1') {
+            return '';
+        }
+
+        $clamped = max(1, min(4, $step));
+        $steps = ['1. Cart', '2. Delivery', '3. Payment', '4. Receipt'];
+        $formatted = [];
+        foreach ($steps as $idx => $name) {
+            $formatted[] = (($idx + 1) === $clamped) ? "▶ [{$name}]" : "[{$name}]";
+        }
+
+        return implode(' ➔ ', $formatted);
+    }
+
+    /**
+     * Smart Regex Mobile Phone Extraction with Myanmar Digit Normalization (F10)
+     */
+    public function extractPhoneNumberFromText(string $text): ?string
+    {
+        if (empty(trim($text))) {
+            return null;
+        }
+
+        // Convert Myanmar digits (၀-၉) and Burmese letter Wa (ဝ) mistyped as 0 in phone context
+        $converted = $this->convertMyanmarDigits($text);
+        $converted = preg_replace('/(?<=\d|^)ဝ(?=\d|$)/u', '0', $converted);
+        $converted = preg_replace('/(?<![\p{L}])ဝ(?=[0-9])/u', '0', $converted);
+
+        // Match standard Myanmar mobile prefix (+959, 09) followed by 7-11 digits with optional spaces/dashes
+        if (preg_match('/(?:\+?959|09)[\s-]*(?:[0-9][\s-]*){7,11}/', $converted, $matches)) {
+            $raw = preg_replace('/[^\d+]/', '', $matches[0]);
+            $normalized = $this->normalizePhoneNumber($raw);
+            $cleanDigits = preg_replace('/\D/', '', $normalized);
+            if (strlen($cleanDigits) >= 8 && strlen($cleanDigits) <= 13) {
+                return $normalized;
+            }
+        }
+
+        // Secondary match: 959... without leading 0 or +
+        if (preg_match('/(?:959)[\s-]*(?:[0-9][\s-]*){7,11}/', $converted, $matches)) {
+            $raw = preg_replace('/[^\d+]/', '', $matches[0]);
+            $normalized = $this->normalizePhoneNumber($raw);
+            $cleanDigits = preg_replace('/\D/', '', $normalized);
+            if (strlen($cleanDigits) >= 8 && strlen($cleanDigits) <= 13) {
+                return $normalized;
+            }
+        }
+
+        // Fallback: check if any valid phone substring (starting with 09 or +959 or 959) exists in digits
+        $digitsOnly = preg_replace('/[^\d+]/', '', $converted);
+        if (preg_match('/(?:\+?959|09|959)\d{7,11}/', $digitsOnly, $dMatch)) {
+            return $this->normalizePhoneNumber($dMatch[0]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Smart Township Extraction from Address Text (F10)
+     * Matches against delivery_townships table with Burmese/English aliases and longest-match priority
+     */
+    public function extractTownshipFromText(string $text, float $cartTotal = 0.0): ?array
+    {
+        if (empty(trim($text))) {
+            return null;
+        }
+
+        $defaultFee = (float)Setting::get('telegram_bot_delivery_city_fee', 2500);
+        $fallbackResult = [
+            'township_id' => null,
+            'id' => null,
+            'name' => null,
+            'name_mm' => null,
+            'region_id' => null,
+            'region_name' => null,
+            'delivery_fee' => $defaultFee,
+            'fee' => $defaultFee,
+            'free_delivery_threshold' => null,
+            'is_free' => ($defaultFee === 0.0),
+            'display_name' => 'Standard City Delivery',
+            'estimated_days' => '1-3 Days',
+            'is_cod_available' => true,
+            'township' => null,
+        ];
+
+        try {
+            $townships = DeliveryTownship::where('is_active', true)->with('region')->get();
+        } catch (\Throwable $e) {
+            return $fallbackResult;
+        }
+
+        if ($townships->isEmpty()) {
+            return $fallbackResult;
+        }
+
+        $convertedText = $this->convertMyanmarDigits($text);
+
+        // If destination prefix exists (e.g. "ပို့ရမည့်လိပ်စာ: [X]"), prioritize that segment
+        $searchTarget = $convertedText;
+        if (preg_match('/(?:ပို့ရမည့်လိပ်စာ|ပို့ရန်|delivery\s*to|to\s*:)\s*[:\-]?\s*([^,\n;]+)/ui', $convertedText, $destMatch)) {
+            $searchTarget = $destMatch[1];
+        }
+
+        // Common colloquial aliases & variations
+        $aliasMap = [
+            'Kamayut' => ['kamaryut', 'hledan', 'လှည်းတန်း', 'ကမာရွတ်'],
+            'Sanchaung' => ['san chaung', 'စမ်းချောင်း', 'ရှင်စောပု'],
+            'Bahan' => ['ဗဟန်း', 'ဆရာစံ'],
+            'Hlaing' => ['hline', 'လှိုင်'],
+            'Hlaingtharyar' => ['hlaing tharyar', 'hlaingtharyar', 'လှိုင်သာယာ'],
+            'Mayangone' => ['mayangon', 'မရမ်းကုန်း', '၈မိုင်', '9မိုင်', 'ကမ္ဘာအေး'],
+            'Yankin' => ['ရန်ကင်း', 'ကန်ဘဲ့'],
+            'Tamwe' => ['tarmwe', 'တာမွေ', 'ကျောက်မြောင်း'],
+            'South Okkalapa' => ['south okkala', 'တောင်ဥက္ကလာ', 'တောင်ဥက္ကလာပ'],
+            'North Okkalapa' => ['north okkala', 'မြောက်ဥက္ကလာ', 'မြောက်ဥက္ကလာပ'],
+            'North Dagon' => ['north dagon', 'မြောက်ဒဂုံ'],
+            'South Dagon' => ['south dagon', 'တောင်ဒဂုံ'],
+            'East Dagon' => ['east dagon', 'အရှေ့ဒဂုံ'],
+            'Dagon' => ['ဒဂုံ'],
+            'Thingangyun' => ['thingangyune', 'သင်္ဃန်းကျွန်း', 'သုဝဏ္ဏ'],
+            'Thaketa' => ['သာကေတ'],
+            'Dawbon' => ['ဒေါပုံ'],
+            'Insein' => ['အင်းစိန်', 'ပေါက်တော'],
+            'Kyauktada' => ['ကျောက်တံတား'],
+            'Pabedan' => ['ပန်းဘဲတန်း'],
+            'Latha' => ['လသာ'],
+            'Lanmadaw' => ['လမ်းမတော်'],
+            'Ahlone' => ['အလုံ'],
+            'Botahtaung' => ['ဗိုလ်တထောင်'],
+            'Pazundaung' => ['ပုဇွန်တောင်'],
+            'Shwepyitha' => ['ရွှေပြည်သာ'],
+            'Chanayethazan' => ['ချမ်းအေးသာစံ'],
+            'Mahaaungmye' => ['မဟာအောင်မြေ'],
+            'Chanmyathazi' => ['ချမ်းမြသာစည်'],
+            'Aungmyethazan' => ['အောင်မြေသာစံ'],
+            'Pyigyidagun' => ['ပြည်ကြီးတံခွန်'],
+            'Amarapura' => ['အမရပူရ'],
+        ];
+
+        // Build candidates list: [ 'keyword' => $township ]
+        $candidates = [];
+        foreach ($townships as $tsp) {
+            $candidates[$tsp->name] = $tsp;
+            if (!empty($tsp->name_mm)) {
+                $candidates[$tsp->name_mm] = $tsp;
+            }
+            if (isset($aliasMap[$tsp->name])) {
+                foreach ($aliasMap[$tsp->name] as $al) {
+                    $candidates[$al] = $tsp;
+                }
+            }
+        }
+
+        // Sort keywords by character length descending (longest match first)
+        uksort($candidates, fn($a, $b) => mb_strlen($b, 'UTF-8') <=> mb_strlen($a, 'UTF-8'));
+
+        $matchedTownship = null;
+
+        // First pass: match against prioritized destination segment
+        foreach ($candidates as $keyword => $tsp) {
+            if (mb_stripos($searchTarget, $keyword) !== false) {
+                $matchedTownship = $tsp;
+                break;
+            }
+        }
+
+        // Second pass: match against entire converted text if first pass didn't find match
+        if (!$matchedTownship && $searchTarget !== $convertedText) {
+            foreach ($candidates as $keyword => $tsp) {
+                if (mb_stripos($convertedText, $keyword) !== false) {
+                    $matchedTownship = $tsp;
+                    break;
+                }
+            }
+        }
+
+        if ($matchedTownship) {
+            $effectiveFee = (float)$matchedTownship->delivery_fee;
+            if ($matchedTownship->free_delivery_threshold && $cartTotal >= (float)$matchedTownship->free_delivery_threshold) {
+                $effectiveFee = 0.0;
+            }
+            $tspTitle = $matchedTownship->name_mm ?? $matchedTownship->name;
+            $regionTitle = $matchedTownship->region ? ($matchedTownship->region->name_mm ?? $matchedTownship->region->name) : '';
+            $displayName = !empty($regionTitle) ? "{$regionTitle} - {$tspTitle}" : $tspTitle;
+
+            return [
+                'township_id' => $matchedTownship->id,
+                'id' => $matchedTownship->id,
+                'name' => $matchedTownship->name,
+                'name_mm' => $matchedTownship->name_mm,
+                'region_id' => $matchedTownship->delivery_region_id,
+                'region_name' => $regionTitle,
+                'delivery_fee' => $effectiveFee,
+                'fee' => $effectiveFee,
+                'free_delivery_threshold' => $matchedTownship->free_delivery_threshold ? (float)$matchedTownship->free_delivery_threshold : null,
+                'is_free' => ($effectiveFee === 0.0),
+                'display_name' => $displayName,
+                'estimated_days' => $matchedTownship->estimated_days ?? '1-2 Days',
+                'is_cod_available' => (bool)$matchedTownship->is_cod_available,
+                'township' => $matchedTownship,
+            ];
+        }
+
+        return $fallbackResult;
+    }
+
+    /**
+     * Resolve User Locale (F12)
+     */
+    public function resolveUserLocale(array $from = [], int|string|null $chatId = null): string
+    {
+        if ($chatId) {
+            $cachedLocale = Cache::get("tg_locale_{$chatId}");
+            if ($cachedLocale) {
+                return $cachedLocale;
+            }
+        }
+        $tgLang = strtolower($from['language_code'] ?? '');
+        if (str_starts_with($tgLang, 'en')) {
+            return 'en';
+        }
+        if (str_starts_with($tgLang, 'my')) {
+            return 'my';
+        }
+        return (string)Setting::get('telegram_bot_default_language', 'my');
+    }
+
+    /**
+     * Localized Callback Toast Notification Dictionary (F12)
+     */
+    public function getLocalizedToast(string $key, string $locale = 'my', array $params = []): string
+    {
+        $toasts = [
+            'cart_added' => [
+                'my' => '✅ ခြင်းတောင်းထဲသို့ {qty} ခု ထည့်ပြီးပါပြီ',
+                'en' => '✅ Added {qty} item(s) to cart',
+            ],
+            'cart_inc' => [
+                'my' => '➕ အရေအတွက် တိုးလိုက်ပါသည် (+1)',
+                'en' => '➕ Quantity increased (+1)',
+            ],
+            'cart_dec' => [
+                'my' => '➖ အရေအတွက် လျှော့ချလိုက်ပါသည် (-1)',
+                'en' => '➖ Quantity decreased (-1)',
+            ],
+            'cart_removed' => [
+                'my' => '🗑️ ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားလိုက်ပါပြီ',
+                'en' => '🗑️ Item removed from cart',
+            ],
+            'cart_cleared' => [
+                'my' => '🗑️ ခြင်းတောင်းကို ရှင်းထုတ်လိုက်ပါပြီ',
+                'en' => '🗑️ Cart cleared',
+            ],
+            'order_cancelled' => [
+                'my' => '❌ အော်ဒါအား ပယ်ဖျက်လိုက်ပါပြီ',
+                'en' => '❌ Order cancelled',
+            ],
+            'out_of_stock' => [
+                'my' => '⚠️ လက်ကျန်ပစ္စည်း ထပ်မံမရရှိနိုင်တော့ပါရှင်',
+                'en' => '⚠️ Item is currently out of stock',
+            ],
+            'select_variant' => [
+                'my' => '🎨 ဆိုဒ်/အရွယ်အစား ရွေးချယ်ပေးပါရှင်',
+                'en' => '🎨 Please select size/variant',
+            ],
+            'select_qty' => [
+                'my' => '🛍️ အရေအတွက် ရွေးချယ်ပေးပါရှင်',
+                'en' => '🛍️ Please select quantity',
+            ],
+            'custom_qty_prompt' => [
+                'my' => '✍️ အရေအတွက် ရိုက်ထည့်ပေးပါရှင်',
+                'en' => '✍️ Please enter quantity',
+            ],
+            'staff_notified' => [
+                'my' => '👨‍💼 ဆိုင်ဝန်ထမ်းထံ အကြောင်းကြားထားပါသည်',
+                'en' => '👨‍💼 Staff has been notified',
+            ],
+            'ai_resumed' => [
+                'my' => '🤖 AI အရောင်းလက်ထောက်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီ',
+                'en' => '🤖 AI Sales Assistant resumed',
+            ],
+            'restock_subscribed' => [
+                'my' => '🔔 ပစ္စည်းပြန်ရောက်ပါက သတိပေးချက် ပို့ပေးပါမည်',
+                'en' => '🔔 You will be notified when restocked',
+            ],
+            'restock_already' => [
+                'my' => 'ℹ️ သင်သည် သတိပေးချက် ရယူရန် စာရင်းသွင်းထားပြီးဖြစ်ပါသည်',
+                'en' => 'ℹ️ You are already subscribed for alerts',
+            ],
+        ];
+
+        if ($key === 'cart_inc') {
+            $customInc = Setting::get('telegram_bot_cart_toast_inc');
+            if (!empty($customInc) && $locale === 'my') {
+                return mb_substr($customInc, 0, 100, 'UTF-8');
+            }
+        } elseif ($key === 'cart_dec') {
+            $customDec = Setting::get('telegram_bot_cart_toast_dec');
+            if (!empty($customDec) && $locale === 'my') {
+                return mb_substr($customDec, 0, 100, 'UTF-8');
+            }
+        } elseif ($key === 'cart_removed') {
+            $customDel = Setting::get('telegram_bot_cart_toast_del');
+            if (!empty($customDel) && $locale === 'my') {
+                return mb_substr($customDel, 0, 100, 'UTF-8');
+            }
+        }
+
+        $template = $toasts[$key][$locale] ?? $toasts[$key]['my'] ?? '';
+        foreach ($params as $k => $v) {
+            $template = str_replace('{' . $k . '}', (string)$v, $template);
+        }
+        return mb_substr($template, 0, 100, 'UTF-8');
+    }
+
+    /**
      * Log Outgoing System Bot Message to Live Chat history
      */
     public function logOutgoingBotMessage(int|string $chatId, string $text, string $type = 'text', ?array $metadata = null): void
@@ -692,9 +1024,12 @@ class TelegramBotService
     public function addToCart(
         int|string $chatId,
         Product $product,
-        ?ProductVariant $variant = null,
+        ProductVariant|int|null $variant = null,
         float|int $qty = 1
     ): array {
+        if (is_numeric($variant)) {
+            $variant = ProductVariant::find((int)$variant);
+        }
         $cart = $this->getCart($chatId);
         $variantId = $variant?->id;
         $itemKey = $variantId ? "p_{$product->id}_v_{$variantId}" : "p_{$product->id}";
@@ -855,8 +1190,13 @@ class TelegramBotService
         $editRows = [];
         $indexIcons = [1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣', 6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟'];
 
+        $maxItemTextLen = 3500;
+        $itemsText = '';
+        $omittedCount = 0;
+
         foreach ($cart as $key => $item) {
-            $title = !empty($item['variant_name']) ? "{$item['product_name']} ({$item['variant_name']})" : $item['product_name'];
+            $rawTitle = !empty($item['variant_name']) ? "{$item['product_name']} ({$item['variant_name']})" : $item['product_name'];
+            $title = $this->escapeMarkdown($rawTitle);
             $priceFmt = number_format($item['price']);
             $subFmt = number_format($item['subtotal']);
             $qtyDisplay = (floor($item['quantity']) == $item['quantity']) ? (int)$item['quantity'] : $item['quantity'];
@@ -866,12 +1206,20 @@ class TelegramBotService
 
             // Tree-structured alignment: Title on line 1, clean calculation indented on line 2
             if ($showUnitPrice) {
-                $text .= "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} × {$priceFmt} = *{$subFmt} ကျပ်*\n\n";
+                $line = "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} × {$priceFmt} = *{$subFmt} ကျပ်*\n\n";
             } else {
-                $text .= "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} — *{$subFmt} ကျပ်*\n\n";
+                $line = "{$badge} *{$title}*\n   ▫️ {$qtyDisplay} {$unitName} — *{$subFmt} ကျပ်*\n\n";
             }
 
-            if ($showEditor) {
+            if (mb_strlen($itemsText . $line, 'UTF-8') > $maxItemTextLen && $idx < count($cart)) {
+                $omittedCount = count($cart) - $idx + 1;
+                $itemsText .= "➕ ... နှင့် အခြားပစ္စည်း *{$omittedCount} မျိုး* (ခြင်းတောင်းထဲတွင် အပြည့်အစုံ ကြည့်ရှုနိုင်ပါသည်)\n\n";
+                break;
+            }
+
+            $itemsText .= $line;
+
+            if ($showEditor && count($editRows) < 20) {
                 $shortTitle = mb_strimwidth($item['product_name'], 0, 14, '..');
                 $row = [];
                 if ($showBtnDec) {
@@ -892,6 +1240,8 @@ class TelegramBotService
             }
             $idx++;
         }
+
+        $text .= $itemsText;
 
         if ($showTotal) {
             $grandTotalFmt = number_format($cartSummary['grand_total']);
@@ -1072,7 +1422,11 @@ class TelegramBotService
             ])
             : "📱 ဆက်သွယ်ရမည့် *ဖုန်းနံပါတ်* ရိုက်ထည့်ပေးပါရှင် (ဥပမာ- 09123456789) -";
 
-        $msg = "📝 *အော်ဒါ အနှစ်ချုပ် ({$cartSummary['items_count']} မျိုး / {$cartSummary['total_qty']} ခု)*\n"
+        $stepper = $this->renderStepIndicator(2);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
+        $msg = $stepperHeader
+             . "📝 *အော်ဒါ အနှစ်ချုပ် ({$cartSummary['items_count']} မျိုး / {$cartSummary['total_qty']} ခု)*\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
              . "{$itemsList}\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1083,7 +1437,8 @@ class TelegramBotService
         $btnSharePhone = Setting::get('telegram_bot_btn_share_phone', '📱 ကျွန်ုပ်၏ ဖုန်းနံပါတ် ပေးပို့မည် (Share Phone)');
         $btnCart = Setting::get('telegram_bot_btn_cart', '🛒 ခြင်းတောင်း ကြည့်မည်');
 
-        $showSharePhone = Setting::get('telegram_bot_show_btn_share_phone', '1') === '1';
+        $isOneTap = Setting::get('telegram_bot_one_tap_checkout', '1') === '1';
+        $showSharePhone = $isOneTap && (Setting::get('telegram_bot_show_btn_share_phone', '1') === '1');
         $showBtnCart = Setting::get('telegram_bot_show_btn_cart', '1') === '1';
         $showBtnCancel = Setting::get('telegram_bot_show_catalog_btn_cancel', '1') === '1';
 
@@ -1103,6 +1458,7 @@ class TelegramBotService
                 'keyboard' => $keyboardRows,
                 'resize_keyboard' => true,
                 'one_time_keyboard' => true,
+                'input_field_placeholder' => '📱 ဖုန်းနံပါတ် ရိုက်ထည့်ပါ သို့မဟုတ် ခလုတ်နှိပ်ပါ...',
             ]
             : ['remove_keyboard' => true];
 
@@ -1149,6 +1505,7 @@ class TelegramBotService
 
             $fileContents = Http::timeout(25)->withoutVerifying()->get($fileUrl)->body();
             $hash = hash('sha256', $fileContents);
+            $phash = app(PerceptualHashService::class)->computePhash($fileContents);
 
             $ext = pathinfo($filePath, PATHINFO_EXTENSION) ?: 'jpg';
             $filename = 'bot_slip_' . date('Ymd_His') . '_' . rand(1000, 9999) . '.' . $ext;
@@ -1163,6 +1520,7 @@ class TelegramBotService
             return [
                 'url' => "{$baseUrl}/storage/{$storagePath}",
                 'hash' => $hash,
+                'phash' => $phash,
                 'contents' => $fileContents,
                 'mime' => 'image/' . ($ext === 'jpg' ? 'jpeg' : $ext),
                 'storage_path' => $storagePath,
@@ -3016,6 +3374,9 @@ class TelegramBotService
         if ($page < 1) $page = 1;
 
         $products = $query->with([
+            'category',
+            'brand',
+            'subCategory',
             'variants' => fn($q) => $q->where('is_active', true)->orderBy('sort_order', 'asc'),
             'images',
             'primaryImage',
@@ -3045,15 +3406,15 @@ class TelegramBotService
         }
 
         // Configurable Field Visibility Settings & Out-of-Stock Selling Policy (SSOT)
-        $showCode = Setting::get('telegram_bot_show_product_code', '1') === '1';
-        $showCat = Setting::get('telegram_bot_show_product_category', '1') === '1';
-        $showSubCat = Setting::get('telegram_bot_show_product_sub_category', '1') === '1';
-        $showBrand = Setting::get('telegram_bot_show_product_brand', '1') === '1';
-        $showPrice = Setting::get('telegram_bot_show_product_price', '1') === '1';
-        $showStock = Setting::get('telegram_bot_show_product_stock', '1') === '1';
-        $showDetails = Setting::get('telegram_bot_show_product_details', '0') === '1';
-        $showImageBtn = Setting::get('telegram_bot_show_product_image', '1') === '1';
-        $showVariants = Setting::get('telegram_bot_show_product_variants', '1') === '1';
+        $showCode = Setting::get('telegram_bot_catalog_show_code', Setting::get('telegram_bot_show_product_code', '1')) === '1';
+        $showCat = Setting::get('telegram_bot_catalog_show_category', Setting::get('telegram_bot_show_product_category', '1')) === '1';
+        $showSubCat = Setting::get('telegram_bot_catalog_show_sub_category', Setting::get('telegram_bot_show_product_sub_category', '1')) === '1';
+        $showBrand = Setting::get('telegram_bot_catalog_show_brand', Setting::get('telegram_bot_show_product_brand', '1')) === '1';
+        $showPrice = Setting::get('telegram_bot_catalog_show_price', Setting::get('telegram_bot_show_product_price', '1')) === '1';
+        $showStock = Setting::get('telegram_bot_catalog_show_stock', Setting::get('telegram_bot_show_product_stock', '1')) === '1';
+        $showDetails = Setting::get('telegram_bot_catalog_show_details', Setting::get('telegram_bot_show_product_details', '0')) === '1';
+        $showImageBtn = Setting::get('telegram_bot_catalog_show_image', Setting::get('telegram_bot_show_product_image', '1')) === '1';
+        $showVariants = Setting::get('telegram_bot_catalog_show_variants', Setting::get('telegram_bot_show_product_variants', '1')) === '1';
         $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
 
         $customSelectVar = Setting::get('telegram_bot_btn_select_variant_catalog', '🎨 ဆိုဒ်ရွေးမည်');
@@ -3175,6 +3536,9 @@ class TelegramBotService
                 }
 
                 $caption = implode("\n", $cardLines);
+                if (mb_strlen($caption, 'UTF-8') > 1000) {
+                    $caption = mb_substr($caption, 0, 997, 'UTF-8') . '...';
+                }
 
                 $imagePath = $p->image_url 
                     ?: ($p->primaryImage?->path ?: ($p->images->first()?->path ?? null));
@@ -3302,64 +3666,116 @@ class TelegramBotService
         $showBtnBuyCatalog = Setting::get('telegram_bot_show_btn_buy_catalog', '1') === '1';
         $showBtnSelectVarCatalog = Setting::get('telegram_bot_show_btn_select_variant_catalog', '1') === '1';
 
+        $isCompact = Setting::get('telegram_bot_compact_markdown', '1') === '1';
+
         foreach ($products as $p) {
             $effectivePrice = (float)($p->retail_price ?: $p->selling_price);
             $stock = (float)($stockMap[$p->id] ?? 0);
             $itemNum = ($page - 1) * $perPage + $index;
 
-            // 1. Title & Classification Badges
-            $badges = [];
-            if ($showCat && !empty($p->category_name)) $badges[] = "📂 {$p->category_name}";
-            if ($showSubCat && !empty($p->sub_category_name)) $badges[] = "🔹 {$p->sub_category_name}";
-            if ($showBrand && !empty($p->brand_name)) $badges[] = "🏷️ {$p->brand_name}";
-            $metaStr = !empty($badges) ? " [" . implode(' • ', $badges) . "]" : "";
-
-            $cardLines = [];
-            $cardLines[] = "{$itemNum}️⃣ *{$p->name}*{$metaStr}";
-
-            // 2. Product Code
-            if ($showCode && !empty($p->code)) {
-                $cardLines[] = "   ▫️ ကုတ်နံပါတ်:  `{$p->code}`";
-            }
-
-            // 3. Price
-            if ($showPrice) {
+            if ($isCompact) {
+                // 2-Line High-Density Mobile Layout (F08)
+                $escapedName = $this->escapeMarkdown($p->name);
                 $priceFormatted = number_format($effectivePrice);
-                $cardLines[] = "   ▫️ ဈေးနှုန်း:    *{$priceFormatted} MMK*";
-            }
 
-            // 4. Stock Badge & Out of Stock Policy
-            if ($showStock) {
-                if ($stock <= 0) {
-                    $stockText = $allowOutOfStock
-                        ? "⚠️ လက်ကျန်ပြတ်လပ် (Pre-Order ရရှိနိုင်)"
-                        : "❌ လက်ကျန်ပြတ်လပ် (Sold Out)";
-                } elseif ($stock <= 5) {
-                    $stockText = "⚡ `{$stock}` " . ($p->unit_name ?: 'ခု') . " သာ ကျန်ပါတော့သည်";
-                } else {
-                    $stockText = "✅ `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
+                // Status Badge
+                $statusBadge = ($stock <= 0)
+                    ? ($allowOutOfStock ? "⚠️ Pre-Order" : "❌ Sold Out")
+                    : "✅ {$stock} " . ($p->unit_name ?: 'ခု');
+
+                $cardLines = [];
+                $cardLines[] = "{$itemNum}️⃣ *{$escapedName}* — *{$priceFormatted} MMK*";
+
+                $metaParts = [];
+                if ($showCode && !empty($p->code)) {
+                    $metaParts[] = "`" . str_replace('`', '', $p->code) . "`";
                 }
-                $cardLines[] = "   ▫️ လက်ကျန်:   {$stockText}";
-            }
-
-            // 5. Details / Description snippet
-            if ($showDetails && !empty($p->description)) {
-                $cleanDesc = trim(strip_tags($p->description));
-                if (!empty($cleanDesc)) {
-                    $snippet = mb_substr($cleanDesc, 0, 75) . (mb_strlen($cleanDesc) > 75 ? '...' : '');
-                    $cardLines[] = "   ▫️ အသေးစိတ်:  _{$snippet}_";
+                if ($showStock) {
+                    $metaParts[] = $statusBadge;
                 }
-            }
+                $catName = !empty($p->category?->name) ? $p->category->name : ($p->category_name ?? '');
+                if ($showCat && !empty($catName)) {
+                    $metaParts[] = "📂 " . $this->escapeMarkdown($catName);
+                }
+                $brandName = !empty($p->brand?->name) ? $p->brand->name : ($p->brand_name ?? '');
+                if ($showBrand && !empty($brandName)) {
+                    $metaParts[] = "🏷️ " . $this->escapeMarkdown($brandName);
+                }
 
-            // 6. Variants
-            $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
-            if ($showVariants && $hasActiveVariants) {
-                $vNames = $p->variants->pluck('name')->implode(', ');
-                $cardLines[] = "   ▫️ ဆိုဒ်များ:   {$vNames}";
-            }
+                if (!empty($metaParts)) {
+                    $cardLines[] = "   ▫️ " . implode(' • ', $metaParts);
+                }
 
-            // Card Divider
-            $text .= implode("\n", $cardLines) . "\n───────────────────\n\n";
+                $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
+                if ($showVariants && $hasActiveVariants) {
+                    $vNames = $p->variants->pluck('name')->map(fn($n) => $this->escapeMarkdown($n))->implode(', ');
+                    $cardLines[] = "   ▫️ 🎨 {$vNames}";
+                }
+
+                if ($showDetails && !empty($p->description)) {
+                    $cleanDesc = trim(strip_tags($p->description));
+                    if (!empty($cleanDesc)) {
+                        $snippet = mb_substr($cleanDesc, 0, 45) . (mb_strlen($cleanDesc) > 45 ? '...' : '');
+                        $cardLines[] = "   ▫️ 📝 _{$this->escapeMarkdown($snippet)}_";
+                    }
+                }
+
+                $text .= implode("\n", $cardLines) . "\n───────────────────\n\n";
+            } else {
+                // 1. Title & Classification Badges (Original expanded layout)
+                $badges = [];
+                if ($showCat && !empty($p->category_name)) $badges[] = "📂 {$p->category_name}";
+                if ($showSubCat && !empty($p->sub_category_name)) $badges[] = "🔹 {$p->sub_category_name}";
+                if ($showBrand && !empty($p->brand_name)) $badges[] = "🏷️ {$p->brand_name}";
+                $metaStr = !empty($badges) ? " [" . implode(' • ', $badges) . "]" : "";
+
+                $cardLines = [];
+                $cardLines[] = "{$itemNum}️⃣ *{$p->name}*{$metaStr}";
+
+                // 2. Product Code
+                if ($showCode && !empty($p->code)) {
+                    $cardLines[] = "   ▫️ ကုတ်နံပါတ်:  `{$p->code}`";
+                }
+
+                // 3. Price
+                if ($showPrice) {
+                    $priceFormatted = number_format($effectivePrice);
+                    $cardLines[] = "   ▫️ ဈေးနှုန်း:    *{$priceFormatted} MMK*";
+                }
+
+                // 4. Stock Badge & Out of Stock Policy
+                if ($showStock) {
+                    if ($stock <= 0) {
+                        $stockText = $allowOutOfStock
+                            ? "⚠️ လက်ကျန်ပြတ်လပ် (Pre-Order ရရှိနိုင်)"
+                            : "❌ လက်ကျန်ပြတ်လပ် (Sold Out)";
+                    } elseif ($stock <= 5) {
+                        $stockText = "⚡ `{$stock}` " . ($p->unit_name ?: 'ခု') . " သာ ကျန်ပါတော့သည်";
+                    } else {
+                        $stockText = "✅ `{$stock}` " . ($p->unit_name ?: 'ခု') . " (Available)";
+                    }
+                    $cardLines[] = "   ▫️ လက်ကျန်:   {$stockText}";
+                }
+
+                // 5. Details / Description snippet
+                if ($showDetails && !empty($p->description)) {
+                    $cleanDesc = trim(strip_tags($p->description));
+                    if (!empty($cleanDesc)) {
+                        $snippet = mb_substr($cleanDesc, 0, 75) . (mb_strlen($cleanDesc) > 75 ? '...' : '');
+                        $cardLines[] = "   ▫️ အသေးစိတ်:  _{$snippet}_";
+                    }
+                }
+
+                // 6. Variants
+                $hasActiveVariants = $p->has_variants && $p->variants && $p->variants->isNotEmpty();
+                if ($showVariants && $hasActiveVariants) {
+                    $vNames = $p->variants->pluck('name')->implode(', ');
+                    $cardLines[] = "   ▫️ ဆိုဒ်များ:   {$vNames}";
+                }
+
+                // Card Divider
+                $text .= implode("\n", $cardLines) . "\n───────────────────\n\n";
+            }
 
             // 7. Action Buttons
             $rowButtons = [];
@@ -3607,6 +4023,9 @@ class TelegramBotService
         }
 
         $caption .= "မှာယူလိုပါက အောက်ပါခလုတ်ကို နှိပ်ပါရှင်-";
+        if (mb_strlen($caption, 'UTF-8') > 1000) {
+            $caption = mb_substr($caption, 0, 997, 'UTF-8') . '...';
+        }
 
         $btnOrderNow = Setting::get('telegram_bot_btn_order_now', '🛒 မှာယူမည် (Order Now)');
         $btnSelectVar = Setting::get('telegram_bot_btn_select_variant', '🎨 ဆိုဒ်ရွေး၍ မှာယူမည်');
@@ -4064,6 +4483,8 @@ class TelegramBotService
 
         if (!$chatId) return;
 
+        $userLocale = $this->resolveUserLocale($callbackQuery['from'] ?? [], $chatId);
+
         // ⚡ Sub-100ms Immediate Acknowledgment for navigation & menus to stop client spinner instantly
         $isInstantNav = str_starts_with($data, 'nav_') 
                      || str_starts_with($data, 'f_cat_') 
@@ -4105,7 +4526,7 @@ class TelegramBotService
                 return;
             }
             $this->aiAgentService->resumeAiForChat($chatId);
-            $this->answerCallbackQuery($id, 'AI အရောင်းလက်ထောက်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီ');
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('ai_resumed', $userLocale));
             $this->sendMessage($chatId, "🤖 *AI အရောင်းလက်ထောက် စနစ်ကို ပြန်လည်ဖွင့်လိုက်ပါပြီရှင်။*\n\nမေးမြန်းလိုသည့် ပစ္စည်းအမည်၊ စျေးနှုန်း သို့မဟုတ် သိရှိလိုသည်များကို စာရိုက်၍ မေးမြန်းနိုင်ပါပြီရှင် 🙏");
             return;
         }
@@ -4115,7 +4536,7 @@ class TelegramBotService
             $this->aiAgentService->pauseAiForChat($chatId, 120);
             BotChatMessage::where('telegram_chat_id', (string)$chatId)->latest('id')->update(['needs_human' => true]);
             $this->notifyAdminCustomerNeedsHelp($chatId, $userName, $usernameTag, "Customer clicked 'Talk to Human Staff'");
-            $this->answerCallbackQuery($id, 'ဆိုင်ဝန်ထမ်းထံ အကြောင်းကြားထားပါသည်');
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('staff_notified', $userLocale));
             $staffNotice = ($this->aiAgentService->getOperatingMode() === 'standard')
                 ? "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ ဝန်ထမ်းမှ ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။ 🙏"
                 : "👨‍💼 *ဆိုင်ဝန်ထမ်းထံသို့ အကြောင်းကြားထားပါသည်ရှင်။*\n\nမကြာမီ ဝန်ထမ်းမှ ဝင်ရောက်စာပြန်ပေးပါမည်ရှင်။\n(AI လက်ထောက်နှင့် ပြန်ပြောလိုပါက /ai ဟု ရိုက်ပို့နိုင်ပါသည်)";
@@ -4125,7 +4546,7 @@ class TelegramBotService
 
         if ($data === 'cancel') {
             Cache::forget("tg_session_{$chatId}");
-            $this->answerCallbackQuery($id, 'အော်ဒါအား ပယ်ဖျက်လိုက်ပါပြီ');
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('order_cancelled', $userLocale));
             $messageId = $callbackQuery['message']['message_id'] ?? null;
             if ($messageId) {
                 $this->deleteMessage($chatId, $messageId);
@@ -4172,7 +4593,7 @@ class TelegramBotService
 
         if ($data === 'cart_clear') {
             $this->clearCart($chatId);
-            $this->answerCallbackQuery($id, 'ခြင်းတောင်းကို ရှင်းထုတ်လိုက်ပါပြီ');
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('cart_cleared', $userLocale));
             $emptyMsgTpl = Setting::get('telegram_bot_cart_cleared_msg', "🗑️ သင်၏ ခြင်းတောင်းကို ရှင်းထုတ်ပြီးပါပြီရှင်။\n\nပစ္စည်းများ ပြန်လည်ရွေးချယ်ရန် '🛍️ ကုန်ပစ္စည်းများ' ကို နှိပ်ပါရှင်။ 🙏");
             $emptyMsg = !empty(trim($emptyMsgTpl))
                 ? $this->replacePlaceholders($emptyMsgTpl, ['customer_name' => $userName, 'user_name' => $userName])
@@ -4221,7 +4642,7 @@ class TelegramBotService
                         return $stockQ->sum('quantity');
                     });
                     if ($newQty > $availableStock) {
-                        $this->answerCallbackQuery($id, '⚠️ လက်ကျန်ပစ္စည်း ထပ်မံမရရှိနိုင်တော့ပါရှင်', true);
+                        $this->answerCallbackQuery($id, $this->getLocalizedToast('out_of_stock', $userLocale), true);
                         return;
                     }
                 }
@@ -4230,9 +4651,9 @@ class TelegramBotService
                 $cart[$itemKey]['subtotal'] = $newQty * (float)$item['price'];
                 $this->saveCart($chatId, $cart);
 
-                // Instant In-App Top Toast Banner (Disabled)
-                $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
-                $toastInc = Setting::get('telegram_bot_cart_toast_inc', 'အရေအတွက် တိုးလိုက်ပါသည် (+1)');
+                // Instant In-App Top Toast Banner
+                $showToast = Setting::get('telegram_bot_cart_show_toast', '1') === '1';
+                $toastInc = Setting::get('telegram_bot_cart_toast_inc', '') ?: $this->getLocalizedToast('cart_inc', $userLocale);
                 $toastText = $showToast ? $toastInc : null;
 
                 $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
@@ -4251,9 +4672,9 @@ class TelegramBotService
             $cart = $this->getCart($chatId);
             if (isset($cart[$itemKey])) {
                 $currentQty = (float)$cart[$itemKey]['quantity'];
-                $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
-                $toastDec = Setting::get('telegram_bot_cart_toast_dec', 'အရေအတွက် လျှော့ချလိုက်ပါသည် (-1)');
-                $toastDel = Setting::get('telegram_bot_cart_toast_del', 'ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားလိုက်ပါပြီ');
+                $showToast = Setting::get('telegram_bot_cart_show_toast', '1') === '1';
+                $toastDec = Setting::get('telegram_bot_cart_toast_dec', '') ?: $this->getLocalizedToast('cart_dec', $userLocale);
+                $toastDel = Setting::get('telegram_bot_cart_toast_del', '') ?: $this->getLocalizedToast('cart_removed', $userLocale);
                 $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
 
                 if ($currentQty > 1) {
@@ -4282,8 +4703,8 @@ class TelegramBotService
                 ? str_replace('cart_del_', '', $data)
                 : str_replace('cart_rem_', '', $data);
             $this->removeFromCart($chatId, $itemKey);
-            $showToast = Setting::get('telegram_bot_cart_show_toast', '0') === '1';
-            $toastDel = Setting::get('telegram_bot_cart_toast_del', 'ပစ္စည်းအား ခြင်းတောင်းမှ ဖယ်ရှားလိုက်ပါပြီ');
+            $showToast = Setting::get('telegram_bot_cart_show_toast', '1') === '1';
+            $toastDel = Setting::get('telegram_bot_cart_toast_del', '') ?: $this->getLocalizedToast('cart_removed', $userLocale);
             $showFlash = Setting::get('telegram_bot_cart_show_flash_notice', '0') === '1';
             $toastText = $showToast ? $toastDel : null;
             $flashNotice = ($showFlash && $showToast) ? "🗑️ *{$toastDel}*" : null;
@@ -4674,7 +5095,7 @@ class TelegramBotService
 
         // Out of Stock Alert Handler
         if (str_starts_with($data, 'stock_out_')) {
-            $this->answerCallbackQuery($id, '⚠️ ယခုကုန်ပစ္စည်း လက်ကျန်ပြတ်လပ်နေပါသည်ရှင်။ မကြာမီ ပြန်လည်ရောက်ရှိပါမည်။', true);
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('out_of_stock', $userLocale), true);
             return;
         }
 
@@ -4713,9 +5134,9 @@ class TelegramBotService
                     Cache::forever($subKey, $subscribers);
                 }
 
-                $this->answerCallbackQuery($id, '🔔 ပစ္စည်းပြန်လည်ရောက်ရှိချိန်တွင် သင့်ထံသို့ အလိုအလျောက် သတင်းစကား ပို့ပေးပါမည်ရှင်။ ကျေးဇူးတင်ပါသည်!', true);
+                $this->answerCallbackQuery($id, $this->getLocalizedToast('restock_subscribed', $userLocale), true);
             } else {
-                $this->answerCallbackQuery($id, 'ℹ️ သင်သည် ဤပစ္စည်းအတွက် သတိပေးချက် ရယူရန် စာရင်းသွင်းထားပြီးဖြစ်ပါသည်ရှင်။', true);
+                $this->answerCallbackQuery($id, $this->getLocalizedToast('restock_already', $userLocale), true);
             }
             return;
         }
@@ -4742,7 +5163,7 @@ class TelegramBotService
                     ->sum('quantity');
                 $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
                 if ($currStock <= 0 && !$allowOutOfStock) {
-                    $this->answerCallbackQuery($id, '⚠️ ယခုကုန်ပစ္စည်း လက်ကျန်ပြတ်လပ်သွားပါပြီရှင်။', true);
+                    $this->answerCallbackQuery($id, $this->getLocalizedToast('out_of_stock', $userLocale), true);
                     return;
                 }
             }
@@ -4753,12 +5174,12 @@ class TelegramBotService
 
             // If product has active variations, prompt for variant selection first at bottom
             if ($product->has_variants && $product->variants->isNotEmpty()) {
-                $this->answerCallbackQuery($id, "🎨 {$product->name} အတွက် ဆိုဒ်/အရွယ်အစား ရွေးချယ်ပေးပါရှင်");
+                $this->answerCallbackQuery($id, $this->getLocalizedToast('select_variant', $userLocale));
                 $this->sendVariantSelection($chatId, $product, $messageId);
                 return;
             }
 
-            $this->answerCallbackQuery($id, "🛍️ {$product->name} အတွက် အရေအတွက် ရွေးချယ်ပေးပါရှင်");
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('select_qty', $userLocale));
             $this->initiateQuantitySelection($chatId, $product, null, $messageId);
             return;
         }
@@ -4787,12 +5208,12 @@ class TelegramBotService
                 $stockTpl = Setting::get('telegram_bot_out_of_stock_msg', '');
                 $stockAlert = !empty(trim($stockTpl))
                     ? $this->replacePlaceholders($stockTpl, ['variant_name' => $variant->name, 'product_name' => $product->name])
-                    : "⚠️ စိတ်မကောင်းပါဘူးရှင်၊ {$variant->name} လက်ကျန်ပြတ်လပ်နေပါသည်";
+                    : $this->getLocalizedToast('out_of_stock', $userLocale);
                 $this->answerCallbackQuery($id, $stockAlert, true);
                 return;
             }
 
-            $this->answerCallbackQuery($id, "🎨 {$variant->name} အတွက် အရေအတွက် ရွေးပါ (သို့မဟုတ်) ရိုက်ထည့်ပါ");
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('select_qty', $userLocale));
             $messageId = $callbackQuery['message']['message_id'] ?? null;
             $this->initiateQuantitySelection($chatId, $product, $variant, $messageId);
             return;
@@ -4835,7 +5256,7 @@ class TelegramBotService
             ];
             Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
 
-            $this->answerCallbackQuery($id, '✍️ အရေအတွက် ရိုက်ထည့်ပေးပါရှင်');
+            $this->answerCallbackQuery($id, $this->getLocalizedToast('custom_qty_prompt', $userLocale));
 
             $unitName = $product->unit_name ?: 'ခု';
             $msg = "✏️ *{$displayName}*\n"
@@ -4873,8 +5294,8 @@ class TelegramBotService
 
             $cartRes = $this->addToCart($chatId, $product, $variant, $qty);
             Cache::forget("tg_session_{$chatId}");
-            if (Setting::get('telegram_bot_cart_show_toast', '0') === '1') {
-                $this->answerCallbackQuery($id, "✅ ခြင်းတောင်းထဲသို့ {$qty} ခု ထည့်ပြီးပါပြီ");
+            if (Setting::get('telegram_bot_cart_show_toast', '1') === '1') {
+                $this->answerCallbackQuery($id, $this->getLocalizedToast('cart_added', $userLocale, ['qty' => $qty]));
             } else {
                 $this->answerCallbackQuery($id);
             }
@@ -5194,12 +5615,13 @@ class TelegramBotService
      */
     public function getAddressKeyboard(): array
     {
+        $isOneTap = Setting::get('telegram_bot_one_tap_checkout', '1') === '1';
         $locMode = Setting::get('telegram_bot_location_input_mode', 'both_button_and_text');
         $btnLocation = Setting::get('telegram_bot_btn_share_location', '📍 လက်ရှိတည်နေရာ ပေးပို့မည် (Share GPS Location)');
         $btnCancel = Setting::get('telegram_bot_btn_cancel', '❌ မမှာတော့ပါ (Cancel)');
 
         $rows = [];
-        if ($locMode !== 'text_only') {
+        if ($isOneTap && $locMode !== 'text_only') {
             $rows[] = [['text' => !empty($btnLocation) ? $btnLocation : '📍 လက်ရှိတည်နေရာ ပေးပို့မည် (Share GPS Location)', 'request_location' => true]];
         }
         $rows[] = [['text' => !empty($btnCancel) ? $btnCancel : '❌ မမှာတော့ပါ (Cancel)']];
@@ -5208,6 +5630,7 @@ class TelegramBotService
             'keyboard' => $rows,
             'resize_keyboard' => true,
             'one_time_keyboard' => true,
+            'input_field_placeholder' => '📍 လိပ်စာ ရိုက်ထည့်ပါ သို့မဟုတ် GPS တည်နေရာ ပို့ပါ...',
         ];
     }
 
@@ -5245,10 +5668,13 @@ class TelegramBotService
      */
     public function formatAskSlipMessage(string $userName, array $session = []): string
     {
+        $stepper = $this->renderStepIndicator(3);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
         $displayName = !empty(trim($userName)) ? $userName : 'ဖောက်သည်';
         $tpl = Setting::get('telegram_bot_ask_slip_msg', '');
         if (!empty(trim($tpl))) {
-            return $this->replacePlaceholders($tpl, [
+            return $stepperHeader . $this->replacePlaceholders($tpl, [
                 'customer_name' => $displayName,
                 'user_name' => $displayName,
                 'name' => $displayName,
@@ -5257,7 +5683,7 @@ class TelegramBotService
             ]);
         }
 
-        return "📸 ငွေလွှဲပြေစာ (Slip) ဓာတ်ပုံကို ပေးပို့ပေးပါရှင်။ (မမှာတော့ပါက '❌ မမှာတော့ပါ (Cancel)' ကို နှိပ်နိုင်ပါသည်)";
+        return $stepperHeader . "📸 ငွေလွှဲပြေစာ (Slip) ဓာတ်ပုံကို ပေးပို့ပေးပါရှင်။ (မမှာတော့ပါက '❌ မမှာတော့ပါ (Cancel)' ကို နှိပ်နိုင်ပါသည်)";
     }
 
     /**
@@ -5581,9 +6007,8 @@ class TelegramBotService
         }
 
         if ($step === 'waiting_phone') {
-            $convertedPhone = $this->convertMyanmarDigits($text);
-            $cleanPhone = preg_replace('/[^0-9+]/', '', $convertedPhone);
-            if (strlen($cleanPhone) < 7) {
+            $normalizedPhone = $this->extractPhoneNumberFromText($text);
+            if (!$normalizedPhone) {
                 $errTpl = Setting::get('telegram_bot_invalid_phone_msg', '');
                 $errMsg = !empty(trim($errTpl))
                     ? $this->replacePlaceholders($errTpl, ['customer_name' => $userName, 'user_name' => $userName])
@@ -5591,7 +6016,6 @@ class TelegramBotService
                 $this->sendMessage($chatId, $errMsg);
                 return;
             }
-            $normalizedPhone = $this->normalizePhoneNumber($convertedPhone);
             $session['phone'] = $normalizedPhone;
             $session['step'] = 'waiting_address';
             Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
@@ -5601,7 +6025,11 @@ class TelegramBotService
                 ? $this->replacePlaceholders($phoneSavedTpl, ['phone' => $normalizedPhone, 'customer_name' => $userName, 'user_name' => $userName])
                 : "✅ ဖုန်းနံပါတ် `{$normalizedPhone}` အောင်မြင်စွာ မှတ်သားပြီးပါပြီရှင်။";
 
-            $askAddr = "{$phoneSavedMsg}\n\n"
+            $stepper = $this->renderStepIndicator(2);
+            $stepperPrefix = $stepper ? "{$stepper}\n\n" : "";
+
+            $askAddr = $stepperPrefix
+                     . "{$phoneSavedMsg}\n\n"
                      . $this->formatAskAddressMessage($userName, $session);
             $this->sendMessage($chatId, $askAddr, $this->getAddressKeyboard());
             $this->logOutgoingBotMessage($chatId, $askAddr);
@@ -5621,16 +6049,52 @@ class TelegramBotService
             $this->sendMessage($chatId, $addrSavedMsg, ['remove_keyboard' => true]);
             $this->logOutgoingBotMessage($chatId, $addrSavedMsg);
 
+            $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
+                ? (float)collect($session['items'])->sum('subtotal')
+                : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
+
             $isQuickCod = Setting::get('telegram_bot_checkout_quick_cod', '1') === '1';
             $isSkipTownship = Setting::get('telegram_bot_checkout_skip_township', '1') === '1';
+            $autoTownshipExtract = Setting::get('telegram_bot_auto_township_extract', '1') === '1';
+
+            // F10: Smart Township Extraction & Fee Calculation
+            $matched = $autoTownshipExtract ? $this->extractTownshipFromText($text, $itemsTotal) : null;
+
+            if ($matched && !empty($matched['township_id'])) {
+                $effectiveFee = (float)$matched['delivery_fee'];
+                $displayName = $matched['display_name'];
+
+                $session['delivery_region_id'] = $matched['region_id'];
+                $session['delivery_township_id'] = $matched['township_id'];
+                $session['shipping_fee'] = $effectiveFee;
+                $session['delivery_method'] = "City Delivery ({$displayName})";
+                $session['delivery_township'] = $displayName;
+                $session['grand_total'] = $itemsTotal + $effectiveFee;
+
+                if ($isQuickCod) {
+                    $session['payment_type'] = 'Cash on Delivery';
+                    $session['payment_status'] = 'Unpaid';
+                    $session['step'] = 'completed';
+                    $this->finalizeOrder($chatId, $session, $userName, $usernameTag);
+                    return;
+                }
+
+                $session['step'] = 'waiting_payment';
+                Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
+
+                $feeNotice = $effectiveFee > 0
+                    ? "🚚 ပို့ဆောင်မည့်မြို့နယ်: *{$displayName}* (ပို့ဆောင်ခ: + " . number_format($effectiveFee) . " MMK) အလိုအလျောက် သတ်မှတ်ပြီးပါပြီရှင်။"
+                    : "🚚 ပို့ဆောင်မည့်မြို့နယ်: *{$displayName}* (ပို့ဆောင်ခ: အခမဲ့ Free) အလိုအလျောက် သတ်မှတ်ပြီးပါပြီရှင်။";
+                $this->sendMessage($chatId, $feeNotice);
+
+                $this->sendPaymentSelection($chatId, $session);
+                return;
+            }
 
             if ($isQuickCod) {
                 $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
                 $session['delivery_method'] = 'အိမ်အရောက်ပို့ (Cash on Delivery)';
                 $session['shipping_fee'] = $cityFee;
-                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
-                    ? (float)collect($session['items'])->sum('subtotal')
-                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
                 $session['grand_total'] = $itemsTotal + $cityFee;
                 $session['payment_type'] = 'Cash on Delivery';
                 $session['payment_status'] = 'Unpaid';
@@ -5643,9 +6107,6 @@ class TelegramBotService
                 $cityFee = (float)Setting::get('telegram_bot_delivery_city_fee', 0);
                 $session['delivery_method'] = 'အိမ်အရောက်ပို့ (Standard Delivery)';
                 $session['shipping_fee'] = $cityFee;
-                $itemsTotal = !empty($session['is_cart']) && !empty($session['items'])
-                    ? (float)collect($session['items'])->sum('subtotal')
-                    : ((float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1));
                 $session['grand_total'] = $itemsTotal + $cityFee;
                 $session['step'] = 'waiting_payment';
                 Cache::put("tg_session_{$chatId}", $session, now()->addHours(2));
@@ -5718,7 +6179,11 @@ class TelegramBotService
             return;
         }
 
-        $msg = "🚚 *ပို့ဆောင်မှု နည်းလမ်း ရွေးချယ်ပေးပါရှင်*\n"
+        $stepper = $this->renderStepIndicator(2);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
+        $msg = $stepperHeader
+             . "🚚 *ပို့ဆောင်မှု နည်းလမ်း ရွေးချယ်ပေးပါရှင်*\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
              . "လူကြီးမင်း၏ အော်ဒါအား ပို့ဆောင်ပေးရမည့် နည်းလမ်းကို ရွေးချယ်ပေးပါ-\n\n";
 
@@ -5774,7 +6239,11 @@ class TelegramBotService
             ->orderBy('id')
             ->get();
 
-        $msg = "🏙️ *ပို့ဆောင်ရမည့် တိုင်းဒေသကြီး / ပြည်နယ် ရွေးချယ်ပေးပါရှင်*\n"
+        $stepper = $this->renderStepIndicator(2);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
+        $msg = $stepperHeader
+             . "🏙️ *ပို့ဆောင်ရမည့် တိုင်းဒေသကြီး / ပြည်နယ် ရွေးချယ်ပေးပါရှင်*\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
              . "လူကြီးမင်း ပစ္စည်းလက်ခံမည့် ဒေသကို အောက်ပါတို့မှ ရွေးချယ်ပေးပါ-";
 
@@ -5827,7 +6296,11 @@ class TelegramBotService
             ? (float)collect($session['items'])->sum('subtotal')
             : (float)($session['price'] ?? 0) * (float)($session['quantity'] ?? 1);
 
-        $msg = "🛵 *ပို့ဆောင်ရမည့် မြို့နယ် ရွေးချယ်ပေးပါရှင်*{$regionName}\n"
+        $stepper = $this->renderStepIndicator(2);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
+        $msg = $stepperHeader
+             . "🛵 *ပို့ဆောင်ရမည့် မြို့နယ် ရွေးချယ်ပေးပါရှင်*{$regionName}\n"
              . "━━━━━━━━━━━━━━━━━━━━━\n"
              . "သတ်မှတ်ထားသော ပို့ဆောင်ခနှုန်းထားများ ဖြစ်ပါသည်ရှင်။\n\n"
              . "သက်ဆိုင်ရာ မြို့နယ်ခလုတ်ကို နှိပ်ပေးပါ-";
@@ -5905,6 +6378,9 @@ class TelegramBotService
         $phoneDisplay = !empty($session['phone']) ? $session['phone'] : '-';
         $addressDisplay = !empty($session['address']) ? $session['address'] : 'ဆိုင်တွင် လာယူမည်';
 
+        $stepper = $this->renderStepIndicator(3);
+        $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
         if ($isCart) {
             $indexIcons = [1 => '1️⃣', 2 => '2️⃣', 3 => '3️⃣', 4 => '4️⃣', 5 => '5️⃣', 6 => '6️⃣', 7 => '7️⃣', 8 => '8️⃣', 9 => '9️⃣', 10 => '🔟'];
             $itemsList = collect($session['items'])->values()->map(function ($it, $idx) use ($indexIcons) {
@@ -5922,7 +6398,8 @@ class TelegramBotService
                 ? "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *+" . number_format($shippingFee) . " MMK*\n"
                 : "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *အခမဲ့ (0 MMK)*\n";
 
-            $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
+            $msg = $stepperHeader
+                 . "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
                  . "━━━━━━━━━━━━━━━━━━━━━\n"
                  . "📦 *မှာယူသော ပစ္စည်းများ (" . count($session['items']) . " မျိုး):*\n\n"
                  . "{$itemsList}\n"
@@ -5941,7 +6418,7 @@ class TelegramBotService
 
             $pmTpl = Setting::get('telegram_bot_select_payment_msg', '');
             if (!empty(trim($pmTpl))) {
-                $msg = $this->replacePlaceholders($pmTpl, [
+                $msg = $stepperHeader . $this->replacePlaceholders($pmTpl, [
                     'product_name' => $itemTitle,
                     'quantity' => (string)($session['quantity'] ?? 1),
                     'amount' => $totalFormatted,
@@ -5955,7 +6432,8 @@ class TelegramBotService
                     ? "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *+" . number_format($shippingFee) . " MMK*\n"
                     : "🚚 ပို့ဆောင်ခ ({$delivMethod}):  *အခမဲ့ (0 MMK)*\n";
 
-                $msg = "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
+                $msg = $stepperHeader
+                     . "💳 *ငွေပေးချေမှု နည်းလမ်း ရွေးချယ်ပါ*\n"
                      . "━━━━━━━━━━━━━━━━━━━━━\n"
                      . "📦 *မှာယူသော ပစ္စည်း:*\n"
                      . "1️⃣ *{$itemTitle}*\n"
@@ -6359,16 +6837,26 @@ class TelegramBotService
 
         $slipUrl = $download['url'];
         $slipHash = $download['hash'] ?? null;
+        $slipPhash = $download['phash'] ?? app(PerceptualHashService::class)->computePhash($download['contents'] ?? '');
 
-        // 🛡️ Anti-Fraud Duplicate Payment Slip Detection (SHA-256 + Telegram file_unique_id)
+        // 🛡️ Anti-Fraud Persistent Duplicate Payment Slip Detection (SHA-256 + Perceptual Hash + Cache)
+        $rejectDuplicate = filter_var(Setting::get('telegram_bot_reject_duplicate_slip', true), FILTER_VALIDATE_BOOLEAN);
+        $dupAction = Setting::get('telegram_bot_duplicate_slip_action', 'reject');
+
+        $duplicateSale = $rejectDuplicate
+            ? app(PerceptualHashService::class)->findDuplicate($slipHash, $slipPhash)
+            : null;
+
         $duplicateRef = null;
-        if ($slipHash && Cache::has("tg_slip_hash_{$slipHash}")) {
+        if ($duplicateSale) {
+            $duplicateRef = $duplicateSale->reference_no;
+        } elseif ($slipHash && Cache::has("tg_slip_hash_{$slipHash}")) {
             $duplicateRef = Cache::get("tg_slip_hash_{$slipHash}");
         } elseif ($fileUniqueId && Cache::has("tg_slip_uid_{$fileUniqueId}")) {
             $duplicateRef = Cache::get("tg_slip_uid_{$fileUniqueId}");
         }
 
-        if ($duplicateRef) {
+        if ($duplicateRef && $rejectDuplicate && $dupAction === 'reject') {
             $dupSlipTpl = Setting::get('telegram_bot_duplicate_slip_msg', '');
             if (!empty(trim($dupSlipTpl))) {
                 $warnMsg = $this->replacePlaceholders($dupSlipTpl, [
@@ -6393,6 +6881,7 @@ class TelegramBotService
         if ($session && (!empty($session['product_id']) || (!empty($session['is_cart']) && !empty($session['items'])))) {
             $session['payment_slip_url'] = $slipUrl;
             $session['payment_slip_hash'] = $slipHash;
+            $session['payment_slip_phash'] = $slipPhash;
             $session['payment_slip_uid'] = $fileUniqueId;
             $session['payment_status'] = 'Paid';
             if (empty($session['payment_type'])) {
@@ -6411,6 +6900,8 @@ class TelegramBotService
         if ($recentSale && now()->diffInDays($recentSale->created_at) <= 7) {
             $meta = ($slipHash ? " [SLIP_HASH:{$slipHash}]" : "") . ($fileUniqueId ? " [SLIP_UID:{$fileUniqueId}]" : "");
             $recentSale->payment_slip_url = $slipUrl;
+            $recentSale->payment_slip_hash = $slipHash;
+            $recentSale->payment_slip_phash = $slipPhash;
             $recentSale->payment_status = 'Paid';
             if ($recentSale->paid_amount <= 0) {
                 $recentSale->paid_amount = $recentSale->grand_total;
@@ -6464,7 +6955,7 @@ class TelegramBotService
     protected function handleContactMessage(int|string $chatId, string $phone, string $userName): void
     {
         $session = Cache::get("tg_session_{$chatId}");
-        if ($session && $session['step'] === 'waiting_phone') {
+        if ($session && ($session['step'] ?? '') === 'waiting_phone') {
             $normalizedPhone = $this->normalizePhoneNumber($phone);
             $session['phone'] = $normalizedPhone;
             $session['step'] = 'waiting_address';
@@ -6475,9 +6966,38 @@ class TelegramBotService
                 ? $this->replacePlaceholders($phoneSavedTpl, ['phone' => $normalizedPhone, 'customer_name' => $userName, 'user_name' => $userName])
                 : "✅ ဖုန်းနံပါတ် `{$normalizedPhone}` အောင်မြင်စွာ မှတ်သားပြီးပါပြီရှင်။";
 
-            $askAddr = "{$phoneSavedMsg}\n\n"
+            $stepper = $this->renderStepIndicator(2);
+            $stepperPrefix = $stepper ? "{$stepper}\n\n" : "";
+
+            $askAddr = $stepperPrefix
+                     . "{$phoneSavedMsg}\n\n"
                      . $this->formatAskAddressMessage($userName, $session);
             $this->sendMessage($chatId, $askAddr, $this->getAddressKeyboard());
+        } else {
+            $normalizedPhone = $this->normalizePhoneNumber($phone);
+            try {
+                $customer = Customer::where('phone', $normalizedPhone)->first();
+                if (!$customer && $chatId) {
+                    $customer = Customer::where('telegram_chat_id', (string)$chatId)->first();
+                }
+                if (!$customer) {
+                    Customer::create([
+                        'name' => $userName ?: 'Telegram Customer',
+                        'phone' => $normalizedPhone,
+                        'telegram_chat_id' => (string)$chatId,
+                    ]);
+                } else {
+                    $customer->update([
+                        'phone' => $normalizedPhone,
+                        'telegram_chat_id' => (string)$chatId,
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Out-of-checkout contact customer sync failed: ' . $e->getMessage());
+            }
+
+            $msg = "📱 ဖုန်းနံပါတ် `{$normalizedPhone}` လက်ခံရရှိပါသည်ရှင်။ ဝယ်ယူလိုပါက ကုန်ပစ္စည်းများ ရွေးချယ်နိုင်ပါသည်-";
+            $this->sendMessage($chatId, $msg, $this->getMainKeyboard($chatId));
         }
     }
 
@@ -6591,10 +7111,51 @@ class TelegramBotService
                 return;
             }
 
-            $subtotal = (float)collect($cartItems)->sum('subtotal');
+            $enableTax = filter_var(Setting::get('telegram_bot_enable_tax', false), FILTER_VALIDATE_BOOLEAN);
+            $defaultTaxRate = (float)Setting::get('telegram_bot_tax_rate', 5.0);
+
+            $subtotal = 0.0;
+            $totalTaxAmount = 0.0;
+            $itemCalculations = [];
+
+            foreach ($cartItems as $idx => $itemData) {
+                $iQty = (float)$itemData['quantity'];
+                $iPrice = (float)$itemData['price'];
+                $iSubtotal = (float)($itemData['subtotal'] ?? ($iPrice * $iQty));
+                $subtotal += $iSubtotal;
+
+                $itemTaxRate = 0.0;
+                $itemTax = 0.0;
+                if ($enableTax) {
+                    $pId = $itemData['product_id'] ?? 0;
+                    $prod = Product::find($pId);
+                    $itemTaxRate = ($prod && (float)$prod->order_tax > 0)
+                        ? (float)$prod->order_tax
+                        : $defaultTaxRate;
+
+                    if ($prod && strcasecmp((string)$prod->tax_type, 'Inclusive') === 0) {
+                        $itemTax = round($iSubtotal - ($iSubtotal / (1 + ($itemTaxRate / 100))), 2);
+                    } else {
+                        $itemTax = round($iSubtotal * ($itemTaxRate / 100), 2);
+                    }
+                }
+
+                $itemCalculations[$idx] = [
+                    'tax_rate' => $itemTaxRate,
+                    'tax' => $itemTax,
+                ];
+                $totalTaxAmount += $itemTax;
+            }
+
+            $totalTaxAmount = round($totalTaxAmount, 2);
+            $overallTaxRate = ($subtotal > 0 && $totalTaxAmount > 0)
+                ? round(($totalTaxAmount / $subtotal) * 100, 2)
+                : ($enableTax ? $defaultTaxRate : 0.0);
+
             $totalQuantity = (float)collect($cartItems)->sum('quantity');
             $shippingFee = (float)($session['shipping_fee'] ?? 0.0);
-            $grandTotal = $subtotal + $shippingFee;
+            $discount = (float)($session['discount'] ?? 0.0);
+            $grandTotal = round($subtotal + $totalTaxAmount + $shippingFee - $discount, 2);
 
             $warehouseId = (int)Setting::get('telegram_bot_warehouse_id', 1);
             $warehouse = Outlet::find($warehouseId) ?: Outlet::first();
@@ -6607,7 +7168,57 @@ class TelegramBotService
             $paymentType = $session['payment_type'] ?? 'Cash on Delivery';
             $paymentStatus = $session['payment_status'] ?? 'Unpaid';
             $paidAmount = ($paymentStatus === 'Paid') ? $grandTotal : 0.0;
-            $dueAmount = max(0, $grandTotal - $paidAmount);
+            $dueAmount = max(0.0, round($grandTotal - $paidAmount, 2));
+
+            $unitService = app(ProductUnitConversionService::class);
+            $enableReservation = Setting::get('telegram_bot_enable_stock_reservation', '0') === '1';
+            $allowOutOfStock = Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1';
+
+            // 1. Strict Stock Availability Check before Sale Creation (when reservation enabled)
+            if ($enableReservation && !$allowOutOfStock) {
+                foreach ($cartItems as $it) {
+                    $prod = Product::find($it['product_id']);
+                    if (!$prod) continue;
+                    $vId = !empty($it['variant_id']) ? (int)$it['variant_id'] : null;
+                    $iQty = (float)$it['quantity'];
+                    $linkedUnit = $unitService->resolve($prod, 'sale', null, $prod->unit_name ?: 'Piece', $vId);
+                    $baseQty = $unitService->baseQuantity($iQty, $linkedUnit['conversion_rate']);
+
+                    $stockBalance = StockBalance::where('warehouse_id', $warehouseId)
+                        ->where('product_id', $prod->id)
+                        ->when($vId, fn($q) => $q->where('product_variant_id', $vId), fn($q) => $q->whereNull('product_variant_id'))
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$stockBalance) {
+                        $hasExistingBalances = StockBalance::where('product_id', $prod->id)->exists();
+                        $initial = $vId === null && !$hasExistingBalances ? (float)$prod->stock_quantity : 0.0;
+                        $stockBalance = StockBalance::create([
+                            'warehouse_id' => $warehouseId,
+                            'product_id' => $prod->id,
+                            'product_variant_id' => $vId,
+                            'quantity' => $initial,
+                            'reserved_quantity' => 0.0,
+                        ]);
+                    }
+
+                    $availableStock = (float)($stockBalance?->quantity ?? 0.0);
+                    if ($availableStock < $baseQty) {
+                        DB::rollBack();
+                        $title = !empty($it['variant_name']) ? "{$prod->name} ({$it['variant_name']})" : $prod->name;
+                        $unitStr = $prod->unit_name ?: 'ခု';
+                        $msg = "⚠️ *တောင်းပန်ပါသည်ရှင်၊ ပစ္စည်းလက်ကျန် မလုံလောက်တော့ပါ:*\n\n"
+                             . "• *{$title}*\n"
+                             . "  မှာယူလိုသော အရေအတွက်: *{$iQty} {$unitStr}*\n"
+                             . "  လက်ကျန်ရှိသော အရေအတွက်: *{$availableStock} {$unitStr}*\n\n"
+                             . "ကျေးဇူးပြု၍ ကုန်ပစ္စည်းအရေအတွက်ကို ပြင်ဆင်၍ ပြန်လည်မှာယူပေးပါရှင်။ 🙏";
+                        $this->sendMessage($chatId, $msg, $this->getMainKeyboard($chatId));
+                        return;
+                    }
+                }
+            }
+
+            $shouldReserve = !$autoApprove && $enableReservation;
 
             $refNo = 'SALE-' . date('Ymd') . '-' . rand(1000, 9999);
             $customerPhone = $session['phone'] ?? '';
@@ -6642,6 +7253,7 @@ class TelegramBotService
             }
 
             $slipHash = $session['payment_slip_hash'] ?? null;
+            $slipPhash = $session['payment_slip_phash'] ?? null;
             $slipUid = $session['payment_slip_uid'] ?? null;
             $slipMeta = ($slipHash ? " [SLIP_HASH:{$slipHash}]" : "") . ($slipUid ? " [SLIP_UID:{$slipUid}]" : "");
 
@@ -6666,9 +7278,9 @@ class TelegramBotService
                 'warehouse_name' => $warehouseName,
                 'date' => now()->format('Y-m-d H:i:s'),
                 'status' => $saleStatus,
-                'tax_rate' => 0.0,
-                'tax_amount' => 0.0,
-                'discount' => 0.0,
+                'tax_rate' => $overallTaxRate,
+                'tax_amount' => $totalTaxAmount,
+                'discount' => $discount,
                 'shipping' => $shippingFee,
                 'subtotal' => $subtotal,
                 'grand_total' => $grandTotal,
@@ -6677,6 +7289,8 @@ class TelegramBotService
                 'change_amount' => 0.0,
                 'payment_status' => $paymentStatus,
                 'payment_type' => $paymentType,
+                'stock_reserved' => $shouldReserve,
+                'stock_reserved_at' => $shouldReserve ? now() : null,
                 'notes' => 'Telegram Bot Order by ' . $userName . ' (' . ($usernameTag ?: $chatId) . ')' . (!empty($session['delivery_method']) ? ' | ပို့ဆောင်မှု: ' . $session['delivery_method'] : '') . (!empty($session['delivery_township']) ? ' | မြို့နယ်: ' . $session['delivery_township'] : '') . $slipMeta . $preorderMeta . $aiMeta,
                 'pos_flag' => false,
                 'order_source' => 'telegram_bot',
@@ -6685,6 +7299,8 @@ class TelegramBotService
                 'telegram_order_id' => $refNo,
                 'bot_approval_status' => $botApprovalStatus,
                 'payment_slip_url' => $session['payment_slip_url'] ?? null,
+                'payment_slip_hash' => $slipHash,
+                'payment_slip_phash' => $slipPhash,
                 'shipping_address' => $shippingAddress,
                 'customer_phone' => $customerPhone,
                 'created_by' => 'Telegram Bot',
@@ -6695,12 +7311,11 @@ class TelegramBotService
             if ($slipHash) Cache::put("tg_slip_hash_{$slipHash}", $sale->reference_no, now()->addDays(30));
             if ($slipUid) Cache::put("tg_slip_uid_{$slipUid}", $sale->reference_no, now()->addDays(30));
 
-            $unitService = app(ProductUnitConversionService::class);
             $fifoService = $autoApprove ? app(FifoInventoryService::class) : null;
             $totalSaleCogs = 0.0;
             $itemsSummaryLines = [];
 
-            foreach ($cartItems as $itemData) {
+            foreach ($cartItems as $idx => $itemData) {
                 $product = Product::find($itemData['product_id']);
                 if (!$product) continue;
 
@@ -6729,7 +7344,7 @@ class TelegramBotService
                     'base_unit_price' => $baseUnitPrice,
                     'quantity' => $iQty,
                     'base_quantity' => $baseQty,
-                    'tax' => 0.0,
+                    'tax' => $itemCalculations[$idx]['tax'] ?? 0.0,
                     'discount' => 0.0,
                     'subtotal' => $iSubtotal,
                 ]);
@@ -6747,7 +7362,16 @@ class TelegramBotService
                 };
                 $itemsSummaryLines[] = "{$badge} *{$nameForReceipt}*\n   ▫️ {$cleanQty} {$unitStr} × {$priceFmt}  =  *{$subFmt} MMK*";
 
-                if ($autoApprove && $fifoService) {
+                if ($shouldReserve) {
+                    $unitService->reserveStock(
+                        $product,
+                        $warehouseId,
+                        $vId,
+                        $baseQty,
+                        (string)$sale->id,
+                        "Stock reserved for Telegram Bot Order #{$sale->reference_no}"
+                    );
+                } elseif ($autoApprove && $fifoService) {
                     $unitService->applyStock(
                         $product,
                         $warehouseId,
@@ -6821,9 +7445,12 @@ class TelegramBotService
             $allItemsFormatted = implode("\n\n", $itemsSummaryLines);
 
             // Custom Order Success Message Template
+            $stepper = $this->renderStepIndicator(4);
+            $stepperHeader = $stepper ? "{$stepper}\n\n" : "";
+
             $customSuccessTemplate = Setting::get('telegram_bot_order_success_msg', '');
             if (!empty(trim($customSuccessTemplate))) {
-                $receiptMsg = $this->replacePlaceholders($customSuccessTemplate, [
+                $receiptMsg = $stepperHeader . $this->replacePlaceholders($customSuccessTemplate, [
                     'order_ref' => $sale->reference_no,
                     'reference_no' => $sale->reference_no,
                     'order_id' => $sale->reference_no,
@@ -6850,13 +7477,15 @@ class TelegramBotService
                     'date' => $sale->date,
                 ]);
             } else {
-                $receiptMsg = "🎉 *အော်ဒါတင်ခြင်း အောင်မြင်ပါသည်ရှင်!*\n\n"
+                $receiptMsg = $stepperHeader
+                            . "🎉 *အော်ဒါတင်ခြင်း အောင်မြင်ပါသည်ရှင်!*\n\n"
                             . "🔖 *အော်ဒါအမှတ်:* `{$sale->reference_no}`\n"
                             . "━━━━━━━━━━━━━━━━━━━━━\n"
                             . "📦 *မှာယူသော ပစ္စည်းများ (" . count($cartItems) . " မျိုး / {$totalQuantity} ခု):*\n\n"
                             . "{$allItemsFormatted}\n"
                             . "━━━━━━━━━━━━━━━━━━━━━\n"
                             . "💵 ကုန်ပစ္စည်းတန်ဖိုး:   *{$itemsTotalFmt} MMK*\n"
+                            . ($totalTaxAmount > 0 ? "🏛️ အခွန် (Tax/VAT {$overallTaxRate}%): *+ " . number_format($totalTaxAmount) . " MMK*\n" : "")
                             . "🚚 ပို့ဆောင်ခ:         *{$shipFmt}*\n"
                             . "💰 စုစုပေါင်း ကျသင့်ငွေ: *{$totalFormatted} MMK*\n"
                             . "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -8051,6 +8680,41 @@ class TelegramBotService
         }
 
         return $res;
+    }
+
+    /**
+     * Release active stock reservations for a cancelled, rejected, or expired order.
+     */
+    public function rollbackStockReservation(Sale $sale, string $reason, ?string $actor = null): bool
+    {
+        if (!$sale->stock_reserved) {
+            return false;
+        }
+
+        $unitService = app(ProductUnitConversionService::class);
+
+        foreach ($sale->items as $item) {
+            $product = Product::find($item->product_id);
+            if (!$product) continue;
+
+            $baseQty = (float)($item->base_quantity ?: $unitService->baseQuantity($item->quantity, $item->conversion_rate ?: 1));
+
+            $unitService->releaseReservedStock(
+                $product,
+                $sale->warehouse_id,
+                $item->product_variant_id,
+                $baseQty,
+                (string)$sale->id,
+                "Stock reservation rolled back: {$reason}"
+            );
+        }
+
+        $sale->update([
+            'stock_reserved' => false,
+            'stock_released_at' => now(),
+        ]);
+
+        return true;
     }
 }
 

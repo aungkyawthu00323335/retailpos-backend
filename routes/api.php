@@ -36,6 +36,8 @@ use App\Http\Controllers\Api\CashRegisterController;
 use App\Http\Controllers\Api\BotOrderController;
 use App\Http\Controllers\Api\DeliveryRegionController;
 use App\Http\Controllers\Api\DeliveryTownshipController;
+use App\Http\Controllers\Api\MasterDataSyncController;
+use App\Http\Controllers\Api\ProductSyncController;
 
 /*
 |--------------------------------------------------------------------------
@@ -97,6 +99,8 @@ Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
 Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
 Route::patch('products/{id}/toggle-bot-status', [ProductController::class, 'toggleBotStatus']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
+Route::post('master-data/sync-batch', [MasterDataSyncController::class, 'syncBatch']);
+Route::post('products/sync-batch', [ProductSyncController::class, 'syncBatch']);
 Route::apiResource('products', ProductController::class);
 
 // Stock Adjustments & Transfers
@@ -261,6 +265,10 @@ Route::get('bot-orders/{id}/voucher', [BotOrderController::class, 'getVoucherIma
 Route::post('bot-orders/{id}/approve', [BotOrderController::class, 'approveOrder']);
 Route::post('bot-orders/{id}/reject', [BotOrderController::class, 'rejectOrder']);
 Route::post('bot-orders/{id}/dispatch', [BotOrderController::class, 'dispatchOrder']);
+// Aliases for hierarchical /api/bot/orders/{id}
+Route::post('bot/orders/{id}/approve', [BotOrderController::class, 'approveOrder']);
+Route::post('bot/orders/{id}/reject', [BotOrderController::class, 'rejectOrder']);
+Route::post('bot/orders/{id}/dispatch', [BotOrderController::class, 'dispatchOrder']);
 Route::get('bot-settings', [BotOrderController::class, 'getBotSettings']);
 Route::post('bot-settings', [BotOrderController::class, 'updateBotSettings']);
 Route::post('bot-settings/test-token', [BotOrderController::class, 'testBotToken']);

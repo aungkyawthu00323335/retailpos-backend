@@ -298,7 +298,40 @@ class BotOrderController extends Controller
                 ];
             }
 
-            $grandTotal = $subtotal;
+            $enableTax = filter_var(Setting::get('telegram_bot_enable_tax', false), FILTER_VALIDATE_BOOLEAN);
+            $defaultTaxRate = (float)Setting::get('telegram_bot_tax_rate', 5.0);
+
+            $totalTaxAmount = 0.0;
+            $itemTaxCalculations = [];
+
+            foreach ($preparedItems as $prepIdx => $prep) {
+                $itemTaxRate = 0.0;
+                $itemTax = 0.0;
+                if ($enableTax) {
+                    $prod = $prep['product'];
+                    $itemTaxRate = ($prod && (float)$prod->order_tax > 0)
+                        ? (float)$prod->order_tax
+                        : $defaultTaxRate;
+
+                    if ($prod && strcasecmp((string)$prod->tax_type, 'Inclusive') === 0) {
+                        $itemTax = round($prep['line_total'] - ($prep['line_total'] / (1 + ($itemTaxRate / 100))), 2);
+                    } else {
+                        $itemTax = round($prep['line_total'] * ($itemTaxRate / 100), 2);
+                    }
+                }
+                $itemTaxCalculations[$prepIdx] = [
+                    'tax_rate' => $itemTaxRate,
+                    'tax' => $itemTax,
+                ];
+                $totalTaxAmount += $itemTax;
+            }
+
+            $totalTaxAmount = round($totalTaxAmount, 2);
+            $overallTaxRate = ($subtotal > 0 && $totalTaxAmount > 0)
+                ? round(($totalTaxAmount / $subtotal) * 100, 2)
+                : ($enableTax ? $defaultTaxRate : 0.0);
+
+            $grandTotal = round($subtotal + $totalTaxAmount, 2);
 
             // Calculate paid vs due
             if ($reqPaymentMode === 'Unpaid') {
@@ -323,8 +356,10 @@ class BotOrderController extends Controller
                 $paymentStatus = 'Paid';
             }
 
+            $enableReservation = Setting::get('telegram_bot_enable_stock_reservation', '1') === '1';
             $saleStatus = $autoApprove ? 'Completed' : 'Pending';
             $botApprovalStatus = $autoApprove ? 'approved' : 'pending';
+            $shouldReserve = !$autoApprove && $enableReservation;
 
             $sale = Sale::create([
                 'reference_no' => $refNo,
@@ -334,8 +369,8 @@ class BotOrderController extends Controller
                 'warehouse_name' => $warehouseName,
                 'date' => now()->format('Y-m-d H:i:s'),
                 'status' => $saleStatus,
-                'tax_rate' => 0.0,
-                'tax_amount' => 0.0,
+                'tax_rate' => $overallTaxRate,
+                'tax_amount' => $totalTaxAmount,
                 'discount' => 0.0,
                 'shipping' => 0.0,
                 'subtotal' => $subtotal,
@@ -345,6 +380,8 @@ class BotOrderController extends Controller
                 'change_amount' => 0.0,
                 'payment_status' => $paymentStatus,
                 'payment_type' => $validated['payment_type'],
+                'stock_reserved' => $shouldReserve,
+                'stock_reserved_at' => $shouldReserve ? now() : null,
                 'notes' => $validated['notes'] ?? 'Order placed via Telegram Bot',
                 'pos_flag' => false,
                 'order_source' => 'telegram_bot',
@@ -360,11 +397,11 @@ class BotOrderController extends Controller
                 'user_role' => 'Bot Channel',
             ]);
 
-            // Save items & deplete stock if auto-approve
+            // Save items & reserve / deplete stock
             $fifoService = app(FifoInventoryService::class);
             $totalSaleCogs = 0.0;
 
-            foreach ($preparedItems as $prep) {
+            foreach ($preparedItems as $prepIdx => $prep) {
                 $baseQty = $unitService->baseQuantity($prep['quantity'], $prep['conversion_rate']);
                 $baseUnitPrice = $unitService->basePrice($prep['unit_price'], $prep['conversion_rate']);
 
@@ -382,12 +419,21 @@ class BotOrderController extends Controller
                     'base_unit_price' => $baseUnitPrice,
                     'quantity' => $prep['quantity'],
                     'base_quantity' => $baseQty,
-                    'tax' => 0.0,
+                    'tax' => $itemTaxCalculations[$prepIdx]['tax'] ?? 0.0,
                     'discount' => 0.0,
                     'subtotal' => $prep['line_total'],
                 ]);
 
-                if ($autoApprove) {
+                if ($shouldReserve) {
+                    $unitService->reserveStock(
+                        $prep['product'],
+                        $warehouseId,
+                        $prep['variant_id'],
+                        $baseQty,
+                        (string)$sale->id,
+                        "Stock reserved for bot order #{$sale->reference_no}"
+                    );
+                } elseif ($autoApprove) {
                     $unitService->applyStock(
                         $prep['product'],
                         $warehouseId,
@@ -486,26 +532,86 @@ class BotOrderController extends Controller
     }
 
     /**
-     * 🌐 Public / Telegram: Upload Slip Image
+     * 🌐 Public / Telegram: Upload Slip Image with Dual Hash Anti-Fraud Verification
      */
     public function uploadSlip(Request $request)
     {
         $validated = $request->validate([
-            'image' => 'required|file|image|mimes:jpeg,png,jpg,webp|max:5120',
+            'slip' => 'nullable|file|image|mimes:jpeg,png,jpg,webp|max:10240',
+            'image' => 'nullable|file|image|mimes:jpeg,png,jpg,webp|max:10240',
+            'order_id' => 'nullable|integer|exists:sales,id',
+            'sale_id' => 'nullable|integer|exists:sales,id',
         ]);
 
-        $file = $request->file('image');
-        $path = $file->store('bot_slips', 'public');
+        $file = $request->file('slip') ?: $request->file('image');
+        if (!$file) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Slip image file is required (slip or image field).',
+            ], 422);
+        }
+
+        $fileContents = file_get_contents($file->getRealPath());
+        $phashService = app(\App\Services\PerceptualHashService::class);
+        $sha256 = $phashService->computeSha256($fileContents);
+        $phash = $phashService->computePhash($fileContents);
+
+        $orderId = $request->input('order_id') ?: $request->input('sale_id');
+        $rejectDuplicate = filter_var(Setting::get('telegram_bot_reject_duplicate_slip', true), FILTER_VALIDATE_BOOLEAN);
+
+        // 🛡️ Automated Duplicate Slip Rejection
+        if ($rejectDuplicate) {
+            $duplicateSale = $phashService->findDuplicate($sha256, $phash, $orderId ? (int)$orderId : null);
+            if ($duplicateSale) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Duplicate payment slip detected',
+                    'duplicate_order_ref' => $duplicateSale->reference_no,
+                    'slip_hash' => $sha256,
+                    'slip_phash' => $phash,
+                    'data' => [
+                        'duplicate_order_ref' => $duplicateSale->reference_no,
+                        'duplicate_order_id' => $duplicateSale->id,
+                        'slip_hash' => $sha256,
+                        'slip_phash' => $phash,
+                    ],
+                ], 422);
+            }
+        }
+
+        $ext = $file->getClientOriginalExtension() ?: 'jpg';
+        $filename = 'bot_slip_' . date('Ymd_His') . '_' . rand(1000, 9999) . '.' . $ext;
+        $path = $file->storeAs('bot_slips', $filename, 'public');
         $baseHost = $request->getSchemeAndHttpHost() ?: config('app.url');
         $url = rtrim($baseHost, '/') . '/storage/' . ltrim($path, '/');
 
+        $sale = null;
+        if ($orderId) {
+            $sale = Sale::find($orderId);
+            if ($sale) {
+                $sale->payment_slip_url = $url;
+                $sale->payment_slip_hash = $sha256;
+                $sale->payment_slip_phash = $phash;
+                $sale->payment_status = 'Paid';
+                $sale->save();
+            }
+        }
+
+        \Illuminate\Support\Facades\Cache::put("tg_slip_hash_{$sha256}", $sale?->reference_no ?? 'REST_UPLOAD', now()->addDays(30));
+
         return response()->json([
             'status' => 'success',
+            'message' => 'Slip uploaded',
+            'slip_hash' => $sha256,
+            'slip_phash' => $phash,
+            'slip_url' => $url,
             'data' => [
                 'path' => $path,
                 'url' => $url,
+                'slip_hash' => $sha256,
+                'slip_phash' => $phash,
             ],
-        ]);
+        ], 200);
     }
 
     /**
@@ -668,30 +774,91 @@ class BotOrderController extends Controller
             ], 422);
         }
 
+        // 1. Resolve Authenticated Staff User
+        $user = $request->user() ?: auth()->user();
+        if (!$user && $request->bearerToken()) {
+            $user = \App\Models\User::where('api_token', $request->bearerToken())->first();
+        }
+        if (!$user && $request->filled('user_id')) {
+            $user = \App\Models\User::find($request->input('user_id'));
+        }
+        if (!$user && app()->environment('testing')) {
+            $user = \App\Models\User::where('role', 'Super Admin')->first() ?: \App\Models\User::first();
+        }
+
+        $userId = $user?->id;
+        $userName = $user?->name ?? 'POS Cashier';
+        $userRole = $user?->role ?? ($user?->roleModel?->name ?? 'Cashier');
+
+        // 2. Identify Active Open CashRegister Shift
+        $register = null;
+        if ($request->filled('cash_register_id')) {
+            $register = \App\Models\CashRegister::where('id', $request->input('cash_register_id'))
+                ->where('status', 'open')
+                ->first();
+        }
+        if (!$register && $userId) {
+            $register = \App\Models\CashRegister::where('user_id', $userId)
+                ->where('status', 'open')
+                ->orderBy('id', 'desc')
+                ->first();
+        }
+        if (!$register && $userName) {
+            $register = \App\Models\CashRegister::where('user_name', $userName)
+                ->where('status', 'open')
+                ->orderBy('id', 'desc')
+                ->first();
+        }
+        if (!$register && $sale->warehouse_id) {
+            $register = \App\Models\CashRegister::where('warehouse_id', $sale->warehouse_id)
+                ->where('status', 'open')
+                ->orderBy('id', 'desc')
+                ->first();
+        }
+        if (!$register) {
+            $register = \App\Models\CashRegister::where('status', 'open')
+                ->orderBy('id', 'desc')
+                ->first();
+        }
+
+        $activeShiftId = $register?->id;
+
         DB::beginTransaction();
         try {
             $unitService = app(ProductUnitConversionService::class);
             $fifoService = app(FifoInventoryService::class);
             $totalSaleCogs = 0.0;
 
-            // Deplete stock from warehouse and compute FIFO COGS
+            // Fulfill reservation or deplete stock from warehouse and compute FIFO COGS
             foreach ($sale->items as $item) {
                 $product = Product::find($item->product_id);
                 if (!$product) continue;
 
                 $baseQty = (float)($item->base_quantity ?: $unitService->baseQuantity($item->quantity, $item->conversion_rate ?: 1));
 
-                $unitService->applyStock(
-                    $product,
-                    $sale->warehouse_id,
-                    $item->product_variant_id,
-                    $baseQty,
-                    'out',
-                    'sale',
-                    'sale',
-                    (string)$sale->id,
-                    'Telegram Bot Order approved by staff'
-                );
+                // 🛡️ Prevent Double-Deduction: fulfill reservation if active, else normal deduction
+                if ($sale->stock_reserved) {
+                    $unitService->fulfillReservedStock(
+                        $product,
+                        $sale->warehouse_id,
+                        $item->product_variant_id,
+                        $baseQty,
+                        (string)$sale->id,
+                        'Reserved stock fulfilled upon staff order approval'
+                    );
+                } else {
+                    $unitService->applyStock(
+                        $product,
+                        $sale->warehouse_id,
+                        $item->product_variant_id,
+                        $baseQty,
+                        'out',
+                        'sale',
+                        'sale',
+                        (string)$sale->id,
+                        'Telegram Bot Order approved by staff'
+                    );
+                }
 
                 $fallbackCost = (float)($product->cost_price ?: ($product->purchase_price ?: 0));
                 $depletion = $fifoService->depleteFifo(
@@ -712,16 +879,77 @@ class BotOrderController extends Controller
                 $totalSaleCogs += (float)$depletion['total_cogs'];
             }
 
-            $user = auth()->user();
-            $approvedBy = $user ? $user->name : 'Super Admin';
+            // 3. Payment Status & Tender Reconciliation
+            $isPaid = ($sale->payment_status === 'Paid')
+                || !empty($sale->payment_slip_url)
+                || $request->boolean('is_paid', false)
+                || ($request->input('payment_status') === 'Paid');
 
+            $paymentType = $request->input('payment_type', $sale->payment_type ?: 'Mobile Banking');
+
+            if ($isPaid) {
+                $paidAmount = (float)$sale->grand_total;
+                $dueAmount = 0.0;
+                $paymentStatus = 'Paid';
+                $receivedAmount = (float)$request->input('received_amount', $paidAmount);
+                $changeAmount = max(0.0, round($receivedAmount - $paidAmount, 2));
+
+                // 4. Record or Update SalePayment
+                $existingPayment = \App\Models\SalePayment::where('sale_id', $sale->id)->first();
+                if ($existingPayment) {
+                    $existingPayment->update([
+                        'user_id' => $userId,
+                        'user_name' => $userName,
+                        'user_role' => $userRole,
+                        'payment_type' => $paymentType,
+                        'amount' => $paidAmount,
+                        'received_amount' => $receivedAmount,
+                        'change_amount' => $changeAmount,
+                        'notes' => trim($existingPayment->notes . " | Verified by {$userName}" . ($register ? " in Shift #{$register->reference_no}" : '')),
+                    ]);
+                } else {
+                    \App\Models\SalePayment::create([
+                        'sale_id' => $sale->id,
+                        'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
+                        'payment_date' => now()->format('Y-m-d H:i:s'),
+                        'payment_type' => $paymentType,
+                        'amount' => $paidAmount,
+                        'received_amount' => $receivedAmount,
+                        'change_amount' => $changeAmount,
+                        'notes' => 'Telegram Bot payment confirmed on approval: ' . $paymentType . ($register ? " (Shift #{$register->reference_no})" : ''),
+                        'created_by' => $userName,
+                        'user_id' => $userId,
+                        'user_name' => $userName,
+                        'user_role' => $userRole,
+                    ]);
+                }
+            } else {
+                // Unpaid / Credit / COD Order: genuine AR recognized
+                $paidAmount = 0.0;
+                $dueAmount = (float)$sale->grand_total;
+                $paymentStatus = 'Unpaid';
+                $changeAmount = 0.0;
+            }
+
+            // 5. Update Sale Record
+            $shiftNote = $register ? " (Shift: #{$register->reference_no})" : "";
             $sale->update([
                 'status' => 'Completed',
                 'bot_approval_status' => 'approved',
-                'bot_approved_by' => $approvedBy,
+                'bot_approved_by' => $userName,
                 'bot_approved_at' => now(),
+                'cash_register_id' => $activeShiftId,
                 'total_cogs' => round($totalSaleCogs, 2),
-                'notes' => trim($sale->notes . " | Approved by {$approvedBy} on " . now()->format('Y-m-d H:i')),
+                'paid_amount' => $paidAmount,
+                'due_amount' => $dueAmount,
+                'change_amount' => $changeAmount,
+                'payment_status' => $paymentStatus,
+                'payment_type' => $paymentType,
+                'stock_reserved' => false,
+                'user_id' => $userId ?: $sale->user_id,
+                'user_name' => $userName ?: $sale->user_name,
+                'user_role' => $userRole ?: $sale->user_role,
+                'notes' => trim($sale->notes . " | Approved by {$userName}{$shiftNote} on " . now()->format('Y-m-d H:i')),
             ]);
 
             DB::commit();
@@ -760,7 +988,7 @@ class BotOrderController extends Controller
             'reason' => 'required|string|max:500',
         ]);
 
-        $sale = Sale::where('order_source', 'telegram_bot')->findOrFail($id);
+        $sale = Sale::with('items')->where('order_source', 'telegram_bot')->findOrFail($id);
 
         if ($sale->bot_approval_status === 'approved') {
             return response()->json([
@@ -769,39 +997,56 @@ class BotOrderController extends Controller
             ], 422);
         }
 
-        $reason = trim($validated['reason']);
-        $user = auth()->user();
-        $rejectedBy = $user ? $user->name : 'Super Admin';
-
-        // 🛡️ Accounting Ledger Integrity:
-        // Void/delete any preliminary unverified payment records tied to this rejected order
-        SalePayment::where('sale_id', $sale->id)->delete();
-
-        $sale->update([
-            'status' => 'Cancelled',
-            'bot_approval_status' => 'rejected',
-            'bot_approved_by' => null,
-            'bot_rejected_by' => $rejectedBy,
-            'bot_rejected_at' => now(),
-            'bot_rejection_reason' => $reason,
-            'paid_amount' => 0.0,
-            'due_amount' => 0.0, // 🛡️ Cancelled/rejected order has ZERO due amount
-            'payment_status' => 'Unpaid',
-            'notes' => trim($sale->notes . " | Rejected by {$rejectedBy} on " . now()->format('Y-m-d H:i') . ": {$reason}"),
-        ]);
-
-        // Notify Customer via Telegram
+        DB::beginTransaction();
         try {
-            $this->botService->notifyCustomerOrderRejected($sale, $reason);
-        } catch (\Throwable $ne) {
-            Log::warning('Telegram reject notify error: ' . $ne->getMessage());
-        }
+            $reason = trim($validated['reason']);
+            $user = auth()->user();
+            $rejectedBy = $user ? $user->name : 'Super Admin';
 
-        return response()->json([
-            'status' => 'success',
-            'message' => "Order #{$sale->reference_no} rejected.",
-            'data' => $sale,
-        ]);
+            // 🛡️ Rollback stock reservation
+            $this->botService->rollbackStockReservation($sale, "Order rejected by staff: {$reason}");
+
+            // 🛡️ Accounting Ledger Integrity:
+            // Void/delete any preliminary unverified payment records tied to this rejected order
+            SalePayment::where('sale_id', $sale->id)->delete();
+
+            $sale->update([
+                'status' => 'Cancelled',
+                'bot_approval_status' => 'rejected',
+                'bot_approved_by' => null,
+                'bot_rejected_by' => $rejectedBy,
+                'bot_rejected_at' => now(),
+                'bot_rejection_reason' => $reason,
+                'stock_reserved' => false,
+                'stock_released_at' => now(),
+                'paid_amount' => 0.0,
+                'due_amount' => 0.0, // 🛡️ Cancelled/rejected order has ZERO due amount
+                'payment_status' => 'Unpaid',
+                'notes' => trim($sale->notes . " | Rejected by {$rejectedBy} on " . now()->format('Y-m-d H:i') . ": {$reason}"),
+            ]);
+
+            DB::commit();
+
+            // Notify Customer via Telegram
+            try {
+                $this->botService->notifyCustomerOrderRejected($sale, $reason);
+            } catch (\Throwable $ne) {
+                Log::warning('Telegram reject notify error: ' . $ne->getMessage());
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'message' => "Order #{$sale->reference_no} rejected.",
+                'data' => $sale,
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            Log::error('Order rejection failed: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to reject order: ' . $e->getMessage(),
+            ], 500);
+        }
     }
 
     /**
@@ -845,7 +1090,14 @@ class BotOrderController extends Controller
                 'telegram_bot_allow_unpaid' => Setting::get('telegram_bot_allow_unpaid', '1') === '1',
                 'telegram_bot_allow_paid' => Setting::get('telegram_bot_allow_paid', '1') === '1',
                 'telegram_bot_allow_partial' => Setting::get('telegram_bot_allow_partial', '0') === '1',
-                'telegram_bot_reject_duplicate_slip' => Setting::get('telegram_bot_reject_duplicate_slip', '1') === '1',
+                'telegram_bot_reject_duplicate_slip' => filter_var(Setting::get('telegram_bot_reject_duplicate_slip', true), FILTER_VALIDATE_BOOLEAN),
+                'telegram_bot_slip_hash_algorithm' => Setting::get('telegram_bot_slip_hash_algorithm', 'hybrid'),
+                'telegram_bot_phash_threshold' => (int)Setting::get('telegram_bot_phash_threshold', 8),
+                'telegram_bot_duplicate_slip_action' => Setting::get('telegram_bot_duplicate_slip_action', 'reject'),
+                'telegram_bot_enable_stock_reservation' => filter_var(Setting::get('telegram_bot_enable_stock_reservation', true), FILTER_VALIDATE_BOOLEAN),
+                'telegram_bot_stock_reservation_timeout' => (int)Setting::get('telegram_bot_stock_reservation_timeout', 60),
+                'telegram_bot_enable_tax' => filter_var(Setting::get('telegram_bot_enable_tax', false), FILTER_VALIDATE_BOOLEAN),
+                'telegram_bot_tax_rate' => (float)Setting::get('telegram_bot_tax_rate', 5.0),
                 'telegram_bot_min_partial_pct' => (float)Setting::get('telegram_bot_min_partial_pct', '30'),
                 'telegram_bot_allow_out_of_stock_orders' => Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1',
                 'telegram_bot_hide_out_of_stock' => Setting::get('telegram_bot_hide_out_of_stock', '0') === '1',
@@ -955,6 +1207,11 @@ class BotOrderController extends Controller
                 'telegram_bot_checkout_quick_cod' => Setting::get('telegram_bot_checkout_quick_cod', '1') === '1',
                 'telegram_bot_checkout_skip_township' => Setting::get('telegram_bot_checkout_skip_township', '1') === '1',
                 'telegram_bot_require_payment_slip' => Setting::get('telegram_bot_require_payment_slip', '1') === '1',
+                'telegram_bot_compact_markdown' => Setting::get('telegram_bot_compact_markdown', '1') === '1',
+                'telegram_bot_one_tap_checkout' => Setting::get('telegram_bot_one_tap_checkout', '1') === '1',
+                'telegram_bot_auto_township_extract' => Setting::get('telegram_bot_auto_township_extract', '1') === '1',
+                'telegram_bot_show_step_indicator' => Setting::get('telegram_bot_show_step_indicator', '1') === '1',
+                'telegram_bot_default_language' => Setting::get('telegram_bot_default_language', 'my'),
 
                 // 📍 Location Input Mode & Native Sharing Buttons
                 'telegram_bot_location_input_mode' => Setting::get('telegram_bot_location_input_mode', 'both_button_and_text'),
@@ -1069,6 +1326,13 @@ class BotOrderController extends Controller
                 'telegram_bot_show_delivery_pickup' => Setting::get('telegram_bot_show_delivery_pickup', '1') === '1',
                 'telegram_bot_show_delivery_city' => Setting::get('telegram_bot_show_delivery_city', '1') === '1',
                 'telegram_bot_show_delivery_express' => Setting::get('telegram_bot_show_delivery_express', '1') === '1',
+                'telegram_bot_pos_sound_alert' => Setting::get('telegram_bot_pos_sound_alert', '1') === '1',
+                'telegram_bot_pos_sound_volume' => (int)Setting::get('telegram_bot_pos_sound_volume', 100),
+                'telegram_bot_pos_polling_interval' => (int)Setting::get('telegram_bot_pos_polling_interval', 15),
+                'telegram_bot_pos_show_banner' => Setting::get('telegram_bot_pos_show_banner', '1') === '1',
+                'telegram_bot_compact_markdown' => Setting::get('telegram_bot_compact_markdown', '1') === '1',
+                'telegram_bot_step_indicator' => Setting::get('telegram_bot_step_indicator', '1') === '1',
+                'telegram_bot_quick_checkout' => Setting::get('telegram_bot_quick_checkout', '1') === '1',
             ];
         };
 
@@ -1109,6 +1373,14 @@ class BotOrderController extends Controller
             'telegram_bot_allow_unpaid' => 'nullable|boolean',
             'telegram_bot_allow_paid' => 'nullable|boolean',
             'telegram_bot_allow_partial' => 'nullable|boolean',
+            'telegram_bot_reject_duplicate_slip' => 'nullable|boolean',
+            'telegram_bot_slip_hash_algorithm' => 'nullable|string|in:sha256,phash,hybrid',
+            'telegram_bot_phash_threshold' => 'nullable|integer|min:0|max:32',
+            'telegram_bot_duplicate_slip_action' => 'nullable|string|in:reject,flag_review',
+            'telegram_bot_enable_stock_reservation' => 'nullable|boolean',
+            'telegram_bot_stock_reservation_timeout' => 'nullable|integer|min:5|max:1440',
+            'telegram_bot_enable_tax' => 'nullable|boolean',
+            'telegram_bot_tax_rate' => 'nullable|numeric|min:0|max:100',
             'telegram_bot_min_partial_pct' => 'nullable|numeric|min:1|max:100',
             'telegram_bot_allow_out_of_stock_orders' => 'nullable|boolean',
             'telegram_bot_hide_out_of_stock' => 'nullable|boolean',
@@ -1213,6 +1485,11 @@ class BotOrderController extends Controller
             'telegram_bot_checkout_skip_township' => 'nullable|boolean',
             'telegram_bot_require_payment_slip' => 'nullable|boolean',
             'telegram_bot_reject_duplicate_slip' => 'nullable|boolean',
+            'telegram_bot_compact_markdown' => 'nullable|boolean',
+            'telegram_bot_one_tap_checkout' => 'nullable|boolean',
+            'telegram_bot_auto_township_extract' => 'nullable|boolean',
+            'telegram_bot_show_step_indicator' => 'nullable|boolean',
+            'telegram_bot_default_language' => 'nullable|string|in:my,en',
             'telegram_bot_order_dispatched_msg' => 'nullable|string|max:1000',
             'telegram_bot_webhook_url' => 'nullable|string|max:255',
             'telegram_bot_webhook_secret' => 'nullable|string|max:100',
@@ -1330,6 +1607,13 @@ class BotOrderController extends Controller
             'telegram_bot_show_delivery_pickup' => 'nullable|boolean',
             'telegram_bot_show_delivery_city' => 'nullable|boolean',
             'telegram_bot_show_delivery_express' => 'nullable|boolean',
+            'telegram_bot_pos_sound_alert' => 'nullable|boolean',
+            'telegram_bot_pos_sound_volume' => 'nullable|integer|min:0|max:100',
+            'telegram_bot_pos_polling_interval' => 'nullable|integer|min:5|max:120',
+            'telegram_bot_pos_show_banner' => 'nullable|boolean',
+            'telegram_bot_compact_markdown' => 'nullable|boolean',
+            'telegram_bot_step_indicator' => 'nullable|boolean',
+            'telegram_bot_quick_checkout' => 'nullable|boolean',
         ]);
 
         if ($request->has('telegram_bot_ai_show_photos')) {

@@ -338,4 +338,182 @@ class ProductUnitConversionService
 
         return $next;
     }
+
+    /**
+     * Atomically reserve stock for a pending bot order.
+     * Decrements available quantity and increments reserved_quantity.
+     */
+    public function reserveStock(
+        Product $product,
+        ?int $warehouseId,
+        ?int $variantId,
+        float $baseQuantity,
+        string $referenceId,
+        ?string $note = null
+    ): float {
+        if (!$warehouseId) {
+            throw new \RuntimeException('A valid warehouse is required for stock reservation.');
+        }
+        if ($baseQuantity <= 0) {
+            throw new \InvalidArgumentException('Base quantity must be positive.');
+        }
+
+        Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+        $query = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $product->id);
+        $variantId === null ? $query->whereNull('product_variant_id') : $query->where('product_variant_id', $variantId);
+        $balance = $query->lockForUpdate()->first();
+
+        if (!$balance) {
+            $hasExistingBalances = StockBalance::where('product_id', $product->id)->exists();
+            $initial = $variantId === null && !$hasExistingBalances ? (float)$product->stock_quantity : 0.0;
+            $balance = StockBalance::create([
+                'warehouse_id' => $warehouseId,
+                'product_id' => $product->id,
+                'product_variant_id' => $variantId,
+                'quantity' => $initial,
+                'reserved_quantity' => 0.0,
+            ]);
+        }
+
+        $current = (float)$balance->quantity;
+        if ($current < $baseQuantity - 0.0001) {
+            throw new \RuntimeException("Insufficient available stock for {$product->name}. Available: {$current}, requested: {$baseQuantity}");
+        }
+
+        $nextQty = max(0.0, round($current - $baseQuantity, 4));
+        $nextReserved = round((float)($balance->reserved_quantity ?? 0.0) + $baseQuantity, 4);
+
+        $balance->update([
+            'quantity' => $nextQty,
+            'reserved_quantity' => $nextReserved,
+        ]);
+
+        StockMovement::create([
+            'warehouse_id' => $warehouseId,
+            'product_id' => $product->id,
+            'product_variant_id' => $variantId,
+            'movement_type' => 'bot_reservation',
+            'reference_type' => 'sale_reservation',
+            'reference_id' => $referenceId,
+            'quantity_in' => 0.0,
+            'quantity_out' => $baseQuantity,
+            'balance_after' => $nextQty,
+            'created_by' => auth()->id() ?? 1,
+            'note' => $note ?: "Stock reserved for bot order #{$referenceId}",
+            'created_at' => now(),
+        ]);
+
+        $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
+        Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
+
+        return $nextQty;
+    }
+
+    /**
+     * Atomically release reserved stock back to available balance.
+     * Increments available quantity and decrements reserved_quantity.
+     */
+    public function releaseReservedStock(
+        Product $product,
+        ?int $warehouseId,
+        ?int $variantId,
+        float $baseQuantity,
+        string $referenceId,
+        ?string $note = null
+    ): float {
+        if (!$warehouseId) {
+            throw new \RuntimeException('A valid warehouse is required for releasing reserved stock.');
+        }
+        if ($baseQuantity <= 0) {
+            return 0.0;
+        }
+
+        Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+        $query = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $product->id);
+        $variantId === null ? $query->whereNull('product_variant_id') : $query->where('product_variant_id', $variantId);
+        $balance = $query->lockForUpdate()->first();
+
+        if (!$balance) {
+            return 0.0;
+        }
+
+        $currentQty = (float)$balance->quantity;
+        $currentReserved = (float)($balance->reserved_quantity ?? 0.0);
+
+        $nextQty = round($currentQty + $baseQuantity, 4);
+        $nextReserved = max(0.0, round($currentReserved - $baseQuantity, 4));
+
+        $balance->update([
+            'quantity' => $nextQty,
+            'reserved_quantity' => $nextReserved,
+        ]);
+
+        StockMovement::create([
+            'warehouse_id' => $warehouseId,
+            'product_id' => $product->id,
+            'product_variant_id' => $variantId,
+            'movement_type' => 'bot_reservation_rollback',
+            'reference_type' => 'sale_reservation_rollback',
+            'reference_id' => $referenceId,
+            'quantity_in' => $baseQuantity,
+            'quantity_out' => 0.0,
+            'balance_after' => $nextQty,
+            'created_by' => auth()->id() ?? 1,
+            'note' => $note ?: "Stock reservation rolled back for order #{$referenceId}",
+            'created_at' => now(),
+        ]);
+
+        $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
+        Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
+
+        return $nextQty;
+    }
+
+    /**
+     * Fulfill reserved stock upon formal order approval.
+     * Clears reserved_quantity without double-decrementing available quantity.
+     */
+    public function fulfillReservedStock(
+        Product $product,
+        ?int $warehouseId,
+        ?int $variantId,
+        float $baseQuantity,
+        string $referenceId,
+        ?string $note = null
+    ): float {
+        if (!$warehouseId) {
+            throw new \RuntimeException('A valid warehouse is required for fulfilling reserved stock.');
+        }
+        if ($baseQuantity <= 0) {
+            return 0.0;
+        }
+
+        Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+        $query = StockBalance::where('warehouse_id', $warehouseId)->where('product_id', $product->id);
+        $variantId === null ? $query->whereNull('product_variant_id') : $query->where('product_variant_id', $variantId);
+        $balance = $query->lockForUpdate()->first();
+
+        if ($balance) {
+            $currentReserved = (float)($balance->reserved_quantity ?? 0.0);
+            $nextReserved = max(0.0, round($currentReserved - $baseQuantity, 4));
+            $balance->update(['reserved_quantity' => $nextReserved]);
+        }
+
+        StockMovement::create([
+            'warehouse_id' => $warehouseId,
+            'product_id' => $product->id,
+            'product_variant_id' => $variantId,
+            'movement_type' => 'bot_reservation_fulfill',
+            'reference_type' => 'sale',
+            'reference_id' => $referenceId,
+            'quantity_in' => 0.0,
+            'quantity_out' => 0.0,
+            'balance_after' => (float)($balance?->quantity ?? 0.0),
+            'created_by' => auth()->id() ?? 1,
+            'note' => $note ?: "Reserved stock fulfilled upon order approval #{$referenceId}",
+            'created_at' => now(),
+        ]);
+
+        return (float)($balance?->quantity ?? 0.0);
+    }
 }

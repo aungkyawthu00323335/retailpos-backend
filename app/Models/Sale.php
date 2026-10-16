@@ -39,6 +39,11 @@ class Sale extends Model
         'bot_approval_status',
         'bot_rejection_reason',
         'payment_slip_url',
+        'payment_slip_hash',
+        'payment_slip_phash',
+        'stock_reserved',
+        'stock_reserved_at',
+        'stock_released_at',
         'shipping_address',
         'customer_phone',
         'cash_register_id',
@@ -72,6 +77,9 @@ class Sale extends Model
         'change_amount' => 'float',
         'pos_flag' => 'boolean',
         'cash_register_id' => 'integer',
+        'stock_reserved' => 'boolean',
+        'stock_reserved_at' => 'datetime',
+        'stock_released_at' => 'datetime',
         'voided_at' => 'datetime',
     ];
 
@@ -129,5 +137,41 @@ class Sale extends Model
         }
 
         return $value;
+    }
+
+    public function getIsDuplicateSlipAttribute(): bool
+    {
+        if (empty($this->payment_slip_hash) && empty($this->payment_slip_phash)) {
+            return false;
+        }
+        return static::where(function ($q) {
+            if (!empty($this->payment_slip_hash)) {
+                $q->where('payment_slip_hash', $this->payment_slip_hash);
+            }
+            if (!empty($this->payment_slip_phash)) {
+                $q->orWhere('payment_slip_phash', $this->payment_slip_phash);
+            }
+        })
+        ->where('id', '!=', $this->id)
+        ->exists();
+    }
+
+    public function getDuplicateWarningAttribute(): ?string
+    {
+        if (empty($this->payment_slip_hash) && empty($this->payment_slip_phash)) {
+            return null;
+        }
+        $dup = static::where(function ($q) {
+            if (!empty($this->payment_slip_hash)) {
+                $q->where('payment_slip_hash', $this->payment_slip_hash);
+            }
+            if (!empty($this->payment_slip_phash)) {
+                $q->orWhere('payment_slip_phash', $this->payment_slip_phash);
+            }
+        })
+        ->where('id', '!=', $this->id)
+        ->first();
+
+        return $dup ? "Duplicate slip reused from order {$dup->reference_no}" : null;
     }
 }

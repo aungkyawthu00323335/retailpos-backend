@@ -14,10 +14,12 @@ class StockBalance extends Model
         'product_id',
         'product_variant_id',
         'quantity',
+        'reserved_quantity',
     ];
 
     protected $casts = [
         'quantity' => 'decimal:4',
+        'reserved_quantity' => 'decimal:4',
     ];
 
     public function product()
