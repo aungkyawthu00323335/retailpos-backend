@@ -15,6 +15,7 @@ class StoreProductRequest extends FormRequest
     {
         return [
             // Basic Product Fields
+            'uuid' => ['nullable', 'string', 'max:100'],
             'name' => ['required', 'string', 'min:3', 'max:150'],
             'sku' => ['nullable', 'string', 'max:100', 'unique:products,code', 'unique:products,sku', 'unique:product_variants,sku'],
             'code' => ['nullable', 'string', 'max:100', 'unique:products,code', 'unique:products,sku', 'unique:product_variants,sku'],

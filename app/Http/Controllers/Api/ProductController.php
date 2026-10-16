@@ -434,6 +434,19 @@ class ProductController extends Controller
             }
         }
 
+        // Idempotent Sync: Return existing product if client uuid is already synced
+        if (!empty($data['uuid'])) {
+            $existingProduct = Product::where('uuid', $data['uuid'])->first();
+            if ($existingProduct) {
+                return response()->json([
+                    'success' => true,
+                    'status' => 'success',
+                    'message' => 'Product already synced (idempotent).',
+                    'data' => new ProductResource($existingProduct),
+                ], 200);
+            }
+        }
+
         $images = $request->file('images', []);
         if (!is_array($images) && $images) {
             $images = [$images];

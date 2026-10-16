@@ -85,7 +85,7 @@ class ProductCreateService
 
                 // 2. Create Base Product
                 $product = Product::create([
-                    'uuid' => (string) Str::uuid(),
+                    'uuid' => !empty($data['uuid']) ? $data['uuid'] : (string) Str::uuid(),
                     'code' => $sku,
                     'sku' => $sku,
                     'barcode' => $barcode,
