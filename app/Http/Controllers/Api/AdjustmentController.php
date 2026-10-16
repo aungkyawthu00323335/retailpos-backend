@@ -48,7 +48,7 @@ class AdjustmentController extends Controller
     public function index(Request $request)
     {
         $query = StockAdjustment::select([
-            'id', 'reference_no', 'warehouse_id', 'warehouse_name', 'date',
+            'id', 'uuid', 'reference_no', 'warehouse_id', 'warehouse_name', 'date',
             'total_products', 'total_quantity', 'type', 'notes',
             'user_id', 'user_name', 'created_by', 'user_role', 'created_at', 'updated_at'
         ])->with([
@@ -170,7 +170,23 @@ class AdjustmentController extends Controller
 
     public function store(Request $request)
     {
+        // Offline-First Idempotency Check: Prevent duplicate adjustments from offline queue replays
+        if ($request->filled('uuid')) {
+            $existing = StockAdjustment::where('uuid', $request->input('uuid'))->with([
+                'user:id,name,role',
+                'items:id,stock_adjustment_id,product_id,product_variant_id,product_code,product_name,variant_name,unit_id,unit_name,conversion_rate,quantity,base_quantity,type,unit_cost,base_unit_cost,subtotal',
+            ])->first();
+            if ($existing) {
+                return response()->json([
+                    'status' => 'success',
+                    'message' => 'Stock adjustment already synced (idempotent)',
+                    'data' => $existing,
+                ], 200);
+            }
+        }
+
         $validated = $request->validate([
+            'uuid' => 'nullable|string|max:100',
             'reference_no' => 'nullable|string|max:255|unique:stock_adjustments,reference_no',
             'warehouse_id' => 'nullable|integer',
             'warehouse_name' => 'required|string|max:255',
@@ -300,6 +316,7 @@ class AdjustmentController extends Controller
             }
 
             $adjustment = StockAdjustment::create([
+                'uuid' => $validated['uuid'] ?? $request->input('uuid'),
                 'reference_no' => $refNo,
                 'warehouse_id' => $warehouseId,
                 'warehouse_name' => $validated['warehouse_name'],

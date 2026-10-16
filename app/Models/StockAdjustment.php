@@ -10,6 +10,7 @@ class StockAdjustment extends Model
     use HasFactory;
 
     protected $fillable = [
+        'uuid',
         'reference_no',
         'warehouse_id',
         'warehouse_name',

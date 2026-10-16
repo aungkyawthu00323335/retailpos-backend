@@ -517,6 +517,56 @@ class AdjustmentEnterpriseTest extends TestCase
         $this->assertContains('ADJ-DATE-02', $augRefs);
         $this->assertNotContains('ADJ-DATE-03', $augRefs);
     }
+
+    /**
+     * Test 12: Store adjustment supports client UUID and idempotent replay
+     */
+    public function test_store_adjustment_supports_client_uuid_and_idempotent_replay(): void
+    {
+        $product = Product::create([
+            'code' => 'ADJ-UUID-TEST',
+            'name' => 'Adjustment UUID Test Product',
+            'cost_price' => 25.0,
+            'price' => 50.0,
+            'stock_quantity' => 10.0,
+            'low_qty' => 1.0,
+            'product_unit' => 'Piece',
+            'barcode_symbol' => 'CODE128',
+        ]);
+
+        $uuid = 'test-adj-uuid-' . uniqid();
+        $payload = [
+            'uuid' => $uuid,
+            'reference_no' => 'ADJ-UUID-001',
+            'warehouse_name' => 'Central Warehouse',
+            'date' => '2026-10-16',
+            'type' => 'Addition',
+            'items' => [
+                [
+                    'product_id' => $product->id,
+                    'product_code' => $product->code,
+                    'product_name' => $product->name,
+                    'quantity' => 2.0,
+                    'type' => 'Addition',
+                    'unit_cost' => 25.0,
+                ],
+            ],
+        ];
+
+        // 1st POST
+        $res1 = $this->postJson('/api/adjustments', $payload);
+        $res1->assertStatus(201);
+        $this->assertEquals($uuid, $res1->json('data.uuid'));
+
+        // 2nd POST with same UUID (simulating offline retry)
+        $res2 = $this->postJson('/api/adjustments', $payload);
+        $res2->assertStatus(200);
+        $this->assertTrue(str_contains($res2->json('message'), 'idempotent'));
+        $this->assertEquals($uuid, $res2->json('data.uuid'));
+
+        // Confirm database only has 1 record with this reference
+        $this->assertEquals(1, StockAdjustment::where('reference_no', 'ADJ-UUID-001')->count());
+    }
 }
 
 
