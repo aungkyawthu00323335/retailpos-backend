@@ -10,6 +10,7 @@ class Variation extends Model
     use HasFactory;
 
     protected $fillable = [
+        'uuid',
         'name',
         'variation_types',
         'status',
