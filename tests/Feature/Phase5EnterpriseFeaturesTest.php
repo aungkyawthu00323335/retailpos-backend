@@ -138,6 +138,7 @@ class Phase5EnterpriseFeaturesTest extends TestCase
 
     public function test_loyalty_points_redemption_on_sale(): void
     {
+        $this->markTestSkipped('Customer loyalty points system decommissioned per commit 53f07a4.');
         $outlet = Outlet::create(['name' => 'Main Outlet', 'code' => 'OUT-01']);
 
         $product = Product::create([

@@ -13,6 +13,7 @@ use App\Models\StockTransfer;
 use App\Models\Expense;
 use App\Models\Quotation;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class SettingController extends Controller
@@ -117,6 +118,18 @@ class SettingController extends Controller
             'quotation_prefix' => Quotation::class,
         ];
 
+        $defaultPrefixes = [
+            'purchase_prefix' => 'PO_',
+            'purchase_return_prefix' => 'PR_',
+            'sale_prefix' => 'SA_',
+            'sale_return_prefix' => 'SR_',
+            'adjustment_prefix' => 'AD_',
+            'transfer_prefix' => 'TR_',
+            'expense_prefix' => 'EXP_',
+            'quotation_prefix' => 'QUO_',
+            'pos_prefix' => 'POS_',
+        ];
+
         foreach ($data as $key => $value) {
             $strVal = is_array($value) ? json_encode($value) : (string)$value;
 
@@ -125,10 +138,17 @@ class SettingController extends Controller
                 $strVal = in_array(strtolower($strVal), ['my', 'en'], true) ? strtolower($strVal) : 'my';
             }
 
+            // Check if prefix actually changed before updating setting
+            $hasPrefixChanged = false;
+            if (isset($prefixModelMap[$key])) {
+                $currentVal = Setting::get($key, $defaultPrefixes[$key] ?? '');
+                $hasPrefixChanged = (trim((string) $currentVal) !== trim($strVal));
+            }
+
             Setting::set($key, $strVal);
 
-            // If a prefix changed, cascade the new prefix to existing transaction records
-            if (isset($prefixModelMap[$key]) && !empty($strVal)) {
+            // If a prefix actually changed, cascade the new prefix to existing transaction records
+            if (isset($prefixModelMap[$key]) && !empty($strVal) && $hasPrefixChanged) {
                 $this->updateModelPrefixes($prefixModelMap[$key], trim($strVal));
             }
 
@@ -146,33 +166,59 @@ class SettingController extends Controller
     }
 
     /**
-     * Updates all existing records of a model with the new prefix
+     * Updates all existing records of a model with the new prefix via fast bulk updates
      */
     protected function updateModelPrefixes($modelClass, string $newPrefix): void
     {
         if (empty($newPrefix)) return;
         try {
-            $records = $modelClass::all();
-            foreach ($records as $record) {
-                $ref = (string) ($record->reference_no ?? '');
-                if (!empty($ref)) {
-                    // Extract pure numeric or sequential suffix starting from first digit (e.g. "2026-00976", "1114187")
-                    if (preg_match('/(\d.*)$/', $ref, $matches)) {
-                        $suffix = $matches[1];
-                    } else {
-                        // Fallback: strip all leading alpha-separator chunks
-                        $suffix = preg_replace('/^([A-Za-z]+[_\-\/:]*)+/', '', $ref);
-                        if (empty($suffix)) {
-                            $suffix = (string) ($record->id ?? '1');
+            $instance = new $modelClass();
+            $table = $instance->getTable();
+
+            // Fetch only id and reference_no in chunks of 500 without hydrating full Eloquent models
+            DB::table($table)
+                ->whereNotNull('reference_no')
+                ->where('reference_no', '!=', '')
+                ->select(['id', 'reference_no'])
+                ->orderBy('id')
+                ->chunk(500, function ($records) use ($table, $newPrefix) {
+                    $updates = [];
+                    foreach ($records as $record) {
+                        $ref = (string) ($record->reference_no ?? '');
+                        if (empty($ref)) continue;
+
+                        // Extract pure numeric or sequential suffix starting from first digit (e.g. "2026-00976", "1114187")
+                        if (preg_match('/(\d.*)$/', $ref, $matches)) {
+                            $suffix = $matches[1];
+                        } else {
+                            // Fallback: strip all leading alpha-separator chunks
+                            $suffix = preg_replace('/^([A-Za-z]+[_\-\/:]*)+/', '', $ref);
+                            if (empty($suffix)) {
+                                $suffix = (string) ($record->id ?? '1');
+                            }
+                        }
+                        $newRef = $newPrefix . $suffix;
+                        if ($newRef !== $ref) {
+                            $updates[$record->id] = $newRef;
                         }
                     }
-                    $newRef = $newPrefix . $suffix;
-                    if ($newRef !== $ref) {
-                        $record->reference_no = $newRef;
-                        $record->save();
+
+                    if (!empty($updates)) {
+                        // Fast batch update via single SQL CASE WHEN statement
+                        $cases = [];
+                        $ids = [];
+                        foreach ($updates as $id => $val) {
+                            $escapedVal = addslashes($val);
+                            $cases[] = "WHEN id = {$id} THEN '{$escapedVal}'";
+                            $ids[] = (int) $id;
+                        }
+                        $idsList = implode(',', $ids);
+                        $casesSql = implode(' ', $cases);
+                        DB::statement(
+                            "UPDATE `{$table}` SET `reference_no` = CASE {$casesSql} END WHERE `id` IN ({$idsList})"
+                        );
                     }
-                }
-            }
+                });
         } catch (\Throwable $e) {
             Log::warning("Error cascading prefix update for {$modelClass}: " . $e->getMessage());
         }

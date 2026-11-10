@@ -181,7 +181,6 @@ class BotVoucherImageService
         $itemCount = max(1, count($sale->items));
         $estimatedHeight = 650 + ($itemCount * 44);
         if ($sale->discount > 0) $estimatedHeight += 26;
-        if ($sale->points_discount > 0) $estimatedHeight += 26;
         if ($sale->tax_amount > 0) $estimatedHeight += 26;
         if ($sale->shipping > 0) $estimatedHeight += 26;
         if ($sale->due_amount > 0) $estimatedHeight += 26;
@@ -329,12 +328,6 @@ class BotVoucherImageService
         if ($sale->discount > 0) {
             imagettftext($im, 11.5, 0, $margin, $y, $greenColor, $this->fontRegular, "Discount:");
             $this->drawRightText($im, 12, $rightMargin, $y, $greenColor, $this->fontBold, "- " . number_format($sale->discount) . " Ks");
-            $y += 24;
-        }
-
-        if ($sale->points_discount > 0) {
-            imagettftext($im, 11.5, 0, $margin, $y, $greenColor, $this->fontRegular, "Loyalty Points Discount:");
-            $this->drawRightText($im, 12, $rightMargin, $y, $greenColor, $this->fontBold, "- " . number_format($sale->points_discount) . " Ks");
             $y += 24;
         }
 

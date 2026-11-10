@@ -17,27 +17,154 @@ use Carbon\Carbon;
 
 class TransferController extends Controller
 {
+    use \App\Traits\GeneratesSequentialCode;
     /**
-     * Generate next transfer reference code (e.g. TR_1234567).
+     * Generate next sequential transfer reference code (e.g. TK_0010001).
      */
     public function generateCode()
     {
-        $prefix = Setting::get('transfer_prefix', 'TR_');
-        $transfers = StockTransfer::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
-        $existingCodes = $transfers->pluck('reference_no')->filter()->toArray();
+        return response()->json($this->peekNextSequentialCode('transfer'));
+    }
 
-        do {
-            $num = rand(1000000, 9999999);
-            $candidate = $prefix . $num;
-        } while (in_array($candidate, $existingCodes) || StockTransfer::where('reference_no', $candidate)->exists());
+    public function export(Request $request)
+    {
+        @set_time_limit(300);
+        @ini_set('memory_limit', '512M');
 
-        return response()->json([
-            'status' => 'success',
-            'data'   => [
-                'code'         => $candidate,
-                'reference_no' => $candidate,
-            ],
+        $query = StockTransfer::select([
+            'id', 'reference_no', 'from_warehouse', 'to_warehouse',
+            'date', 'transfer_time', 'items_count', 'total_quantity',
+            'shipping_charge', 'status', 'notes', 'created_by',
+            'user_name', 'user_role', 'created_at'
         ]);
+
+        if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
+            $wh = $request->input('warehouse');
+            $query->where(function($q) use ($wh) {
+                $q->where('from_warehouse', $wh)->orWhere('to_warehouse', $wh);
+            });
+        }
+        if ($request->filled('from_warehouse') && $request->input('from_warehouse') !== 'All') {
+            $query->where('from_warehouse', $request->input('from_warehouse'));
+        }
+        if ($request->filled('to_warehouse') && $request->input('to_warehouse') !== 'All') {
+            $query->where('to_warehouse', $request->input('to_warehouse'));
+        }
+        if ($request->filled('status') && $request->input('status') !== 'All') {
+            $query->where('status', $request->input('status'));
+        }
+        $userFilter = $request->input('created_by') ?: ($request->input('user') ?: 'All');
+        if (!empty($userFilter) && $userFilter !== 'All') {
+            $query->where('created_by', $userFilter);
+        }
+        $df = $request->input('from_date') ?: $request->input('date_from');
+        if (!empty($df)) {
+            $query->whereDate('date', '>=', $df);
+        }
+        $dt = $request->input('to_date') ?: $request->input('date_to');
+        if (!empty($dt)) {
+            $query->whereDate('date', '<=', $dt);
+        }
+        if ($request->filled('search')) {
+            $search = trim($request->input('search'));
+            $cleanSearch = preg_replace('/[-_ ]/', '', $search);
+            $query->where(function ($q) use ($search, $cleanSearch) {
+                $q->where('reference_no', 'like', "%{$search}%");
+                if (!empty($cleanSearch)) {
+                    $q->orWhereRaw("REPLACE(REPLACE(reference_no, '_', ''), '-', '') LIKE ?", ["%{$cleanSearch}%"]);
+                }
+                $q->orWhere('from_warehouse', 'like', "%{$search}%")
+                  ->orWhere('to_warehouse', 'like', "%{$search}%")
+                  ->orWhere('notes', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
+                  ->orWhere('user_role', 'like', "%{$search}%");
+            });
+        }
+
+        $sortColumn = $request->input('sort_by', 'id');
+        $sortDirection = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $allowedSorts = ['id', 'reference_no', 'date', 'status', 'total_quantity', 'shipping_charge', 'created_by'];
+        if (!in_array($sortColumn, $allowedSorts, true)) {
+            $sortColumn = 'id';
+        }
+        $query->orderBy($sortColumn, $sortDirection);
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="transfers_export_' . date('Ymd_His') . '.csv"',
+            'X-Accel-Buffering' => 'no',
+            'Cache-Control' => 'no-cache, no-store, must-revalidate',
+            'Pragma' => 'no-cache',
+            'Expires' => '0',
+        ];
+
+        $callback = function () use ($query, $request) {
+            $output = fopen('php://output', 'w');
+            fwrite($output, "\xEF\xBB\xBF");
+
+            fputcsv($output, ['Stock Transfers Export']);
+            fputcsv($output, ['Generated At', date('Y-m-d H:i:s')]);
+            fputcsv($output, []);
+
+            fputcsv($output, [
+                'SN', 'Reference No', 'From Warehouse', 'To Warehouse',
+                'Status', 'Items Count', 'Total Quantity', 'Shipping Charge',
+                'Created By', 'User Role', 'Date', 'Time', 'Notes'
+            ]);
+
+            $sn = 1;
+            $totalQty = 0.0;
+            $totalShipping = 0.0;
+            $flushCount = 0;
+
+            foreach ($query->toBase()->cursor() as $t) {
+                $qty = (float)$t->total_quantity;
+                $shipping = (float)$t->shipping_charge;
+                $totalQty += $qty;
+                $totalShipping += $shipping;
+
+                $userName = $t->user_name ?: ($t->created_by ?: 'System');
+                $userRole = $t->user_role ?: 'Warehouse Staff';
+
+                $dateOnly = $t->date ? explode(' ', trim($t->date))[0] : '';
+                $timeStr = $t->transfer_time ?: '';
+                if (empty($timeStr) && $t->created_at) {
+                    $timeStr = date('H:i:s', strtotime($t->created_at));
+                }
+
+                fputcsv($output, [
+                    $sn++,
+                    $t->reference_no,
+                    $t->from_warehouse,
+                    $t->to_warehouse,
+                    $t->status,
+                    $t->items_count ?: 0,
+                    number_format($qty, 2, '.', ''),
+                    number_format($shipping, 2, '.', ''),
+                    $userName,
+                    $userRole,
+                    $dateOnly,
+                    $timeStr,
+                    $t->notes ?: '',
+                ]);
+
+                if (++$flushCount % 500 === 0) {
+                    flush();
+                }
+            }
+
+            fputcsv($output, [
+                'TOTAL', ($sn - 1) . ' Transfers', '—', '—', '—', '—',
+                number_format($totalQty, 2, '.', ''),
+                number_format($totalShipping, 2, '.', ''),
+                '—', '—', '—', '—', '—'
+            ]);
+
+            fclose($output);
+        };
+
+        return response()->stream($callback, 200, $headers);
     }
 
     public function index(Request $request)
@@ -375,10 +502,7 @@ class TransferController extends Controller
 
         DB::beginTransaction();
         try {
-            $prefix   = Setting::get('transfer_prefix', 'TR_');
-            $refNo    = !empty($validated['reference_no'])
-                ? $validated['reference_no']
-                : ($prefix . rand(1000000, 9999999));
+            $refNo = $this->acquireUniqueReference('transfer', $validated['reference_no'] ?? null);
             $totalQty = 0;
 
             foreach ($validated['items'] as $item) {

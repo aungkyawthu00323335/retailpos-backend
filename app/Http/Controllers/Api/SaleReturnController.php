@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\DB;
 
 class SaleReturnController extends Controller
 {
+    use \App\Traits\GeneratesSequentialCode;
     /** Return reason options */
     public const RETURN_REASONS = [
         'Defective / Damaged Product',
@@ -20,6 +21,163 @@ class SaleReturnController extends Controller
         'Duplicate Order',
         'Other',
     ];
+
+    /**
+     * Generate next sequential sale return reference code (e.g. SR_0010001).
+     */
+    public function generateCode()
+    {
+        return response()->json($this->peekNextSequentialCode('sale_return'));
+    }
+
+    public function export(Request $request)
+    {
+        @set_time_limit(300);
+        @ini_set('memory_limit', '512M');
+
+        $query = SaleReturn::select([
+            'id', 'reference_no', 'sale_reference_no', 'customer_name',
+            'warehouse_name', 'status', 'return_reason', 'refund_tender',
+            'subtotal', 'tax_amount', 'discount', 'shipping', 'grand_total',
+            'paid_amount', 'due_amount', 'payment_status', 'date',
+            'created_by', 'user_name', 'user_role', 'notes', 'created_at'
+        ]);
+
+        if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
+            $query->where('warehouse_name', $request->input('warehouse'));
+        }
+        if ($request->filled('status') && $request->input('status') !== 'All') {
+            $query->where('status', $request->input('status'));
+        }
+        if ($request->filled('payment_status') && $request->input('payment_status') !== 'All') {
+            $query->where('payment_status', $request->input('payment_status'));
+        }
+        if ($request->filled('return_reason') && $request->input('return_reason') !== 'All') {
+            $query->where('return_reason', $request->input('return_reason'));
+        }
+        if ($request->filled('refund_tender') && $request->input('refund_tender') !== 'All') {
+            $query->where('refund_tender', $request->input('refund_tender'));
+        }
+        $userFilter = $request->input('created_by') ?: ($request->input('user') ?: 'All');
+        if (!empty($userFilter) && $userFilter !== 'All') {
+            $query->where('created_by', $userFilter);
+        }
+        $df = $request->input('from_date') ?: $request->input('date_from');
+        if (!empty($df)) {
+            $query->whereDate('date', '>=', $df);
+        }
+        $dt = $request->input('to_date') ?: $request->input('date_to');
+        if (!empty($dt)) {
+            $query->whereDate('date', '<=', $dt);
+        }
+        if ($request->filled('search')) {
+            $search = trim($request->input('search'));
+            $query->where(function ($q) use ($search) {
+                $q->where('reference_no', 'like', "%{$search}%")
+                  ->orWhere('sale_reference_no', 'like', "%{$search}%")
+                  ->orWhere('customer_name', 'like', "%{$search}%")
+                  ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
+                  ->orWhere('return_reason', 'like', "%{$search}%")
+                  ->orWhere('notes', 'like', "%{$search}%");
+            });
+        }
+
+        $sortColumn = $request->input('sort_by', 'id');
+        $sortDirection = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $allowedSorts = ['id', 'reference_no', 'date', 'grand_total', 'paid_amount', 'due_amount', 'status'];
+        if (!in_array($sortColumn, $allowedSorts, true)) {
+            $sortColumn = 'id';
+        }
+        $query->orderBy($sortColumn, $sortDirection);
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="sale_returns_export_' . date('Ymd_His') . '.csv"',
+            'X-Accel-Buffering' => 'no',
+            'Cache-Control' => 'no-cache, no-store, must-revalidate',
+            'Pragma' => 'no-cache',
+            'Expires' => '0',
+        ];
+
+        $callback = function () use ($query, $request) {
+            $output = fopen('php://output', 'w');
+            fwrite($output, "\xEF\xBB\xBF");
+
+            fputcsv($output, ['Sales Returns Export']);
+            fputcsv($output, ['Generated At', date('Y-m-d H:i:s')]);
+            fputcsv($output, []);
+
+            fputcsv($output, [
+                'SN', 'Return Reference', 'Sale Reference', 'Customer', 'Warehouse',
+                'Status', 'Return Reason', 'Grand Total', 'Paid Amount', 'Due Amount',
+                'Refund Tender', 'Payment Status', 'Created By', 'User Role', 'Date', 'Time', 'Notes'
+            ]);
+
+            $sn = 1;
+            $totalGrand = 0.0;
+            $totalPaid = 0.0;
+            $totalDue = 0.0;
+            $flushCount = 0;
+
+            foreach ($query->toBase()->cursor() as $ret) {
+                $grand = (float)$ret->grand_total;
+                $paid = (float)$ret->paid_amount;
+                $due = (float)$ret->due_amount;
+                $totalGrand += $grand;
+                $totalPaid += $paid;
+                $totalDue += $due;
+
+                $userName = $ret->user_name ?: ($ret->created_by ?: 'System');
+                $userRole = $ret->user_role ?: 'Sales Staff';
+
+                $dateOnly = $ret->date ? explode(' ', trim($ret->date))[0] : '';
+                $timeStr = '';
+                if ($ret->created_at) {
+                    $timeStr = date('H:i:s', strtotime($ret->created_at));
+                } elseif ($ret->date && strpos($ret->date, ' ') !== false) {
+                    $timeStr = explode(' ', trim($ret->date))[1];
+                }
+
+                fputcsv($output, [
+                    $sn++,
+                    $ret->reference_no,
+                    $ret->sale_reference_no ?: '—',
+                    $ret->customer_name ?: 'Walk-in Customer',
+                    $ret->warehouse_name,
+                    $ret->status,
+                    $ret->return_reason ?: 'General',
+                    number_format($grand, 2, '.', ''),
+                    number_format($paid, 2, '.', ''),
+                    number_format($due, 2, '.', ''),
+                    $ret->refund_tender ?: 'Cash',
+                    $ret->payment_status ?: 'Completed',
+                    $userName,
+                    $userRole,
+                    $dateOnly,
+                    $timeStr,
+                    $ret->notes ?: '',
+                ]);
+
+                if (++$flushCount % 500 === 0) {
+                    flush();
+                }
+            }
+
+            fputcsv($output, [
+                'TOTAL', ($sn - 1) . ' Returns', '—', '—', '—', '—', '—',
+                number_format($totalGrand, 2, '.', ''),
+                number_format($totalPaid, 2, '.', ''),
+                number_format($totalDue, 2, '.', ''),
+                '—', '—', '—', '—', '—', '—', '—'
+            ]);
+
+            fclose($output);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
 
     public function index(Request $request)
     {
@@ -55,19 +213,31 @@ class SaleReturnController extends Controller
             });
         }
 
+        $baseQuery = (clone $query);
+        $totalRecords = (int)(clone $baseQuery)->count();
+        $totalGrandTotal = (float)(clone $baseQuery)->sum('grand_total');
+        $totalPaid = (float)(clone $baseQuery)->sum('paid_amount');
+        $totalDue = (float)(clone $baseQuery)->sum('due_amount');
+
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
-            $totalCount = (clone $query)->count();
             $limit = min(500, max(1, (int)$request->input('limit', 500)));
             $returns = $query->orderBy('id', 'desc')->take($limit)->get();
             return response()->json([
-                'status' => 'success',
-                'data'   => $returns,
+                'status'  => 'success',
+                'data'    => $returns,
+                'total'   => $totalRecords,
+                'summary' => [
+                    'total_records'     => $totalRecords,
+                    'total_grand_total' => $totalGrandTotal,
+                    'total_paid'        => $totalPaid,
+                    'total_due'         => $totalDue,
+                ],
                 'pagination' => [
                     'current_page' => 1,
                     'per_page'     => $returns->count(),
-                    'total'        => $totalCount,
-                    'last_page'    => (int)ceil($totalCount / max(1, $limit)),
+                    'total'        => $totalRecords,
+                    'last_page'    => (int)ceil($totalRecords / max(1, $limit)),
                 ],
             ]);
         }
@@ -76,12 +246,19 @@ class SaleReturnController extends Controller
         $returns = $query->orderBy('id', 'desc')->paginate($perPage);
 
         return response()->json([
-            'status' => 'success',
-            'data'   => $returns->items(),
+            'status'  => 'success',
+            'data'    => $returns->items(),
+            'total'   => $totalRecords,
+            'summary' => [
+                'total_records'     => $totalRecords,
+                'total_grand_total' => $totalGrandTotal,
+                'total_paid'        => $totalPaid,
+                'total_due'         => $totalDue,
+            ],
             'pagination' => [
                 'current_page' => $returns->currentPage(),
                 'per_page'     => $returns->perPage(),
-                'total'        => $returns->total(),
+                'total'        => $totalRecords,
                 'last_page'    => $returns->lastPage(),
             ],
         ]);
@@ -170,10 +347,7 @@ class SaleReturnController extends Controller
             }
         }
 
-        $prefix      = Setting::get('sale_return_prefix', 'SR_');
-        $refNo       = !empty($validated['reference_no'])
-            ? $validated['reference_no']
-            : ($prefix . date('Ymd') . '-' . rand(1000, 9999));
+        $refNo = $this->acquireUniqueReference('sale_return', $validated['reference_no'] ?? null);
 
         $grandTotal    = (float)$validated['grand_total'];
         $paidAmount    = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $grandTotal;
@@ -366,6 +540,7 @@ class SaleReturnController extends Controller
             }
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',
@@ -418,33 +593,44 @@ class SaleReturnController extends Controller
             'user_role'        => 'nullable|string|max:100',
         ]);
 
-        if (isset($validated['grand_total'])) {
-            $grandTotal    = (float)$validated['grand_total'];
-            $paidAmount    = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : (float)$return->paid_amount;
-            $dueAmount     = max(0, $grandTotal - $paidAmount);
-            $validated['due_amount'] = $dueAmount;
-            if (!isset($validated['payment_status'])) {
-                $validated['payment_status'] = $dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid');
+        DB::beginTransaction();
+        try {
+            if (isset($validated['grand_total'])) {
+                $grandTotal    = (float)$validated['grand_total'];
+                $paidAmount    = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : (float)$return->paid_amount;
+                $dueAmount     = max(0, $grandTotal - $paidAmount);
+                $validated['due_amount'] = $dueAmount;
+                if (!isset($validated['payment_status'])) {
+                    $validated['payment_status'] = $dueAmount == 0 ? 'Paid' : ($paidAmount > 0 ? 'Partial' : 'Unpaid');
+                }
             }
+
+            if (isset($validated['items'])) {
+                $validated['items_payload'] = json_encode($validated['items']);
+                unset($validated['items']);
+            }
+
+            if (isset($validated['payments'])) {
+                $validated['payments_payload'] = json_encode($validated['payments']);
+                unset($validated['payments']);
+            }
+
+            $return->update($validated);
+            DB::commit();
+            ReportController::invalidateDashboardCache();
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Sale return updated successfully',
+                'data'    => $return->fresh(),
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json([
+                'status'  => 'error',
+                'message' => $e->getMessage(),
+            ], 422);
         }
-
-        if (isset($validated['items'])) {
-            $validated['items_payload'] = json_encode($validated['items']);
-            unset($validated['items']);
-        }
-
-        if (isset($validated['payments'])) {
-            $validated['payments_payload'] = json_encode($validated['payments']);
-            unset($validated['payments']);
-        }
-
-        $return->update($validated);
-
-        return response()->json([
-            'status'  => 'success',
-            'message' => 'Sale return updated successfully',
-            'data'    => $return,
-        ]);
     }
 
     public function destroy($id)
@@ -646,6 +832,7 @@ class SaleReturnController extends Controller
             }
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',
@@ -759,6 +946,7 @@ class SaleReturnController extends Controller
             }
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',

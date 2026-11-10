@@ -105,35 +105,6 @@ class PurchaseReturn extends Model
             }
         }
 
-        // Try to load items from linked purchase if available
-        if (!empty($this->purchase_reference_no)) {
-            $clean = trim($this->purchase_reference_no);
-            $linkedPurchase = Purchase::where('reference_no', $clean)
-                ->orWhere('reference_no', str_replace('-', '_', $clean))
-                ->orWhere('reference_no', str_replace('_', '-', $clean))
-                ->with('items')
-                ->first();
-
-            if ($linkedPurchase && $linkedPurchase->items && $linkedPurchase->items->isNotEmpty()) {
-                return $linkedPurchase->items->map(function ($it) {
-                    return [
-                        'id'                 => $it->id,
-                        'product_id'         => $it->product_id,
-                        'product_variant_id' => $it->product_variant_id ?? null,
-                        'product_name'       => $it->product_name,
-                        'product_code'       => $it->product_code ?? '',
-                        'unit_name'          => $it->unit_name ?? 'Pcs',
-                        'unit_price'         => (float)($it->unit_price ?? $it->purchase_price ?? 0),
-                        'quantity'           => (float)($it->quantity ?? 0),
-                        'discount'           => (float)($it->discount ?? 0),
-                        'tax'                => (float)($it->tax ?? 0),
-                        'subtotal'           => (float)($it->subtotal ?? 0),
-                        'unit_cost'          => (float)($it->unit_price ?? $it->purchase_price ?? 0),
-                    ];
-                })->values()->all();
-            }
-        }
-
         return [];
     }
 

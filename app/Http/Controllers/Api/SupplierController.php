@@ -384,8 +384,6 @@ class SupplierController extends Controller
             $query->orderBy('id', 'asc');
         }
 
-        $suppliers = $query->get();
-
         $columns = [
             'Supplier ID',
             'Supplier Name',
@@ -405,7 +403,6 @@ class SupplierController extends Controller
         $formatPhone = function ($phone) {
             $phone = trim((string)$phone);
             if ($phone === '') return '';
-            // If phone starts with 0 or + or has spaces, format as text for Excel
             if (str_starts_with($phone, '0') || str_starts_with($phone, '+') || str_contains($phone, ' ')) {
                 return '="' . $phone . '"';
             }
@@ -417,21 +414,25 @@ class SupplierController extends Controller
             return ($floatVal == (int)$floatVal) ? (string)(int)$floatVal : (string)number_format($floatVal, 2, '.', '');
         };
 
+        @set_time_limit(300);
+
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="suppliers_export_' . date('Ymd_His') . '.csv"',
             'Pragma' => 'no-cache',
-            'Cache-Control' => 'must-revalidate, post-check=0, pre-check=0',
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
             'Expires' => '0',
+            'X-Accel-Buffering' => 'no',
         ];
 
-        $callback = function () use ($columns, $suppliers, $formatPhone, $formatNum) {
+        $callback = function () use ($query, $columns, $formatPhone, $formatNum) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
             fputcsv($file, $columns);
 
-            foreach ($suppliers as $supplier) {
+            $rowCount = 0;
+            foreach ($query->toBase()->cursor() as $supplier) {
                 fputcsv($file, [
                     $supplier->id,
                     $supplier->name,
@@ -447,6 +448,11 @@ class SupplierController extends Controller
                     $supplier->status ?? 'Active',
                     $supplier->notes ?? '',
                 ]);
+
+                $rowCount++;
+                if ($rowCount % 200 === 0) {
+                    flush();
+                }
             }
 
             fclose($file);

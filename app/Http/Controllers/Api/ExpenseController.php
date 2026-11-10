@@ -12,69 +12,84 @@ use Carbon\Carbon;
 
 class ExpenseController extends Controller
 {
+    use \App\Traits\GeneratesSequentialCode;
     /**
-     * Generate next expense reference code (e.g. EXP_1234567).
+     * Generate next sequential expense reference code (e.g. EXP_0010001).
      */
     public function generateCode()
     {
-        $prefix = Setting::get('expense_prefix', 'EXP_');
-        $expenses = Expense::select('reference_no')->orderBy('id', 'desc')->take(200)->get();
-        $existingCodes = $expenses->pluck('reference_no')->filter()->toArray();
-
-        do {
-            $num = rand(1000000, 9999999);
-            $candidate = $prefix . $num;
-        } while (in_array($candidate, $existingCodes) || Expense::where('reference_no', $candidate)->exists());
-
-        return response()->json([
-            'status' => 'success',
-            'data'   => [
-                'code'         => $candidate,
-                'reference_no' => $candidate,
-            ],
-        ]);
+        return response()->json($this->peekNextSequentialCode('expense'));
     }
 
-    public function index(Request $request)
+    public function buildFilteredQuery(Request $request, bool $forExport = false)
     {
-        $query = Expense::with(['category', 'payments']);
+        $selectCols = [
+            'id', 'reference_no', 'warehouse_name', 'warehouse_id',
+            'expense_category_id', 'expense_category_name', 'title',
+            'amount', 'paid_amount', 'due_amount', 'payment_status',
+            'payment_method', 'payment_method_id', 'date', 'details',
+            'created_by', 'user_id', 'user_name', 'user_role', 'created_at'
+        ];
+
+        $query = Expense::select($selectCols);
+
+        if (!$forExport) {
+            $query->with(['category', 'payments']);
+        }
 
         if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
-            $query->where('warehouse_id', $request->input('warehouse_id'));
+            $query->where('warehouse_id', (int)$request->input('warehouse_id'));
         }
 
-        if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
-            $query->where('warehouse_name', $request->input('warehouse'));
+        $warehouseFilter = $request->input('warehouse') ?: $request->input('warehouse_name');
+        if (!empty($warehouseFilter) && $warehouseFilter !== 'All') {
+            $query->where('warehouse_name', $warehouseFilter);
         }
 
-        if ($request->filled('category_id') && $request->input('category_id') !== 'All') {
-            $query->where('expense_category_id', $request->input('category_id'));
+        $catId = $request->input('category_id') ?: $request->input('expense_category_id');
+        if (!empty($catId) && $catId !== 'All') {
+            $query->where('expense_category_id', (int)$catId);
         }
 
-        if ($request->filled('category_name') && $request->input('category_name') !== 'All') {
-            $query->where('expense_category_name', $request->input('category_name'));
+        $catName = $request->input('category_name') ?: ($request->input('category') ?: $request->input('expense_category_name'));
+        if (!empty($catName) && $catName !== 'All') {
+            $query->where('expense_category_name', $catName);
         }
 
-        if ($request->filled('payment_method') && $request->input('payment_method') !== 'All') {
-            $query->where('payment_method', $request->input('payment_method'));
+        $pm = $request->input('payment_method') ?: $request->input('payment_type');
+        if (!empty($pm) && $pm !== 'All') {
+            $query->where('payment_method', $pm);
         }
 
         if ($request->filled('payment_status') && $request->input('payment_status') !== 'All') {
             $query->where('payment_status', $request->input('payment_status'));
         }
 
-        if ($request->filled('date_from')) {
-            $query->where('date', '>=', $request->input('date_from'));
+        $fromDate = $request->input('from_date') ?: ($request->input('date_from') ?: $request->input('start_date'));
+        if (!empty($fromDate)) {
+            $fromDate = trim($fromDate);
+            $fromStr = strlen($fromDate) === 10 ? ($fromDate . ' 00:00:00') : $fromDate;
+            $query->where(function ($q) use ($fromDate, $fromStr) {
+                $q->where('date', '>=', $fromDate)
+                  ->orWhere('date', '>=', $fromStr);
+            });
         }
 
-        if ($request->filled('date_to')) {
-            $query->where('date', '<=', $request->input('date_to'));
+        $toDate = $request->input('to_date') ?: ($request->input('date_to') ?: $request->input('end_date'));
+        if (!empty($toDate)) {
+            $toDate = trim($toDate);
+            $toStr = strlen($toDate) === 10 ? ($toDate . ' 23:59:59') : $toDate;
+            $query->where(function ($q) use ($toDate, $toStr) {
+                $q->where('date', '<=', $toStr);
+            });
         }
 
-        if ($request->filled('created_by') && $request->input('created_by') !== 'All') {
-            $filterUser = $request->input('created_by');
+        $userFilter = $request->input('created_by') ?: ($request->input('user') ?: $request->input('user_name'));
+        if (!empty($userFilter) && $userFilter !== 'All') {
+            $filterUser = trim((string)$userFilter);
             $query->where(function ($q) use ($filterUser) {
                 $q->where('created_by', $filterUser)
+                  ->orWhere('created_by', 'like', $filterUser . ' (%')
                   ->orWhere('user_name', $filterUser);
             });
         }
@@ -85,26 +100,47 @@ class ExpenseController extends Controller
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
-            $query->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('title', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%")
-                  ->orWhere('expense_category_name', 'like', "%{$search}%")
-                  ->orWhere('payment_method', 'like', "%{$search}%")
-                  ->orWhere('created_by', 'like', "%{$search}%")
-                  ->orWhere('user_name', 'like', "%{$search}%")
-                  ->orWhere('user_role', 'like', "%{$search}%")
-                  ->orWhere('details', 'like', "%{$search}%");
-            });
+            if (preg_match('/^EXP[-_]/i', $search)) {
+                $query->where('reference_no', 'like', "%{$search}%");
+            } else {
+                $query->where(function ($q) use ($search) {
+                    $q->where('reference_no', 'like', "%{$search}%")
+                      ->orWhere('title', 'like', "%{$search}%")
+                      ->orWhere('warehouse_name', 'like', "%{$search}%")
+                      ->orWhere('expense_category_name', 'like', "%{$search}%")
+                      ->orWhere('payment_method', 'like', "%{$search}%")
+                      ->orWhere('created_by', 'like', "%{$search}%")
+                      ->orWhere('user_name', 'like', "%{$search}%")
+                      ->orWhere('user_role', 'like', "%{$search}%")
+                      ->orWhere('details', 'like', "%{$search}%");
+                });
+            }
         }
 
-        // Aggregate total spend for filtered result
-        $baseQuery = (clone $query)->without(['category', 'payments']);
-        $totalAmount = (float)(clone $baseQuery)->sum('amount');
-        $totalRecords = (int)(clone $baseQuery)->count();
+        return $query;
+    }
+
+    public function index(Request $request)
+    {
+        $query = $this->buildFilteredQuery($request, false);
+
+        // Aggregate total spend for filtered result in a single fast DB query
+        $baseQuery = (clone $query)->without(['category', 'payments'])->toBase();
+        $baseQuery->columns = null;
+        $aggregates = $baseQuery->selectRaw("
+            COUNT(*) as total_records,
+            COALESCE(SUM(amount), 0) as total_amount,
+            COALESCE(SUM(COALESCE(paid_amount, amount - COALESCE(due_amount, 0))), 0) as total_paid,
+            COALESCE(SUM(COALESCE(due_amount, 0)), 0) as total_due
+        ")->first();
+
+        $totalRecords = (int)($aggregates->total_records ?? 0);
+        $totalAmount  = (float)($aggregates->total_amount ?? 0);
+        $totalPaid    = (float)($aggregates->total_paid ?? 0);
+        $totalDue     = (float)($aggregates->total_due ?? 0);
 
         // ── Cash vs Non-Cash Breakdown (Ultra-fast SQL Subquery without PHP memory overhead) ──
-        $expenseIdSubquery = (clone $baseQuery)->select('id');
+        $expenseIdSubquery = (clone $query)->select('id');
         $cashTotal    = (float)ExpensePayment::whereIn('expense_id', $expenseIdSubquery)
             ->where('payment_type', 'Cash')
             ->sum('amount');
@@ -113,14 +149,31 @@ class ExpenseController extends Controller
             ->sum('amount');
 
         // High-performance sorting
-        $sortBy = $request->input('sort_by', 'id');
-        $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'date', 'amount', 'title', 'reference_no', 'warehouse_name', 'expense_category_name', 'payment_method', 'created_by', 'user_name'];
-        if (in_array($sortBy, $allowedSorts, true)) {
-            $query->orderBy($sortBy, $sortOrder);
-        } else {
-            $query->orderBy('id', 'desc');
+        $sortColumn = $request->input('sort_by', 'id');
+        $sortDirection = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $sortColumnMap = [
+            'ref' => 'reference_no',
+            'reference' => 'reference_no',
+            'warehouse' => 'warehouse_name',
+            'category' => 'expense_category_name',
+            'due' => 'due_amount',
+            'paid' => 'paid_amount',
+            'paymentMethod' => 'payment_method',
+            'createdBy' => 'created_by',
+            'user' => 'created_by',
+        ];
+        if (isset($sortColumnMap[$sortColumn])) {
+            $sortColumn = $sortColumnMap[$sortColumn];
         }
+        $allowedSorts = [
+            'id', 'date', 'amount', 'paid_amount', 'due_amount', 'title',
+            'reference_no', 'warehouse_name', 'expense_category_name',
+            'payment_method', 'payment_status', 'created_by', 'user_name'
+        ];
+        if (!in_array($sortColumn, $allowedSorts, true)) {
+            $sortColumn = 'id';
+        }
+        $query->orderBy($sortColumn, $sortDirection);
 
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
@@ -131,6 +184,8 @@ class ExpenseController extends Controller
                 'data'   => $items,
                 'summary' => [
                     'total_amount'   => (float)$totalAmount,
+                    'total_paid'     => (float)$totalPaid,
+                    'total_due'      => (float)$totalDue,
                     'cash_total'     => (float)$cashTotal,
                     'digital_total'  => (float)$digitalTotal,
                     'total_records'  => $totalRecords,
@@ -152,6 +207,8 @@ class ExpenseController extends Controller
             'data'   => $expenses->items(),
             'summary' => [
                 'total_amount'   => (float)$totalAmount,
+                'total_paid'     => (float)$totalPaid,
+                'total_due'      => (float)$totalDue,
                 'cash_total'     => (float)$cashTotal,
                 'digital_total'  => (float)$digitalTotal,
                 'total_records'  => $expenses->total(),
@@ -163,6 +220,158 @@ class ExpenseController extends Controller
                 'last_page'    => $expenses->lastPage(),
             ],
         ]);
+    }
+
+    /**
+     * Stream complete RFC-4180 UTF-8 BOM CSV matching all active filters.
+     */
+    public function export(Request $request)
+    {
+        @set_time_limit(300);
+        @ini_set('memory_limit', '512M');
+
+        $query = $this->buildFilteredQuery($request, true);
+
+        $sortColumn = $request->input('sort_by', 'id');
+        $sortDirection = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $sortColumnMap = [
+            'ref' => 'reference_no',
+            'reference' => 'reference_no',
+            'warehouse' => 'warehouse_name',
+            'category' => 'expense_category_name',
+            'due' => 'due_amount',
+            'paid' => 'paid_amount',
+            'paymentMethod' => 'payment_method',
+            'createdBy' => 'created_by',
+            'user' => 'created_by',
+        ];
+        if (isset($sortColumnMap[$sortColumn])) {
+            $sortColumn = $sortColumnMap[$sortColumn];
+        }
+        $allowedSorts = [
+            'id', 'date', 'amount', 'paid_amount', 'due_amount', 'title',
+            'reference_no', 'warehouse_name', 'expense_category_name',
+            'payment_method', 'payment_status', 'created_by', 'user_name'
+        ];
+        if (!in_array($sortColumn, $allowedSorts, true)) {
+            $sortColumn = 'id';
+        }
+        $query->orderBy($sortColumn, $sortDirection);
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="expenses_export_' . date('Ymd_His') . '.csv"',
+            'X-Accel-Buffering' => 'no',
+            'Cache-Control' => 'no-cache, no-store, must-revalidate',
+            'Pragma' => 'no-cache',
+            'Expires' => '0',
+        ];
+
+        $warehouseFilter = $request->input('warehouse') ?: ($request->input('warehouse_name') ?: 'All');
+        $categoryFilter = $request->input('category_name') ?: ($request->input('category') ?: 'All');
+        $paymentMethodFilter = $request->input('payment_method') ?: ($request->input('payment_type') ?: 'All');
+        $paymentStatusFilter = $request->input('payment_status', 'All');
+        $userFilter = $request->input('created_by') ?: ($request->input('user') ?: 'All');
+        $fromDate = $request->input('from_date') ?: ($request->input('date_from') ?: $request->input('start_date'));
+        $toDate = $request->input('to_date') ?: ($request->input('date_to') ?: $request->input('end_date'));
+        $search = $request->input('search');
+
+        $callback = function () use ($query, $warehouseFilter, $categoryFilter, $paymentMethodFilter, $paymentStatusFilter, $userFilter, $fromDate, $toDate, $search) {
+            $output = fopen('php://output', 'w');
+
+            // 1. UTF-8 BOM for Microsoft Excel on Windows
+            fwrite($output, "\xEF\xBB\xBF");
+
+            // 2. Metadata Header Block
+            fputcsv($output, ['Expense Transactions Export']);
+            fputcsv($output, ['Generated At', date('Y-m-d H:i:s')]);
+            fputcsv($output, ['Warehouse Filter', $warehouseFilter]);
+            fputcsv($output, ['Category Filter', $categoryFilter]);
+            fputcsv($output, ['Payment Method Filter', $paymentMethodFilter]);
+            fputcsv($output, ['Payment Status Filter', $paymentStatusFilter]);
+            fputcsv($output, ['Created By Filter', $userFilter]);
+            fputcsv($output, ['Date Range', ($fromDate ?: 'Beginning') . ' to ' . ($toDate ?: 'Present')]);
+            if (!empty($search)) {
+                fputcsv($output, ['Search Query', $search]);
+            }
+            fputcsv($output, []); // Blank separator line
+
+            // 3. Table Column Headers (12 Columns)
+            fputcsv($output, [
+                'SN',
+                'Reference No',
+                'Warehouse',
+                'Expense Category',
+                'Expense Title',
+                'Amount',
+                'Payment Method',
+                'Created By',
+                'User Role',
+                'Date',
+                'Time',
+                'Details / Notes',
+            ]);
+
+            // 4. Stream Data via toBase()->cursor() (Zero Eloquent Hydration, O(N) streaming)
+            $sn = 1;
+            $totalAmount = 0.0;
+            $flushCounter = 0;
+
+            foreach ($query->toBase()->cursor() as $exp) {
+                $amount = (float)$exp->amount;
+                $totalAmount += $amount;
+
+                $userName = $exp->user_name ?: ($exp->created_by ?: 'System');
+                $userRole = $exp->user_role ?: 'Cashier';
+
+                $dateOnly = $exp->date ? explode(' ', trim($exp->date))[0] : '';
+                $timeStr = '';
+                if ($exp->created_at) {
+                    $timeStr = date('H:i:s', strtotime($exp->created_at));
+                } elseif ($exp->date && strpos($exp->date, ' ') !== false) {
+                    $timeStr = explode(' ', trim($exp->date))[1];
+                }
+
+                fputcsv($output, [
+                    $sn++,
+                    $exp->reference_no,
+                    $exp->warehouse_name ?: 'Main Warehouse Branch',
+                    $exp->expense_category_name ?: 'General',
+                    $exp->title,
+                    number_format($amount, 2, '.', ''),
+                    $exp->payment_method ?: 'Cash',
+                    $userName,
+                    $userRole,
+                    $dateOnly,
+                    $timeStr,
+                    $exp->details ?: '',
+                ]);
+
+                if (++$flushCounter % 500 === 0) {
+                    flush();
+                }
+            }
+
+            // 5. Accounting Summary Totals Row
+            fputcsv($output, [
+                'TOTAL',
+                ($sn - 1) . ' Expenses',
+                '—',
+                '—',
+                '—',
+                number_format($totalAmount, 2, '.', ''),
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+            ]);
+
+            fclose($output);
+        };
+
+        return response()->stream($callback, 200, $headers);
     }
 
     public function store(Request $request)
@@ -195,11 +404,7 @@ class ExpenseController extends Controller
             'payments.*.change_amount'   => 'nullable|numeric',
         ]);
 
-        $refNo = !empty($validated['reference_no']) ? trim($validated['reference_no']) : null;
-        if (empty($refNo)) {
-            $prefix = Setting::get('expense_prefix', 'EXP_');
-            $refNo  = $prefix . date('Ymd') . '-' . rand(1000, 9999);
-        }
+        $refNo = $this->acquireUniqueReference('expense', $validated['reference_no'] ?? null);
 
         $userName = $validated['user_name'] ?? ($validated['created_by'] ?? ($request->user()?->name ?? 'Admin User'));
         $amount   = (float)$validated['amount'];
@@ -300,6 +505,7 @@ class ExpenseController extends Controller
             }
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',
@@ -374,6 +580,7 @@ class ExpenseController extends Controller
             ]);
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',
@@ -398,6 +605,7 @@ class ExpenseController extends Controller
             $expense->delete();
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json(['status' => 'success', 'message' => 'Expense deleted']);
         } catch (\Throwable $e) {
@@ -565,6 +773,7 @@ class ExpenseController extends Controller
             ]);
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',
@@ -658,6 +867,7 @@ class ExpenseController extends Controller
             ]);
 
             DB::commit();
+            ReportController::invalidateDashboardCache();
 
             return response()->json([
                 'status'  => 'success',

@@ -69,10 +69,12 @@ class SupplierCategoryController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'name' => 'required|string|max:255',
+            'name' => 'required|string|max:255|unique:supplier_categories,name',
             'color' => 'nullable|string|max:20',
             'description' => 'nullable|string',
             'status' => 'nullable|string|in:Active,Inactive',
+        ], [
+            'name.unique' => 'ဤကုန်သွင်းသူအုပ်စုအမည် (Supplier Group Name) ရှိပြီးဖြစ်ပါသည်။ အခြားအမည်တစ်ခု သတ်မှတ်ပေးပါ။',
         ]);
 
         $category = SupplierCategory::create([
@@ -133,10 +135,12 @@ class SupplierCategoryController extends Controller
         }
 
         $validated = $request->validate([
-            'name' => 'sometimes|required|string|max:255',
+            'name' => 'sometimes|required|string|max:255|unique:supplier_categories,name,' . $id,
             'color' => 'nullable|string|max:20',
             'description' => 'nullable|string',
             'status' => 'nullable|string|in:Active,Inactive',
+        ], [
+            'name.unique' => 'ဤကုန်သွင်းသူအုပ်စုအမည် (Supplier Group Name) ရှိပြီးဖြစ်ပါသည်။ အခြားအမည်တစ်ခု သတ်မှတ်ပေးပါ။',
         ]);
 
         $oldName = $category->name;

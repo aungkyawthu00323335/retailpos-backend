@@ -68,10 +68,16 @@ class TelegramAiAgentService
      */
     public function getModel(): string
     {
-        $default = $this->getProvider() === 'openai' ? 'gpt-4o-mini' : 'gemini-3.5-flash-lite';
+        $provider = $this->getProvider();
+        $default = match($provider) {
+            'openai' => 'gpt-4o-mini',
+            'deepseek' => 'deepseek-chat',
+            'anthropic' => 'claude-3-5-haiku-20241022',
+            default => 'gemini-2.0-flash',
+        };
         $model = trim((string)Setting::get('telegram_bot_ai_model', $default));
-        if (empty($model) || in_array($model, ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.0-pro', 'gemini-3.7-flash'])) {
-            return $this->getProvider() === 'openai' ? 'gpt-4o-mini' : 'gemini-3.5-flash-lite';
+        if (empty($model)) {
+            return $default;
         }
         return $model;
     }
@@ -133,12 +139,16 @@ class TelegramAiAgentService
             $systemPrompt = $this->buildSystemPrompt($context);
             $history = $this->getChatHistoryForLlm($chatId);
 
-            // 3. Call LLM Provider (Gemini or OpenAI)
+            // 3. Call LLM Provider (Gemini, OpenAI, DeepSeek, Anthropic)
             $provider = $this->getProvider();
             $result = null;
 
             if ($provider === 'openai') {
                 $result = $this->callOpenAi($apiKey, $this->getModel(), $systemPrompt, $history, $customerQuery);
+            } elseif ($provider === 'deepseek') {
+                $result = $this->callDeepSeek($apiKey, $this->getModel(), $systemPrompt, $history, $customerQuery);
+            } elseif ($provider === 'anthropic') {
+                $result = $this->callAnthropic($apiKey, $this->getModel(), $systemPrompt, $history, $customerQuery);
             } else {
                 $result = $this->callGemini($apiKey, $this->getModel(), $systemPrompt, $history, $customerQuery);
             }
@@ -508,9 +518,9 @@ EOT;
         array $history,
         string $userMessage
     ): ?array {
-        $cleanModel = ltrim($model ?: 'gemini-3.5-flash-lite', '/');
-        if (in_array($cleanModel, ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.0-pro', 'gemini-3.7-flash', 'gemini-flash-latest', 'gemini-3.8-flash'])) {
-            $cleanModel = 'gemini-3.5-flash-lite';
+        $cleanModel = ltrim($model ?: 'gemini-2.0-flash', '/');
+        if (in_array($cleanModel, ['gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-flash-latest'])) {
+            $cleanModel = 'gemini-2.0-flash';
         }
 
         $contents = [];
@@ -539,9 +549,10 @@ EOT;
 
         $candidateModels = array_unique([
             $cleanModel,
-            'gemini-3.5-flash-lite',
-            'gemini-3.5-flash',
-            'gemini-flash-lite-latest',
+            'gemini-2.0-flash',
+            'gemini-1.5-flash',
+            'gemini-2.0-flash-lite',
+            'gemini-1.5-pro',
         ]);
         $response = null;
 
@@ -620,6 +631,104 @@ EOT;
 
         $resJson = $response->json();
         $rawText = $resJson['choices'][0]['message']['content'] ?? null;
+        if (!$rawText) return null;
+
+        return $this->parseLlmJsonOutput($rawText);
+    }
+
+    /**
+     * 🌐 Call DeepSeek API (OpenAI Compatible)
+     */
+    protected function callDeepSeek(
+        string $apiKey,
+        string $model,
+        string $systemPrompt,
+        array $history,
+        string $userMessage
+    ): ?array {
+        $endpoint = 'https://api.deepseek.com/chat/completions';
+
+        $messages = [
+            ['role' => 'system', 'content' => $systemPrompt],
+        ];
+        foreach ($history as $h) {
+            $messages[] = [
+                'role' => $h['role'],
+                'content' => $h['content'],
+            ];
+        }
+        $messages[] = ['role' => 'user', 'content' => $userMessage];
+
+        $payload = [
+            'model' => $model ?: 'deepseek-chat',
+            'messages' => $messages,
+            'temperature' => 0.5,
+            'response_format' => ['type' => 'json_object'],
+            'max_tokens' => 2048,
+        ];
+
+        $response = Http::timeout(25)
+            ->withToken($apiKey)
+            ->withoutVerifying()
+            ->post($endpoint, $payload);
+
+        if (!$response->successful()) {
+            Log::error('DeepSeek API error: ' . $response->body());
+            return null;
+        }
+
+        $resJson = $response->json();
+        $rawText = $resJson['choices'][0]['message']['content'] ?? null;
+        if (!$rawText) return null;
+
+        return $this->parseLlmJsonOutput($rawText);
+    }
+
+    /**
+     * 🌐 Call Anthropic Claude API
+     */
+    protected function callAnthropic(
+        string $apiKey,
+        string $model,
+        string $systemPrompt,
+        array $history,
+        string $userMessage
+    ): ?array {
+        $endpoint = 'https://api.anthropic.com/v1/messages';
+
+        $messages = [];
+        foreach ($history as $h) {
+            $messages[] = [
+                'role' => ($h['role'] === 'user') ? 'user' : 'assistant',
+                'content' => $h['content'],
+            ];
+        }
+        $messages[] = ['role' => 'user', 'content' => $userMessage];
+
+        $payload = [
+            'model' => $model ?: 'claude-3-5-haiku-20241022',
+            'system' => $systemPrompt,
+            'messages' => $messages,
+            'max_tokens' => 2048,
+            'temperature' => 0.5,
+        ];
+
+        $response = Http::timeout(25)
+            ->withHeaders([
+                'x-api-key' => $apiKey,
+                'anthropic-version' => '2023-06-01',
+                'content-type' => 'application/json',
+            ])
+            ->withoutVerifying()
+            ->post($endpoint, $payload);
+
+        if (!$response->successful()) {
+            Log::error('Anthropic API error: ' . $response->body());
+            return null;
+        }
+
+        $resJson = $response->json();
+        $rawText = $resJson['content'][0]['text'] ?? null;
         if (!$rawText) return null;
 
         return $this->parseLlmJsonOutput($rawText);
@@ -1291,13 +1400,54 @@ EOT;
                 }
                 $err = $res->json('error.message') ?? $res->body();
                 return ['ok' => false, 'message' => "OpenAI Connection Failed: {$err}"];
+            } elseif ($provider === 'deepseek') {
+                $endpoint = 'https://api.deepseek.com/chat/completions';
+                $useModel = $model ?: 'deepseek-chat';
+                $res = Http::timeout(10)->withToken($apiKey)->withoutVerifying()->post($endpoint, [
+                    'model' => $useModel,
+                    'messages' => [['role' => 'user', 'content' => 'Hello, respond with: OK']],
+                    'max_tokens' => 10,
+                ]);
+                $latency = round((microtime(true) - $startTime) * 1000);
+                if ($res->successful()) {
+                    return [
+                        'ok' => true,
+                        'provider' => 'DeepSeek',
+                        'model' => $useModel,
+                        'latency_ms' => $latency,
+                        'message' => "Connected successfully to DeepSeek ({$useModel}) in {$latency}ms.",
+                    ];
+                }
+                $err = $res->json('error.message') ?? $res->body();
+                return ['ok' => false, 'message' => "DeepSeek Connection Failed: {$err}"];
+            } elseif ($provider === 'anthropic') {
+                $endpoint = 'https://api.anthropic.com/v1/messages';
+                $useModel = $model ?: 'claude-3-5-haiku-20241022';
+                $res = Http::timeout(12)->withHeaders([
+                    'x-api-key' => $apiKey,
+                    'anthropic-version' => '2023-06-01',
+                    'content-type' => 'application/json',
+                ])->withoutVerifying()->post($endpoint, [
+                    'model' => $useModel,
+                    'max_tokens' => 10,
+                    'messages' => [['role' => 'user', 'content' => 'Hello, respond with: OK']],
+                ]);
+                $latency = round((microtime(true) - $startTime) * 1000);
+                if ($res->successful()) {
+                    return [
+                        'ok' => true,
+                        'provider' => 'Anthropic Claude',
+                        'model' => $useModel,
+                        'latency_ms' => $latency,
+                        'message' => "Connected successfully to Anthropic Claude ({$useModel}) in {$latency}ms.",
+                    ];
+                }
+                $err = $res->json('error.message') ?? $res->body();
+                return ['ok' => false, 'message' => "Anthropic Claude Connection Failed: {$err}"];
             } else {
                 // Gemini test
-                $cleanModel = ltrim($model ?: 'gemini-3.7-flash', '/');
-                if (in_array($cleanModel, ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.0-pro'])) {
-                    $cleanModel = 'gemini-3.7-flash';
-                }
-                $candidateModels = array_unique([$cleanModel, 'gemini-3.7-flash', 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest']);
+                $cleanModel = ltrim($model ?: 'gemini-2.0-flash', '/');
+                $candidateModels = array_unique([$cleanModel, 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro']);
                 $res = null;
                 $activeModel = $cleanModel;
 

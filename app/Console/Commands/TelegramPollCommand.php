@@ -83,13 +83,10 @@ class TelegramPollCommand extends Command
                     }
                 }
 
-                $response = Http::connectTimeout(20)
-                    ->timeout(35)
-                    ->withoutVerifying()
-                    ->get("https://api.telegram.org/bot{$token}/getUpdates", [
-                        'offset' => $offset,
-                        'timeout' => 20,
-                    ]);
+                $response = $botService->client(35, 20)->get("https://api.telegram.org/bot{$token}/getUpdates", [
+                    'offset' => $offset,
+                    'timeout' => 20,
+                ]);
 
                 if ($response->successful() && $response->json('ok')) {
                     $updates = $response->json('result') ?? [];

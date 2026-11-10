@@ -14,6 +14,15 @@ use Illuminate\Http\Resources\Json\JsonResource;
  */
 class ProductListResource extends JsonResource
 {
+    private static ?array $cachedOutletsMap = null;
+    private static ?object $cachedDefaultOutlet = null;
+
+    public static function clearStaticCache(): void
+    {
+        self::$cachedOutletsMap = null;
+        self::$cachedDefaultOutlet = null;
+    }
+
     public function toArray(Request $request): array
     {
         $user = \App\Models\User::resolveFromRequest($request);
@@ -113,31 +122,37 @@ class ProductListResource extends JsonResource
                 ? ProductVariantResource::collection($this->variants)
                 : [],
             'warehouse_stocks' => $this->relationLoaded('stockBalances') && $this->stockBalances->isNotEmpty()
-                ? $this->stockBalances->map(function ($sb) {
-                    static $outletsMap = null;
-                    if ($outletsMap === null) {
-                        $outletsMap = \App\Models\Outlet::pluck('name', 'id')->toArray();
+                ? (function () {
+                    if (self::$cachedOutletsMap === null) {
+                        self::$cachedOutletsMap = \App\Models\Outlet::pluck('name', 'id')->toArray();
                     }
                     $variantsMap = $this->relationLoaded('variants')
                         ? $this->variants->pluck('name', 'id')->toArray()
                         : [];
-                    return [
-                        'warehouse_id' => (int)$sb->warehouse_id,
-                        'warehouse_name' => $outletsMap[$sb->warehouse_id] ?? ('Warehouse #' . $sb->warehouse_id),
-                        'product_variant_id' => $sb->product_variant_id ? (int)$sb->product_variant_id : null,
-                        'variant_name' => $sb->product_variant_id ? ($variantsMap[$sb->product_variant_id] ?? '') : '',
-                        'quantity' => (float)$sb->quantity,
-                    ];
-                })->values()->all()
+                    return $this->stockBalances->map(function ($sb) use ($variantsMap) {
+                        return [
+                            'warehouse_id' => (int)$sb->warehouse_id,
+                            'warehouse_name' => self::$cachedOutletsMap[$sb->warehouse_id] ?? ('Warehouse #' . $sb->warehouse_id),
+                            'product_variant_id' => $sb->product_variant_id ? (int)$sb->product_variant_id : null,
+                            'variant_name' => $sb->product_variant_id ? ($variantsMap[$sb->product_variant_id] ?? '') : '',
+                            'quantity' => (float)$sb->quantity,
+                        ];
+                    })->values()->all();
+                })()
                 : ((float)$this->stock_quantity > 0
                     ? [
-                        [
-                            'warehouse_id' => (int)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->id ?? 1),
-                            'warehouse_name' => (string)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet'),
-                            'product_variant_id' => null,
-                            'variant_name' => '',
-                            'quantity' => (float)$this->stock_quantity,
-                        ]
+                        (function () {
+                            if (self::$cachedDefaultOutlet === null) {
+                                self::$cachedDefaultOutlet = \App\Models\Outlet::where('is_active', true)->orderBy('id')->first();
+                            }
+                            return [
+                                'warehouse_id' => (int)(self::$cachedDefaultOutlet?->id ?? 1),
+                                'warehouse_name' => (string)(self::$cachedDefaultOutlet?->name ?? 'Main Branch Outlet'),
+                                'product_variant_id' => null,
+                                'variant_name' => '',
+                                'quantity' => (float)$this->stock_quantity,
+                            ];
+                        })()
                     ]
                     : []
                 ),

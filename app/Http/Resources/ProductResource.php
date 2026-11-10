@@ -143,12 +143,21 @@ class ProductResource extends JsonResource
                 })->values()
                 : ((float)$this->stock_quantity > 0
                     ? [
-                        [
-                            'warehouse_id' => (int)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->id ?? 1),
-                            'warehouse_name' => (string)(\App\Models\Outlet::where('is_active', true)->orderBy('id')->first()?->name ?? 'Main Branch Outlet'),
-                            'product_variant_id' => null,
-                            'quantity' => (float)$this->stock_quantity,
-                        ]
+                        (function () {
+                            static $defOutletId = null;
+                            static $defOutletName = null;
+                            if ($defOutletId === null) {
+                                $def = \App\Models\Outlet::where('is_active', true)->orderBy('id')->first();
+                                $defOutletId = (int)($def?->id ?? 1);
+                                $defOutletName = (string)($def?->name ?? 'Main Branch Outlet');
+                            }
+                            return [
+                                'warehouse_id' => $defOutletId,
+                                'warehouse_name' => $defOutletName,
+                                'product_variant_id' => null,
+                                'quantity' => (float)$this->stock_quantity,
+                            ];
+                        })()
                     ]
                     : []
                 ),

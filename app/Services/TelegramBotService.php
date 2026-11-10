@@ -73,6 +73,36 @@ class TelegramBotService
         return $this->apiUrl;
     }
 
+    /**
+     * Pre-configured HTTP client with forced IPv4 resolution, Windows SSL support,
+     * and synchronous CurlHandler to prevent curl_multi socket stalling on TAP VPN adapters.
+     */
+    public function client(int $timeout = 25, int $connectTimeout = 15): \Illuminate\Http\Client\PendingRequest
+    {
+        $req = Http::connectTimeout($connectTimeout)
+            ->timeout($timeout)
+            ->withoutVerifying()
+            ->withOptions([
+                'force_ip_resolve' => 'v4',
+                'curl' => [
+                    CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+                ],
+            ]);
+
+        // In Windows/TAP VPN environments, Guzzle's default CurlMultiHandler stalls on connection.
+        // Attaching synchronous CurlHandler ensures instant and resilient cURL execution through VPNs.
+        if (!app()->runningUnitTests()) {
+            $guzzle = new \GuzzleHttp\Client([
+                'handler' => \GuzzleHttp\HandlerStack::create(new \GuzzleHttp\Handler\CurlHandler()),
+                'force_ip_resolve' => 'v4',
+                'verify' => false,
+            ]);
+            $req->setClient($guzzle);
+        }
+
+        return $req;
+    }
+
     public function isConfigured(): bool
     {
         $this->ensureFreshToken();
@@ -82,15 +112,20 @@ class TelegramBotService
     /**
      * Test Bot Token via getMe
      */
-    public function getMe(): array
+    public function getMe(?string $customToken = null): array
     {
-        if (!$this->isConfigured()) {
+        $token = $customToken ? trim($customToken) : $this->token;
+        if (empty($token)) {
+            $this->ensureFreshToken();
+            $token = $this->token;
+        }
+        if (empty($token)) {
             return ['ok' => false, 'description' => 'Telegram Bot Token is not configured.'];
         }
 
         try {
-            $response = Http::timeout(10)->withoutVerifying()->get("{$this->getApiUrl()}/getMe");
-            return $response->json();
+            $response = $this->client(20, 15)->retry(2, 500)->get("https://api.telegram.org/bot{$token}/getMe");
+            return $response->json() ?? ['ok' => false, 'description' => 'Empty response from Telegram'];
         } catch (\Throwable $e) {
             Log::error('Telegram getMe failed: ' . $e->getMessage());
             return ['ok' => false, 'description' => $e->getMessage()];
@@ -115,7 +150,7 @@ class TelegramBotService
         }
 
         try {
-            $response = Http::timeout(15)->withoutVerifying()->post("{$this->getApiUrl()}/setWebhook", $payload);
+            $response = $this->client(15, 8)->post("{$this->getApiUrl()}/setWebhook", $payload);
             return $response->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('Telegram setWebhook failed: ' . $e->getMessage());
@@ -133,7 +168,7 @@ class TelegramBotService
         }
 
         try {
-            $response = Http::timeout(15)->withoutVerifying()->post("{$this->getApiUrl()}/deleteWebhook", [
+            $response = $this->client(15, 8)->post("{$this->getApiUrl()}/deleteWebhook", [
                 'drop_pending_updates' => $dropPendingUpdates,
             ]);
             return $response->json() ?? ['ok' => false];
@@ -153,7 +188,7 @@ class TelegramBotService
         }
 
         try {
-            $res = Http::timeout(10)->withoutVerifying()->get("{$this->getApiUrl()}/getWebhookInfo");
+            $res = $this->client(10, 5)->get("{$this->getApiUrl()}/getWebhookInfo");
             return $res->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('getWebhookInfo error: ' . $e->getMessage());
@@ -186,7 +221,7 @@ class TelegramBotService
                 ];
             }
 
-            $response = Http::timeout(15)->withoutVerifying()->post("{$this->getApiUrl()}/setChatMenuButton", $payload);
+            $response = $this->client(15, 8)->asJson()->post("{$this->getApiUrl()}/setChatMenuButton", $payload);
             return $response->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('Telegram setChatMenuButton failed: ' . $e->getMessage());
@@ -214,7 +249,7 @@ class TelegramBotService
         ];
 
         try {
-            $response = Http::timeout(10)->withoutVerifying()->post("{$this->getApiUrl()}/setMyCommands", [
+            $response = $this->client(15, 8)->asJson()->post("{$this->getApiUrl()}/setMyCommands", [
                 'commands' => $commands,
             ]);
             $res = $response->json() ?? ['ok' => false];
@@ -297,7 +332,7 @@ class TelegramBotService
         }
 
         try {
-            $response = Http::connectTimeout(2)->timeout(3)->withoutVerifying()->post("{$this->getApiUrl()}/sendChatAction", [
+            $response = $this->client(10, 5)->asJson()->post("{$this->getApiUrl()}/sendChatAction", [
                 'chat_id' => (string)$chatId,
                 'action' => $action,
             ]);
@@ -331,19 +366,13 @@ class TelegramBotService
                 $payload['reply_to_message_id'] = $replyToMessageId;
             }
 
-            $response = Http::connectTimeout(15)
-                ->timeout(25)
-                ->withoutVerifying()
-                ->post("{$this->getApiUrl()}/sendMessage", $payload);
+            $response = $this->client(25, 15)->retry(2, 300)->asJson()->post("{$this->getApiUrl()}/sendMessage", $payload);
             $resData = $response->json() ?? ['ok' => false];
 
             // If Markdown parsing fails (e.g. customer address or name has special characters), fallback to plain text
             if (empty($resData['ok']) && !empty($resData['description']) && (str_contains($resData['description'], "can't parse entities") || str_contains($resData['description'], "Bad Request"))) {
                 unset($payload['parse_mode']);
-                $retryRes = Http::connectTimeout(15)
-                    ->timeout(25)
-                    ->withoutVerifying()
-                    ->post("{$this->getApiUrl()}/sendMessage", $payload);
+                $retryRes = $this->client(25, 15)->asJson()->post("{$this->getApiUrl()}/sendMessage", $payload);
                 return $retryRes->json() ?? ['ok' => false];
             }
 
@@ -362,10 +391,7 @@ class TelegramBotService
                     if ($replyToMessageId) {
                         $plainPayload['reply_to_message_id'] = $replyToMessageId;
                     }
-                    $retryRes = Http::connectTimeout(15)
-                        ->timeout(25)
-                        ->withoutVerifying()
-                        ->post("{$this->getApiUrl()}/sendMessage", $plainPayload);
+                    $retryRes = $this->client(25, 15)->asJson()->post("{$this->getApiUrl()}/sendMessage", $plainPayload);
                     $resFallback = $retryRes->json() ?? ['ok' => false];
                     if (!empty($resFallback['ok'])) {
                         return $resFallback;
@@ -457,14 +483,14 @@ class TelegramBotService
                 $fileName = basename($localFilePath);
                 $fileContents = file_get_contents($localFilePath);
 
-                $request = Http::connectTimeout(15)->timeout(25)->retry(2, 300)->withoutVerifying()->attach('photo', $fileContents, $fileName);
+                $request = $this->client(25, 15)->retry(2, 300)->attach('photo', $fileContents, $fileName);
                 $response = $request->post("{$this->getApiUrl()}/sendPhoto", $payload);
                 $resData = $response->json() ?? ['ok' => false];
 
                 // Retry without Markdown if parse error occurs
                 if (empty($resData['ok']) && str_contains($resData['description'] ?? '', "can't parse entities")) {
                     unset($payload['parse_mode']);
-                    $retryReq = Http::connectTimeout(15)->timeout(25)->withoutVerifying()->attach('photo', $fileContents, $fileName);
+                    $retryReq = $this->client(25, 15)->attach('photo', $fileContents, $fileName);
                     $retryRes = $retryReq->post("{$this->getApiUrl()}/sendPhoto", $payload);
                     return $retryRes->json() ?? ['ok' => false];
                 }
@@ -475,12 +501,12 @@ class TelegramBotService
             // If it's a valid remote URL (http/https and NOT 127.0.0.1 / localhost)
             if (filter_var($photoSource, FILTER_VALIDATE_URL) && !str_contains($photoSource, '127.0.0.1') && !str_contains($photoSource, 'localhost')) {
                 $payload['photo'] = $photoSource;
-                $response = Http::connectTimeout(15)->timeout(20)->retry(2, 300)->withoutVerifying()->post("{$this->getApiUrl()}/sendPhoto", $payload);
+                $response = $this->client(20, 15)->retry(2, 300)->post("{$this->getApiUrl()}/sendPhoto", $payload);
                 $resData = $response->json() ?? ['ok' => false];
 
                 if (empty($resData['ok']) && str_contains($resData['description'] ?? '', "can't parse entities")) {
                     unset($payload['parse_mode']);
-                    $retryRes = Http::connectTimeout(15)->timeout(20)->withoutVerifying()->post("{$this->getApiUrl()}/sendPhoto", $payload);
+                    $retryRes = $this->client(20, 15)->post("{$this->getApiUrl()}/sendPhoto", $payload);
                     return $retryRes->json() ?? ['ok' => false];
                 }
 
@@ -514,7 +540,7 @@ class TelegramBotService
                 $payload['reply_markup'] = json_encode($replyMarkup);
             }
 
-            $response = Http::connectTimeout(8)->timeout(12)->withoutVerifying()->post("{$this->getApiUrl()}/editMessageText", $payload);
+            $response = $this->client(20, 10)->retry(2, 300)->asJson()->post("{$this->getApiUrl()}/editMessageText", $payload);
             $resData = $response->json() ?? ['ok' => false];
 
             if (empty($resData['ok'])) {
@@ -526,7 +552,7 @@ class TelegramBotService
                 // If entities parsing error, retry without parse_mode
                 if (str_contains($resData['description'] ?? '', "can't parse entities")) {
                     unset($payload['parse_mode']);
-                    $retryRes = Http::connectTimeout(8)->timeout(12)->withoutVerifying()->post("{$this->getApiUrl()}/editMessageText", $payload);
+                    $retryRes = $this->client(20, 10)->asJson()->post("{$this->getApiUrl()}/editMessageText", $payload);
                     return $retryRes->json() ?? ['ok' => false];
                 }
             }
@@ -557,12 +583,12 @@ class TelegramBotService
                 $payload['reply_markup'] = json_encode($replyMarkup);
             }
 
-            $response = Http::connectTimeout(15)->timeout(20)->retry(2, 300)->withoutVerifying()->post("{$this->getApiUrl()}/editMessageCaption", $payload);
+            $response = $this->client(20, 15)->retry(2, 300)->asJson()->post("{$this->getApiUrl()}/editMessageCaption", $payload);
             $resData = $response->json() ?? ['ok' => false];
 
             if (empty($resData['ok']) && str_contains($resData['description'] ?? '', "can't parse entities")) {
                 unset($payload['parse_mode']);
-                $retryRes = Http::connectTimeout(15)->timeout(20)->withoutVerifying()->post("{$this->getApiUrl()}/editMessageCaption", $payload);
+                $retryRes = $this->client(20, 15)->asJson()->post("{$this->getApiUrl()}/editMessageCaption", $payload);
                 return $retryRes->json() ?? ['ok' => false];
             }
 
@@ -590,7 +616,7 @@ class TelegramBotService
                 $payload['reply_markup'] = json_encode($replyMarkup);
             }
 
-            $response = Http::connectTimeout(15)->timeout(20)->retry(2, 300)->withoutVerifying()->post("{$this->getApiUrl()}/editMessageReplyMarkup", $payload);
+            $response = $this->client(20, 15)->retry(2, 300)->asJson()->post("{$this->getApiUrl()}/editMessageReplyMarkup", $payload);
             return $response->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('Telegram editMessageReplyMarkup error: ' . $e->getMessage());
@@ -624,7 +650,7 @@ class TelegramBotService
         if (!$this->isConfigured()) return ['ok' => false];
 
         try {
-            $response = Http::connectTimeout(5)->timeout(10)->withoutVerifying()->post("{$this->getApiUrl()}/deleteMessage", [
+            $response = $this->client(10, 6)->asJson()->post("{$this->getApiUrl()}/deleteMessage", [
                 'chat_id' => (string)$chatId,
                 'message_id' => $messageId,
             ]);
@@ -786,19 +812,11 @@ class TelegramBotService
                         $ansPayload['show_alert'] = false;
                     }
                     try {
-                        Http::pool(fn (\Illuminate\Http\Client\Pool $pool) => [
-                            $pool->as('answer')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/answerCallbackQuery", $ansPayload),
-                            $pool->as('edit')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", [
-                                'chat_id' => (string)$chatId,
-                                'message_id' => $messageIdToEdit,
-                                'text' => $emptyMsg,
-                                'parse_mode' => 'Markdown',
-                                'reply_markup' => json_encode($emptyButtons),
-                            ]),
-                        ]);
-                        return;
+                        $this->answerCallbackQuery($callbackQueryId, $toastText);
+                        $res = $this->editMessageText($chatId, $messageIdToEdit, $emptyMsg, $emptyButtons);
+                        if (!empty($res['ok'])) return;
                     } catch (\Throwable $e) {
-                        Log::warning('Parallel sendCartView empty error: ' . $e->getMessage());
+                        Log::warning('sendCartView empty error: ' . $e->getMessage());
                     }
                 } else {
                     $res = $this->editMessageText($chatId, $messageIdToEdit, $emptyMsg, $emptyButtons);
@@ -949,22 +967,11 @@ class TelegramBotService
                 }
 
                 try {
-                    $responses = Http::pool(fn (\Illuminate\Http\Client\Pool $pool) => [
-                        $pool->as('answer')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/answerCallbackQuery", $ansPayload),
-                        $pool->as('edit')->connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", $editPayload),
-                    ]);
-
-                    $editRes = $responses['edit']->json() ?? ['ok' => false];
-                    if (!empty($editRes['ok']) || str_contains($editRes['description'] ?? '', 'message is not modified')) {
-                        return;
-                    }
-                    if (str_contains($editRes['description'] ?? '', "can't parse entities")) {
-                        unset($editPayload['parse_mode']);
-                        Http::connectTimeout(4)->timeout(8)->withoutVerifying()->post("{$apiUrl}/editMessageText", $editPayload);
-                        return;
-                    }
+                    $this->answerCallbackQuery($callbackQueryId, $toastText);
+                    $res = $this->editMessageText($chatId, $messageIdToEdit, $text, $markup);
+                    if (!empty($res['ok'])) return;
                 } catch (\Throwable $e) {
-                    Log::warning('Parallel sendCartView pool error: ' . $e->getMessage());
+                    Log::warning('sendCartView pool error: ' . $e->getMessage());
                 }
             } else {
                 $res = $this->editMessageText($chatId, $messageIdToEdit, $text, $markup);
@@ -1123,7 +1130,7 @@ class TelegramBotService
                 $payload['text'] = $text;
                 $payload['show_alert'] = $showAlert;
             }
-            $res = Http::connectTimeout(3)->timeout(5)->withoutVerifying()->post("{$this->getApiUrl()}/answerCallbackQuery", $payload);
+            $res = $this->client(10, 6)->asJson()->post("{$this->getApiUrl()}/answerCallbackQuery", $payload);
             return $res->json() ?? ['ok' => false];
         } catch (\Throwable $e) {
             Log::error('answerCallbackQuery error: ' . $e->getMessage());
@@ -1139,7 +1146,7 @@ class TelegramBotService
         if (!$this->isConfigured()) return null;
 
         try {
-            $res = Http::timeout(10)->withoutVerifying()->get("{$this->getApiUrl()}/getFile", ['file_id' => $fileId]);
+            $res = $this->client(10, 6)->get("{$this->getApiUrl()}/getFile", ['file_id' => $fileId]);
             if (!$res->successful() || !$res->json('ok')) {
                 return null;
             }
@@ -1147,7 +1154,7 @@ class TelegramBotService
             $filePath = $res->json('result.file_path');
             $fileUrl = "https://api.telegram.org/file/bot{$this->getToken()}/{$filePath}";
 
-            $fileContents = Http::timeout(25)->withoutVerifying()->get($fileUrl)->body();
+            $fileContents = $this->client(25, 15)->get($fileUrl)->body();
             $hash = hash('sha256', $fileContents);
 
             $ext = pathinfo($filePath, PATHINFO_EXTENSION) ?: 'jpg';
@@ -2332,7 +2339,7 @@ class TelegramBotService
         $tmaUrl = Setting::get('telegram_bot_tma_url', '');
         $tmaEnabled = Setting::get('telegram_bot_tma_enabled', '1') === '1';
         $navRow = [];
-        if ($tmaEnabled && !empty($tmaUrl)) {
+        if ($tmaEnabled && !empty($tmaUrl) && str_starts_with($tmaUrl, 'https://')) {
             $navRow[] = ['text' => '🛍️ Shop Now', 'web_app' => ['url' => $tmaUrl]];
         }
         $navRow[] = ['text' => '🏠 ပင်မ မီနူး', 'callback_data' => 'catalog_main'];
@@ -2567,15 +2574,17 @@ class TelegramBotService
             ];
         }
 
-        // Telegram Mini App (TMA) Touch Storefront
+        // Telegram Mini App (TMA) Touch Storefront (Telegram API strictly requires HTTPS)
         if (Setting::get('telegram_bot_tma_enabled', '1') === '1') {
             $tmaUrl = trim(Setting::get('telegram_bot_tma_url', ''));
             if (empty($tmaUrl)) {
                 $tmaUrl = url('/bot/shop');
             }
-            array_unshift($buttons, [
-                ['text' => '🛍️ Mini App ဖြင့်ကြည့်ရှုရန် (Touch App)', 'web_app' => ['url' => $tmaUrl]],
-            ]);
+            if (str_starts_with($tmaUrl, 'https://')) {
+                array_unshift($buttons, [
+                    ['text' => '🛍️ Mini App ဖြင့်ကြည့်ရှုရန် (Touch App)', 'web_app' => ['url' => $tmaUrl]],
+                ]);
+            }
         }
 
         $this->editOrSendMessage($chatId, $messageIdToEdit, $text, ['inline_keyboard' => $buttons]);
@@ -3181,7 +3190,7 @@ class TelegramBotService
 
                 $cardReplyMarkup = !empty($cardButtons) ? ['inline_keyboard' => $cardButtons] : null;
                 $sent = false;
-                if (!empty($imagePath)) {
+                if ($showImageBtn && !empty($imagePath)) {
                     $res = $this->sendPhoto($chatId, $imagePath, $caption, $cardReplyMarkup);
                     if (!empty($res['ok'])) {
                         $sent = true;
@@ -6626,7 +6635,6 @@ class TelegramBotService
                         'name' => !empty($userName) ? $userName : 'Telegram Customer',
                         'phone' => $customerPhone,
                         'tier' => 'Silver Regular',
-                        'reward_points' => 0,
                         'total_spent' => (float)$grandTotal,
                         'total_visits' => 1,
                         'status' => 'Active',
@@ -7003,19 +7011,21 @@ class TelegramBotService
     }
 
     /**
-     * Send Payment Info (Single Source of Truth from PaymentMethod database)
+     * Send Payment Info (Single Source of Truth from PaymentMethod database with full merchant customization)
      */
     public function sendPaymentInfo(int|string $chatId): void
     {
+        $shopName = Setting::get('company_name', 'အလင်းသစ် (Ah Linn Thit)');
+        $phone = Setting::get('company_phone', '09123456789');
+        $address = Setting::get('company_address', 'ရန်ကုန်');
+
         $activeMethods = PaymentMethod::where('is_active', true)
             ->where('is_bot_available', true)
             ->orderBy('is_default', 'desc')
             ->orderBy('id', 'asc')
             ->get();
 
-        $msg = "ℹ️ *ငွေပေးချေရန် နည်းလမ်းများနှင့် အချက်အလက်များ*\n"
-             . "━━━━━━━━━━━━━━━━━━━━━\n\n";
-
+        $methodsText = "";
         if ($activeMethods->isNotEmpty()) {
             foreach ($activeMethods as $pm) {
                 $code = strtoupper($pm->code ?? '');
@@ -7023,12 +7033,12 @@ class TelegramBotService
                 $isCash = ($code === 'CASH' || str_contains($name, 'cash') || str_contains($name, 'cod'));
 
                 if ($isCash) {
-                    $msg .= "💵 *{$pm->name}*\n"
+                    $methodsText .= "💵 *{$pm->name}*\n"
                           . "   ▫️ အမျိုးအစား:     ပစ္စည်းရောက်မှ ငွေချေစနစ် (Cash on Delivery)\n";
                     if (!empty($pm->description)) {
-                        $msg .= "   ▫️ အသေးစိတ်:     {$pm->description}\n";
+                        $methodsText .= "   ▫️ အသေးစိတ်:     {$pm->description}\n";
                     }
-                    $msg .= "\n";
+                    $methodsText .= "\n";
                     continue;
                 }
 
@@ -7040,17 +7050,17 @@ class TelegramBotService
                     default => '💳',
                 };
 
-                $msg .= "{$icon} *{$pm->name}*\n";
+                $methodsText .= "{$icon} *{$pm->name}*\n";
                 if (!empty($pm->account_name)) {
-                    $msg .= "   ▫️ အကောင့်အမည်:   `{$pm->account_name}`\n";
+                    $methodsText .= "   ▫️ အကောင့်အမည်:   `{$pm->account_name}`\n";
                 }
                 if (!empty($pm->account_number)) {
-                    $msg .= "   ▫️ အကောင့်နံပါတ်:  `{$pm->account_number}` _(နှိပ်၍ ကူးယူပါ)_\n";
+                    $methodsText .= "   ▫️ အကောင့်နံပါတ်:  `{$pm->account_number}` _(နှိပ်၍ ကူးယူပါ)_\n";
                 }
                 if (!empty($pm->description)) {
-                    $msg .= "   ▫️ မှတ်ချက်:      {$pm->description}\n";
+                    $methodsText .= "   ▫️ မှတ်ချက်:      {$pm->description}\n";
                 }
-                $msg .= "\n";
+                $methodsText .= "\n";
             }
         } else {
             // Fallback to legacy settings if payment methods table has none enabled
@@ -7061,19 +7071,35 @@ class TelegramBotService
             $other = Setting::get('telegram_bot_other_bank_info');
             $generic = Setting::get('telegram_bot_payment_info');
 
-            if ($kpay) $msg .= "📱 *KBZPay:* {$kpay}\n\n";
-            if ($wave) $msg .= "📱 *WavePay:* {$wave}\n\n";
-            if ($aya) $msg .= "📱 *AYA Pay:* {$aya}\n\n";
-            if ($cb) $msg .= "📱 *CB Pay:* {$cb}\n\n";
-            if ($other) $msg .= "🏦 *ဘဏ်အကောင့်:* {$other}\n\n";
+            if ($kpay) $methodsText .= "📱 *KBZPay:* {$kpay}\n\n";
+            if ($wave) $methodsText .= "📱 *WavePay:* {$wave}\n\n";
+            if ($aya) $methodsText .= "📱 *AYA Pay:* {$aya}\n\n";
+            if ($cb) $methodsText .= "📱 *CB Pay:* {$cb}\n\n";
+            if ($other) $methodsText .= "🏦 *ဘဏ်အကောင့်:* {$other}\n\n";
 
             if (!$kpay && !$wave && !$aya && !$cb && !$other && $generic) {
-                $msg .= "{$generic}\n\n";
+                $methodsText .= "{$generic}\n\n";
             }
         }
 
-        $msg .= "━━━━━━━━━━━━━━━━━━━━━\n"
-             . "ပစ္စည်းများ မှာယူလိုပါက '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်' ကို နှိပ်၍ မှာယူနိုင်ပါသည်ရှင်။ 🙏";
+        $methodsText = trim($methodsText);
+
+        $customPaymentMsg = Setting::get('telegram_bot_payment_instructions_msg', '');
+        if (!empty(trim($customPaymentMsg))) {
+            $msg = $this->replacePlaceholders($customPaymentMsg, [
+                'payment_methods' => $methodsText,
+                'shop_name' => $shopName,
+                'shop_phone' => $phone,
+                'shop_address' => $address,
+            ]);
+        } else {
+            $catalogBtn = Setting::get('telegram_bot_btn_catalog', '🛍️ ကုန်ပစ္စည်းများ');
+            $msg = "ℹ️ *ငွေပေးချေရန် နည်းလမ်းများနှင့် အချက်အလက်များ*\n"
+                 . "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 . ($methodsText ? "{$methodsText}\n\n" : "")
+                 . "━━━━━━━━━━━━━━━━━━━━━\n"
+                 . "ပစ္စည်းများ မှာယူလိုပါက '{$catalogBtn}' ကို နှိပ်၍ မှာယူနိုင်ပါသည်ရှင်။ 🙏";
+        }
 
         $this->sendMessage($chatId, $msg, $this->getMainKeyboard($chatId));
     }
@@ -7916,15 +7942,17 @@ class TelegramBotService
             ]
         ];
 
-        // Telegram Mini App (TMA) Touch Storefront button
+        // Telegram Mini App (TMA) Touch Storefront button (Telegram API strictly requires HTTPS)
         if (Setting::get('telegram_bot_tma_enabled', '1') === '1') {
             $tmaUrl = trim(Setting::get('telegram_bot_tma_url', ''));
             if (empty($tmaUrl)) {
                 $tmaUrl = url('/bot/shop');
             }
-            array_unshift($inlineKeyboard, [
-                ['text' => '🛍️ Mini App ဖြင့်ဖွင့်ကြည့်ရန်', 'web_app' => ['url' => $tmaUrl]]
-            ]);
+            if (str_starts_with($tmaUrl, 'https://')) {
+                array_unshift($inlineKeyboard, [
+                    ['text' => '🛍️ Mini App ဖြင့်ဖွင့်ကြည့်ရန်', 'web_app' => ['url' => $tmaUrl]]
+                ]);
+            }
         }
 
         $markup = ['inline_keyboard' => $inlineKeyboard];

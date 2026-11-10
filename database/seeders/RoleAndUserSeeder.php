@@ -128,6 +128,130 @@ class RoleAndUserSeeder extends Seeder
             ]
         );
 
+        // 2. Store Manager Role
+        $storeManagerPermissions = [
+            'dashboard.view',
+            'products.view', 'products.create', 'products.update', 'products.delete', 'products.view_cost', 'products.export', 'products.import',
+            'barcode.view', 'barcode.create',
+            'product_categories.view', 'product_categories.create', 'product_categories.update', 'product_categories.delete',
+            'sub_categories.view', 'sub_categories.create', 'sub_categories.update', 'sub_categories.delete',
+            'variations.view', 'variations.create', 'variations.update', 'variations.delete',
+            'brands.view', 'brands.create', 'brands.update', 'brands.delete',
+            'units.view', 'units.create', 'units.update', 'units.delete',
+            'adjustments.view', 'adjustments.create', 'adjustments.update', 'adjustments.delete', 'adjustments.approve', 'adjustments.export',
+            'quotations.view', 'quotations.create', 'quotations.update', 'quotations.delete', 'quotations.convert_sale', 'quotations.export',
+            'purchases.view', 'purchases.create', 'purchases.update', 'purchases.delete', 'purchases.pay', 'purchases.export',
+            'purchase_returns.view', 'purchase_returns.create', 'purchase_returns.update', 'purchase_returns.delete', 'purchase_returns.pay', 'purchase_returns.export',
+            'sales.view', 'sales.create', 'sales.update', 'sales.delete', 'sales.void', 'sales.refund', 'sales.pay', 'sales.export',
+            'pos.view', 'pos.create', 'pos.checkout',
+            'cash_register.view', 'cash_register.open_close', 'cash_register.safe_drop', 'cash_register.view_expected',
+            'sale_returns.view', 'sale_returns.create', 'sale_returns.update', 'sale_returns.delete', 'sale_returns.pay', 'sale_returns.export',
+            'bot_orders.view', 'bot_orders.update', 'bot_orders.approve', 'bot_orders.dispatch',
+            'bot_chat.view', 'bot_chat.create',
+            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.export',
+            'expenses.view', 'expenses.create', 'expenses.update', 'expenses.pay', 'expenses.export',
+            'expense_categories.view', 'expense_categories.create', 'expense_categories.update',
+            'processings.view', 'processings.create', 'processings.update', 'processings.export',
+            'customers.view', 'customers.create', 'customers.update', 'customers.delete', 'customers.export', 'customers.import',
+            'customer_groups.view', 'customer_groups.create', 'customer_groups.update', 'customer_groups.delete',
+            'suppliers.view', 'suppliers.create', 'suppliers.update', 'suppliers.delete', 'suppliers.export', 'suppliers.import',
+            'supplier_categories.view', 'supplier_categories.create', 'supplier_categories.update', 'supplier_categories.delete',
+            'users.view', 'users.create', 'users.update',
+            'roles.view',
+            'reports.view', 'reports.export', 'report_sales.view', 'report_purchases.view', 'report_stock.view',
+            'report_profit_loss.view', 'report_cashier_audit.view', 'report_expense.view', 'report_top_selling.view',
+        ];
+        Role::updateOrCreate(
+            ['slug' => 'store_manager'],
+            [
+                'name' => 'Store Manager',
+                'description' => 'Comprehensive store operations, staff coordination, inventory control, and retail performance analytics.',
+                'color' => '#2563EB',
+                'permissions' => $storeManagerPermissions,
+                'is_default' => false,
+                'status' => 'Active',
+            ]
+        );
+
+        // 3. Cashier Role
+        $cashierPermissions = [
+            'dashboard.view',
+            'pos.view', 'pos.create', 'pos.checkout',
+            'cash_register.view', 'cash_register.open_close', 'cash_register.safe_drop',
+            'sales.view', 'sales.create',
+            'sale_returns.view', 'sale_returns.create',
+            'customers.view', 'customers.create',
+            'products.view', 'barcode.view',
+            'report_sales.view', 'report_cashier_audit.view',
+        ];
+        Role::updateOrCreate(
+            ['slug' => 'cashier'],
+            [
+                'name' => 'Cashier',
+                'description' => 'Fast front-desk checkout, customer billing, and daily cash drawer reconciliation.',
+                'color' => '#059669',
+                'permissions' => $cashierPermissions,
+                'is_default' => false,
+                'status' => 'Active',
+            ]
+        );
+
+        // 4. Inventory Clerk Role
+        $inventoryPermissions = [
+            'dashboard.view',
+            'products.view', 'products.create', 'products.update',
+            'barcode.view', 'barcode.create',
+            'product_categories.view', 'product_categories.create', 'product_categories.update',
+            'sub_categories.view', 'sub_categories.create', 'sub_categories.update',
+            'variations.view', 'variations.create', 'variations.update',
+            'brands.view', 'brands.create', 'brands.update',
+            'units.view', 'units.create', 'units.update',
+            'adjustments.view', 'adjustments.create', 'adjustments.update',
+            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.receive',
+            'purchases.view', 'purchases.create', 'purchases.update',
+            'purchase_returns.view', 'purchase_returns.create',
+            'suppliers.view', 'suppliers.create', 'suppliers.update',
+            'supplier_categories.view',
+            'report_stock.view', 'report_stock_alert.view', 'report_stock_ledger.view',
+        ];
+        Role::updateOrCreate(
+            ['slug' => 'inventory_clerk'],
+            [
+                'name' => 'Inventory Clerk',
+                'description' => 'Stock warehouse control, purchase receiving, batch adjustments, and inventory tracking.',
+                'color' => '#D97706',
+                'permissions' => $inventoryPermissions,
+                'is_default' => false,
+                'status' => 'Active',
+            ]
+        );
+
+        // 5. Accountant Role
+        $accountantPermissions = [
+            'dashboard.view',
+            'expenses.view', 'expenses.create', 'expenses.update', 'expenses.pay', 'expenses.export',
+            'expense_categories.view', 'expense_categories.create', 'expense_categories.update',
+            'sales.view', 'sales.export',
+            'purchases.view', 'purchases.export',
+            'customers.view', 'suppliers.view',
+            'reports.view', 'reports.export',
+            'report_sales.view', 'report_purchases.view', 'report_expense.view',
+            'report_profit_loss.view', 'report_cash_flow.view',
+            'report_ar_aging.view', 'report_ap_aging.view',
+            'report_commercial_tax.view',
+        ];
+        Role::updateOrCreate(
+            ['slug' => 'accountant'],
+            [
+                'name' => 'Accountant',
+                'description' => 'Expense tracking, accounts receivable/payable, taxation reports, and general financial audit.',
+                'color' => '#0284C7',
+                'permissions' => $accountantPermissions,
+                'is_default' => false,
+                'status' => 'Active',
+            ]
+        );
+
         // 2. Super Admin User
         User::where('email', 'admin@infypos.com')->delete();
         $admin = User::updateOrCreate(

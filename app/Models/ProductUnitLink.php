@@ -35,4 +35,9 @@ class ProductUnitLink extends Model
     {
         return $this->belongsTo(ProductVariant::class, 'product_variant_id');
     }
+
+    public function unit()
+    {
+        return $this->belongsTo(ProductUnit::class, 'unit_id');
+    }
 }

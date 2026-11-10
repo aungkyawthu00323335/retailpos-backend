@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\SubCategory;
 use App\Models\ProductCategory;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class SubCategoryController extends Controller
 {
@@ -14,6 +15,24 @@ class SubCategoryController extends Controller
      */
     public function index(Request $request)
     {
+        $hasFilters = $request->filled('search') ||
+            ($request->filled('parent_category') && $request->input('parent_category') !== 'All') ||
+            ($request->filled('status') && $request->input('status') !== 'All') ||
+            $request->filled('sort_by');
+
+        if (!$hasFilters) {
+            $items = Cache::remember('api_sub_categories_list', 60, function () {
+                return SubCategory::withCount('products')
+                    ->orderBy('id', 'desc')
+                    ->get();
+            });
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $items,
+            ]);
+        }
+
         $query = SubCategory::withCount('products');
 
         if ($request->filled('search')) {
@@ -62,6 +81,8 @@ class SubCategoryController extends Controller
         $subCategory->status = ($subCategory->status === 'Active') ? 'Inactive' : 'Active';
         $subCategory->save();
 
+        Cache::forget('api_sub_categories_list');
+
         return response()->json([
             'status' => 'success',
             'message' => 'Sub category status toggled successfully',
@@ -89,6 +110,8 @@ class SubCategoryController extends Controller
             'description' => $validated['description'] ?? null,
             'status' => $validated['status'] ?? 'Active',
         ]);
+
+        Cache::forget('api_sub_categories_list');
 
         return response()->json([
             'status' => 'success',
@@ -135,6 +158,8 @@ class SubCategoryController extends Controller
 
         $subCategory->update($validated);
 
+        Cache::forget('api_sub_categories_list');
+
         return response()->json([
             'status' => 'success',
             'message' => 'Sub category updated successfully',
@@ -161,6 +186,8 @@ class SubCategoryController extends Controller
         }
 
         $subCategory->delete();
+
+        Cache::forget('api_sub_categories_list');
 
         return response()->json([
             'status' => 'success',

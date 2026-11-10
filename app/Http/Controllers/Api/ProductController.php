@@ -18,6 +18,7 @@ use App\Http\Requests\StoreProductRequest;
 use App\Http\Resources\ProductResource;
 use App\Http\Resources\ProductListResource;
 use App\Services\ProductCreateService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 
@@ -76,33 +77,94 @@ class ProductController extends Controller
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
-            $query->where(function ($q) use ($search) {
-                $q->where('code', $search)
-                  ->orWhere('sku', $search)
-                  ->orWhere('barcode', $search)
-                  ->orWhere('code', 'like', "%{$search}%")
-                  ->orWhere('sku', 'like', "%{$search}%")
-                  ->orWhere('barcode', 'like', "%{$search}%")
-                  ->orWhere('name', 'like', "%{$search}%")
-                  ->orWhere('alternative_name', 'like', "%{$search}%")
-                  ->orWhere('brand_name', 'like', "%{$search}%")
-                  ->orWhere('category_name', 'like', "%{$search}%")
-                  ->orWhere('sub_category_name', 'like', "%{$search}%")
-                  ->orWhere('sub_category_id', is_numeric($search) ? (int)$search : -1)
-                  ->orWhereIn('id', function ($sub) use ($search) {
-                      $sub->select('product_id')
-                          ->from('product_variants')
-                          ->where('name', 'like', "%{$search}%")
-                          ->orWhere('sku', 'like', "%{$search}%")
-                          ->orWhere('barcode', 'like', "%{$search}%");
-                  })
-                  ->orWhereIn('id', function ($sub) use ($search) {
-                      $sub->select('pv.product_id')
-                          ->from('product_variants as pv')
-                          ->join('product_variant_values as pvv', 'pv.id', '=', 'pvv.product_variant_id')
-                          ->where('pvv.attribute_value', 'like', "%{$search}%")
-                          ->orWhere('pvv.attribute_name', 'like', "%{$search}%");
-                  });
+            $isAsciiOnly = (bool)preg_match('/^[\x20-\x7E]+$/', $search);
+            $cleanSearch = $search;
+            $isNumeric = is_numeric($cleanSearch);
+            $intVal = $isNumeric ? (int)$cleanSearch : null;
+            $padded6 = $isNumeric ? sprintf('%06d', $intVal) : null;
+
+            $extractedNumber = null;
+            $extractedPadded = null;
+            if ($isAsciiOnly && preg_match('/^(?:(PRD|SKU)[-_ ]*)?0*([1-9][0-9]*|[0-9]+)$/i', $cleanSearch, $m)) {
+                $numStr = $m[2] ?? '';
+                if ($numStr !== '') {
+                    $extractedNumber = (int)$numStr;
+                    $extractedPadded = sprintf('%06d', $extractedNumber);
+                }
+            }
+
+            // Variant product IDs lookup
+            $variantProductIds = [];
+            if ($isAsciiOnly && strlen($cleanSearch) >= 2) {
+                $variantProductIds = ProductVariant::where('sku', $search)
+                    ->orWhere('barcode', $search)
+                    ->orWhere('sku', 'like', "{$search}%")
+                    ->orWhere('barcode', 'like', "{$search}%")
+                    ->limit(50)
+                    ->pluck('product_id')
+                    ->toArray();
+            }
+
+            // Variant names lookup
+            $variantNameProductIds = ProductVariant::where('name', 'like', "%{$search}%")
+                ->limit(50)
+                ->pluck('product_id')
+                ->toArray();
+            if (!empty($variantNameProductIds)) {
+                $variantProductIds = array_values(array_unique(array_merge($variantProductIds, $variantNameProductIds)));
+            }
+
+            // Variant attribute values (e.g. 'Chocolat Gray', 'Color')
+            $variantAttrProductIds = \DB::table('product_variant_values')
+                ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+                ->where('product_variant_values.attribute_value', 'like', "%{$search}%")
+                ->whereNull('product_variants.deleted_at')
+                ->limit(50)
+                ->pluck('product_variants.product_id')
+                ->toArray();
+
+            if (!empty($variantAttrProductIds)) {
+                $variantProductIds = array_values(array_unique(array_merge($variantProductIds, $variantAttrProductIds)));
+            }
+
+            $query->where(function ($q) use ($search, $isAsciiOnly, $isNumeric, $intVal, $padded6, $extractedNumber, $extractedPadded, $variantProductIds) {
+                // Name and alternative name searches apply to all queries
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('alternative_name', 'like', "%{$search}%");
+
+                if (!$isNumeric) {
+                    $q->orWhere('brand_name', 'like', "%{$search}%")
+                      ->orWhere('category_name', 'like', "%{$search}%");
+                }
+
+                // If user typed alphanumeric / code / barcode / ID, check indexed code columns
+                if ($isAsciiOnly) {
+                    $q->orWhere('code', $search)
+                      ->orWhere('sku', $search)
+                      ->orWhere('barcode', $search)
+                      ->orWhere('code', 'like', "{$search}%")
+                      ->orWhere('sku', 'like', "{$search}%")
+                      ->orWhere('barcode', 'like', "{$search}%");
+
+                    if ($extractedNumber !== null) {
+                        $q->orWhere('id', $extractedNumber)
+                          ->orWhere('code', $extractedPadded)
+                          ->orWhere('code', 'PRD-' . $extractedPadded)
+                          ->orWhere('sku', $extractedPadded)
+                          ->orWhere('sku', 'SKU-' . $extractedPadded);
+                    }
+
+                    if ($isNumeric) {
+                        $q->orWhere('id', $intVal)
+                          ->orWhere('code', $padded6)
+                          ->orWhere('code', 'PRD-' . $padded6)
+                          ->orWhere('sku', 'SKU-' . $padded6);
+                    }
+                }
+
+                if (!empty($variantProductIds)) {
+                    $q->orWhereIn('id', $variantProductIds);
+                }
             });
         }
 
@@ -132,6 +194,10 @@ class ProductController extends Controller
 
         if ($request->has('is_bot_available')) {
             $query->where('is_bot_available', $request->boolean('is_bot_available'));
+        }
+
+        if ($request->has('has_variants')) {
+            $query->where('has_variants', $request->boolean('has_variants'));
         }
 
         $sortBy = $request->input('sort_by', 'id');
@@ -165,33 +231,49 @@ class ProductController extends Controller
         $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
         $costScope = $canViewCost ? 'with_cost' : 'masked_cost';
 
-        $cacheKey = 'pos_prod_list_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0') . "|{$costScope}");
+        $cacheVersion = \Illuminate\Support\Facades\Cache::get('products_cache_version', 1);
+        $hasVariantsParam = $request->has('has_variants') ? ($request->boolean('has_variants') ? '1' : '0') : 'all';
+        $cacheKey = 'pos_prod_list_v' . $cacheVersion . '_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0') . "|{$costScope}|{$hasVariantsParam}");
 
         if (!$request->boolean('force_refresh') && \Illuminate\Support\Facades\Cache::store('file')->has($cacheKey)) {
             $cached = \Illuminate\Support\Facades\Cache::store('file')->get($cacheKey);
             return response()->json($cached)
                 ->header('Cache-Control', 'private, max-age=60')
+                ->header('ETag', '"' . md5("{$cacheVersion}|{$page}|{$perPage}|" . ($cached['pagination']['total'] ?? 0) . "|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}|{$hasVariantsParam}") . '"')
                 ->header('X-Cache', 'HIT');
         }
 
-        // ── Single query via paginate() ────────────────────────────────────
-        // Replaces the previous `(clone $query)->count()` + `offset()->limit()`
-        // pattern which executed two full WHERE-clause scans. Laravel's paginate()
-        // issues one COUNT(*) wrapped in the same query builder state and one
-        // SELECT, sharing all WHERE/ORDER clauses without duplication.
-        $paginator = $query->paginate($perPage, ['*'], 'page', $page);
-
-        $total    = $paginator->total();
-        $lastPage = $paginator->lastPage();
-        $items    = $paginator->getCollection();
+        // Optimized pagination for search: if page 1 search results are <= perPage,
+        // we can skip the expensive COUNT(*) scan entirely.
+        if ($page === 1 && $search !== '') {
+            $cloned = clone $query;
+            $fetched = $cloned->forPage(1, $perPage + 1)->get();
+            if ($fetched->count() <= $perPage) {
+                $total = $fetched->count();
+                $lastPage = 1;
+                $items = $fetched;
+            } else {
+                $items = $fetched->take($perPage);
+                $total = $query->count();
+                $lastPage = (int)ceil($total / $perPage);
+            }
+        } else {
+            // Cache the total count for 60 seconds to eliminate repeated full-table COUNT(*) scans on every progressive page
+            $countKey = 'pos_prod_count_v' . $cacheVersion . '_' . md5(($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|{$hasVariantsParam}");
+            $total = (int)\Illuminate\Support\Facades\Cache::store('file')->remember($countKey, 60, function () use ($query) {
+                return (clone $query)->toBase()->getCountForPagination();
+            });
+            $lastPage = (int)ceil($total / max(1, $perPage));
+            $items = $query->forPage($page, $perPage)->get();
+        }
 
         // ── HTTP caching headers ───────────────────────────────────────────
         // ETag: changes whenever total count, page, per_page, warehouse filter or costScope changes.
         // Cache-Control: private (user-specific data), max-age matches the
         //   Flutter client's _pageCacheTtl so downstream caches stay in sync.
-        $etag = '"' . md5("{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}") . '"';
+        $etag = '"' . md5("{$cacheVersion}|{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}|{$hasVariantsParam}") . '"';
 
-        if ($request->header('If-None-Match') === $etag) {
+        if (!$request->boolean('force_refresh') && $request->header('If-None-Match') === $etag) {
             return response(null, 304)->header('ETag', $etag);
         }
 
@@ -214,6 +296,88 @@ class ProductController extends Controller
             ->header('X-Cache', 'MISS');
     }
 
+    /**
+     * High-performance Delta / Incremental Synchronization endpoint for POS & ERP clients.
+     * Returns products updated since a given timestamp, along with deleted product IDs.
+     */
+    public function sync(Request $request)
+    {
+        $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
+        $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
+            ? (int)$warehouseParam
+            : null;
+
+        $sinceParam = $request->input('updated_since') ?? $request->input('since');
+        $limit = min((int)($request->input('limit', 1000)), 5000);
+
+        $query = Product::query()
+            ->select([
+                'id', 'uuid', 'code', 'sku', 'barcode', 'barcode_symbology',
+                'name', 'alternative_name', 'category_id', 'category_name',
+                'sub_category_id', 'sub_category_name', 'brand_id', 'brand_name',
+                'supplier_id', 'supplier_name', 'base_unit_id', 'unit_name',
+                'purchase_unit_id', 'purchase_unit', 'sale_unit_id', 'sale_unit',
+                'cost_price', 'selling_price', 'purchase_price', 'retail_price',
+                'retail_prices', 'wholesale_price', 'wholesale_prices', 'stock_quantity',
+                'alert_quantity', 'stock_alert', 'low_qty', 'has_variants',
+                'is_bot_available', 'bot_price',
+                'image_url', 'status', 'is_active', 'added_by', 'updated_at',
+            ])
+            ->with([
+                'primaryImage:id,product_id,disk,path,is_primary,sort_order',
+                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
+                'variants.values:id,product_variant_id,attribute_name,attribute_value',
+                'variants.stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
+                'stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
+                'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
+            ]);
+
+        if ($warehouseId !== null) {
+            $query->withSum(['stockBalances as warehouse_stock' => function ($q) use ($warehouseId) {
+                $q->where('warehouse_id', $warehouseId);
+            }], 'quantity');
+        }
+
+        $deletedIds = [];
+        if (!empty($sinceParam)) {
+            try {
+                $since = Carbon::parse($sinceParam);
+                $query->where(function ($q) use ($since) {
+                    $q->where('updated_at', '>', $since)
+                      ->orWhereHas('variants', function ($vq) use ($since) {
+                          $vq->where('updated_at', '>', $since);
+                      });
+                });
+
+                $deletedIds = Product::onlyTrashed()
+                    ->where('deleted_at', '>', $since)
+                    ->pluck('id')
+                    ->toArray();
+            } catch (\Exception $e) {
+                // If timestamp parsing fails, ignore updated_since filter
+            }
+        }
+
+        $items = $query->orderBy('updated_at', 'asc')->limit($limit)->get();
+
+        return response()->json([
+            'status' => 'success',
+            'server_time' => now()->toIso8601String(),
+            'count' => $items->count(),
+            'products' => ProductListResource::collection($items)->resolve($request),
+            'deleted_ids' => $deletedIds,
+        ])->header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
 
     public function createOptions(Request $request)
     {
@@ -391,6 +555,274 @@ class ProductController extends Controller
         ]);
     }
 
+    public function quickSearch(Request $request)
+    {
+        $rawQuery = trim((string)$request->input('q', $request->input('search', '')));
+        $limit = min(max((int)$request->input('limit', 20), 1), 50);
+
+        $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
+        $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
+            ? (int)$warehouseParam
+            : null;
+
+        if ($rawQuery === '') {
+            $products = Product::where(function ($q) {
+                    $q->where('status', 'Active')->orWhere('is_active', true);
+                })
+                ->orderBy('id', 'desc')
+                ->limit($limit)
+                ->with([
+                    'primaryImage:id,product_id,disk,path,is_primary,sort_order',
+                    'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
+                    'variants.values:id,product_variant_id,attribute_name,attribute_value',
+                    'variants.stockBalances' => function ($q) use ($warehouseId) {
+                        $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
+                        if ($warehouseId !== null) {
+                            $q->where('warehouse_id', $warehouseId);
+                        }
+                    },
+                    'stockBalances' => function ($q) use ($warehouseId) {
+                        $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                        if ($warehouseId !== null) {
+                            $q->where('warehouse_id', $warehouseId);
+                        }
+                    },
+                    'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
+                ])
+                ->get();
+
+            return response()->json([
+                'status' => 'success',
+                'data' => \App\Http\Resources\ProductListResource::collection($products),
+            ]);
+        }
+
+        $cacheVersion = \Illuminate\Support\Facades\Cache::get('products_cache_version', 1);
+        $cacheKey = 'quick_search_v' . $cacheVersion . '_' . md5("{$rawQuery}|" . ($warehouseId ?? 'all') . "|{$limit}");
+
+        $result = \Illuminate\Support\Facades\Cache::store('file')->remember($cacheKey, 120, function () use ($rawQuery, $limit, $warehouseId) {
+            $isNumeric = ctype_digit($rawQuery);
+            $intVal = $isNumeric ? (int)$rawQuery : null;
+            $padded6 = $isNumeric ? sprintf('%06d', $intVal) : null;
+            $unpadded = $isNumeric ? (string)$intVal : null;
+
+            $extractedNumber = null;
+            $extractedPadded = null;
+            if (preg_match('/^(?:(PRD|SKU)[-_ ]*)?0*([1-9][0-9]*|[0-9]+)$/i', $rawQuery, $m)) {
+                $numStr = $m[2] ?? '';
+                if ($numStr !== '') {
+                    $extractedNumber = (int)$numStr;
+                    $extractedPadded = sprintf('%06d', $extractedNumber);
+                }
+            }
+
+            $activeProductScope = function ($query) {
+                $query->where(function ($q) {
+                    $q->where('status', 'Active')->orWhere('is_active', true);
+                });
+            };
+
+            // 1. Tier 1: Exact match on code, barcode, sku, or numeric id
+            $exactProductIds = Product::tap($activeProductScope)
+                ->where(function ($q) use ($rawQuery, $isNumeric, $intVal, $padded6, $unpadded, $extractedNumber, $extractedPadded) {
+                    $q->where('code', $rawQuery)
+                      ->orWhere('barcode', $rawQuery)
+                      ->orWhere('sku', $rawQuery);
+
+                    if ($extractedNumber !== null) {
+                        $q->orWhere('id', $extractedNumber)
+                          ->orWhere('code', $extractedPadded)
+                          ->orWhere('code', 'PRD-' . $extractedPadded)
+                          ->orWhere('code', (string)$extractedNumber)
+                          ->orWhere('sku', $extractedPadded)
+                          ->orWhere('sku', 'SKU-' . $extractedPadded);
+                    }
+
+                    if ($isNumeric) {
+                        $q->orWhere('id', $intVal);
+                        if ($padded6 && $padded6 !== $rawQuery) {
+                            $q->orWhere('code', $padded6)
+                              ->orWhere('code', 'PRD-' . $padded6)
+                              ->orWhere('sku', 'SKU-' . $padded6);
+                        }
+                        if ($unpadded && $unpadded !== $rawQuery) {
+                            $q->orWhere('code', $unpadded);
+                        }
+                    }
+                })->limit(10)->pluck('id')->toArray();
+
+            // 2. Exact match on variant barcode or SKU
+            $exactVariantProductIds = ProductVariant::where(function ($q) use ($rawQuery, $isNumeric, $padded6, $extractedPadded) {
+                    $q->where('barcode', $rawQuery)
+                      ->orWhere('sku', $rawQuery);
+                    if ($extractedPadded) {
+                        $q->orWhere('sku', 'SKU-' . $extractedPadded)
+                          ->orWhere('sku', $extractedPadded);
+                    } elseif ($isNumeric && $padded6) {
+                        $q->orWhere('sku', 'SKU-' . $padded6)
+                          ->orWhere('sku', $padded6);
+                    }
+                })
+                ->whereHas('product', $activeProductScope)
+                ->limit(10)
+                ->pluck('product_id')
+                ->toArray();
+
+            $allIds = array_values(array_unique(array_merge($exactProductIds, $exactVariantProductIds)));
+
+            // EARLY EXIT: If exact match found (e.g., barcode scanner or direct code match), satisfy immediately
+            if (!empty($allIds) && count($allIds) >= $limit) {
+                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+            }
+
+            // 3. Prefix match on indexed columns (code, barcode, sku) using B-Tree index
+            $prefixProductIds = Product::tap($activeProductScope)
+                ->where(function ($q) use ($rawQuery, $extractedPadded) {
+                    $q->where('code', 'like', "{$rawQuery}%")
+                      ->orWhere('sku', 'like', "{$rawQuery}%")
+                      ->orWhere('barcode', 'like', "{$rawQuery}%");
+
+                    if ($extractedPadded) {
+                        $q->orWhere('code', 'like', "PRD-{$extractedPadded}%")
+                          ->orWhere('sku', 'like', "SKU-{$extractedPadded}%");
+                    }
+                })
+                ->limit(15)
+                ->pluck('id')
+                ->toArray();
+
+            $allIds = array_values(array_unique(array_merge($allIds, $prefixProductIds)));
+            if (count($allIds) >= $limit) {
+                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+            }
+
+            // 4. FULLTEXT match on MariaDB (name, code, sku, barcode, category_name, brand_name)
+            $cleanTerms = trim(preg_replace('/[+\-><()~*"@]+/u', ' ', $rawQuery));
+            if (mb_strlen($cleanTerms) >= 2) {
+                $words = array_filter(explode(' ', $cleanTerms));
+                if (!empty($words)) {
+                    $booleanMode = implode(' ', array_map(fn($w) => "+{$w}*", $words));
+                    try {
+                        $fulltextIds = Product::tap($activeProductScope)
+                            ->whereRaw(
+                                "MATCH(name, code, sku, barcode, category_name, brand_name) AGAINST(? IN BOOLEAN MODE)",
+                                [$booleanMode]
+                            )
+                            ->limit($limit)
+                            ->pluck('id')
+                            ->toArray();
+
+                        $allIds = array_values(array_unique(array_merge($allIds, $fulltextIds)));
+                        if (count($allIds) >= $limit) {
+                            return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+                        }
+                    } catch (\Throwable $e) {
+                        // In case MariaDB throws on fulltext, fallback to prefix/name matching
+                    }
+                }
+            }
+
+            // 5. Variant SKU prefix or name match
+            $variantFuzzyIds = ProductVariant::where(function ($q) use ($rawQuery) {
+                    $q->where('sku', 'like', "{$rawQuery}%")
+                      ->orWhere('barcode', 'like', "{$rawQuery}%")
+                      ->orWhere('name', 'like', "{$rawQuery}%");
+                })
+                ->whereHas('product', $activeProductScope)
+                ->limit(10)
+                ->pluck('product_id')
+                ->toArray();
+
+            $allIds = array_values(array_unique(array_merge($allIds, $variantFuzzyIds)));
+            if (count($allIds) >= $limit) {
+                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+            }
+
+            // 6. Name / Alternative name fallback (prefix first, then contains)
+            $fallbackProductIds = Product::tap($activeProductScope)
+                ->where(function ($q) use ($rawQuery) {
+                    $q->where('name', 'like', "{$rawQuery}%")
+                      ->orWhere('alternative_name', 'like', "{$rawQuery}%")
+                      ->orWhere('name', 'like', "%{$rawQuery}%");
+                })
+                ->limit($limit)
+                ->pluck('id')
+                ->toArray();
+
+            $allIds = array_values(array_unique(array_merge($allIds, $fallbackProductIds)));
+            if (count($allIds) >= $limit) {
+                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+            }
+
+            // 7. Variant attribute match only if still under limit
+            $variantAttrIds = \DB::table('product_variant_values')
+                ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+                ->join('products', 'product_variants.product_id', '=', 'products.id')
+                ->where(function ($q) {
+                    $q->where('products.status', 'Active')->orWhere('products.is_active', true);
+                })
+                ->whereNull('products.deleted_at')
+                ->whereNull('product_variants.deleted_at')
+                ->where(function ($q) use ($rawQuery) {
+                    $q->where('product_variant_values.attribute_value', 'like', "%{$rawQuery}%")
+                      ->orWhere('product_variant_values.attribute_name', 'like', "%{$rawQuery}%");
+                })
+                ->limit(10)
+                ->pluck('product_variants.product_id')
+                ->toArray();
+
+            $allIds = array_values(array_unique(array_merge($allIds, $variantAttrIds)));
+            $targetIds = array_slice($allIds, 0, $limit);
+
+            if (empty($targetIds)) {
+                return [];
+            }
+
+            return $this->loadProductsForQuickSearch($targetIds, $warehouseId);
+        });
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $result,
+        ]);
+    }
+
+    protected function loadProductsForQuickSearch(array $targetIds, ?int $warehouseId): array
+    {
+        if (empty($targetIds)) {
+            return [];
+        }
+
+        $products = Product::whereIn('id', $targetIds)
+            ->with([
+                'primaryImage:id,product_id,disk,path,is_primary,sort_order',
+                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
+                'variants.values:id,product_variant_id,attribute_name,attribute_value',
+                'variants.stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
+                'stockBalances' => function ($q) use ($warehouseId) {
+                    $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                    if ($warehouseId !== null) {
+                        $q->where('warehouse_id', $warehouseId);
+                    }
+                },
+                'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
+            ])
+            ->get();
+
+        // Preserve order of relevance
+        $sorted = $products->sortBy(function ($p) use ($targetIds) {
+            $pos = array_search($p->id, $targetIds);
+            return $pos === false ? 999 : $pos;
+        })->values();
+
+        return \App\Http\Resources\ProductListResource::collection($sorted)->resolve();
+    }
+
     public function findByBarcode(Request $request)
     {
         $code = $request->input('code');
@@ -398,10 +830,26 @@ class ProductController extends Controller
             return response()->json(['status' => 'error', 'message' => 'Barcode is required'], 400);
         }
 
+        $isNumeric = ctype_digit($code);
+        $intVal = $isNumeric ? (int)$code : null;
+        $padded6 = $isNumeric ? sprintf('%06d', $intVal) : null;
+        $unpadded = $isNumeric ? (string)$intVal : null;
+
         $product = Product::with($this->productDetailRelations())
-            ->where('code', $code)
-            ->orWhere('sku', $code)
-            ->orWhere('barcode', $code)
+            ->where(function ($q) use ($code, $isNumeric, $intVal, $padded6, $unpadded) {
+                $q->where('code', $code)
+                  ->orWhere('sku', $code)
+                  ->orWhere('barcode', $code);
+                if ($isNumeric) {
+                    $q->orWhere('id', $intVal);
+                    if ($padded6 && $padded6 !== $code) {
+                        $q->orWhere('code', $padded6)->orWhere('sku', 'SKU-' . $padded6);
+                    }
+                    if ($unpadded && $unpadded !== $code) {
+                        $q->orWhere('code', $unpadded);
+                    }
+                }
+            })
             ->first();
 
         if (!$product) {
@@ -794,8 +1242,6 @@ class ProductController extends Controller
             $query->where('status', $request->input('status'));
         }
 
-        $products = $query->orderBy('id', 'asc')->get();
-
         $columns = [
             'Product Type', 'Product Code', 'Product Name', 'Alternative Name (မြန်မာ)',
             'Category', 'Brand', 'Base Unit', 'Purchase Unit', 'Sale Unit', 'Purchase Unit Links', 'Sale Unit Links',
@@ -828,29 +1274,34 @@ class ProductController extends Controller
         $formatBarcode = function ($code) {
             $code = trim((string)$code);
             if ($code === '') return '';
-            // If code has 10 or more digits or starts with 0 followed by digits, format as ="<code>"
-            // so Microsoft Excel displays it as exact text instead of scientific notation (e.g. 8.93E+12)
             if (preg_match('/^\d{10,}$/', $code) || (strlen($code) > 1 && $code[0] === '0' && ctype_digit($code))) {
                 return '="' . $code . '"';
             }
             return $code;
         };
 
+        @set_time_limit(300);
+
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="products_export_' . date('Ymd_His') . '.csv"',
             'Pragma' => 'no-cache',
-            'Cache-Control' => 'must-revalidate, post-check=0, pre-check=0',
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
             'Expires' => '0',
+            'X-Accel-Buffering' => 'no',
         ];
 
-        $callback = function () use ($columns, $products, $formatNum, $formatPriceList, $formatBarcode) {
+        $callback = function () use ($query, $columns, $formatNum, $formatPriceList, $formatBarcode) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
             fputcsv($file, $columns);
 
-            foreach ($products as $product) {
+            $rowCount = 0;
+            $query->orderBy('id', 'asc')->chunk(500, function ($products) use (
+                &$rowCount, $file, $formatBarcode, $formatNum, $formatPriceList
+            ) {
+                foreach ($products as $product) {
                 $baseUnit = $product->unit_name ?: 'Piece';
                 $purchUnit = $product->purchase_unit ?: $baseUnit;
                 $saleUnit = $product->sale_unit ?: $baseUnit;
@@ -961,7 +1412,11 @@ class ProductController extends Controller
                         $status,
                     ]);
                 }
-            }
+
+                $rowCount++;
+                }
+                flush();
+            });
 
             fclose($file);
         };

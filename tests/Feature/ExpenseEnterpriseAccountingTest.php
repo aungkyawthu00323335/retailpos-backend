@@ -197,4 +197,61 @@ class ExpenseEnterpriseAccountingTest extends TestCase
         // Digital total should be 80,000
         $this->assertEquals(80000.0, $res->json('summary.digital_total'));
     }
+
+    public function test_expense_export_streams_csv_with_filters_and_summary_row(): void
+    {
+        Expense::create([
+            'reference_no'          => 'EXP_EXP_001',
+            'warehouse_name'        => 'Downtown Store Branch',
+            'expense_category_name' => 'Store Utilities',
+            'title'                 => 'Office Water Filter',
+            'amount'                => 15000.0,
+            'paid_amount'           => 15000.0,
+            'due_amount'            => 0.0,
+            'payment_status'        => 'Paid',
+            'payment_method'        => 'Cash',
+            'created_by'            => 'Cashier Daw Nu',
+            'user_name'             => 'Daw Nu',
+            'user_role'             => 'Cashier',
+            'date'                  => '2026-10-15 09:30:00',
+            'details'               => 'Purified water jugs',
+        ]);
+
+        Expense::create([
+            'reference_no'          => 'EXP_EXP_002',
+            'warehouse_name'        => 'Main Warehouse Branch',
+            'expense_category_name' => 'Hardware',
+            'title'                 => 'Forklift Maintenance',
+            'amount'                => 80000.0,
+            'paid_amount'           => 50000.0,
+            'due_amount'            => 30000.0,
+            'payment_status'        => 'Partial',
+            'payment_method'        => 'Bank Transfer',
+            'created_by'            => 'Manager U Ba',
+            'user_name'             => 'U Ba',
+            'user_role'             => 'Manager',
+            'date'                  => '2026-10-16 14:00:00',
+            'details'               => 'Hydraulic oil and filter replacement',
+        ]);
+
+        // 1. Export all without filter
+        $response = $this->get('/api/expenses/export');
+        $response->assertStatus(200);
+        $this->assertTrue(str_contains($response->headers->get('content-type'), 'text/csv'));
+
+        $content = $response->streamedContent();
+        $this->assertStringStartsWith("\xEF\xBB\xBF", $content);
+        $this->assertStringContainsString('Expense Transactions Export', $content);
+        $this->assertStringContainsString('EXP_EXP_001', $content);
+        $this->assertStringContainsString('EXP_EXP_002', $content);
+        $this->assertStringContainsString('TOTAL', $content);
+        $this->assertStringContainsString('95000.00', $content); // Total Amount = 15000 + 80000
+
+        // 2. Export with warehouse filter
+        $responseFilter = $this->get('/api/expenses/export?warehouse=' . urlencode('Downtown Store Branch'));
+        $responseFilter->assertStatus(200);
+        $contentFilter = $responseFilter->streamedContent();
+        $this->assertStringContainsString('EXP_EXP_001', $contentFilter);
+        $this->assertStringNotContainsString('EXP_EXP_002', $contentFilter);
+    }
 }

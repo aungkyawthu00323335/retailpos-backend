@@ -128,33 +128,28 @@ class ProductUnitConversionService
             throw new InvalidArgumentException('Unit type must be purchase or sale.');
         }
 
-        $links = ProductUnitLink::where('product_id', $product->id)
-            ->where('unit_type', $type)
-            ->where('is_active', true)
-            ->when(
-                $variantId === null,
-                fn($q) => $q->whereNull('product_variant_id'),
-                function ($q) use ($variantId) {
-                    $q->where(function ($variantQuery) use ($variantId) {
-                        $variantQuery->where('product_variant_id', $variantId)->orWhereNull('product_variant_id');
-                    });
+        $hasPreloaded = $product->relationLoaded('unitLinks');
+
+        if ($hasPreloaded) {
+            $allLinks = $product->unitLinks;
+            $links = $allLinks->filter(function ($l) use ($type, $variantId) {
+                if (!$l->is_active || strtolower((string)$l->unit_type) !== $type) {
+                    return false;
                 }
-            )
-            ->orderByRaw('CASE WHEN product_variant_id IS NULL THEN 1 ELSE 0 END')
-            ->orderByDesc('is_default')
-            ->orderBy('id')
-            ->get();
-
-        $match = $links->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
-            if ($unitId !== null && (int)$link->unit_id === $unitId) {
-                return true;
-            }
-            return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
-        });
-
-        // If not found in the requested unit_type, search other active unit links for this product
-        if (!$match && ($unitId !== null || ($unitName !== null && trim($unitName) !== ''))) {
-            $crossLinks = ProductUnitLink::where('product_id', $product->id)
+                if ($variantId === null) {
+                    return $l->product_variant_id === null;
+                }
+                return $l->product_variant_id === $variantId || $l->product_variant_id === null;
+            })->sort(function ($a, $b) {
+                $aNull = $a->product_variant_id === null ? 1 : 0;
+                $bNull = $b->product_variant_id === null ? 1 : 0;
+                if ($aNull !== $bNull) return $aNull <=> $bNull;
+                if ($a->is_default !== $b->is_default) return $b->is_default <=> $a->is_default;
+                return $a->id <=> $b->id;
+            });
+        } else {
+            $links = ProductUnitLink::where('product_id', $product->id)
+                ->where('unit_type', $type)
                 ->where('is_active', true)
                 ->when(
                     $variantId === null,
@@ -169,6 +164,48 @@ class ProductUnitConversionService
                 ->orderByDesc('is_default')
                 ->orderBy('id')
                 ->get();
+        }
+
+        $match = $links->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
+            if ($unitId !== null && (int)$link->unit_id === $unitId) {
+                return true;
+            }
+            return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
+        });
+
+        // If not found in the requested unit_type, search other active unit links for this product
+        if (!$match && ($unitId !== null || ($unitName !== null && trim($unitName) !== ''))) {
+            if ($hasPreloaded) {
+                $crossLinks = $allLinks->filter(function ($l) use ($variantId) {
+                    if (!$l->is_active) return false;
+                    if ($variantId === null) {
+                        return $l->product_variant_id === null;
+                    }
+                    return $l->product_variant_id === $variantId || $l->product_variant_id === null;
+                })->sort(function ($a, $b) {
+                    $aNull = $a->product_variant_id === null ? 1 : 0;
+                    $bNull = $b->product_variant_id === null ? 1 : 0;
+                    if ($aNull !== $bNull) return $aNull <=> $bNull;
+                    if ($a->is_default !== $b->is_default) return $b->is_default <=> $a->is_default;
+                    return $a->id <=> $b->id;
+                });
+            } else {
+                $crossLinks = ProductUnitLink::where('product_id', $product->id)
+                    ->where('is_active', true)
+                    ->when(
+                        $variantId === null,
+                        fn($q) => $q->whereNull('product_variant_id'),
+                        function ($q) use ($variantId) {
+                            $q->where(function ($variantQuery) use ($variantId) {
+                                $variantQuery->where('product_variant_id', $variantId)->orWhereNull('product_variant_id');
+                            });
+                        }
+                    )
+                    ->orderByRaw('CASE WHEN product_variant_id IS NULL THEN 1 ELSE 0 END')
+                    ->orderByDesc('is_default')
+                    ->orderBy('id')
+                    ->get();
+            }
 
             $match = $crossLinks->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
                 if ($unitId !== null && (int)$link->unit_id === $unitId) {
@@ -249,6 +286,8 @@ class ProductUnitConversionService
         return round($unitPrice / $conversionRate, 8);
     }
 
+    protected static array $warehouseCache = [];
+
     public function warehouseId(?int $warehouseId, ?string $warehouseName): ?int
     {
         if ($warehouseId && $warehouseId > 0) {
@@ -256,14 +295,19 @@ class ProductUnitConversionService
         }
 
         $name = trim((string)$warehouseName);
-        $warehouse = null;
-        if ($name !== '') {
-            $warehouse = Outlet::where('name', $name)->first()
-                ?? Outlet::where('name', 'LIKE', '%' . $name . '%')->first();
+        if ($name === '') {
+            return Outlet::orderBy('id')->value('id');
         }
-        $warehouse ??= Outlet::orderBy('id')->first();
 
-        return $warehouse?->id;
+        if (isset(self::$warehouseCache[$name])) {
+            return self::$warehouseCache[$name];
+        }
+
+        $warehouse = Outlet::where('name', $name)->first()
+            ?? Outlet::where('name', 'LIKE', '%' . $name . '%')->first();
+        $id = $warehouse?->id ?? Outlet::orderBy('id')->value('id');
+        self::$warehouseCache[$name] = $id;
+        return $id;
     }
 
     public function applyStock(
@@ -275,7 +319,10 @@ class ProductUnitConversionService
         string $movementType,
         string $referenceType,
         string $referenceId,
-        ?string $note = null
+        ?string $note = null,
+        bool $notifyRestock = true,
+        bool $allowOverdraft = false,
+        bool $syncAggregates = true
     ): float {
         if (!$warehouseId) {
             throw new RuntimeException('A valid warehouse is required for stock movement.');
@@ -304,9 +351,13 @@ class ProductUnitConversionService
         $current = (float)$balance->quantity;
         $next = strtolower($direction) === 'out' ? $current - $baseQuantity : $current + $baseQuantity;
         if ($next < -0.0001) {
-            throw new RuntimeException('Insufficient stock in the selected warehouse.');
+            if (!$allowOverdraft) {
+                throw new RuntimeException('Insufficient stock in the selected warehouse.');
+            }
+            $next = round($next, 4);
+        } else {
+            $next = max(0.0, round($next, 4));
         }
-        $next = max(0.0, round($next, 4));
         $balance->update(['quantity' => $next]);
 
         StockMovement::create([
@@ -324,18 +375,71 @@ class ProductUnitConversionService
             'created_at' => now(),
         ]);
 
-        $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
-        Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
+        if ($syncAggregates) {
+            $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
+            Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
 
-        // 🔔 Trigger Telegram Restock Notifications if items were replenished
-        if (strtolower($direction) === 'in' && $next > 0) {
-            try {
-                app(\App\Services\TelegramBotService::class)->notifyRestockSubscribers($product->id, $variantId);
-            } catch (\Throwable $e) {
-                \Illuminate\Support\Facades\Log::warning("Telegram restock alert dispatch error: " . $e->getMessage());
+            // 🛡️ Sync variant-level stock_quantity on the product_variants table if column exists
+            if ($variantId) {
+                static $hasVariantStockCol = null;
+                if ($hasVariantStockCol === null) {
+                    $hasVariantStockCol = \Illuminate\Support\Facades\Schema::hasColumn('product_variants', 'stock_quantity');
+                }
+                if ($hasVariantStockCol) {
+                    $variantAggregate = (float)StockBalance::where('product_id', $product->id)
+                        ->where('product_variant_id', $variantId)
+                        ->sum('quantity');
+                    \App\Models\ProductVariant::whereKey($variantId)->update(['stock_quantity' => $variantAggregate]);
+                }
             }
         }
 
+        // 🔔 Trigger Telegram Restock Notifications if items were replenished
+        if ($notifyRestock && strtolower($direction) === 'in' && $next > 0) {
+            \Illuminate\Support\Facades\DB::afterCommit(function () use ($product, $variantId) {
+                try {
+                    app(\App\Services\TelegramBotService::class)->notifyRestockSubscribers($product->id, $variantId);
+                } catch (\Throwable $e) {
+                    \Illuminate\Support\Facades\Log::warning("Telegram restock alert dispatch error: " . $e->getMessage());
+                }
+            });
+        }
+
         return $next;
+    }
+
+    public function syncAggregatesForProducts(array $productIds, array $variantIds = []): void
+    {
+        $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
+        if (!empty($productIds)) {
+            $sums = StockBalance::whereIn('product_id', $productIds)
+                ->selectRaw('product_id, COALESCE(SUM(quantity), 0) as total_qty')
+                ->groupBy('product_id')
+                ->pluck('total_qty', 'product_id');
+
+            foreach ($productIds as $pid) {
+                $agg = (float)($sums[$pid] ?? 0.0);
+                Product::whereKey($pid)->update(['stock_quantity' => $agg]);
+            }
+        }
+
+        $variantIds = array_values(array_unique(array_filter(array_map('intval', $variantIds))));
+        if (!empty($variantIds)) {
+            static $hasVariantStockCol = null;
+            if ($hasVariantStockCol === null) {
+                $hasVariantStockCol = \Illuminate\Support\Facades\Schema::hasColumn('product_variants', 'stock_quantity');
+            }
+            if ($hasVariantStockCol) {
+                $vSums = StockBalance::whereIn('product_variant_id', $variantIds)
+                    ->selectRaw('product_variant_id, COALESCE(SUM(quantity), 0) as total_qty')
+                    ->groupBy('product_variant_id')
+                    ->pluck('total_qty', 'product_variant_id');
+
+                foreach ($variantIds as $vid) {
+                    $vAgg = (float)($vSums[$vid] ?? 0.0);
+                    \App\Models\ProductVariant::whereKey($vid)->update(['stock_quantity' => $vAgg]);
+                }
+            }
+        }
     }
 }

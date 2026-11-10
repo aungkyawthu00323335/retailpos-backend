@@ -339,6 +339,11 @@ class ProductExcelController extends Controller
                     $importedCount++;
                 }
             });
+
+            // Flush product search cache so newly imported items are immediately searchable
+            try {
+                \Illuminate\Support\Facades\Cache::store('file')->flush();
+            } catch (\Throwable $e) {}
         } catch (\Throwable $e) {
             return response()->json([
                 'status' => 'error',
@@ -363,15 +368,38 @@ class ProductExcelController extends Controller
         ]);
 
         $file = $request->file('file');
-        try {
-            $spreadsheet = IOFactory::load($file->getRealPath());
-            $sheet = $spreadsheet->getActiveSheet();
-            $rows = $sheet->toArray(null, true, true, false);
-        } catch (\Throwable $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Failed to parse Excel file: ' . $e->getMessage(),
-            ], 422);
+        $ext = strtolower($file->getClientOriginalExtension());
+        $rows = [];
+
+        // For CSV files (UTF-8 comma delimited), use standard native CSV parser with BOM handling
+        if ($ext === 'csv' || str_contains((string)$file->getMimeType(), 'csv') || str_contains((string)$file->getMimeType(), 'text')) {
+            $path = $file->getRealPath();
+            $handle = fopen($path, 'r');
+            if ($handle !== false) {
+                // Strip UTF-8 BOM if present
+                $bom = fread($handle, 3);
+                if ($bom !== "\xEF\xBB\xBF") {
+                    rewind($handle);
+                }
+                while (($line = fgetcsv($handle, 0, ',', '"', '\\')) !== false) {
+                    $rows[] = $line;
+                }
+                fclose($handle);
+            }
+        }
+
+        // If not CSV or failed to parse, fallback to PhpSpreadsheet for Excel (.xlsx, .xls)
+        if (empty($rows)) {
+            try {
+                $spreadsheet = IOFactory::load($file->getRealPath());
+                $sheet = $spreadsheet->getActiveSheet();
+                $rows = $sheet->toArray(null, true, true, false);
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Failed to parse price change file: ' . $e->getMessage(),
+                ], 422);
+            }
         }
 
         if (count($rows) < 2) {
@@ -540,59 +568,84 @@ class ProductExcelController extends Controller
         DB::transaction(function () use ($updates, &$updatedCount) {
             foreach ($updates as $u) {
                 $code = $u['code'];
-                $product = Product::where('code', $code)->orWhere('sku', $code)->first();
 
-                if ($product) {
-                    if ($u['new_cost'] !== null) {
-                        $product->cost_price = $u['new_cost'];
-                        $product->purchase_price = $u['new_cost'];
-                    }
+                // 1. Prioritize variant lookup by SKU or Barcode
+                $variant = ProductVariant::where('sku', $code)->orWhere('barcode', $code)->first();
+                if ($variant) {
+                    if ($u['new_cost'] !== null) $variant->cost_price = $u['new_cost'];
                     if ($u['new_retail'] !== null) {
-                        $product->retail_price = $u['new_retail'];
-                        $product->selling_price = $u['new_retail'];
-                        $product->retail_prices = [$u['new_retail']];
+                        $variant->selling_price = $u['new_retail'];
+                        $variant->retail_prices = [$u['new_retail']];
                     }
                     if ($u['new_wholesale'] !== null) {
-                        $product->wholesale_price = $u['new_wholesale'];
-                        $product->wholesale_prices = [$u['new_wholesale']];
+                        $variant->wholesale_price = $u['new_wholesale'];
+                        $variant->wholesale_prices = [$u['new_wholesale']];
                     }
-                    $product->save();
+                    $variant->save();
 
-                    // If has single variant with matching SKU, update variant too
-                    if ($product->has_variants) {
-                        ProductVariant::where('product_id', $product->id)->each(function ($v) use ($u) {
-                            if ($u['new_cost'] !== null) $v->cost_price = $u['new_cost'];
-                            if ($u['new_retail'] !== null) {
-                                $v->selling_price = $u['new_retail'];
-                                $v->retail_prices = [$u['new_retail']];
-                            }
-                            if ($u['new_wholesale'] !== null) {
-                                $v->wholesale_price = $u['new_wholesale'];
-                                $v->wholesale_prices = [$u['new_wholesale']];
-                            }
-                            $v->save();
-                        });
+                    // If parent product exists and this is its only variant or matches parent code, sync parent too
+                    $parent = Product::find($variant->product_id);
+                    if ($parent && (!$parent->has_variants || $parent->code === $code || $parent->sku === $code)) {
+                        if ($u['new_cost'] !== null) {
+                            $parent->cost_price = $u['new_cost'];
+                            $parent->purchase_price = $u['new_cost'];
+                        }
+                        if ($u['new_retail'] !== null) {
+                            $parent->retail_price = $u['new_retail'];
+                            $parent->selling_price = $u['new_retail'];
+                            $parent->retail_prices = [$u['new_retail']];
+                        }
+                        if ($u['new_wholesale'] !== null) {
+                            $parent->wholesale_price = $u['new_wholesale'];
+                            $parent->wholesale_prices = [$u['new_wholesale']];
+                        }
+                        $parent->save();
                     }
                     $updatedCount++;
                 } else {
-                    // Try finding variant by SKU/barcode
-                    $variant = ProductVariant::where('sku', $code)->orWhere('barcode', $code)->first();
-                    if ($variant) {
-                        if ($u['new_cost'] !== null) $variant->cost_price = $u['new_cost'];
+                    // 2. Fallback to Product code or SKU lookup
+                    $product = Product::where('code', $code)->orWhere('sku', $code)->first();
+                    if ($product) {
+                        if ($u['new_cost'] !== null) {
+                            $product->cost_price = $u['new_cost'];
+                            $product->purchase_price = $u['new_cost'];
+                        }
                         if ($u['new_retail'] !== null) {
-                            $variant->selling_price = $u['new_retail'];
-                            $variant->retail_prices = [$u['new_retail']];
+                            $product->retail_price = $u['new_retail'];
+                            $product->selling_price = $u['new_retail'];
+                            $product->retail_prices = [$u['new_retail']];
                         }
                         if ($u['new_wholesale'] !== null) {
-                            $variant->wholesale_price = $u['new_wholesale'];
-                            $variant->wholesale_prices = [$u['new_wholesale']];
+                            $product->wholesale_price = $u['new_wholesale'];
+                            $product->wholesale_prices = [$u['new_wholesale']];
                         }
-                        $variant->save();
+                        $product->save();
+
+                        // If has variants and user updated by parent product code, update child variants
+                        if ($product->has_variants) {
+                            ProductVariant::where('product_id', $product->id)->each(function ($v) use ($u) {
+                                if ($u['new_cost'] !== null) $v->cost_price = $u['new_cost'];
+                                if ($u['new_retail'] !== null) {
+                                    $v->selling_price = $u['new_retail'];
+                                    $v->retail_prices = [$u['new_retail']];
+                                }
+                                if ($u['new_wholesale'] !== null) {
+                                    $v->wholesale_price = $u['new_wholesale'];
+                                    $v->wholesale_prices = [$u['new_wholesale']];
+                                }
+                                $v->save();
+                            });
+                        }
                         $updatedCount++;
                     }
                 }
             }
         });
+
+        // Flush product cache so new prices reflect immediately on POS searches
+        try {
+            \Illuminate\Support\Facades\Cache::store('file')->flush();
+        } catch (\Throwable $e) {}
 
         return response()->json([
             'status' => 'success',
@@ -765,19 +818,19 @@ class ProductExcelController extends Controller
     }
 
     /**
-     * Download Excel templates (.xlsx) for New Product Import or Bulk Price Changes.
+     * Download Excel/CSV templates for New Product Import or Bulk Price Changes.
      */
     public function downloadTemplate(Request $request)
     {
         $type = $request->input('type', 'import');
-        $spreadsheet = new Spreadsheet();
-        $sheet = $spreadsheet->getActiveSheet();
 
         if ($type === 'price_change') {
-            $sheet->setTitle('Product Price Change');
+            $format = strtolower((string)$request->input('format', 'csv'));
             $headers = [
                 'Product Code',
                 'Product Name',
+                'Variation Name',
+                'Variation Type',
                 'Current Cost',
                 'New Cost Price',
                 'Current Retail Price',
@@ -785,11 +838,103 @@ class ProductExcelController extends Controller
                 'Current Wholesale Price',
                 'New Wholesale Price',
             ];
+
+            // 1. Deliver as UTF-8 Comma Delimited CSV with BOM for Windows Excel compatibility
+            if ($format === 'csv') {
+                $fileName = 'product_price_change_template.csv';
+                $prefill = $request->boolean('prefill', true);
+
+                return new StreamedResponse(function () use ($headers, $prefill) {
+                    $handle = fopen('php://output', 'w');
+                    // UTF-8 BOM (\xEF\xBB\xBF) ensures Microsoft Excel on Windows parses Myanmar Unicode without mojibake
+                    fwrite($handle, "\xEF\xBB\xBF");
+                    fputcsv($handle, $headers);
+
+                    if ($prefill) {
+                        $products = Product::with(['variants.values'])->orderBy('name')->take(2000)->get();
+                        foreach ($products as $p) {
+                            if ($p->has_variants && $p->variants->isNotEmpty()) {
+                                foreach ($p->variants as $v) {
+                                    $vCost = (float)($v->cost_price ?: $p->cost_price);
+                                    $vRetail = (float)($v->selling_price ?: $p->retail_price);
+                                    $vWholesale = (float)($v->wholesale_price ?: $p->wholesale_price);
+
+                                    $varName = 'Variation';
+                                    $varType = $v->name ?: 'Standard';
+
+                                    if ($v->values && $v->values->isNotEmpty()) {
+                                        $attrNames = $v->values->pluck('attribute_name')->filter()->unique()->values();
+                                        if ($attrNames->isNotEmpty()) $varName = $attrNames->implode(' / ');
+                                        $attrVals = $v->values->pluck('attribute_value')->filter()->values();
+                                        if ($attrVals->isNotEmpty()) $varType = $attrVals->implode(' - ');
+                                    }
+
+                                    $vCode = $v->sku ?: ($v->barcode ?: $p->code);
+
+                                    fputcsv($handle, [
+                                        $vCode,
+                                        $p->name,
+                                        $varName,
+                                        $varType,
+                                        $vCost,
+                                        $vCost,
+                                        $vRetail,
+                                        $vRetail,
+                                        $vWholesale,
+                                        $vWholesale,
+                                    ]);
+                                }
+                            } else {
+                                $cost = (float)$p->cost_price;
+                                $retail = (float)$p->retail_price;
+                                $wholesale = (float)$p->wholesale_price;
+                                fputcsv($handle, [
+                                    $p->code,
+                                    $p->name,
+                                    '-',
+                                    '-',
+                                    $cost,
+                                    $cost,
+                                    $retail,
+                                    $retail,
+                                    $wholesale,
+                                    $wholesale,
+                                ]);
+                            }
+                        }
+                    } else {
+                        // Sample guide row
+                        fputcsv($handle, [
+                            '10001',
+                            'Classic Cheeseburger Deluxe',
+                            '-',
+                            '-',
+                            4500,
+                            4800,
+                            8500,
+                            9000,
+                            7500,
+                            8000,
+                        ]);
+                    }
+                    fclose($handle);
+                }, 200, [
+                    'Content-Type' => 'text/csv; charset=UTF-8',
+                    'Content-Disposition' => "attachment; filename=\"{$fileName}\"",
+                    'Cache-Control' => 'max-age=0, no-cache, must-revalidate',
+                    'Pragma' => 'public',
+                ]);
+            }
+
+            // 2. Deliver as Microsoft Excel (.xlsx)
+            $spreadsheet = new Spreadsheet();
+            $sheet = $spreadsheet->getActiveSheet();
+            $sheet->setTitle('Product Price Change');
             $sheet->fromArray($headers, null, 'A1');
 
-            $sheet->getStyle('A1:H1')->applyFromArray([
+            $sheet->getStyle('A1:J1')->applyFromArray([
                 'font' => ['bold' => true, 'color' => ['rgb' => 'FFFFFF'], 'size' => 11],
-                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '10B981']], // Green
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '10B981']], // Emerald Green
                 'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
             ]);
             $sheet->getRowDimension(1)->setRowHeight(26);
@@ -800,37 +945,79 @@ class ProductExcelController extends Controller
             $currentRow = 2;
 
             if ($prefill) {
-                $products = Product::orderBy('name')->take(1000)->get();
+                $products = Product::with(['variants.values'])->orderBy('name')->take(2000)->get();
                 foreach ($products as $p) {
-                    $sheet->setCellValueExplicit("A{$currentRow}", (string)$p->code, DataType::TYPE_STRING);
-                    $sheet->setCellValue("B{$currentRow}", $p->name);
-                    $sheet->setCellValue("C{$currentRow}", (float)$p->cost_price);
-                    $sheet->setCellValue("D{$currentRow}", (float)$p->cost_price); // Pre-fill with current cost as starting point
-                    $sheet->setCellValue("E{$currentRow}", (float)$p->retail_price);
-                    $sheet->setCellValue("F{$currentRow}", (float)$p->retail_price); // Pre-fill with current retail price
-                    $sheet->setCellValue("G{$currentRow}", (float)$p->wholesale_price);
-                    $sheet->setCellValue("H{$currentRow}", (float)$p->wholesale_price);
-                    $currentRow++;
+                    if ($p->has_variants && $p->variants->isNotEmpty()) {
+                        foreach ($p->variants as $v) {
+                            $vCost = (float)($v->cost_price ?: $p->cost_price);
+                            $vRetail = (float)($v->selling_price ?: $p->retail_price);
+                            $vWholesale = (float)($v->wholesale_price ?: $p->wholesale_price);
+
+                            $varName = 'Variation';
+                            $varType = $v->name ?: 'Standard';
+
+                            if ($v->values && $v->values->isNotEmpty()) {
+                                $attrNames = $v->values->pluck('attribute_name')->filter()->unique()->values();
+                                if ($attrNames->isNotEmpty()) $varName = $attrNames->implode(' / ');
+                                $attrVals = $v->values->pluck('attribute_value')->filter()->values();
+                                if ($attrVals->isNotEmpty()) $varType = $attrVals->implode(' - ');
+                            }
+
+                            $vCode = $v->sku ?: ($v->barcode ?: $p->code);
+
+                            $sheet->setCellValueExplicit("A{$currentRow}", (string)$vCode, DataType::TYPE_STRING);
+                            $sheet->setCellValue("B{$currentRow}", $p->name);
+                            $sheet->setCellValue("C{$currentRow}", $varName);
+                            $sheet->setCellValue("D{$currentRow}", $varType);
+                            $sheet->setCellValue("E{$currentRow}", $vCost);
+                            $sheet->setCellValue("F{$currentRow}", $vCost);
+                            $sheet->setCellValue("G{$currentRow}", $vRetail);
+                            $sheet->setCellValue("H{$currentRow}", $vRetail);
+                            $sheet->setCellValue("I{$currentRow}", $vWholesale);
+                            $sheet->setCellValue("J{$currentRow}", $vWholesale);
+                            $currentRow++;
+                        }
+                    } else {
+                        $cost = (float)$p->cost_price;
+                        $retail = (float)$p->retail_price;
+                        $wholesale = (float)$p->wholesale_price;
+
+                        $sheet->setCellValueExplicit("A{$currentRow}", (string)$p->code, DataType::TYPE_STRING);
+                        $sheet->setCellValue("B{$currentRow}", $p->name);
+                        $sheet->setCellValue("C{$currentRow}", '-');
+                        $sheet->setCellValue("D{$currentRow}", '-');
+                        $sheet->setCellValue("E{$currentRow}", $cost);
+                        $sheet->setCellValue("F{$currentRow}", $cost);
+                        $sheet->setCellValue("G{$currentRow}", $retail);
+                        $sheet->setCellValue("H{$currentRow}", $retail);
+                        $sheet->setCellValue("I{$currentRow}", $wholesale);
+                        $sheet->setCellValue("J{$currentRow}", $wholesale);
+                        $currentRow++;
+                    }
                 }
             } else {
                 // Sample guide row
                 $sheet->setCellValueExplicit('A2', '10001', DataType::TYPE_STRING);
                 $sheet->setCellValue('B2', 'Classic Cheeseburger Deluxe');
-                $sheet->setCellValue('C2', 4500.0);
-                $sheet->setCellValue('D2', 4800.0);
-                $sheet->setCellValue('E2', 8500.0);
-                $sheet->setCellValue('F2', 9000.0);
-                $sheet->setCellValue('G2', 7500.0);
-                $sheet->setCellValue('H2', 8000.0);
+                $sheet->setCellValue('C2', '-');
+                $sheet->setCellValue('D2', '-');
+                $sheet->setCellValue('E2', 4500.0);
+                $sheet->setCellValue('F2', 4800.0);
+                $sheet->setCellValue('G2', 8500.0);
+                $sheet->setCellValue('H2', 9000.0);
+                $sheet->setCellValue('I2', 7500.0);
+                $sheet->setCellValue('J2', 8000.0);
             }
 
-            foreach (range('A', 'H') as $col) {
+            foreach (range('A', 'J') as $col) {
                 $sheet->getColumnDimension($col)->setAutoSize(true);
             }
 
             $fileName = 'product_price_change_template.xlsx';
         } else {
             // New Product Import Template
+            $spreadsheet = new Spreadsheet();
+            $sheet = $spreadsheet->getActiveSheet();
             $sheet->setTitle('Product Import Template');
             $headers = [
                 'Product Type',
@@ -993,12 +1180,24 @@ class ProductExcelController extends Controller
         $map = [];
         foreach ($headers as $index => $raw) {
             $clean = strtolower(trim((string)$raw));
-            if (in_array($clean, ['product code', 'code', 'sku', 'barcode', 'item code'])) {
+            if (in_array($clean, ['product code', 'code', 'sku', 'barcode', 'item code', 'variation code', 'variant code'])) {
                 $map['code'] = $index;
-            } elseif (in_array($clean, ['new cost price', 'new cost', 'product cost', 'cost price', 'cost'])) {
+            } elseif (in_array($clean, ['product name', 'name', 'item name'])) {
+                $map['name'] = $index;
+            } elseif (in_array($clean, ['variation name', 'variant name', 'attribute name'])) {
+                $map['variation_name'] = $index;
+            } elseif (in_array($clean, ['variation type', 'variant type', 'attribute value', 'variation'])) {
+                $map['variation_type'] = $index;
+            } elseif (in_array($clean, ['current cost', 'current cost price', 'old cost'])) {
+                $map['current_cost'] = $index;
+            } elseif (in_array($clean, ['new cost price', 'new cost', 'cost price', 'cost'])) {
                 $map['new_cost'] = $index;
+            } elseif (in_array($clean, ['current retail price', 'current price', 'old price', 'current retail'])) {
+                $map['current_retail'] = $index;
             } elseif (in_array($clean, ['new retail price', 'new price', 'retail price', 'selling price', 'price'])) {
                 $map['new_retail'] = $index;
+            } elseif (in_array($clean, ['current wholesale price', 'current wholesale', 'old wholesale'])) {
+                $map['current_wholesale'] = $index;
             } elseif (in_array($clean, ['new wholesale price', 'new wholesale', 'wholesale price', 'wholesale'])) {
                 $map['new_wholesale'] = $index;
             }

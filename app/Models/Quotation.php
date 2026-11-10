@@ -31,6 +31,7 @@ class Quotation extends Model
     ];
 
     protected $casts = [
+        'date' => 'datetime:Y-m-d H:i:s',
         'warehouse_id' => 'integer',
         'user_id' => 'integer',
         'expiry_date' => 'date',
@@ -54,5 +55,10 @@ class Quotation extends Model
     public function user()
     {
         return $this->belongsTo(User::class, 'user_id');
+    }
+
+    public function sale()
+    {
+        return $this->hasOne(Sale::class, 'quotation_id');
     }
 }

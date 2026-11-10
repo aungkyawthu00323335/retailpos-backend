@@ -712,16 +712,49 @@ class BotOrderController extends Controller
                 $totalSaleCogs += (float)$depletion['total_cogs'];
             }
 
+            $salePrefix = Setting::get('sale_prefix', 'SA-');
+            if (empty($salePrefix)) {
+                $salePrefix = 'SA-';
+            }
+            if (!str_ends_with($salePrefix, '-') && !str_ends_with($salePrefix, '_')) {
+                $salePrefix .= '-';
+            }
+
+            $currentRef = $sale->reference_no;
+            $newRef = $currentRef;
+            if (!str_starts_with($currentRef, $salePrefix) && !str_starts_with($currentRef, 'SA-')) {
+                $maxNum = (int)Sale::count();
+                $recent = Sale::where('reference_no', 'like', $salePrefix . '%')
+                    ->orWhere('reference_no', 'like', 'SA-%')
+                    ->orderBy('id', 'desc')->take(100)->get();
+                foreach ($recent as $s) {
+                    if (preg_match('/(?:' . preg_quote($salePrefix, '/') . '|SA-)(\d+)/', (string)$s->reference_no, $m)) {
+                        $val = (int)$m[1];
+                        if ($val > $maxNum && $val < 99999999) {
+                            $maxNum = $val;
+                        }
+                    }
+                }
+                $nextNum = $maxNum + 1;
+                $newRef = $salePrefix . sprintf('%07d', $nextNum);
+                while (Sale::where('reference_no', $newRef)->exists()) {
+                    $nextNum++;
+                    $newRef = $salePrefix . sprintf('%07d', $nextNum);
+                }
+            }
+
             $user = auth()->user();
             $approvedBy = $user ? $user->name : 'Super Admin';
+            $origRefNote = ($newRef !== $currentRef) ? " | Orig Bot Order: {$currentRef}" : "";
 
             $sale->update([
+                'reference_no' => $newRef,
                 'status' => 'Completed',
                 'bot_approval_status' => 'approved',
                 'bot_approved_by' => $approvedBy,
                 'bot_approved_at' => now(),
                 'total_cogs' => round($totalSaleCogs, 2),
-                'notes' => trim($sale->notes . " | Approved by {$approvedBy} on " . now()->format('Y-m-d H:i')),
+                'notes' => trim($sale->notes . " | Approved by {$approvedBy} on " . now()->format('Y-m-d H:i') . $origRefNote),
             ]);
 
             DB::commit();
@@ -836,23 +869,44 @@ class BotOrderController extends Controller
             $paymentMethods = is_string($paymentMethodsRaw) ? json_decode($paymentMethodsRaw, true) : $paymentMethodsRaw;
 
             return [
+                // 🔌 1. Core Retail: Bot Connection & POS Warehouse Binding
                 'telegram_bot_enabled' => Setting::get('telegram_bot_enabled', '0') === '1',
                 'telegram_bot_token' => Setting::get('telegram_bot_token', ''),
                 'telegram_bot_username' => Setting::get('telegram_bot_username', ''),
                 'telegram_bot_warehouse_id' => $warehouse?->id ?? 1,
                 'telegram_bot_warehouse_name' => $warehouse?->name ?? 'Default Warehouse',
+
+                // ⚖️ 2. Core Retail: Order & Accounting Policy
                 'telegram_bot_auto_approve' => Setting::get('telegram_bot_auto_approve', '0') === '1',
                 'telegram_bot_allow_unpaid' => Setting::get('telegram_bot_allow_unpaid', '1') === '1',
                 'telegram_bot_allow_paid' => Setting::get('telegram_bot_allow_paid', '1') === '1',
                 'telegram_bot_allow_partial' => Setting::get('telegram_bot_allow_partial', '0') === '1',
-                'telegram_bot_reject_duplicate_slip' => Setting::get('telegram_bot_reject_duplicate_slip', '1') === '1',
                 'telegram_bot_min_partial_pct' => (float)Setting::get('telegram_bot_min_partial_pct', '30'),
-                'telegram_bot_allow_out_of_stock_orders' => Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1',
+                'telegram_bot_require_payment_slip' => Setting::get('telegram_bot_require_payment_slip', '1') === '1',
+                'telegram_bot_reject_duplicate_slip' => Setting::get('telegram_bot_reject_duplicate_slip', '1') === '1',
+                'telegram_admin_chat_ids' => Setting::get('telegram_admin_chat_ids', ''),
+
+                // 🛍️ 3. Core Retail: Catalog & Delivery Controls
                 'telegram_bot_hide_out_of_stock' => Setting::get('telegram_bot_hide_out_of_stock', '0') === '1',
-                'telegram_bot_tma_enabled' => Setting::get('telegram_bot_tma_enabled', '0') === '1',
-                'telegram_bot_tma_url' => Setting::get('telegram_bot_tma_url', ''),
-                'telegram_bot_menu_button_text' => Setting::get('telegram_bot_menu_button_text', '🛍️ Shop Now'),
-                'telegram_bot_restock_notify_enabled' => Setting::get('telegram_bot_restock_notify_enabled', '0') === '1',
+                'telegram_bot_allow_out_of_stock_orders' => Setting::get('telegram_bot_allow_out_of_stock_orders', '0') === '1',
+                'telegram_bot_catalog_per_page' => (int)Setting::get('telegram_bot_catalog_per_page', 3),
+                'telegram_bot_catalog_style' => Setting::get('telegram_bot_catalog_style', 'card_feed'),
+                'telegram_bot_show_product_code' => Setting::get('telegram_bot_show_product_code', '1') === '1',
+                'telegram_bot_show_product_category' => Setting::get('telegram_bot_show_product_category', '1') === '1',
+                'telegram_bot_show_product_brand' => Setting::get('telegram_bot_show_product_brand', '1') === '1',
+                'telegram_bot_show_product_price' => Setting::get('telegram_bot_show_product_price', '1') === '1',
+                'telegram_bot_show_product_stock' => Setting::get('telegram_bot_show_product_stock', '1') === '1',
+                'telegram_bot_show_product_image' => Setting::get('telegram_bot_show_product_image', '1') === '1',
+                'telegram_bot_welcome_msg' => Setting::get('telegram_bot_welcome_msg', ''),
+                'telegram_bot_delivery_store_pickup_fee' => (float)Setting::get('telegram_bot_delivery_store_pickup_fee', 0),
+                'telegram_bot_delivery_city_fee' => (float)Setting::get('telegram_bot_delivery_city_fee', 2500),
+                'telegram_bot_delivery_express_fee' => (float)Setting::get('telegram_bot_delivery_express_fee', 3000),
+
+                // 💬 4. Core Retail: Essential Customer Messages
+                'telegram_bot_order_success_msg' => Setting::get('telegram_bot_order_success_msg', ''),
+                'telegram_bot_contact_info_msg' => Setting::get('telegram_bot_contact_info_msg', ''),
+
+                // 🔄 5. Legacy & Backward Compatibility Fallbacks (Preserved for existing services, TMA, and tests)
                 'telegram_bot_payment_methods' => $paymentMethods ?: ['Cash on Delivery', 'KBZPay', 'WavePay'],
                 'telegram_bot_payment_info' => Setting::get('telegram_bot_payment_info', ''),
                 'telegram_bot_kpay_info' => Setting::get('telegram_bot_kpay_info', ''),
@@ -860,9 +914,10 @@ class BotOrderController extends Controller
                 'telegram_bot_ayapay_info' => Setting::get('telegram_bot_ayapay_info', ''),
                 'telegram_bot_cbpay_info' => Setting::get('telegram_bot_cbpay_info', ''),
                 'telegram_bot_other_bank_info' => Setting::get('telegram_bot_other_bank_info', ''),
-                'telegram_bot_welcome_msg' => Setting::get('telegram_bot_welcome_msg', ''),
-                'telegram_bot_catalog_per_page' => (int)Setting::get('telegram_bot_catalog_per_page', 3),
-                'telegram_bot_catalog_style' => Setting::get('telegram_bot_catalog_style', 'card_feed'),
+                'telegram_bot_tma_enabled' => Setting::get('telegram_bot_tma_enabled', '0') === '1',
+                'telegram_bot_tma_url' => Setting::get('telegram_bot_tma_url', ''),
+                'telegram_bot_menu_button_text' => Setting::get('telegram_bot_menu_button_text', '🛍️ Shop Now'),
+                'telegram_bot_restock_notify_enabled' => Setting::get('telegram_bot_restock_notify_enabled', '0') === '1',
                 'telegram_bot_catalog_menu_msg' => Setting::get('telegram_bot_catalog_menu_msg', ''),
                 'telegram_bot_no_products_msg' => Setting::get('telegram_bot_no_products_msg', ''),
                 'telegram_bot_select_variant_msg' => Setting::get('telegram_bot_select_variant_msg', ''),
@@ -874,7 +929,6 @@ class BotOrderController extends Controller
                 'telegram_bot_select_payment_msg' => Setting::get('telegram_bot_select_payment_msg', ''),
                 'telegram_bot_unexpected_slip_msg' => Setting::get('telegram_bot_unexpected_slip_msg', ''),
                 'telegram_bot_order_error_msg' => Setting::get('telegram_bot_order_error_msg', ''),
-                'telegram_bot_order_success_msg' => Setting::get('telegram_bot_order_success_msg', ''),
                 'telegram_bot_order_approved_msg' => Setting::get('telegram_bot_order_approved_msg', ''),
                 'telegram_bot_order_rejected_msg' => Setting::get('telegram_bot_order_rejected_msg', ''),
                 'telegram_bot_order_dispatched_msg' => Setting::get('telegram_bot_order_dispatched_msg', ''),
@@ -882,7 +936,6 @@ class BotOrderController extends Controller
                 'telegram_bot_webhook_mode' => Setting::get('telegram_bot_webhook_mode', '0') === '1',
                 'telegram_bot_webhook_secret' => Setting::get('telegram_bot_webhook_secret', ''),
                 'telegram_bot_payment_instructions_msg' => Setting::get('telegram_bot_payment_instructions_msg', ''),
-                'telegram_bot_contact_info_msg' => Setting::get('telegram_bot_contact_info_msg', ''),
                 'telegram_bot_no_orders_msg' => Setting::get('telegram_bot_no_orders_msg', ''),
                 'telegram_bot_ask_phone_msg' => Setting::get('telegram_bot_ask_phone_msg', ''),
                 'telegram_bot_ask_address_msg' => Setting::get('telegram_bot_ask_address_msg', ''),
@@ -892,10 +945,9 @@ class BotOrderController extends Controller
                 'telegram_bot_no_brands_msg' => Setting::get('telegram_bot_no_brands_msg', ''),
                 'telegram_bot_photo_error_msg' => Setting::get('telegram_bot_photo_error_msg', ''),
                 'telegram_admin_new_order_msg' => Setting::get('telegram_admin_new_order_msg', ''),
-                'telegram_admin_chat_ids' => Setting::get('telegram_admin_chat_ids', ''),
 
-                // 🔘 Customizable Button Texts & Icons
-                'telegram_bot_btn_catalog' => Setting::get('telegram_bot_btn_catalog', '🛍️ ကုန်ပစ္စည်းများ ကြည့်မည်'),
+                // 🔘 Customer Main Keyboard Menu Buttons
+                'telegram_bot_btn_catalog' => Setting::get('telegram_bot_btn_catalog', '🛍️ ကုန်ပစ္စည်းများ'),
                 'telegram_bot_btn_orders' => Setting::get('telegram_bot_btn_orders', '📦 တင်ထားသော Order များ'),
                 'telegram_bot_btn_payment' => Setting::get('telegram_bot_btn_payment', 'ℹ️ ငွေလွှဲရန် အချက်အလက်'),
                 'telegram_bot_btn_reorder' => Setting::get('telegram_bot_btn_reorder', '🔄 ယခင်မှာယူခဲ့သည်များ ထပ်မှာမည် (Re-Order)'),
@@ -947,27 +999,15 @@ class BotOrderController extends Controller
                 'telegram_bot_btn_continue_shopping' => Setting::get('telegram_bot_btn_continue_shopping', 'တခြားပစ္စည်းကြည့်ဦးမယ်'),
                 'telegram_bot_cart_badge_style' => Setting::get('telegram_bot_cart_badge_style', 'none'),
                 'telegram_bot_cart_badge_hide_when_empty' => filter_var(Setting::get('telegram_bot_cart_badge_hide_when_empty', false), FILTER_VALIDATE_BOOLEAN),
-                'telegram_bot_delivery_store_pickup_fee' => (float)Setting::get('telegram_bot_delivery_store_pickup_fee', 0),
-                'telegram_bot_delivery_city_fee' => (float)Setting::get('telegram_bot_delivery_city_fee', 2500),
-                'telegram_bot_delivery_express_fee' => (float)Setting::get('telegram_bot_delivery_express_fee', 3000),
-
-                // ⚡ Simplified Checkout & Quick Order Flow Controls
                 'telegram_bot_checkout_quick_cod' => Setting::get('telegram_bot_checkout_quick_cod', '1') === '1',
                 'telegram_bot_checkout_skip_township' => Setting::get('telegram_bot_checkout_skip_township', '1') === '1',
-                'telegram_bot_require_payment_slip' => Setting::get('telegram_bot_require_payment_slip', '1') === '1',
-
-                // 📍 Location Input Mode & Native Sharing Buttons
                 'telegram_bot_location_input_mode' => Setting::get('telegram_bot_location_input_mode', 'both_button_and_text'),
                 'telegram_bot_btn_share_location' => Setting::get('telegram_bot_btn_share_location', '📍 လက်ရှိတည်နေရာ ပေးပို့မည် (Share GPS Location)'),
                 'telegram_bot_btn_share_phone' => Setting::get('telegram_bot_btn_share_phone', '📱 ကျွန်ုပ်၏ ဖုန်းနံပါတ် ပေးပို့မည် (Share Phone)'),
-
-                // 🚚 Delivery Labels & Selection
                 'telegram_bot_delivery_select_msg' => Setting::get('telegram_bot_delivery_select_msg', ''),
                 'telegram_bot_delivery_store_pickup_label' => Setting::get('telegram_bot_delivery_store_pickup_label', '🏢 ဆိုင်တွင် ကိုယ်တိုင်လာယူမည် (Store Pickup)'),
                 'telegram_bot_delivery_city_label' => Setting::get('telegram_bot_delivery_city_label', '🚚 မြို့တွင်း အိမ်အရောက်ပို့ (City Delivery)'),
                 'telegram_bot_delivery_express_label' => Setting::get('telegram_bot_delivery_express_label', '📦 နယ်ဝေး ကားဂိတ်ပို့ဆောင် (Highway Bus Gate)'),
-
-                // 🛒 Cart Messages & Acknowledgments
                 'telegram_bot_cart_empty_msg' => Setting::get('telegram_bot_cart_empty_msg', ''),
                 'telegram_bot_cart_cleared_msg' => Setting::get('telegram_bot_cart_cleared_msg', ''),
                 'telegram_bot_duplicate_slip_msg' => Setting::get('telegram_bot_duplicate_slip_msg', ''),
@@ -975,8 +1015,6 @@ class BotOrderController extends Controller
                 'telegram_bot_address_saved_msg' => Setting::get('telegram_bot_address_saved_msg', ''),
                 'telegram_bot_location_received_msg' => Setting::get('telegram_bot_location_received_msg', ''),
                 'telegram_bot_invalid_slip_doc_msg' => Setting::get('telegram_bot_invalid_slip_doc_msg', ''),
-
-                // 🛒 Cart Customizations & Visibility Controls
                 'telegram_bot_cart_header_title' => Setting::get('telegram_bot_cart_header_title', '🛒 ယူထားတဲ့ စာရင်း'),
                 'telegram_bot_cart_show_header' => Setting::get('telegram_bot_cart_show_header', '1') === '1',
                 'telegram_bot_cart_total_label' => Setting::get('telegram_bot_cart_total_label', '💰 စုစုပေါင်း:'),
@@ -1013,24 +1051,14 @@ class BotOrderController extends Controller
                 'telegram_bot_show_cart_updated_btn_continue' => Setting::get('telegram_bot_show_cart_updated_btn_continue', '1') === '1',
                 'telegram_bot_show_cart_updated_btn_clear' => Setting::get('telegram_bot_show_cart_updated_btn_clear', '1') === '1',
                 'telegram_bot_show_cart_updated_btn_menu' => Setting::get('telegram_bot_show_cart_updated_btn_menu', '1') === '1',
-
-                // 👁️ Product Catalog Field Visibility Controls
-                'telegram_bot_show_product_code' => Setting::get('telegram_bot_show_product_code', '1') === '1',
-                'telegram_bot_show_product_category' => Setting::get('telegram_bot_show_product_category', '1') === '1',
                 'telegram_bot_show_product_sub_category' => Setting::get('telegram_bot_show_product_sub_category', '1') === '1',
-                'telegram_bot_show_product_brand' => Setting::get('telegram_bot_show_product_brand', '1') === '1',
-                'telegram_bot_show_product_price' => Setting::get('telegram_bot_show_product_price', '1') === '1',
-                'telegram_bot_show_product_stock' => Setting::get('telegram_bot_show_product_stock', '1') === '1',
                 'telegram_bot_show_product_details' => Setting::get('telegram_bot_show_product_details', '0') === '1',
-                'telegram_bot_show_product_image' => Setting::get('telegram_bot_show_product_image', '1') === '1',
                 'telegram_bot_show_product_variants' => Setting::get('telegram_bot_show_product_variants', '1') === '1',
-
-                // 🧭 Navigation Drilldown Controls
                 'telegram_bot_direct_categories' => Setting::get('telegram_bot_direct_categories', '0') === '1',
                 'telegram_bot_category_drilldown_sub' => Setting::get('telegram_bot_category_drilldown_sub', '1') === '1',
                 'telegram_bot_brand_drilldown_category' => Setting::get('telegram_bot_brand_drilldown_category', '1') === '1',
 
-                // 🤖 Bot Operating Mode & AI Sales Agent Configuration
+                // 🤖 Operating Mode & AI Agent Config
                 'telegram_bot_mode' => $this->aiAgentService->getOperatingMode(),
                 'telegram_bot_ai_enabled' => $this->aiAgentService->isEnabled(),
                 'telegram_bot_ai_provider' => Setting::get('telegram_bot_ai_provider', 'gemini'),
@@ -1041,7 +1069,7 @@ class BotOrderController extends Controller
                 'telegram_bot_ai_custom_prompt' => Setting::get('telegram_bot_ai_custom_prompt', ''),
                 'telegram_bot_ai_show_photos' => Setting::get('telegram_bot_ai_show_photos', '1'),
 
-                // 🔘 Extended Button & Delivery Visibility Controls Across All Sections
+                // 🔘 Extended Button & Delivery Visibility Controls
                 'telegram_bot_show_btn_catalog' => Setting::get('telegram_bot_show_btn_catalog', '1') === '1',
                 'telegram_bot_show_btn_cart' => Setting::get('telegram_bot_show_btn_cart', '1') === '1',
                 'telegram_bot_show_btn_orders' => Setting::get('telegram_bot_show_btn_orders', '1') === '1',
@@ -1294,7 +1322,7 @@ class BotOrderController extends Controller
             // 🤖 Bot Operating Mode & AI Sales Agent Controls
             'telegram_bot_mode' => 'nullable|string|in:standard,hybrid',
             'telegram_bot_ai_enabled' => 'nullable|boolean',
-            'telegram_bot_ai_provider' => 'nullable|string|in:gemini,openai',
+            'telegram_bot_ai_provider' => 'nullable|string|in:gemini,openai,deepseek,anthropic',
             'telegram_bot_ai_api_key' => 'nullable|string|max:500',
             'telegram_bot_ai_model' => 'nullable|string|max:100',
             'telegram_bot_ai_persona' => 'nullable|string|in:polite_sales,professional,friendly,custom',
@@ -1352,10 +1380,11 @@ class BotOrderController extends Controller
             $currentToken = trim((string)Setting::get('telegram_bot_token', ''));
 
             if (!empty($newToken) && $newToken !== $currentToken) {
-                // Validate new token with Telegram getMe API
+                // Fast 4s verification with IPv4 resolution to prevent DNS delay
                 try {
-                    $res = \Illuminate\Support\Facades\Http::timeout(10)
+                    $res = \Illuminate\Support\Facades\Http::timeout(4)
                         ->withoutVerifying()
+                        ->withOptions(['curl' => [CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4]])
                         ->get("https://api.telegram.org/bot{$newToken}/getMe");
 
                     if ($res->successful() && ($res->json('ok') === true)) {
@@ -1364,11 +1393,7 @@ class BotOrderController extends Controller
                             $validated['telegram_bot_username'] = '@' . $botData['username'];
                             Setting::set('telegram_bot_username', '@' . $botData['username']);
                         }
-                        // Delete webhook on new token to allow polling immediately
-                        \Illuminate\Support\Facades\Http::timeout(10)
-                            ->withoutVerifying()
-                            ->post("https://api.telegram.org/bot{$newToken}/deleteWebhook");
-                    } else {
+                    } elseif ($res->status() === 401 || $res->status() === 404) {
                         $desc = $res->json('description') ?? 'Unauthorized';
                         $status = $res->status();
                         return response()->json([
@@ -1460,26 +1485,13 @@ class BotOrderController extends Controller
         }
 
         try {
-            $res = \Illuminate\Support\Facades\Http::timeout(10)
-                ->withoutVerifying()
-                ->get("https://api.telegram.org/bot{$token}/getMe");
+            $resData = $this->botService->getMe($token);
 
-            if ($res->successful() && ($res->json('ok') === true)) {
-                $botData = $res->json('result');
+            if (!empty($resData['ok']) && !empty($resData['result'])) {
+                $botData = $resData['result'];
                 // Auto update username
                 if (!empty($botData['username'])) {
                     Setting::set('telegram_bot_username', '@' . $botData['username']);
-                }
-                // Also delete webhook so polling works smoothly
-                \Illuminate\Support\Facades\Http::timeout(10)
-                    ->withoutVerifying()
-                    ->post("https://api.telegram.org/bot{$token}/deleteWebhook");
-
-                // Auto synchronize Telegram Menu Commands
-                try {
-                    $this->botService->syncBotCommands();
-                } catch (\Throwable $ce) {
-                    \Illuminate\Support\Facades\Log::warning('Auto sync commands error: ' . $ce->getMessage());
                 }
 
                 return response()->json([
@@ -1489,15 +1501,26 @@ class BotOrderController extends Controller
                 ]);
             }
 
+            $desc = $resData['description'] ?? 'Invalid token or network error';
+            $hint = '';
+            if (str_contains($desc, 'cURL error 28') || str_contains($desc, 'timed out') || str_contains($desc, 'Failed to connect')) {
+                $hint = ' (မြန်မာနိုင်ငံ အင်တာနက်လိုင်းများတွင် Telegram ပိတ်ထားနိုင်သဖြင့် Outline/VPN ဖွင့်ထားပေးပါရန်)';
+            }
+
             return response()->json([
                 'status' => 'error',
-                'message' => 'Connection failed: ' . ($res->json('description') ?? 'Invalid token or network error'),
+                'message' => 'Connection failed: ' . $desc . $hint,
             ], 400);
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::error('Telegram testBotToken failed: ' . $e->getMessage());
+            $rawMsg = $e->getMessage();
+            $hint = '';
+            if (str_contains($rawMsg, 'cURL error 28') || str_contains($rawMsg, 'timed out') || str_contains($rawMsg, 'Failed to connect')) {
+                $hint = ' (မြန်မာနိုင်ငံ အင်တာနက်လိုင်းများတွင် Telegram ပိတ်ထားနိုင်သဖြင့် Outline/VPN ဖွင့်ထားပေးပါရန်)';
+            }
             return response()->json([
                 'status' => 'error',
-                'message' => 'Telegram connection error: ' . $e->getMessage(),
+                'message' => 'Telegram connection error: ' . $rawMsg . $hint,
             ], 400);
         }
     }

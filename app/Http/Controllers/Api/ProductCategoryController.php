@@ -5,12 +5,18 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\ProductCategory;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class ProductCategoryController extends Controller
 {
     public function index()
     {
-        $categories = ProductCategory::withCount('products')->orderBy('id', 'desc')->get();
+        $categories = Cache::remember('api_product_categories_list', 60, function () {
+            return ProductCategory::select(['id', 'name', 'description', 'status', 'created_at', 'updated_at'])
+                ->withCount('products')
+                ->orderBy('id', 'desc')
+                ->get();
+        });
 
         return response()->json([
             'status' => 'success',
@@ -31,6 +37,8 @@ class ProductCategoryController extends Controller
             'description' => $validated['description'] ?? null,
             'status' => $validated['status'] ?? 'Active',
         ]);
+
+        Cache::forget('api_product_categories_list');
 
         return response()->json([
             'status' => 'success',
@@ -75,6 +83,8 @@ class ProductCategoryController extends Controller
 
         $category->update($validated);
 
+        Cache::forget('api_product_categories_list');
+
         return response()->json([
             'status' => 'success',
             'message' => 'Product category updated successfully',
@@ -101,6 +111,8 @@ class ProductCategoryController extends Controller
         }
 
         $category->delete();
+
+        Cache::forget('api_product_categories_list');
 
         return response()->json([
             'status' => 'success',

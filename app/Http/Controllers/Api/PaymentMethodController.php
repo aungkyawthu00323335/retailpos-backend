@@ -241,6 +241,14 @@ class PaymentMethodController extends Controller
         if (!$method) {
             return response()->json(['status' => 'error', 'message' => 'Payment method not found'], 404);
         }
+
+        if ($method->is_default) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Default payment method cannot be deleted. Please set another payment method as default first.',
+            ], 422);
+        }
+
         $method->delete();
 
         Cache::forget(self::CACHE_KEY);

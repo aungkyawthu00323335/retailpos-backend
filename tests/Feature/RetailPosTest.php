@@ -187,6 +187,80 @@ class RetailPosTest extends TestCase
     }
 
     /**
+     * 4b. POS Offline Bulk Sync Testing (Phase 1 Enterprise Feature)
+     */
+    public function test_sales_bulk_sync(): void
+    {
+        $batch = [
+            'sales' => [
+                [
+                    'reference_no' => 'OFFLINE-SYNC-TEST-001',
+                    'customer_name' => 'Walk-in Customer',
+                    'warehouse_name' => 'Main Warehouse Branch',
+                    'date' => date('Y-m-d'),
+                    'status' => 'Completed',
+                    'subtotal' => 130.00,
+                    'grand_total' => 130.00,
+                    'paid_amount' => 130.00,
+                    'due_amount' => 0.00,
+                    'payment_status' => 'Paid',
+                    'payment_type' => 'Cash',
+                    'items' => [
+                        [
+                            'product_code' => '8934567890123',
+                            'product_name' => 'Nike Air Zoom Pegasus 40',
+                            'unit_price' => 130.00,
+                            'quantity' => 1,
+                            'subtotal' => 130.00,
+                        ]
+                    ],
+                ],
+                [
+                    'reference_no' => 'OFFLINE-SYNC-TEST-002',
+                    'customer_name' => 'Walk-in Customer',
+                    'warehouse_name' => 'Main Warehouse Branch',
+                    'date' => date('Y-m-d'),
+                    'status' => 'Completed',
+                    'subtotal' => 130.00,
+                    'grand_total' => 130.00,
+                    'paid_amount' => 130.00,
+                    'due_amount' => 0.00,
+                    'payment_status' => 'Paid',
+                    'payment_type' => 'Cash',
+                    'items' => [
+                        [
+                            'product_code' => '8934567890123',
+                            'product_name' => 'Nike Air Zoom Pegasus 40',
+                            'unit_price' => 130.00,
+                            'quantity' => 1,
+                            'subtotal' => 130.00,
+                        ]
+                    ],
+                ],
+            ]
+        ];
+
+        // 1. Initial Batch Sync
+        $res = $this->postJson('/api/sales/bulk-sync', $batch);
+        $res->assertStatus(200)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('synced_count', 2)
+            ->assertJsonPath('failed_count', 0);
+
+        $this->assertDatabaseHas('sales', ['reference_no' => 'OFFLINE-SYNC-TEST-001']);
+        $this->assertDatabaseHas('sales', ['reference_no' => 'OFFLINE-SYNC-TEST-002']);
+
+        // 2. Idempotent Retry of same batch (should report already_synced without error or duplicate records)
+        $retryRes = $this->postJson('/api/sales/bulk-sync', $batch);
+        $retryRes->assertStatus(200)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('synced_count', 2)
+            ->assertJsonPath('failed_count', 0)
+            ->assertJsonPath('synced.0.status', 'already_synced')
+            ->assertJsonPath('synced.1.status', 'already_synced');
+    }
+
+    /**
      * 5. Quotations Testing
      */
     public function test_quotations_crud(): void

@@ -92,7 +92,8 @@ class ReportController extends Controller
             $endDate = $temp;
         }
 
-        $cacheKey = "pos_dashboard_" . md5($warehouse . '_' . $dateFilter . '_' . ($startDate ?? 'all') . '_' . ($endDate ?? 'all') . '_' . $year);
+        $cacheVersion = (int)Cache::get('pos_dashboard_version', 1);
+        $cacheKey = "pos_dashboard_v{$cacheVersion}_" . md5($warehouse . '_' . $dateFilter . '_' . ($startDate ?? 'all') . '_' . ($endDate ?? 'all') . '_' . $year);
         if (!$forceRefresh) {
             try {
                 $cachedData = Cache::get($cacheKey);
@@ -106,6 +107,10 @@ class ReportController extends Controller
         $yesterday = Carbon::yesterday()->toDateString();
         $todayPrefix = $today . '%';
         $yesterdayPrefix = $yesterday . '%';
+        $todayStart = $today . ' 00:00:00';
+        $todayEnd = $today . ' 23:59:59';
+        $yesterdayStart = $yesterday . ' 00:00:00';
+        $yesterdayEnd = $yesterday . ' 23:59:59';
 
         // Date scoping helper (preserves index range seek)
         $applyDateScope = function ($query, $column = 'date') use ($startDate, $endDate) {
@@ -147,11 +152,11 @@ class ReportController extends Controller
 
         // Real-time Pulse Metrics (Today vs Yesterday)
         $pulseSalesAgg = (clone $salesBaseQuery)->selectRaw('
-            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as today_sales,
-            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN 1 ELSE 0 END), 0) as today_sales_count,
-            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN total_cogs ELSE 0 END), 0) as today_cogs,
-            COALESCE(SUM(CASE WHEN date LIKE ? OR date = ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
-        ', [$todayPrefix, $today, $todayPrefix, $today, $todayPrefix, $today, $yesterdayPrefix, $yesterday])->first();
+            COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN grand_total ELSE 0 END), 0) as today_sales,
+            COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN 1 ELSE 0 END), 0) as today_sales_count,
+            COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN total_cogs ELSE 0 END), 0) as today_cogs,
+            COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
+        ', [$todayStart, $todayEnd, $todayStart, $todayEnd, $todayStart, $todayEnd, $yesterdayStart, $yesterdayEnd])->first();
 
         $todaySales = (float)($pulseSalesAgg->today_sales ?? 0);
         $todaySalesCount = (int)($pulseSalesAgg->today_sales_count ?? 0);
@@ -175,7 +180,7 @@ class ReportController extends Controller
             $totalSaleReturns = (float)$srQuery->sum('grand_total');
         } catch (\Throwable $e) {}
 
-        $netSales = max(0.0, $totalSales - $totalSaleReturns);
+        $netSales = round($totalSales - $totalSaleReturns, 2);
         $averageOrderValue = $ordersCount > 0 ? round($netSales / $ordersCount, 2) : 0.0;
         $cashRatioPct = $totalSales > 0 ? round(($periodPaid / $totalSales) * 100, 1) : 0.0;
 
@@ -193,9 +198,8 @@ class ReportController extends Controller
         $periodPurchDue = (float)($periodPurchAgg->due_amount ?? 0);
 
         $todayPurchases = (float)(clone $purchBaseQuery)
-            ->where(function ($q) use ($todayPrefix, $today) {
-                $q->where('date', 'LIKE', $todayPrefix)->orWhere('date', $today);
-            })
+            ->where('date', '>=', $todayStart)
+            ->where('date', '<=', $todayEnd)
             ->sum('grand_total');
 
         $totalPurchaseReturns = 0.0;
@@ -208,7 +212,7 @@ class ReportController extends Controller
             $totalPurchaseReturns = (float)$prQuery->sum('grand_total');
         } catch (\Throwable $e) {}
 
-        $netPurchases = max(0.0, $totalPurchases - $totalPurchaseReturns);
+        $netPurchases = round($totalPurchases - $totalPurchaseReturns, 2);
 
         // 4. Single-Pass Consolidated Expenses Aggregation in Period
         $periodExpQuery = clone $expBaseQuery;
@@ -216,9 +220,8 @@ class ReportController extends Controller
         $totalExpenses = (float)$periodExpQuery->sum('amount');
 
         $todayExpenses = (float)(clone $expBaseQuery)
-            ->where(function ($q) use ($todayPrefix, $today) {
-                $q->where('date', 'LIKE', $todayPrefix)->orWhere('date', $today);
-            })
+            ->where('date', '>=', $todayStart)
+            ->where('date', '<=', $todayEnd)
             ->sum('amount');
 
         // 5. Cost of Goods Sold (COGS) & GAAP/IFRS Operational Profitability
@@ -242,78 +245,303 @@ class ReportController extends Controller
             } catch (\Throwable $e) {}
         }
 
+        // 4b. Stock Adjustments (Inventory Shrinkage/Loss from Subtractions: Damage, Expiry, Theft)
+        $totalAdjustmentLoss = 0.0;
+        try {
+            $adjQuery = DB::table('stock_adjustment_items')
+                ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+                ->where('stock_adjustment_items.type', 'Subtraction');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $adjQuery->where('stock_adjustments.warehouse_name', $warehouse);
+            }
+            $applyDateScope($adjQuery, 'stock_adjustments.date');
+            $totalAdjustmentLoss = (float)$adjQuery->sum('stock_adjustment_items.subtotal');
+        } catch (\Throwable $e) {}
+
         $grossProfit = round($netSales - $totalCogs, 2);
-        $netProfit = round($grossProfit - $totalExpenses, 2);
+        $netProfit = round($grossProfit - $totalExpenses - $totalAdjustmentLoss, 2);
         $profitMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 2) : 0.0;
         $todayGrossProfit = round($todaySales - $todayCogs, 2);
         $todayProfit = round($todayGrossProfit - $todayExpenses, 2);
 
-        // 6. Balance Sheet Health Snapshots (Current as of today)
-        $customerDue = (float) DB::table('sales')
-            ->where('status', '!=', 'Voided')
-            ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
-            ->sum('due_amount');
+        // 6. Balance Sheet & Inventory Health Snapshots (Cached per warehouse & version for 5 minutes)
+        $snapshotCacheKey = "pos_dashboard_snapshot_v{$cacheVersion}_" . md5($warehouse);
+        $forceSnapshot = $request->boolean('force_snapshot') || $request->query('force_snapshot') === '1';
+        if ($forceSnapshot) {
+            try { Cache::forget($snapshotCacheKey); } catch (\Throwable $e) {}
+        }
 
-        $supplierDue = (float) DB::table('purchases')
-            ->where(function ($q) {
-                $q->whereNull('status')->orWhere('status', '!=', 'Voided');
-            })
-            ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
-            ->sum('due_amount');
+        $snapshot = Cache::remember($snapshotCacheKey, 1800, function () use ($warehouse) {
+            $customerDue = (float) DB::table('sales')
+                ->where('status', '!=', 'Voided')
+                ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
+                ->sum('due_amount');
 
-        // Total Inventory Stock Asset Valuation at Cost Price
-        $singleValuation = (float) DB::table('products')
-            ->whereNull('deleted_at')
-            ->where(function ($q) {
-                $q->where('has_variants', false)->orWhereNull('has_variants');
-            })
-            ->where('stock_quantity', '>', 0)
-            ->selectRaw('COALESCE(SUM(stock_quantity * COALESCE(NULLIF(cost_price, 0), NULLIF(purchase_price, 0), 0)), 0) as val')
-            ->value('val');
+            $supplierDue = (float) DB::table('purchases')
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+                })
+                ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse))
+                ->sum('due_amount');
 
-        $variantValuation = 0.0;
-        try {
-            $variantValuation = (float) DB::table('stock_balances')
-                ->join('products', 'stock_balances.product_id', '=', 'products.id')
-                ->leftJoin('product_variants', 'stock_balances.product_variant_id', '=', 'product_variants.id')
-                ->whereNull('products.deleted_at')
-                ->where('products.has_variants', true)
-                ->where('stock_balances.quantity', '>', 0)
-                ->selectRaw('COALESCE(SUM(stock_balances.quantity * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)), 0) as val')
-                ->value('val');
-        } catch (\Throwable $e) {}
+            $inventoryAgg = DB::table('products')
+                ->whereNull('deleted_at')
+                ->where(function ($q) {
+                    $q->where('has_variants', false)->orWhereNull('has_variants');
+                })
+                ->selectRaw('
+                    COUNT(*) as total_products,
+                    COALESCE(SUM(stock_quantity), 0) as total_stock,
+                    COALESCE(SUM(CASE WHEN stock_quantity > 0 THEN stock_quantity * COALESCE(NULLIF(cost_price, 0), NULLIF(purchase_price, 0), 0) ELSE 0 END), 0) as single_valuation
+                ')
+                ->first();
 
-        $inventoryValuationCost = round($singleValuation + $variantValuation, 2);
+            $totalProducts = (int)($inventoryAgg->total_products ?? 0);
+            $singleInStock = (float)($inventoryAgg->total_stock ?? 0);
+            $singleValuation = (float)($inventoryAgg->single_valuation ?? 0);
+            $variantValuation = 0.0;
+            try {
+                $variantValuation = (float) DB::table('stock_balances')
+                    ->join('products', 'stock_balances.product_id', '=', 'products.id')
+                    ->leftJoin('product_variants', 'stock_balances.product_variant_id', '=', 'product_variants.id')
+                    ->whereNull('products.deleted_at')
+                    ->where('products.has_variants', true)
+                    ->where('stock_balances.quantity', '>', 0)
+                    ->selectRaw('COALESCE(SUM(stock_balances.quantity * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)), 0) as val')
+                    ->value('val');
+            } catch (\Throwable $e) {}
 
-        // 7. Monthly 12-Month Trends for Selected Year (Annual Graphic)
+            $inventoryValuationCost = round($singleValuation + $variantValuation, 2);
+
+            $singleLowStock = Product::where(function ($q) {
+                    $q->where('has_variants', false)->orWhereNull('has_variants');
+                })
+                ->where(function ($q) {
+                    $q->whereColumn('stock_quantity', '<=', 'alert_quantity')
+                      ->orWhereColumn('stock_quantity', '<=', 'stock_alert')
+                      ->orWhereColumn('stock_quantity', '<=', 'low_qty')
+                      ->orWhere('stock_quantity', '<=', 0);
+                })
+                ->select([
+                    'id', 'name', 'code', 'sku', 'alternative_name',
+                    'category_name', 'brand_name', 'unit_name',
+                    'stock_quantity', 'alert_quantity', 'stock_alert', 'low_qty',
+                    'retail_price', 'selling_price'
+                ])
+                ->limit(15)
+                ->get()
+                ->map(function ($p) {
+                    $alertQty = (float)($p->alert_quantity ?: ($p->stock_alert ?: ($p->low_qty ?: 10)));
+                    $stockQty = (float)($p->stock_quantity ?? 0);
+                    return [
+                        'id' => (int)$p->id,
+                        'product_id' => (int)$p->id,
+                        'is_variant' => false,
+                        'variant_name' => '',
+                        'product_name' => $p->name,
+                        'code' => $p->code ?: ($p->sku ?? ''),
+                        'name' => $p->name,
+                        'display_name' => $p->name,
+                        'alternative_name' => $p->alternative_name ?? '',
+                        'category_name' => $p->category_name ?? 'General',
+                        'brand_name' => $p->brand_name ?? 'Generic',
+                        'unit_name' => $p->unit_name ?? 'Piece',
+                        'stock_quantity' => $stockQty,
+                        'alert_quantity' => $alertQty,
+                        'retail_price' => (float)($p->retail_price ?? ($p->selling_price ?? 0)),
+                    ];
+                });
+
+            $variantLowStock = collect();
+            try {
+                $lowStockVariantIds = DB::table('stock_balances')
+                    ->select('product_variant_id', DB::raw('SUM(quantity) as current_stock'))
+                    ->whereNotNull('product_variant_id')
+                    ->groupBy('product_variant_id')
+                    ->havingRaw('current_stock <= 10')
+                    ->limit(15)
+                    ->get();
+
+                if ($lowStockVariantIds->isNotEmpty()) {
+                    $vIds = $lowStockVariantIds->pluck('product_variant_id')->all();
+                    $variantDetails = DB::table('product_variants')
+                        ->join('products', 'product_variants.product_id', '=', 'products.id')
+                        ->whereIn('product_variants.id', $vIds)
+                        ->whereNull('products.deleted_at')
+                        ->whereNull('product_variants.deleted_at')
+                        ->select(
+                            'product_variants.id as variant_id',
+                            'products.id as product_id',
+                            'products.name as product_name',
+                            'product_variants.name as variant_name',
+                            'product_variants.sku as variant_sku',
+                            'product_variants.barcode as variant_barcode',
+                            'products.code as product_code',
+                            'products.alternative_name',
+                            'products.category_name',
+                            'products.brand_name',
+                            'products.unit_name',
+                            'products.alert_quantity',
+                            'products.stock_alert',
+                            'products.low_qty',
+                            'product_variants.selling_price as variant_price',
+                            'products.retail_price as product_price'
+                        )
+                        ->get()
+                        ->keyBy('variant_id');
+
+                    foreach ($lowStockVariantIds as $vItem) {
+                        $v = $variantDetails->get($vItem->product_variant_id);
+                        if (!$v) continue;
+                        $alertQty = (float)($v->alert_quantity ?: ($v->stock_alert ?: ($v->low_qty ?: 10)));
+                        $stockQty = (float)$vItem->current_stock;
+                        $displayName = $v->product_name . ' (' . $v->variant_name . ')';
+                        $variantLowStock->push([
+                            'id' => (int)$v->variant_id,
+                            'product_id' => (int)$v->product_id,
+                            'is_variant' => true,
+                            'variant_name' => $v->variant_name,
+                            'product_name' => $v->product_name,
+                            'code' => $v->variant_sku ?: ($v->variant_barcode ?: ($v->product_code ?? '')),
+                            'name' => $displayName,
+                            'display_name' => $displayName,
+                            'alternative_name' => $v->alternative_name ?? '',
+                            'category_name' => $v->category_name ?? 'General',
+                            'brand_name' => $v->brand_name ?? 'Generic',
+                            'unit_name' => $v->unit_name ?? 'Piece',
+                            'stock_quantity' => $stockQty,
+                            'alert_quantity' => $alertQty,
+                            'retail_price' => (float)($v->variant_price ?? ($v->product_price ?? 0)),
+                        ]);
+                    }
+                }
+            } catch (\Throwable $e) {}
+
+            $allLowStock = $singleLowStock->concat($variantLowStock)
+                ->sortBy('stock_quantity')
+                ->values();
+
+            $lowStockProducts = $allLowStock->take(10)->values();
+
+            // Single-pass inventoryAgg already computed above with singleValuation
+
+            $totalVariants = 0;
+            try {
+                $totalVariants = DB::table('product_variants')
+                    ->join('products', 'product_variants.product_id', '=', 'products.id')
+                    ->whereNull('products.deleted_at')
+                    ->whereNull('product_variants.deleted_at')
+                    ->count();
+            } catch (\Throwable $e) {}
+
+            $variantInStock = 0.0;
+            try {
+                $variantInStock = (float)DB::table('stock_balances')
+                    ->whereNotNull('product_variant_id')
+                    ->sum('quantity');
+            } catch (\Throwable $e) {}
+
+            $totalInStockUnits = $singleInStock + $variantInStock;
+            $lowStockCount = $allLowStock->count();
+            $outOfStockCount = $allLowStock->where('stock_quantity', '<=', 0)->count();
+            $totalCustomers = Customer::count();
+            $totalSuppliers = Supplier::count();
+            $totalOutlets = 1;
+            try {
+                $totalOutlets = DB::table('outlets')->count() ?: 1;
+            } catch (\Throwable $e) {}
+
+            return [
+                'customer_due' => $customerDue,
+                'supplier_due' => $supplierDue,
+                'inventory_valuation_cost' => $inventoryValuationCost,
+                'low_stock_products' => $lowStockProducts,
+                'total_products' => $totalProducts,
+                'total_variants' => $totalVariants,
+                'total_in_stock_units' => $totalInStockUnits,
+                'low_stock_count' => $lowStockCount,
+                'out_of_stock_count' => $outOfStockCount,
+                'total_customers' => $totalCustomers,
+                'total_suppliers' => $totalSuppliers,
+                'total_outlets' => $totalOutlets,
+            ];
+        });
+
+        $customerDue = $snapshot['customer_due'];
+        $supplierDue = $snapshot['supplier_due'];
+        $inventoryValuationCost = $snapshot['inventory_valuation_cost'];
+        $lowStockProducts = $snapshot['low_stock_products'];
+        $totalProducts = $snapshot['total_products'];
+        $totalVariants = $snapshot['total_variants'];
+        $totalInStockUnits = $snapshot['total_in_stock_units'];
+        $lowStockCount = $snapshot['low_stock_count'];
+        $outOfStockCount = $snapshot['out_of_stock_count'];
+        $totalCustomers = $snapshot['total_customers'];
+        $totalSuppliers = $snapshot['total_suppliers'];
+        $totalOutlets = $snapshot['total_outlets'];
+
+        // 7. Monthly 12-Month Trends for Selected Year (Annual Graphic - Single Pass Range Scan)
         $monthlySales = array_fill(0, 12, 0.0);
         $monthlyPurchases = array_fill(0, 12, 0.0);
         $monthlyExpenses = array_fill(0, 12, 0.0);
         $monthlyProfit = array_fill(0, 12, 0.0);
+        $monthlyCogs = array_fill(0, 12, 0.0);
+
+        $yearStart = "{$year}-01-01 00:00:00";
+        $yearEnd = "{$year}-12-31 23:59:59";
 
         $isSqlite = DB::connection()->getDriverName() === 'sqlite';
-        $monthExpr = $isSqlite ? DB::raw("CAST(strftime('%m', date) AS integer) as m") : DB::raw('MONTH(date) as m');
-        $monthGroup = $isSqlite ? DB::raw("CAST(strftime('%m', date) AS integer)") : DB::raw('MONTH(date)');
+        $monthExpr = $isSqlite ? DB::raw("CAST(strftime('%m', date) AS integer)") : DB::raw('MONTH(date)');
 
-        // Group sales by month
-        $salesByMonth = (clone $salesBaseQuery)
-            ->whereYear('date', $year)
-            ->select($monthExpr, DB::raw('SUM(grand_total) as total'))
-            ->groupBy($monthGroup)
-            ->pluck('total', 'm');
+        // Group sales + cogs by month in a single query using date range index
+        $salesMonthlyData = (clone $salesBaseQuery)
+            ->where('date', '>=', $yearStart)
+            ->where('date', '<=', $yearEnd)
+            ->selectRaw($isSqlite
+                ? "CAST(strftime('%m', date) AS integer) as m, SUM(grand_total) as total, SUM(total_cogs) as total_cogs"
+                : "MONTH(date) as m, SUM(grand_total) as total, SUM(total_cogs) as total_cogs"
+            )
+            ->groupBy($monthExpr)
+            ->get();
 
-        foreach ($salesByMonth as $m => $tot) {
-            $mIdx = (int)$m;
+        foreach ($salesMonthlyData as $row) {
+            $mIdx = (int)$row->m;
             if ($mIdx >= 1 && $mIdx <= 12) {
-                $monthlySales[$mIdx - 1] = (float)$tot;
+                $monthlySales[$mIdx - 1] = (float)$row->total;
+                $monthlyCogs[$mIdx - 1] = (float)($row->total_cogs ?? 0);
             }
         }
 
+        // Deduct monthly sale returns from monthly gross sales for GAAP-compliant net sales
+        try {
+            $srMonthQuery = DB::table('sale_returns')
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'Voided');
+                });
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $srMonthQuery->where('warehouse_name', $warehouse);
+            }
+            $saleReturnsByMonth = $srMonthQuery
+                ->where('date', '>=', $yearStart)
+                ->where('date', '<=', $yearEnd)
+                ->selectRaw($isSqlite ? "CAST(strftime('%m', date) AS integer) as m, SUM(grand_total) as total" : "MONTH(date) as m, SUM(grand_total) as total")
+                ->groupBy($monthExpr)
+                ->pluck('total', 'm');
+
+            foreach ($saleReturnsByMonth as $m => $tot) {
+                $mIdx = (int)$m;
+                if ($mIdx >= 1 && $mIdx <= 12) {
+                    $monthlySales[$mIdx - 1] = max(0.0, round($monthlySales[$mIdx - 1] - (float)$tot, 2));
+                }
+            }
+        } catch (\Throwable $e) {}
+
         // Group purchases by month
         $purchasesByMonth = (clone $purchBaseQuery)
-            ->whereYear('date', $year)
-            ->select($monthExpr, DB::raw('SUM(grand_total) as total'))
-            ->groupBy($monthGroup)
+            ->where('date', '>=', $yearStart)
+            ->where('date', '<=', $yearEnd)
+            ->selectRaw($isSqlite ? "CAST(strftime('%m', date) AS integer) as m, SUM(grand_total) as total" : "MONTH(date) as m, SUM(grand_total) as total")
+            ->groupBy($monthExpr)
             ->pluck('total', 'm');
 
         foreach ($purchasesByMonth as $m => $tot) {
@@ -323,32 +551,39 @@ class ReportController extends Controller
             }
         }
 
+        // Deduct monthly purchase returns from monthly gross purchases for GAAP-compliant net purchases
+        try {
+            $prMonthQuery = DB::table('purchase_returns');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $prMonthQuery->where('warehouse_name', $warehouse);
+            }
+            $purchaseReturnsByMonth = $prMonthQuery
+                ->where('date', '>=', $yearStart)
+                ->where('date', '<=', $yearEnd)
+                ->selectRaw($isSqlite ? "CAST(strftime('%m', date) AS integer) as m, SUM(grand_total) as total" : "MONTH(date) as m, SUM(grand_total) as total")
+                ->groupBy($monthExpr)
+                ->pluck('total', 'm');
+
+            foreach ($purchaseReturnsByMonth as $m => $tot) {
+                $mIdx = (int)$m;
+                if ($mIdx >= 1 && $mIdx <= 12) {
+                    $monthlyPurchases[$mIdx - 1] = max(0.0, round($monthlyPurchases[$mIdx - 1] - (float)$tot, 2));
+                }
+            }
+        } catch (\Throwable $e) {}
+
         // Group expenses by month
         $expensesByMonth = (clone $expBaseQuery)
-            ->whereYear('date', $year)
-            ->select($monthExpr, DB::raw('SUM(amount) as total'))
-            ->groupBy($monthGroup)
+            ->where('date', '>=', $yearStart)
+            ->where('date', '<=', $yearEnd)
+            ->selectRaw($isSqlite ? "CAST(strftime('%m', date) AS integer) as m, SUM(amount) as total" : "MONTH(date) as m, SUM(amount) as total")
+            ->groupBy($monthExpr)
             ->pluck('total', 'm');
 
         foreach ($expensesByMonth as $m => $tot) {
             $mIdx = (int)$m;
             if ($mIdx >= 1 && $mIdx <= 12) {
                 $monthlyExpenses[$mIdx - 1] = (float)$tot;
-            }
-        }
-
-        // Group COGS by month for true operational monthly profitability
-        $cogsByMonth = (clone $salesBaseQuery)
-            ->whereYear('date', $year)
-            ->select($monthExpr, DB::raw('SUM(total_cogs) as total_cogs'))
-            ->groupBy($monthGroup)
-            ->pluck('total_cogs', 'm');
-
-        $monthlyCogs = array_fill(0, 12, 0.0);
-        foreach ($cogsByMonth as $m => $c) {
-            $mIdx = (int)$m;
-            if ($mIdx >= 1 && $mIdx <= 12) {
-                $monthlyCogs[$mIdx - 1] = (float)$c;
             }
         }
 
@@ -378,68 +613,64 @@ class ReportController extends Controller
             ];
         }
 
-        // 9. Real Top Selling Products in Period
+        // 9. Real Top Selling Products in Period (Optimized 2-step indexed lookup)
         $topProducts = [];
         try {
-            $topProductsQuery = DB::table('sale_items')
+            $topProductAggQuery = DB::table('sale_items')
                 ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-                ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
                 ->where('sales.status', '!=', 'Voided')
                 ->when($warehouse !== 'All' && !empty($warehouse), function ($q) use ($warehouse) {
                     $q->where('sales.warehouse_name', $warehouse);
                 });
-            $applyDateScope($topProductsQuery, 'sales.date');
+            $applyDateScope($topProductAggQuery, 'sales.date');
 
-            $topProductsRaw = $topProductsQuery
+            $topProductAggs = $topProductAggQuery
                 ->select(
                     'sale_items.product_id',
-                    'sale_items.product_name',
-                    'sale_items.product_code',
-                    'products.alternative_name',
-                    'products.brand_name',
-                    'products.category_name',
-                    'products.retail_price',
-                    'products.stock_quantity',
-                    'products.image_url',
+                    DB::raw('MAX(sale_items.product_name) as product_name'),
+                    DB::raw('MAX(sale_items.product_code) as product_code'),
                     DB::raw('SUM(sale_items.quantity) as total_qty'),
                     DB::raw('SUM(sale_items.subtotal) as total_rev')
                 )
-                ->groupBy(
-                    'sale_items.product_id',
-                    'sale_items.product_name',
-                    'sale_items.product_code',
-                    'products.alternative_name',
-                    'products.brand_name',
-                    'products.category_name',
-                    'products.retail_price',
-                    'products.stock_quantity',
-                    'products.image_url'
-                )
+                ->groupBy('sale_items.product_id')
                 ->orderByDesc('total_qty')
                 ->limit(6)
                 ->get();
 
-            if ($topProductsRaw->isNotEmpty()) {
-                foreach ($topProductsRaw as $tp) {
+            if ($topProductAggs->isNotEmpty()) {
+                $pIds = $topProductAggs->pluck('product_id')->filter()->all();
+                $productDetails = DB::table('products')
+                    ->whereIn('id', $pIds)
+                    ->select('id', 'name', 'alternative_name', 'brand_name', 'category_name', 'retail_price', 'stock_quantity', 'image_url')
+                    ->get()
+                    ->keyBy('id');
+
+                foreach ($topProductAggs as $tp) {
+                    $prod = $productDetails->get($tp->product_id);
                     $topProducts[] = [
                         'id' => (int)$tp->product_id,
-                        'name' => $tp->product_name ?? 'Product',
+                        'name' => $prod->name ?? ($tp->product_name ?? 'Product'),
                         'code' => $tp->product_code ?? '',
-                        'alternative_name' => $tp->alternative_name ?? '',
-                        'brand' => $tp->brand_name ?? 'Generic',
-                        'category' => $tp->category_name ?? 'General',
-                        'price' => (float)($tp->retail_price ?? 0),
-                        'stock_quantity' => (float)($tp->stock_quantity ?? 0),
+                        'alternative_name' => $prod->alternative_name ?? '',
+                        'brand' => $prod->brand_name ?? 'Generic',
+                        'category' => $prod->category_name ?? 'General',
+                        'price' => (float)($prod->retail_price ?? 0),
+                        'stock_quantity' => (float)($prod->stock_quantity ?? 0),
                         'total_quantity' => (float)$tp->total_qty,
                         'total_revenue' => (float)$tp->total_rev,
-                        'image_url' => $tp->image_url ?? '',
+                        'image_url' => $prod->image_url ?? '',
                     ];
                 }
             }
         } catch (\Throwable $e) {}
 
         if (empty($topProducts)) {
-            $topProducts = Product::orderBy('stock_quantity', 'desc')->limit(5)->get()->map(function ($prod) {
+            $topProducts = Product::whereNull('deleted_at')
+                ->select('id', 'name', 'code', 'alternative_name', 'brand_name', 'category_name', 'retail_price', 'selling_price', 'stock_quantity', 'image_url')
+                ->orderBy('stock_quantity', 'desc')
+                ->limit(5)
+                ->get()
+                ->map(function ($prod) {
                 return [
                     'id' => $prod->id,
                     'name' => $prod->name,
@@ -471,7 +702,7 @@ class ReportController extends Controller
                     DB::raw("COALESCE(NULLIF(products.category_name, ''), 'General') as category_name"),
                     DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales'),
                     DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_qty'),
-                    DB::raw('COUNT(DISTINCT sale_items.sale_id) as orders_count')
+                    DB::raw('COUNT(sale_items.id) as orders_count')
                 )
                 ->groupBy('category_name')
                 ->orderByDesc('total_sales')
@@ -511,162 +742,7 @@ class ReportController extends Controller
                 ];
             });
 
-        // 12. Low Stock & Out of Stock Products
-        $singleLowStock = Product::where(function ($q) {
-                $q->where('has_variants', false)->orWhereNull('has_variants');
-            })
-            ->where(function ($q) {
-                $q->whereColumn('stock_quantity', '<=', 'alert_quantity')
-                  ->orWhereColumn('stock_quantity', '<=', 'stock_alert')
-                  ->orWhereColumn('stock_quantity', '<=', 'low_qty')
-                  ->orWhere('stock_quantity', '<=', 0);
-            })
-            ->select([
-                'id', 'name', 'code', 'sku', 'alternative_name',
-                'category_name', 'brand_name', 'unit_name',
-                'stock_quantity', 'alert_quantity', 'stock_alert', 'low_qty',
-                'retail_price', 'selling_price'
-            ])
-            ->limit(15)
-            ->get()
-            ->map(function ($p) {
-                $alertQty = (float)($p->alert_quantity ?: ($p->stock_alert ?: ($p->low_qty ?: 10)));
-                $stockQty = (float)($p->stock_quantity ?? 0);
-                return [
-                    'id' => (int)$p->id,
-                    'product_id' => (int)$p->id,
-                    'is_variant' => false,
-                    'variant_name' => '',
-                    'product_name' => $p->name,
-                    'code' => $p->code ?: ($p->sku ?? ''),
-                    'name' => $p->name,
-                    'display_name' => $p->name,
-                    'alternative_name' => $p->alternative_name ?? '',
-                    'category_name' => $p->category_name ?? 'General',
-                    'brand_name' => $p->brand_name ?? 'Generic',
-                    'unit_name' => $p->unit_name ?? 'Piece',
-                    'stock_quantity' => $stockQty,
-                    'alert_quantity' => $alertQty,
-                    'retail_price' => (float)($p->retail_price ?? ($p->selling_price ?? 0)),
-                ];
-            });
-
-        $variantLowStock = collect();
-        try {
-            $variantLowStock = DB::table('product_variants')
-                ->join('products', 'product_variants.product_id', '=', 'products.id')
-                ->leftJoin('stock_balances', 'product_variants.id', '=', 'stock_balances.product_variant_id')
-                ->where('products.has_variants', true)
-                ->whereNull('products.deleted_at')
-                ->whereNull('product_variants.deleted_at')
-                ->select(
-                    'product_variants.id as variant_id',
-                    'products.id as product_id',
-                    'products.name as product_name',
-                    'product_variants.name as variant_name',
-                    'product_variants.sku as variant_sku',
-                    'product_variants.barcode as variant_barcode',
-                    'products.code as product_code',
-                    'products.alternative_name',
-                    'products.category_name',
-                    'products.brand_name',
-                    'products.unit_name',
-                    'products.alert_quantity',
-                    'products.stock_alert',
-                    'products.low_qty',
-                    'product_variants.selling_price as variant_price',
-                    'products.retail_price as product_price',
-                    DB::raw('COALESCE(SUM(stock_balances.quantity), 0) as current_stock')
-                )
-                ->groupBy(
-                    'product_variants.id',
-                    'products.id',
-                    'products.name',
-                    'product_variants.name',
-                    'product_variants.sku',
-                    'product_variants.barcode',
-                    'products.code',
-                    'products.alternative_name',
-                    'products.category_name',
-                    'products.brand_name',
-                    'products.unit_name',
-                    'products.alert_quantity',
-                    'products.stock_alert',
-                    'products.low_qty',
-                    'product_variants.selling_price',
-                    'products.retail_price'
-                )
-                ->havingRaw('current_stock <= COALESCE(products.alert_quantity, products.stock_alert, products.low_qty, 10)')
-                ->limit(15)
-                ->get()
-                ->map(function ($v) {
-                    $alertQty = (float)($v->alert_quantity ?: ($v->stock_alert ?: ($v->low_qty ?: 10)));
-                    $stockQty = (float)$v->current_stock;
-                    $displayName = $v->product_name . ' (' . $v->variant_name . ')';
-                    return [
-                        'id' => (int)$v->variant_id,
-                        'product_id' => (int)$v->product_id,
-                        'is_variant' => true,
-                        'variant_name' => $v->variant_name,
-                        'product_name' => $v->product_name,
-                        'code' => $v->variant_sku ?: ($v->variant_barcode ?: ($v->product_code ?? '')),
-                        'name' => $displayName,
-                        'display_name' => $displayName,
-                        'alternative_name' => $v->alternative_name ?? '',
-                        'category_name' => $v->category_name ?? 'General',
-                        'brand_name' => $v->brand_name ?? 'Generic',
-                        'unit_name' => $v->unit_name ?? 'Piece',
-                        'stock_quantity' => $stockQty,
-                        'alert_quantity' => $alertQty,
-                        'retail_price' => (float)($v->variant_price ?? ($v->product_price ?? 0)),
-                    ];
-                });
-        } catch (\Throwable $e) {}
-
-        $allLowStock = $singleLowStock->concat($variantLowStock)
-            ->sortBy('stock_quantity')
-            ->values();
-
-        $lowStockProducts = $allLowStock->take(10)->values();
-
-        // 13. Operational & Inventory Metrics
-        $inventoryAgg = DB::table('products')
-            ->whereNull('deleted_at')
-            ->where(function ($q) {
-                $q->where('has_variants', false)->orWhereNull('has_variants');
-            })
-            ->selectRaw('COUNT(*) as total_products, COALESCE(SUM(stock_quantity), 0) as total_stock')
-            ->first();
-
-        $totalProducts = (int)($inventoryAgg->total_products ?? 0);
-        $singleInStock = (float)($inventoryAgg->total_stock ?? 0);
-
-        $totalVariants = 0;
-        try {
-            $totalVariants = DB::table('product_variants')
-                ->join('products', 'product_variants.product_id', '=', 'products.id')
-                ->whereNull('products.deleted_at')
-                ->whereNull('product_variants.deleted_at')
-                ->count();
-        } catch (\Throwable $e) {}
-
-        $variantInStock = 0.0;
-        try {
-            $variantInStock = (float)DB::table('stock_balances')
-                ->whereNotNull('product_variant_id')
-                ->sum('quantity');
-        } catch (\Throwable $e) {}
-
-        $totalInStockUnits = $singleInStock + $variantInStock;
-        $lowStockCount = $allLowStock->count();
-        $outOfStockCount = $allLowStock->where('stock_quantity', '<=', 0)->count();
-        $totalCustomers = Customer::count();
-        $totalSuppliers = Supplier::count();
-        $totalOutlets = 1;
-        try {
-            $totalOutlets = DB::table('outlets')->count() ?: 1;
-        } catch (\Throwable $e) {}
-
+        // 12. & 13. Sourced from Snapshot Cache
         $responsePayload = [
             'status' => 'success',
             'data' => [
@@ -689,6 +765,7 @@ class ReportController extends Controller
                 'net_purchases' => $netPurchases,
 
                 'total_expenses' => $totalExpenses,
+                'total_adjustment_loss' => round($totalAdjustmentLoss, 2),
                 'cogs' => $totalCogs,
                 'gross_profit' => $grossProfit,
                 'net_profit' => $netProfit,
@@ -734,10 +811,46 @@ class ReportController extends Controller
         ];
 
         try {
-            Cache::put($cacheKey, $responsePayload, 60);
+            Cache::put($cacheKey, $responsePayload, 300);
         } catch (\Throwable $e) {}
 
         return response()->json($responsePayload);
+    }
+
+    /**
+     * Atomically invalidates all dashboard cache entries across all filters, branches and years.
+     */
+    public static function invalidateDashboardCache(): void
+    {
+        try {
+            Cache::increment('pos_dashboard_version');
+            Cache::increment('pos_expenses_cache_version');
+            Cache::increment('pos_sale_returns_cache_version');
+            Cache::increment('pos_purchase_returns_cache_version');
+            Cache::increment('pos_register_report_cache_version');
+            Cache::increment('pos_z_report_cache_version');
+            Cache::increment('pos_cash_flow_cache_version');
+            Cache::increment('pos_stock_ledger_cache_version');
+            Cache::increment('pos_product_margins_cache_version');
+            Cache::increment('pos_dead_stock_cache_version');
+            Cache::increment('pos_cashier_audit_cache_version');
+            Cache::increment('pos_commercial_tax_cache_version');
+        } catch (\Throwable $e) {
+            try {
+                Cache::put('pos_dashboard_version', (int)Cache::get('pos_dashboard_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_expenses_cache_version', (int)Cache::get('pos_expenses_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_sale_returns_cache_version', (int)Cache::get('pos_sale_returns_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_purchase_returns_cache_version', (int)Cache::get('pos_purchase_returns_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_register_report_cache_version', (int)Cache::get('pos_register_report_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_z_report_cache_version', (int)Cache::get('pos_z_report_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_cash_flow_cache_version', (int)Cache::get('pos_cash_flow_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_stock_ledger_cache_version', (int)Cache::get('pos_stock_ledger_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_product_margins_cache_version', (int)Cache::get('pos_product_margins_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_dead_stock_cache_version', (int)Cache::get('pos_dead_stock_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_cashier_audit_cache_version', (int)Cache::get('pos_cashier_audit_cache_version', 1) + 1, now()->addDays(30));
+                Cache::put('pos_commercial_tax_cache_version', (int)Cache::get('pos_commercial_tax_cache_version', 1) + 1, now()->addDays(30));
+            } catch (\Throwable $e2) {}
+        }
     }
 
     public function salesReport(Request $request)
@@ -1045,8 +1158,9 @@ class ReportController extends Controller
     {
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
 
+        $cacheVersion = (int)Cache::get('pos_expenses_cache_version', 1);
         $params = $request->except(['force_refresh']);
-        $cacheKey = 'pos_expense_report_raw_' . md5(json_encode($params));
+        $cacheKey = 'pos_exp_rep_v' . $cacheVersion . '_' . md5(json_encode($params));
         if (!$forceRefresh) {
             try {
                 $cachedJson = Cache::get($cacheKey);
@@ -1192,11 +1306,22 @@ class ReportController extends Controller
             $baseQuery->orderBy('date', 'desc')->orderBy('id', 'desc');
         }
 
-        $perPage = max(1, min(10000, (int)$request->input('per_page', 5000)));
-        $expenses = $baseQuery->limit($perPage)->get();
+        $page = max(1, (int)$request->input('page', 1));
+        $perPage = max(1, min(10000, (int)$request->input('per_page', 50)));
+        $expenses = $baseQuery->forPage($page, $perPage)->get();
+
+        $totalRecords = (int)($totals->total_count ?? 0);
+        $lastPage = (int)ceil($totalRecords / max(1, $perPage));
+
+        $pagination = [
+            'current_page' => $page,
+            'per_page'     => $perPage,
+            'total'        => $totalRecords,
+            'last_page'    => $lastPage,
+        ];
 
         $summary = [
-            'total_count' => (int)($totals->total_count ?? 0),
+            'total_count' => $totalRecords,
             'total_amount' => $totalAmount,
             'average_amount' => (float)($totals->average_amount ?? 0.0),
             'top_category_name' => $topCategoryName,
@@ -1207,16 +1332,18 @@ class ReportController extends Controller
             'status' => 'success',
             'data' => [
                 'total_expense' => $totalAmount,
-                'total_count' => (int)($totals->total_count ?? 0),
+                'total_count' => $totalRecords,
                 'total_amount' => $totalAmount,
                 'average_amount' => (float)($totals->average_amount ?? 0.0),
                 'top_category_name' => $topCategoryName,
                 'top_category_amount' => $topCategoryAmount,
                 'summary' => $summary,
+                'pagination' => $pagination,
                 'by_category' => $byCategoryList,
                 'by_payment_method' => $byPaymentMethodList,
                 'expenses' => $expenses,
             ],
+            'pagination' => $pagination,
         ];
 
         $jsonPayload = json_encode($payload);
@@ -1305,7 +1432,6 @@ class ReportController extends Controller
             'customers.email',
             'customers.tier',
             'customers.status',
-            'customers.reward_points',
             DB::raw('COALESCE(sa.total_orders, customers.total_visits, 0) as total_orders'),
             DB::raw('COALESCE(sa.total_spent, customers.total_spent, 0) as total_spent'),
             DB::raw('COALESCE(ra.total_returns, 0) as total_returns'),
@@ -1417,7 +1543,6 @@ class ReportController extends Controller
                 'email' => (string)($c->email ?? ''),
                 'tier' => (string)($c->tier ?? 'General'),
                 'status' => (string)($c->status ?? 'Active'),
-                'reward_points' => (int)($c->reward_points ?? 0),
                 'total_orders' => (int)($c->total_orders ?? 0),
                 'total_spent' => (float)($c->total_spent ?? 0),
                 'total_returns' => (int)($c->total_returns ?? 0),
@@ -1614,7 +1739,6 @@ class ReportController extends Controller
                     'email' => (string)($customer->email ?? ''),
                     'tier' => (string)($customer->tier ?? 'General'),
                     'status' => (string)($customer->status ?? 'Active'),
-                    'reward_points' => (int)($customer->reward_points ?? 0),
                     'total_orders' => count($invoices),
                     'total_returns' => count($returns),
                     'total_spent' => $totalInvoiced > 0 ? $totalInvoiced : (float)($customer->total_spent ?? 0),
@@ -2034,6 +2158,8 @@ class ReportController extends Controller
 
     public function stockReport(Request $request)
     {
+        ini_set('memory_limit', '512M');
+
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
@@ -2043,9 +2169,9 @@ class ReportController extends Controller
         $brand = $request->input('brand', 'All');
         $stockStatus = $request->input('stock_status', 'All');
         $search = trim($request->input('search', ''));
-        $perPage = (int)$request->input('per_page', 5000);
-        if ($perPage <= 0 || $perPage > 10000) {
-            $perPage = 5000;
+        $perPage = (int)$request->input('per_page', 500);
+        if ($perPage <= 0 || $perPage > 1000) {
+            $perPage = 500;
         }
         $page = (int)$request->input('page', 1);
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
@@ -2159,10 +2285,19 @@ class ReportController extends Controller
                 }
             } else if ($stockStatus === 'low_stock_only') {
                 if ($warehouseId !== null) {
-                    $query->whereHas('stockBalances', function ($q) use ($warehouseId) {
-                        $q->where('warehouse_id', $warehouseId)
-                          ->where('quantity', '>', 0)
-                          ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
+                    $query->where(function ($sq) use ($warehouseId) {
+                        $sq->whereHas('stockBalances', function ($q) use ($warehouseId) {
+                            $q->where('warehouse_id', $warehouseId)
+                              ->where('quantity', '>', 0)
+                              ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
+                        })
+                        ->orWhereHas('variants', function ($vq) use ($warehouseId) {
+                            $vq->whereHas('stockBalances', function ($sbq) use ($warehouseId) {
+                                $sbq->where('warehouse_id', $warehouseId)
+                                    ->where('quantity', '>', 0)
+                                    ->whereRaw('quantity <= 10');
+                            });
+                        });
                     });
                 } else {
                     $query->where(function ($q) {
@@ -2188,6 +2323,12 @@ class ReportController extends Controller
                         $sq->whereHas('stockBalances', function ($q) use ($warehouseId) {
                             $q->where('warehouse_id', $warehouseId)
                               ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
+                        })
+                        ->orWhereHas('variants', function ($vq) use ($warehouseId) {
+                            $vq->whereHas('stockBalances', function ($sbq) use ($warehouseId) {
+                                $sbq->where('warehouse_id', $warehouseId)
+                                    ->whereRaw('quantity <= 10');
+                            });
                         })
                         ->orWhere('stock_quantity', '<=', 0);
                     });
@@ -2228,7 +2369,9 @@ class ReportController extends Controller
                 ->leftJoin('product_variants', 'stock_balances.product_variant_id', '=', 'product_variants.id')
                 ->selectRaw('
                     SUM(stock_balances.quantity * COALESCE(product_variants.cost_price, products.cost_price, products.purchase_price, 0)) as total_cost,
-                    SUM(stock_balances.quantity * COALESCE(product_variants.selling_price, products.retail_price, products.selling_price, 0)) as total_retail
+                    SUM(stock_balances.quantity * COALESCE(product_variants.selling_price, products.retail_price, products.selling_price, 0)) as total_retail,
+                    COALESCE(SUM(GREATEST(0, COALESCE(products.alert_quantity, 10) - stock_balances.quantity)), 0) as total_deficit_qty,
+                    COALESCE(SUM(GREATEST(0, COALESCE(products.alert_quantity, 10) - stock_balances.quantity) * COALESCE(product_variants.cost_price, products.cost_price, products.purchase_price, 0)), 0) as estimated_restock_cost
                 ')
                 ->first();
 
@@ -2243,7 +2386,9 @@ class ReportController extends Controller
                     COUNT(*) as total_products,
                     COALESCE(SUM(stock_quantity), 0) as total_qty,
                     COALESCE(SUM(stock_quantity * COALESCE(cost_price, purchase_price, 0)), 0) as total_cost,
-                    COALESCE(SUM(stock_quantity * COALESCE(retail_price, selling_price, 0)), 0) as total_retail
+                    COALESCE(SUM(stock_quantity * COALESCE(retail_price, selling_price, 0)), 0) as total_retail,
+                    COALESCE(SUM(GREATEST(0, COALESCE(alert_quantity, 10) - stock_quantity)), 0) as total_deficit_qty,
+                    COALESCE(SUM(GREATEST(0, COALESCE(alert_quantity, 10) - stock_quantity) * COALESCE(cost_price, purchase_price, 0)), 0) as estimated_restock_cost
                 '))
                 ->first();
 
@@ -2264,7 +2409,11 @@ class ReportController extends Controller
         $grossMarginPercent = $totalRetail > 0 ? round((($totalRetail - $totalCost) / $totalRetail) * 100, 2) : 0;
 
         // 3. Fast Pagination & Dedicated StockReportResource
-        $paginator = $query->paginate($perPage);
+        if ($warehouseId !== null) {
+            $paginator = $query->orderBy('warehouse_stock', 'asc')->orderBy('id', 'asc')->paginate($perPage);
+        } else {
+            $paginator = $query->orderBy('stock_quantity', 'asc')->orderBy('id', 'asc')->paginate($perPage);
+        }
 
         $responsePayload = [
             'status' => 'success',
@@ -2280,6 +2429,8 @@ class ReportController extends Controller
                     'total_cost_value' => $totalCost,
                     'total_retail_value' => $totalRetail,
                     'gross_margin_percent' => $grossMarginPercent,
+                    'total_deficit_quantity' => (float)($totals->total_deficit_qty ?? ($summaryAgg->total_deficit_qty ?? 0)),
+                    'estimated_restock_cost' => (float)($totals->estimated_restock_cost ?? ($summaryAgg->estimated_restock_cost ?? 0)),
                 ],
                 'items' => StockReportResource::collection($paginator->getCollection())->resolve(),
             ],
@@ -2504,8 +2655,10 @@ class ReportController extends Controller
 
     public function topSellingReport(Request $request)
     {
-        $limit = (int)$request->input('limit', 50);
-        if ($limit <= 0) $limit = 50;
+        $page = (int)$request->input('page', 1);
+        if ($page <= 0) $page = 1;
+        $perPage = (int)$request->input('per_page', $request->input('limit', 50));
+        if ($perPage <= 0) $perPage = 50;
         $warehouse = $request->input('warehouse_name', 'All');
         $category = $request->input('category_name', 'All');
         $startDate = $request->input('start_date');
@@ -2519,7 +2672,8 @@ class ReportController extends Controller
             'cat' => $category,
             'sd' => $startDate,
             'ed' => $endDate,
-            'limit' => $limit,
+            'page' => $page,
+            'per_page' => $perPage,
             'q' => $search,
             'sort' => $sortBy,
         ]));
@@ -2598,10 +2752,14 @@ class ReportController extends Controller
             $query->orderByDesc('total_sales_revenue')->orderByDesc('total_sold_quantity');
         }
 
-        if ($limit > 0) {
-            $query->limit($limit);
-        }
+        $countQuery = clone $query;
+        $totalCount = (int)DB::query()->fromSub($countQuery, 'sub_count')->count();
 
+        $summaryRow = DB::query()->fromSub(clone $query, 'sub_sum')
+            ->selectRaw('COUNT(*) as total_products, COALESCE(SUM(total_sales_revenue), 0) as total_revenue, COALESCE(SUM(total_sold_quantity), 0) as total_quantity')
+            ->first();
+
+        $query->forPage($page, $perPage);
         $topProductsRaw = $query->get();
 
         $topProducts = [];
@@ -2644,17 +2802,28 @@ class ReportController extends Controller
             ];
         }
 
-        $productsCount = count($topProducts);
-        $averageRevenue = $productsCount > 0 ? round($totalRevenue / $productsCount, 2) : 0.0;
+        $lastPage = (int)ceil($totalCount / $perPage);
+        if ($lastPage < 1) $lastPage = 1;
+
+        $globalProductsCount = (int)($summaryRow->total_products ?? $totalCount);
+        $globalTotalRevenue = round((float)($summaryRow->total_revenue ?? $totalRevenue), 2);
+        $globalTotalQuantity = round((float)($summaryRow->total_quantity ?? $totalQuantity), 2);
+        $averageRevenue = $globalProductsCount > 0 ? round($globalTotalRevenue / $globalProductsCount, 2) : 0.0;
 
         $responsePayload = [
             'status' => 'success',
             'data' => $topProducts,
             'summary' => [
-                'total_products' => $productsCount,
-                'total_revenue' => round($totalRevenue, 2),
-                'total_quantity' => round($totalQuantity, 2),
+                'total_products' => $globalProductsCount,
+                'total_revenue' => $globalTotalRevenue,
+                'total_quantity' => $globalTotalQuantity,
                 'average_revenue' => $averageRevenue,
+            ],
+            'pagination' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $totalCount,
+                'last_page' => $lastPage,
             ],
         ];
 
@@ -2777,7 +2946,7 @@ class ReportController extends Controller
         $saleReturns = (float)$returnsQuery->sum('grand_total');
 
         $grossSales = (float)($salesSummary->gross_sales ?? 0);
-        $netSales = max(0.0, $grossSales - $saleReturns);
+        $netSales = round($grossSales - $saleReturns, 2);
 
         // 3. Purchases & Purchase Returns Query Scope
         $purchQuery = DB::table('purchases')->where(function ($q) {
@@ -2802,7 +2971,7 @@ class ReportController extends Controller
         }
         $applyDateScope($prQuery, 'date');
         $purchaseReturns = (float)$prQuery->sum('grand_total');
-        $netPurchases = max(0.0, $grossPurchases - $purchaseReturns);
+        $netPurchases = round($grossPurchases - $purchaseReturns, 2);
 
         // 4. Cost of Goods Sold (COGS) via FIFO Cost Snapshot / Base Quantities
         $cogsQuery = DB::table('sale_items')
@@ -2840,8 +3009,20 @@ class ReportController extends Controller
         $applyDateScope($lossQuery, 'stock_adjustments.date');
         $inventoryLoss = (float)$lossQuery->sum('stock_adjustment_items.subtotal');
 
-        // Standard GAAP / Retail Accounting: Net Profit = Gross Profit - Operating Expenses - Inventory Loss
-        $netProfit = round($grossProfit - $totalExpenses - $inventoryLoss, 2);
+        // 5c. Inventory Overage / Surplus Gain (Stocktake Additions)
+        $gainQuery = DB::table('stock_adjustment_items')
+            ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+            ->where('stock_adjustment_items.type', 'Addition');
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $gainQuery->where('stock_adjustments.warehouse_name', $warehouse);
+        }
+        $applyDateScope($gainQuery, 'stock_adjustments.date');
+        $inventoryGain = (float)$gainQuery->sum('stock_adjustment_items.subtotal');
+
+        $netInventoryLoss = max(0.0, round($inventoryLoss - $inventoryGain, 2));
+
+        // Standard GAAP / Retail Accounting: Net Profit = Gross Profit - Operating Expenses - Inventory Loss + Inventory Gain
+        $netProfit = round($grossProfit - $totalExpenses - $inventoryLoss + $inventoryGain, 2);
         $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 2) : 0.0;
 
         // 6. Expense Category Breakdown
@@ -2917,7 +3098,7 @@ class ReportController extends Controller
             $mGross = (float)$sm->gross_sales;
             $retObj = $returnsMonthly->get($mKey);
             $mReturns = $retObj ? (float)$retObj->returns_total : 0.0;
-            $mNetSales = max(0.0, $mGross - $mReturns);
+            $mNetSales = round($mGross - $mReturns, 2);
 
             $cogsObj = $cogsMonthly->get($mKey);
             $mCogs = $cogsObj ? (float)$cogsObj->cogs_total : 0.0;
@@ -2982,6 +3163,8 @@ class ReportController extends Controller
             'gross_margin_percentage' => $grossMarginPct,
             'total_expenses' => round($totalExpenses, 2),
             'inventory_loss' => round($inventoryLoss, 2),
+            'inventory_gain' => round($inventoryGain, 2),
+            'net_inventory_loss' => $netInventoryLoss,
             'total_net_profit' => round($netProfit, 2),
             'net_margin_percentage' => $netMarginPct,
             'total_periods' => count($periods),
@@ -3003,6 +3186,8 @@ class ReportController extends Controller
             'gross_profit' => round($grossProfit, 2),
             'expenses' => round($totalExpenses, 2),
             'inventory_loss' => round($inventoryLoss, 2),
+            'inventory_gain' => round($inventoryGain, 2),
+            'net_inventory_loss' => $netInventoryLoss,
             'total_expenses' => round($totalExpenses, 2),
             'net_profit' => round($netProfit, 2),
             'summary' => $summary,
@@ -3453,6 +3638,29 @@ class ReportController extends Controller
         }
         $transfersList = $transQuery->orderByDesc('stock_transfers.id')->limit(100)->get()->map($mapRow);
 
+        $mappedVariants = [];
+        if ($product->variants && $product->variants->isNotEmpty()) {
+            foreach ($product->variants as $v) {
+                $vStock = (float)($v->stock_quantity ?? 0.0);
+                if ($warehouseId !== null) {
+                    $vBal = \App\Models\StockBalance::where('product_variant_id', $v->id)
+                        ->where('warehouse_id', $warehouseId)
+                        ->sum('quantity');
+                    $vStock = (float)$vBal;
+                }
+                $mappedVariants[] = [
+                    'id' => (int)$v->id,
+                    'name' => (string)$v->name,
+                    'sku' => (string)($v->sku ?? ''),
+                    'barcode' => (string)($v->barcode ?? ''),
+                    'cost_price' => (float)$v->cost_price,
+                    'retail_price' => (float)($v->selling_price ?? $v->retail_price ?? 0.0),
+                    'stock_quantity' => $vStock,
+                    'image_url' => (string)($v->image_url ?? ''),
+                ];
+            }
+        }
+
         return response()->json([
             'status' => 'success',
             'data' => [
@@ -3468,6 +3676,9 @@ class ReportController extends Controller
                     'cost_price' => (float)($selectedVariant ? $selectedVariant->cost_price : $product->cost_price),
                     'retail_price' => (float)($selectedVariant ? $selectedVariant->retail_price : $product->retail_price),
                     'image_url' => $selectedVariant && !empty($selectedVariant->image_url) ? $selectedVariant->image_url : ($product->image_url ?? ''),
+                    'has_variants' => (bool)($product->has_variants || count($mappedVariants) > 0),
+                    'variants_count' => count($mappedVariants),
+                    'variants' => $mappedVariants,
                 ],
                 'warehouse_stocks' => $warehouseStocks,
                 'movements' => [
@@ -3597,13 +3808,14 @@ class ReportController extends Controller
         $startDate = $request->input('start_date') ?? $request->input('date_from');
         $endDate = $request->input('end_date') ?? $request->input('date_to');
         $search = trim((string)$request->input('search', ''));
-        $page = (int)$request->input('page', 1);
-        $perPage = (int)$request->input('per_page', 5000);
-        if ($perPage <= 0 || $perPage > 10000) $perPage = 5000;
+        $page = max(1, (int)$request->input('page', 1));
+        $perPage = (int)$request->input('per_page', 50);
+        if ($perPage <= 0 || $perPage > 10000) $perPage = 50;
         $forceRefresh = $request->boolean('force_refresh', false);
 
         // 1. Fast Cache Layer (Sub-10ms response via high-speed file storage)
-        $cacheKey = "pos_sale_returns_report_" . md5(json_encode([
+        $cacheVersion = (int)Cache::get('pos_sale_returns_cache_version', 1);
+        $cacheKey = "pos_sale_returns_rep_v" . $cacheVersion . '_' . md5(json_encode([
             'wh' => $warehouse,
             'cust' => $customer,
             'st' => $status,
@@ -3832,13 +4044,14 @@ class ReportController extends Controller
         $startDate = $request->input('start_date') ?? $request->input('date_from');
         $endDate = $request->input('end_date') ?? $request->input('date_to');
         $search = trim((string)$request->input('search', ''));
-        $page = (int)$request->input('page', 1);
-        $perPage = (int)$request->input('per_page', 5000);
-        if ($perPage <= 0 || $perPage > 10000) $perPage = 5000;
+        $page = max(1, (int)$request->input('page', 1));
+        $perPage = (int)$request->input('per_page', 50);
+        if ($perPage <= 0 || $perPage > 10000) $perPage = 50;
         $forceRefresh = $request->boolean('force_refresh', false);
 
         // 1. Fast Cache Layer (Sub-10ms response via high-speed file storage)
-        $cacheKey = "pos_purchase_returns_report_" . md5(json_encode([
+        $cacheVersion = (int)Cache::get('pos_purchase_returns_cache_version', 1);
+        $cacheKey = "pos_purchase_returns_rep_v" . $cacheVersion . '_' . md5(json_encode([
             'wh' => $warehouse,
             'sup' => $supplier,
             'st' => $status,
@@ -4066,19 +4279,6 @@ class ReportController extends Controller
      */
     public function zReport(Request $request)
     {
-        $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
-        $params = $request->except(['force_refresh']);
-        $cacheKey = 'pos_z_report_v2_' . md5(json_encode($params));
-
-        if (!$forceRefresh) {
-            try {
-                $cached = Cache::store('file')->get($cacheKey);
-                if ($cached) {
-                    return response()->json($cached);
-                }
-            } catch (\Throwable $e) {}
-        }
-
         $warehouseFilter = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
         $registerFilter = $request->input('register', 'All');
         $statusFilter = $request->input('status', 'All');
@@ -4087,6 +4287,24 @@ class ReportController extends Controller
         $endDate = $request->input('end_date') ?? $request->input('to_date');
         $singleDate = $request->input('date');
         $search = trim($request->input('search', ''));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) $perPage = 50;
+        $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
+
+        $cacheVersion = (int)Cache::get('pos_z_report_cache_version', 1);
+        $cacheKey = "pos_z_report_v" . $cacheVersion . '_' . md5(json_encode([
+            $warehouseFilter, $registerFilter, $statusFilter, $paymentStatusFilter, $startDate, $endDate, $singleDate, $search, $page, $perPage
+        ]));
+
+        if (!$forceRefresh) {
+            try {
+                $cached = Cache::store('file')->get($cacheKey);
+                if ($cached && is_array($cached)) {
+                    return response()->json($cached);
+                }
+            } catch (\Throwable $e) {}
+        }
 
         // 1. Base Grouped Sales Query
         $salesQuery = DB::table('sales')
@@ -4190,8 +4408,8 @@ class ReportController extends Controller
             $returns = $ret ? (float)$ret->total_returns : 0.0;
             $expenses = $exp ? (float)$exp->total_expenses : 0.0;
             $cogs = $cogsObj ? (float)$cogsObj->total_cogs : 0.0;
-            $netSales = max(0.0, $gross - $returns);
-            $grossProfit = max(0.0, $netSales - $cogs);
+            $netSales = round($gross - $returns, 2);
+            $grossProfit = round($netSales - $cogs, 2);
             $netProfit = round($grossProfit - $expenses, 2);
             $tax = (float)$s->tax_amount;
             $discount = (float)$s->discount;
@@ -4311,22 +4529,27 @@ class ReportController extends Controller
             $totalDiscrepancy += $discrepancy;
         }
 
+        $totalReportsCount = count($items);
+        $lastPage = max(1, (int)ceil($totalReportsCount / $perPage));
+        $offset = ($page - 1) * $perPage;
+        $pagedItems = array_slice($items, $offset, $perPage);
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
-                'total_reports' => count($items),
+                'total_reports' => $totalReportsCount,
                 'total_gross_sales' => round($totalGrossSales, 2),
                 'total_net_sales' => round($totalNetSales, 2),
                 'total_closing_cash' => round($totalClosingCash, 2),
                 'total_discrepancy' => round($totalDiscrepancy, 2),
             ],
-            'data' => $items,
-            'current_day' => $items[0] ?? null,
+            'data' => $pagedItems,
+            'current_day' => $pagedItems[0] ?? null,
             'pagination' => [
-                'current_page' => 1,
-                'per_page' => max(1, count($items)),
-                'total' => count($items),
-                'last_page' => 1,
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $totalReportsCount,
+                'last_page' => $lastPage,
             ],
         ];
 
@@ -4353,10 +4576,14 @@ class ReportController extends Controller
         $startDate = $request->query('start_date', $request->query('date_from', ''));
         $endDate = $request->query('end_date', $request->query('date_to', ''));
         $search = trim($request->query('search', ''));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) $perPage = 50;
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
 
-        $cacheKey = "pos_register_report_" . md5(json_encode([
-            $warehouse, $cashier, $registerFilter, $statusFilter, $paymentTypeFilter, $startDate, $endDate, $search
+        $cacheVersion = (int)Cache::get('pos_register_report_cache_version', 1);
+        $cacheKey = "pos_register_rep_v" . $cacheVersion . '_' . md5(json_encode([
+            $warehouse, $cashier, $registerFilter, $statusFilter, $paymentTypeFilter, $startDate, $endDate, $search, $page, $perPage
         ]));
 
         if (!$forceRefresh) {
@@ -4917,13 +5144,13 @@ class ReportController extends Controller
             ],
             'drawer_flow_summary' => $drawerFlowSummary,
             'by_payment_tender' => $byPaymentTender,
-            'data' => $items,
-            'sessions' => $items,
+            'data' => array_slice($items, ($page - 1) * $perPage, $perPage),
+            'sessions' => array_slice($items, ($page - 1) * $perPage, $perPage),
             'pagination' => [
-                'current_page' => 1,
-                'per_page' => max(1, count($items)),
+                'current_page' => $page,
+                'per_page' => $perPage,
                 'total' => count($items),
-                'last_page' => 1,
+                'last_page' => max(1, (int)ceil(count($items) / $perPage)),
             ],
         ];
 
@@ -5311,7 +5538,12 @@ class ReportController extends Controller
         $endDate = $request->input('end_date') ?? $request->input('to_date');
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_cash_flow_' . md5(json_encode([$warehouse, $startDate, $endDate]));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) $perPage = 50;
+
+        $cacheVersion = (int)Cache::get('pos_cash_flow_cache_version', 1);
+        $cacheKey = 'pos_cash_flow_v' . $cacheVersion . '_' . md5(json_encode([$warehouse, $startDate, $endDate, $page, $perPage]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -5659,6 +5891,10 @@ class ReportController extends Controller
         // Reverse for newest first in table
         $transactions = array_reverse($transactions);
 
+        $totalRecords = count($transactions);
+        $lastPage = (int)ceil($totalRecords / max(1, $perPage));
+        $pagedTransactions = array_values(array_slice($transactions, ($page - 1) * $perPage, $perPage));
+
         $closingBalance = $openingBalance + $netCashFlow;
 
         $responsePayload = [
@@ -5674,7 +5910,7 @@ class ReportController extends Controller
                 'operating_expenses_paid' => round($totalExpenses, 2),
                 'refunds_paid' => round($refundsPaid, 2),
                 'closing_balance' => round($closingBalance, 2),
-                'total_transactions' => count($transactions),
+                'total_transactions' => $totalRecords,
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
@@ -5682,8 +5918,14 @@ class ReportController extends Controller
             'tender_inflows' => $tenderInflows,
             'expense_outflows' => $expenseCategories,
             'timeline' => $timeline,
-            'transactions' => $transactions,
-            'data' => $transactions,
+            'transactions' => $pagedTransactions,
+            'data' => $pagedTransactions,
+            'pagination' => [
+                'current_page' => $page,
+                'last_page'    => $lastPage,
+                'per_page'     => $perPage,
+                'total'        => $totalRecords,
+            ],
         ];
 
         try {
@@ -5707,7 +5949,14 @@ class ReportController extends Controller
         $search = trim($request->input('search', ''));
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_stock_ledger_v2_' . md5(json_encode([$warehouse, $startDate, $endDate, $movementType, $category, $search]));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) {
+            $perPage = 50;
+        }
+
+        $cacheVersion = (int)Cache::get('pos_stock_ledger_cache_version', 1);
+        $cacheKey = 'pos_stock_ledger_v' . $cacheVersion . '_' . md5(json_encode([$warehouse, $startDate, $endDate, $movementType, $category, $search, $page, $perPage]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -5962,12 +6211,19 @@ class ReportController extends Controller
         $totalInflowQty = (float)(clone $movementsSub)->sum('quantity_in');
         $totalOutflowQty = (float)(clone $movementsSub)->sum('quantity_out');
         $netMovementQty = round($totalInflowQty - $totalOutflowQty, 2);
+        $totalMovementValue = (float)(clone $movementsSub)->selectRaw('COALESCE(SUM((quantity_in + quantity_out) * unit_cost), 0) as total_val')->value('total_val');
+
+        $lastPage = (int)ceil($totalMovements / max(1, $perPage));
+        if ($lastPage < 1) {
+            $lastPage = 1;
+        }
+        $offset = ($page - 1) * $perPage;
 
         $movementsData = (clone $movementsSub)
             ->orderByDesc('date')
-            ->limit(1000)
+            ->forPage($page, $perPage)
             ->get()
-            ->map(function ($row, $idx) {
+            ->map(function ($row, $idx) use ($offset) {
                 $qtyIn = (float)$row->quantity_in;
                 $qtyOut = (float)$row->quantity_out;
                 $unitCost = (float)$row->unit_cost;
@@ -5976,8 +6232,8 @@ class ReportController extends Controller
                 $userName = !empty($row->user_name) ? (string)$row->user_name : (!empty($row->created_by) ? (string)$row->created_by : 'Super Admin');
                 $userRole = !empty($row->user_role) ? (string)$row->user_role : 'Super Admin';
                 return [
-                    'id' => (int)($row->source_id ?? ($idx + 1)),
-                    'reference_no' => (string)($row->reference_no ?? 'REF-'.($idx + 1)),
+                    'id' => (int)($row->source_id ?? ($offset + $idx + 1)),
+                    'reference_no' => (string)($row->reference_no ?? 'REF-'.($offset + $idx + 1)),
                     'movement_type' => (string)$row->movement_type,
                     'type_label' => (string)$row->type_label,
                     'product_id' => (int)($row->product_id ?? 0),
@@ -5998,8 +6254,6 @@ class ReportController extends Controller
                     'date' => (string)$row->date,
                 ];
             });
-
-        $totalMovementValue = (float)$movementsData->sum('total_value');
 
         // ── 2. Product-Level Bin Card Summary (SKU View) ──
         $prodQuery = DB::table('products')->select([
@@ -6137,6 +6391,12 @@ class ReportController extends Controller
             ],
             'movements' => $movementsData,
             'data' => $items,
+            'pagination' => [
+                'current_page' => $page,
+                'last_page'    => $lastPage,
+                'per_page'     => $perPage,
+                'total'        => $totalMovements,
+            ],
         ];
 
         try {
@@ -6159,7 +6419,14 @@ class ReportController extends Controller
         $search = trim($request->input('search', ''));
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_prod_margins_' . md5(json_encode([$warehouse, $startDate ?? '', $endDate ?? '', $category, $search]));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) {
+            $perPage = 50;
+        }
+
+        $cacheVersion = (int)Cache::get('pos_product_margins_cache_version', 1);
+        $cacheKey = 'pos_prod_margins_v' . $cacheVersion . '_' . md5(json_encode([$warehouse, $startDate ?? '', $endDate ?? '', $category, $search, $page, $perPage]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -6282,11 +6549,18 @@ class ReportController extends Controller
         });
 
         $overallMarginPct = $totalRevenue > 0 ? round(($totalProfit / $totalRevenue) * 100, 2) : 0.0;
+        $totalProducts = count($items);
+        $lastPage = (int)ceil($totalProducts / max(1, $perPage));
+        if ($lastPage < 1) {
+            $lastPage = 1;
+        }
+        $offset = ($page - 1) * $perPage;
+        $pagedItems = array_slice($items, $offset, $perPage);
 
         $responsePayload = [
             'status' => 'success',
             'summary' => [
-                'total_products' => count($items),
+                'total_products' => $totalProducts,
                 'total_units_sold' => round($totalUnits, 2),
                 'total_revenue' => round($totalRevenue, 2),
                 'total_cogs' => round($totalCogs, 2),
@@ -6297,7 +6571,13 @@ class ReportController extends Controller
                 'warehouse' => $warehouse,
                 'category' => $category,
             ],
-            'data' => $items,
+            'data' => $pagedItems,
+            'pagination' => [
+                'current_page' => $page,
+                'last_page'    => $lastPage,
+                'per_page'     => $perPage,
+                'total'        => $totalProducts,
+            ],
         ];
 
         try {
@@ -6321,7 +6601,14 @@ class ReportController extends Controller
         $velocityStatusFilter = $request->input('velocity_status', 'All'); // 'All', 'dead', 'slow'
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_dead_stock_' . md5(json_encode([$warehouse, $daysInactive, $category, $search, $velocityStatusFilter]));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) {
+            $perPage = 50;
+        }
+
+        $cacheVersion = (int)Cache::get('pos_dead_stock_cache_version', 1);
+        $cacheKey = 'pos_dead_stock_v' . $cacheVersion . '_' . md5(json_encode([$warehouse, $daysInactive, $category, $search, $velocityStatusFilter, $page, $perPage]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -6506,10 +6793,16 @@ class ReportController extends Controller
             return $b['tied_up_capital'] <=> $a['tied_up_capital'];
         });
 
+        $totalDeadProducts = count($items);
+        $lastPage = (int)ceil($totalDeadProducts / max(1, $perPage));
+        if ($lastPage < 1) $lastPage = 1;
+        $offset = ($page - 1) * $perPage;
+        $pagedItems = array_slice($items, $offset, $perPage);
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
-                'total_dead_products' => count($items),
+                'total_dead_products' => $totalDeadProducts,
                 'total_dead_units' => round($totalDeadUnits, 2),
                 'total_tied_up_capital' => round($totalTiedUpCapital, 2),
                 'slow_moving_capital' => round($slowMovingCapital, 2),
@@ -6519,7 +6812,13 @@ class ReportController extends Controller
                 'as_of_date' => Carbon::today()->toDateString(),
                 'warehouse' => $warehouse,
             ],
-            'data' => $items,
+            'data' => $pagedItems,
+            'pagination' => [
+                'current_page' => $page,
+                'last_page'    => $lastPage,
+                'per_page'     => $perPage,
+                'total'        => $totalDeadProducts,
+            ],
         ];
 
         try {
@@ -6542,7 +6841,14 @@ class ReportController extends Controller
         $riskFilter = $request->input('audit_risk', 'All');
         $forceRefresh = $request->boolean('force_refresh');
 
-        $cacheKey = 'pos_cashier_audit_' . md5(json_encode([$warehouse, $startDate, $endDate, $search, $riskFilter]));
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage <= 0 || $perPage > 10000) {
+            $perPage = 50;
+        }
+
+        $cacheVersion = (int)Cache::get('pos_cashier_audit_cache_version', 1);
+        $cacheKey = 'pos_cashier_audit_v' . $cacheVersion . '_' . md5(json_encode([$warehouse, $startDate, $endDate, $search, $riskFilter, $page, $perPage]));
         if (!$forceRefresh) {
             try {
                 $cached = Cache::store('file')->get($cacheKey);
@@ -6815,10 +7121,16 @@ class ReportController extends Controller
             return $b['total_sales'] <=> $a['total_sales'];
         });
 
+        $totalCashiers = count($items);
+        $lastPage = (int)ceil($totalCashiers / max(1, $perPage));
+        if ($lastPage < 1) $lastPage = 1;
+        $offset = ($page - 1) * $perPage;
+        $pagedItems = array_slice($items, $offset, $perPage);
+
         $responsePayload = [
             'status' => 'success',
             'summary' => [
-                'total_cashiers' => count($items),
+                'total_cashiers' => $totalCashiers,
                 'total_store_bills' => $totalStoreBills,
                 'total_store_sales' => round($totalStoreSales, 2),
                 'total_collected' => round($totalStoreCollected, 2),
@@ -6832,7 +7144,13 @@ class ReportController extends Controller
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
             ],
-            'data' => $items,
+            'data' => $pagedItems,
+            'pagination' => [
+                'current_page' => $page,
+                'last_page'    => $lastPage,
+                'per_page'     => $perPage,
+                'total'        => $totalCashiers,
+            ],
         ];
 
         try {
@@ -6852,6 +7170,20 @@ class ReportController extends Controller
         $startDate = $request->query('start_date', $request->query('from_date', ''));
         $endDate = $request->query('end_date', $request->query('to_date', ''));
         $month = $request->query('month', '');
+        $search = trim((string)($request->input('search') ?? $request->query('search', '')));
+
+        // Progressive Pagination & Filtering parameters
+        $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
+        $perPage = (int)($request->input('per_page') ?? $request->query('per_page', 50));
+        if ($perPage < 1) $perPage = 50;
+        if ($perPage > 10000) $perPage = 10000;
+
+        $type = strtolower(trim((string)($request->input('type') ?? $request->query('type', 'all'))));
+        if (!in_array($type, ['all', 'sales', 'purchases'])) {
+            $type = 'all';
+        }
+
+        $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
 
         if (!empty($month)) {
             $startDate = Carbon::parse($month . '-01')->startOfMonth()->toDateString();
@@ -6871,6 +7203,21 @@ class ReportController extends Controller
                 $warehouseId = $matchedOutlet->id;
                 $warehouse = $matchedOutlet->name;
             }
+        }
+
+        // Cache lookup
+        $cacheVersion = Cache::get('pos_commercial_tax_cache_version', 1);
+        $cacheKey = 'pos_commercial_tax_v' . $cacheVersion . '_' . md5(json_encode([
+            $warehouse, $startDate, $endDate, $month, $search, $page, $perPage, $type
+        ]));
+
+        if (!$forceRefresh) {
+            try {
+                $cached = Cache::get($cacheKey);
+                if ($cached !== null) {
+                    return response()->json($cached);
+                }
+            } catch (\Throwable $e) {}
         }
 
         // 1. Output Tax from Sales (collected from customers)
@@ -6986,76 +7333,92 @@ class ReportController extends Controller
             $taxCreditForward = round($netInputTax - $netOutputTax, 2);
         }
 
-        // Taxable Invoices with Tax Breakdown (up to 2,000 records for client-side progressive chunked rendering)
-        $search = trim($request->query('search', ''));
-        $salesListQuery = (clone $salesQuery)->where('tax_amount', '>', 0);
-        if (!empty($search)) {
-            $salesListQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('customer_name', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
-            });
+        // Taxable Invoices with Tax Breakdown (Progressive pagination per tab)
+        $totalSales = 0;
+        $taxableSalesList = collect();
+        if ($type === 'all' || $type === 'sales') {
+            $salesListQuery = (clone $salesQuery)->where('tax_amount', '>', 0);
+            if (!empty($search)) {
+                $salesListQuery->where(function ($q) use ($search) {
+                    $q->where('reference_no', 'like', "%{$search}%")
+                      ->orWhere('customer_name', 'like', "%{$search}%")
+                      ->orWhere('warehouse_name', 'like', "%{$search}%");
+                });
+            }
+            $totalSales = (clone $salesListQuery)->count();
+            $taxableSalesList = $salesListQuery
+                ->select('id', 'reference_no', 'date', 'customer_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'subtotal', 'discount', 'grand_total')
+                ->orderBy('date', 'desc')
+                ->offset(($page - 1) * $perPage)
+                ->limit($perPage)
+                ->get()
+                ->map(function ($row) {
+                    $subtotal = (float)($row->subtotal ?? 0);
+                    $discount = (float)($row->discount ?? 0);
+                    $grandTotal = (float)($row->grand_total ?? 0);
+                    $taxAmount = (float)($row->tax_amount ?? 0);
+                    $taxableAmount = round($subtotal > 0 ? ($subtotal - $discount) : ($grandTotal - $taxAmount), 2);
+                    return [
+                        'id'             => $row->id,
+                        'reference_no'   => $row->reference_no,
+                        'date'           => $row->date,
+                        'customer_name'  => $row->customer_name ?? 'Walk-in Customer',
+                        'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
+                        'tax_rate'       => (float)($row->tax_rate ?? 0),
+                        'tax_amount'     => $taxAmount,
+                        'taxable_amount' => $taxableAmount,
+                        'subtotal'       => $subtotal,
+                        'discount'       => $discount,
+                        'grand_total'    => $grandTotal,
+                    ];
+                });
+        } else {
+            $totalSales = (clone $salesQuery)->where('tax_amount', '>', 0)->count();
         }
 
-        $taxableSalesList = $salesListQuery
-            ->select('id', 'reference_no', 'date', 'customer_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'subtotal', 'discount', 'grand_total')
-            ->orderBy('date', 'desc')
-            ->limit(2000)
-            ->get()
-            ->map(function ($row) {
-                $subtotal = (float)($row->subtotal ?? 0);
-                $discount = (float)($row->discount ?? 0);
-                $grandTotal = (float)($row->grand_total ?? 0);
-                $taxAmount = (float)($row->tax_amount ?? 0);
-                $taxableAmount = round($subtotal > 0 ? ($subtotal - $discount) : ($grandTotal - $taxAmount), 2);
-                return [
-                    'id'             => $row->id,
-                    'reference_no'   => $row->reference_no,
-                    'date'           => $row->date,
-                    'customer_name'  => $row->customer_name ?? 'Walk-in Customer',
-                    'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
-                    'tax_rate'       => (float)($row->tax_rate ?? 0),
-                    'tax_amount'     => $taxAmount,
-                    'taxable_amount' => $taxableAmount,
-                    'subtotal'       => $subtotal,
-                    'discount'       => $discount,
-                    'grand_total'    => $grandTotal,
-                ];
-            });
-
-        $purchListQuery = (clone $purchQuery)->where('tax_amount', '>', 0);
-        if (!empty($search)) {
-            $purchListQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('supplier_name', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
-            });
+        $totalPurchases = 0;
+        $taxablePurchasesList = collect();
+        if ($type === 'all' || $type === 'purchases') {
+            $purchListQuery = (clone $purchQuery)->where('tax_amount', '>', 0);
+            if (!empty($search)) {
+                $purchListQuery->where(function ($q) use ($search) {
+                    $q->where('reference_no', 'like', "%{$search}%")
+                      ->orWhere('supplier_name', 'like', "%{$search}%")
+                      ->orWhere('warehouse_name', 'like', "%{$search}%");
+                });
+            }
+            $totalPurchases = (clone $purchListQuery)->count();
+            $taxablePurchasesList = $purchListQuery
+                ->select('id', 'reference_no', 'date', 'supplier_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'discount', 'grand_total')
+                ->orderBy('date', 'desc')
+                ->offset(($page - 1) * $perPage)
+                ->limit($perPage)
+                ->get()
+                ->map(function ($row) {
+                    $grandTotal = (float)($row->grand_total ?? 0);
+                    $taxAmount = (float)($row->tax_amount ?? 0);
+                    $taxableAmount = round(max(0.0, $grandTotal - $taxAmount), 2);
+                    return [
+                        'id'             => $row->id,
+                        'reference_no'   => $row->reference_no,
+                        'date'           => $row->date,
+                        'supplier_name'  => $row->supplier_name ?? 'Default Supplier',
+                        'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
+                        'tax_rate'       => (float)($row->tax_rate ?? 0),
+                        'tax_amount'     => $taxAmount,
+                        'taxable_amount' => $taxableAmount,
+                        'discount'       => (float)($row->discount ?? 0),
+                        'grand_total'    => $grandTotal,
+                    ];
+                });
+        } else {
+            $totalPurchases = (clone $purchQuery)->where('tax_amount', '>', 0)->count();
         }
 
-        $taxablePurchasesList = $purchListQuery
-            ->select('id', 'reference_no', 'date', 'supplier_name', 'warehouse_name', 'tax_rate', 'tax_amount', 'discount', 'grand_total')
-            ->orderBy('date', 'desc')
-            ->limit(2000)
-            ->get()
-            ->map(function ($row) {
-                $grandTotal = (float)($row->grand_total ?? 0);
-                $taxAmount = (float)($row->tax_amount ?? 0);
-                $taxableAmount = round(max(0.0, $grandTotal - $taxAmount), 2);
-                return [
-                    'id'             => $row->id,
-                    'reference_no'   => $row->reference_no,
-                    'date'           => $row->date,
-                    'supplier_name'  => $row->supplier_name ?? 'Default Supplier',
-                    'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
-                    'tax_rate'       => (float)($row->tax_rate ?? 0),
-                    'tax_amount'     => $taxAmount,
-                    'taxable_amount' => $taxableAmount,
-                    'discount'       => (float)($row->discount ?? 0),
-                    'grand_total'    => $grandTotal,
-                ];
-            });
+        $salesLastPage = $perPage > 0 ? (int)ceil($totalSales / $perPage) : 1;
+        $purchasesLastPage = $perPage > 0 ? (int)ceil($totalPurchases / $perPage) : 1;
 
-        return response()->json([
+        $responseData = [
             'status' => 'success',
             'period' => [
                 'start_date' => $startDate,
@@ -7083,9 +7446,27 @@ class ReportController extends Controller
                 'tax_credit_forward'     => $taxCreditForward,
                 'tax_status'             => $netTaxPayable > 0 ? 'Tax Payable (ပေးဆောင်ရန်)' : ($taxCreditForward > 0 ? 'Tax Credit (ပိုလျှံ/ရရန်)' : 'Balanced (ညီမျှ)'),
             ],
+            'sales_pagination' => [
+                'current_page' => $page,
+                'last_page'    => max(1, $salesLastPage),
+                'per_page'     => $perPage,
+                'total'        => $totalSales,
+            ],
+            'purchases_pagination' => [
+                'current_page' => $page,
+                'last_page'    => max(1, $purchasesLastPage),
+                'per_page'     => $perPage,
+                'total'        => $totalPurchases,
+            ],
             'sales_tax_records'     => $taxableSalesList,
             'purchases_tax_records' => $taxablePurchasesList,
-        ]);
+        ];
+
+        try {
+            Cache::put($cacheKey, $responseData, now()->addSeconds(300));
+        } catch (\Throwable $e) {}
+
+        return response()->json($responseData);
     }
 
     /**

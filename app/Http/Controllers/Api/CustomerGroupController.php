@@ -63,7 +63,7 @@ class CustomerGroupController extends Controller
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'name' => 'required|string|max:255',
+            'name' => 'required|string|max:255|unique:customer_groups,name',
             'discount_percentage' => 'nullable|numeric|min:0|max:100',
             'color' => 'nullable|string|max:50',
             'description' => 'nullable|string',
@@ -124,7 +124,7 @@ class CustomerGroupController extends Controller
         }
 
         $validated = $request->validate([
-            'name' => 'sometimes|required|string|max:255',
+            'name' => 'sometimes|required|string|max:255|unique:customer_groups,name,' . $id,
             'discount_percentage' => 'nullable|numeric|min:0|max:100',
             'color' => 'nullable|string|max:50',
             'description' => 'nullable|string',

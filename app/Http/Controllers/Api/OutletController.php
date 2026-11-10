@@ -129,6 +129,20 @@ class OutletController extends Controller
             ], 404);
         }
 
+        if (Outlet::count() <= 1) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Cannot delete the only remaining outlet/warehouse in the system.',
+            ], 422);
+        }
+
+        if ($outlet->id === 1) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'The primary central warehouse and head store cannot be deleted.',
+            ], 422);
+        }
+
         $outlet->delete();
 
         return response()->json([

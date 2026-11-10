@@ -16,7 +16,10 @@ class StockAdjustment extends Model
         'date',
         'total_products',
         'total_quantity',
-        'type', // Addition, Subtraction
+        'net_quantity',
+        'gross_quantity',
+        'type', // Addition, Subtraction, Mixed
+        'reason_code',
         'notes',
         'user_id',
         'user_name',
@@ -29,6 +32,8 @@ class StockAdjustment extends Model
         'user_id' => 'integer',
         'total_products' => 'integer',
         'total_quantity' => 'float',
+        'net_quantity' => 'float',
+        'gross_quantity' => 'float',
     ];
 
     public function user()

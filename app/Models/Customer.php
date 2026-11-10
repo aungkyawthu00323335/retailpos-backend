@@ -17,6 +17,7 @@ class Customer extends Model
         'tier',
         'reward_points',
         'total_spent',
+        'credit_limit',
         'total_visits',
         'avatar',
         'status',
@@ -26,6 +27,7 @@ class Customer extends Model
     protected $casts = [
         'reward_points' => 'integer',
         'total_spent' => 'decimal:2',
+        'credit_limit' => 'decimal:2',
         'total_visits' => 'integer',
     ];
 

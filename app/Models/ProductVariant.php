@@ -10,6 +10,8 @@ class ProductVariant extends Model
 {
     use HasFactory, SoftDeletes;
 
+    protected $touches = ['product'];
+
     protected $fillable = [
         'product_id',
         'name',

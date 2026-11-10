@@ -40,7 +40,7 @@ class CustomerController extends Controller
 
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        $allowedSorts = ['id', 'customer_id', 'name', 'phone', 'email', 'tier', 'reward_points', 'total_spent', 'total_visits', 'status'];
+        $allowedSorts = ['id', 'customer_id', 'name', 'phone', 'email', 'tier', 'total_spent', 'total_visits', 'status'];
         if (in_array($sortBy, $allowedSorts)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
@@ -60,7 +60,6 @@ class CustomerController extends Controller
         $summaryData = Customer::selectRaw("
             COUNT(*) as total_customers,
             SUM(CASE WHEN tier IN ('VIP Platinum', 'Gold VIP') THEN 1 ELSE 0 END) as vip_members,
-            0 as total_points,
             SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active_customers
         ")->first();
 
@@ -69,7 +68,6 @@ class CustomerController extends Controller
             'summary' => [
                 'total_customers' => (int)($summaryData->total_customers ?? 0),
                 'vip_members' => (int)($summaryData->vip_members ?? 0),
-                'total_points' => (float)($summaryData->total_points ?? 0),
                 'active_customers' => (int)($summaryData->active_customers ?? 0),
             ],
             'data' => $paginated->items(),
@@ -83,27 +81,27 @@ class CustomerController extends Controller
     }
 
     /**
-     * Generate the next sequential unique Customer ID (e.g. CUST-052).
+     * Generate the next sequential unique Customer ID (e.g. CUST-00021).
      */
     public function generateCustomerId(Request $request)
     {
         $existing = Customer::whereNotNull('customer_id')->pluck('customer_id');
-        $maxNum = (int)(Customer::max('id') ?? 0);
+        $maxNum = 0;
 
         foreach ($existing as $cid) {
             if (preg_match('/(?:CUST-)?([0-9]+)$/i', (string)$cid, $matches)) {
                 $n = (int)$matches[1];
-                if ($n > $maxNum) {
+                if ($n > $maxNum && $n < 999999) {
                     $maxNum = $n;
                 }
             }
         }
 
         $nextNum = $maxNum + 1;
-        $candidateId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+        $candidateId = 'CUST-' . sprintf('%05d', $nextNum);
         while (Customer::where('customer_id', $candidateId)->exists()) {
             $nextNum++;
-            $candidateId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+            $candidateId = 'CUST-' . sprintf('%05d', $nextNum);
         }
 
         return response()->json([
@@ -111,6 +109,8 @@ class CustomerController extends Controller
             'data' => [
                 'customer_id' => $candidateId,
             ],
+            'customer_id' => $candidateId,
+            'next_number' => $nextNum,
         ]);
     }
 
@@ -125,7 +125,7 @@ class CustomerController extends Controller
             'phone' => 'nullable|string|max:50',
             'email' => 'nullable|email|max:255',
             'tier' => 'nullable|string|max:100',
-            'reward_points' => 'nullable|integer',
+            'credit_limit' => 'nullable|numeric|min:0',
             'total_spent' => 'nullable|numeric',
             'total_visits' => 'nullable|integer',
             'avatar' => 'nullable|string',
@@ -136,18 +136,18 @@ class CustomerController extends Controller
         $customerId = !empty($validated['customer_id']) ? trim($validated['customer_id']) : null;
         if (empty($customerId)) {
             $existing = Customer::whereNotNull('customer_id')->pluck('customer_id');
-            $maxNum = (int)(Customer::max('id') ?? 0);
+            $maxNum = 0;
             foreach ($existing as $cid) {
                 if (preg_match('/(?:CUST-)?([0-9]+)$/i', (string)$cid, $matches)) {
                     $n = (int)$matches[1];
-                    if ($n > $maxNum) $maxNum = $n;
+                    if ($n > $maxNum && $n < 999999) $maxNum = $n;
                 }
             }
             $nextNum = $maxNum + 1;
-            $customerId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+            $customerId = 'CUST-' . sprintf('%05d', $nextNum);
             while (Customer::where('customer_id', $customerId)->exists()) {
                 $nextNum++;
-                $customerId = 'CUST-' . str_pad((string)$nextNum, 3, '0', STR_PAD_LEFT);
+                $customerId = 'CUST-' . sprintf('%05d', $nextNum);
             }
         }
 
@@ -157,7 +157,7 @@ class CustomerController extends Controller
             'phone' => $validated['phone'] ?? null,
             'email' => $validated['email'] ?? null,
             'tier' => $validated['tier'] ?? 'Silver Regular',
-            'reward_points' => $validated['reward_points'] ?? 0,
+            'credit_limit' => isset($validated['credit_limit']) ? (float)$validated['credit_limit'] : null,
             'total_spent' => $validated['total_spent'] ?? 0.00,
             'total_visits' => $validated['total_visits'] ?? 1,
             'avatar' => $validated['avatar'] ?? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
@@ -214,7 +214,7 @@ class CustomerController extends Controller
             'phone' => 'nullable|string|max:50',
             'email' => 'nullable|email|max:255',
             'tier' => 'nullable|string|max:100',
-            'reward_points' => 'nullable|integer',
+            'credit_limit' => 'nullable|numeric|min:0',
             'total_spent' => 'nullable|numeric',
             'total_visits' => 'nullable|integer',
             'avatar' => 'nullable|string',
@@ -308,7 +308,6 @@ class CustomerController extends Controller
             'Phone',
             'Email',
             'Customer Group',
-            'Reward Points',
             'Total Spent',
             'Total Visits',
             'Status',
@@ -321,7 +320,6 @@ class CustomerController extends Controller
                 '+95 9 1234 5678',
                 'david.aung@gmail.com',
                 'VIP Platinum',
-                '950',
                 '3420.00',
                 '48',
                 'Active',
@@ -332,7 +330,6 @@ class CustomerController extends Controller
                 '+95 9 9876 5432',
                 'emily.w@restaurant.com',
                 'Gold VIP',
-                '680',
                 '1890.00',
                 '26',
                 'Active',
@@ -343,7 +340,6 @@ class CustomerController extends Controller
                 '+95 9 5555 4444',
                 'aungkyaw@myanmar.net',
                 'Silver Regular',
-                '320',
                 '840.00',
                 '14',
                 'Active',
@@ -354,7 +350,6 @@ class CustomerController extends Controller
                 '+95 9 7788 9900',
                 'khin.khin@yangon.biz',
                 'Gold VIP',
-                '540',
                 '1450.00',
                 '19',
                 'Active',
@@ -365,7 +360,6 @@ class CustomerController extends Controller
                 '+95 9 3322 1100',
                 'm.chen@venture.sg',
                 'Bronze Club',
-                '120',
                 '310.00',
                 '5',
                 'Active',
@@ -392,7 +386,7 @@ class CustomerController extends Controller
      */
     public function export(Request $request)
     {
-        $query = Customer::withCount(['sales']);
+        $query = Customer::withCount(['sales'])->withSum('sales as total_due', 'due_amount');
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
@@ -414,14 +408,12 @@ class CustomerController extends Controller
 
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'asc')) === 'desc' ? 'desc' : 'asc';
-        $allowedSorts = ['id', 'name', 'phone', 'email', 'tier', 'reward_points', 'total_spent', 'total_visits', 'status'];
+        $allowedSorts = ['id', 'name', 'phone', 'email', 'tier', 'total_spent', 'total_visits', 'status'];
         if (in_array($sortBy, $allowedSorts)) {
             $query->orderBy($sortBy, $sortOrder);
         } else {
             $query->orderBy('id', 'asc');
         }
-
-        $customers = $query->get();
 
         $columns = [
             'Customer ID',
@@ -429,7 +421,6 @@ class CustomerController extends Controller
             'Phone',
             'Email',
             'Customer Group',
-            'Reward Points',
             'Total Spent',
             'Total Due',
             'Sales Count',
@@ -452,29 +443,32 @@ class CustomerController extends Controller
             return ($floatVal == (int)$floatVal) ? (string)(int)$floatVal : (string)number_format($floatVal, 2, '.', '');
         };
 
+        @set_time_limit(300);
+
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="customers_export_' . date('Ymd_His') . '.csv"',
             'Pragma' => 'no-cache',
-            'Cache-Control' => 'must-revalidate, post-check=0, pre-check=0',
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
             'Expires' => '0',
+            'X-Accel-Buffering' => 'no',
         ];
 
-        $callback = function () use ($columns, $customers, $formatPhone, $formatNum) {
+        $callback = function () use ($query, $columns, $formatPhone, $formatNum) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
             fputcsv($file, $columns);
 
-            foreach ($customers as $customer) {
-                $totalDue = (float)($customer->sales()->sum('due_amount') ?? 0.0);
+            $rowCount = 0;
+            foreach ($query->cursor() as $customer) {
+                $totalDue = (float)($customer->total_due ?? 0.0);
                 fputcsv($file, [
                     $customer->id,
                     $customer->name,
                     $formatPhone($customer->phone),
                     $customer->email ?? '',
                     $customer->tier ?? 'Silver Regular',
-                    $customer->reward_points ?? 0,
                     $formatNum($customer->total_spent ?? 0),
                     $formatNum($totalDue),
                     $customer->sales_count ?? 0,
@@ -482,6 +476,11 @@ class CustomerController extends Controller
                     $customer->status ?? 'Active',
                     $customer->notes ?? '',
                 ]);
+
+                $rowCount++;
+                if ($rowCount % 200 === 0) {
+                    flush();
+                }
             }
 
             fclose($file);
@@ -531,7 +530,6 @@ class CustomerController extends Controller
 
             $email = !empty($item['email']) ? trim($item['email']) : null;
             $tier = !empty($item['tier']) ? trim($item['tier']) : (!empty($item['group']) ? trim($item['group']) : 'Silver Regular');
-            $rewardPoints = isset($item['reward_points']) ? (int)$item['reward_points'] : 0;
             $totalSpent = isset($item['total_spent']) ? (float)$item['total_spent'] : 0.00;
             $totalVisits = isset($item['total_visits']) ? (int)$item['total_visits'] : 1;
             $status = !empty($item['status']) && in_array(ucfirst(strtolower(trim($item['status']))), ['Active', 'Inactive'])
@@ -567,7 +565,6 @@ class CustomerController extends Controller
                     'phone' => $phone,
                     'email' => $email ?? $existing->email,
                     'tier' => $tier ?: $existing->tier,
-                    'reward_points' => isset($item['reward_points']) ? $rewardPoints : $existing->reward_points,
                     'total_spent' => isset($item['total_spent']) ? $totalSpent : $existing->total_spent,
                     'total_visits' => isset($item['total_visits']) ? $totalVisits : $existing->total_visits,
                     'status' => $status,
@@ -580,7 +577,6 @@ class CustomerController extends Controller
                     'phone' => $phone,
                     'email' => $email,
                     'tier' => $tier,
-                    'reward_points' => $rewardPoints,
                     'total_spent' => $totalSpent,
                     'total_visits' => $totalVisits,
                     'status' => $status,

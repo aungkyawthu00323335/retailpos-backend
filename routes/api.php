@@ -48,7 +48,9 @@ Route::get('ping', function () {
     return response()->json([
         'status' => 'ok',
         'timestamp' => now()->timestamp,
-    ]);
+    ])
+    ->header('Connection', 'close')
+    ->header('Cache-Control', 'no-cache, no-store');
 });
 
 // Authentication & Session
@@ -93,15 +95,19 @@ Route::get('products/excel-template', [ProductExcelController::class, 'downloadT
 Route::get('products/excel-export', [ProductExcelController::class, 'exportProducts']);
 Route::post('products/excel-import', [ProductExcelController::class, 'importNewProducts']);
 Route::post('products/price-change-import', [ProductExcelController::class, 'importPriceChanges']);
+Route::get('products/quick-search', [ProductController::class, 'quickSearch']);
 Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
+Route::get('products/sync', [ProductController::class, 'sync']);
 Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
 Route::patch('products/{id}/toggle-bot-status', [ProductController::class, 'toggleBotStatus']);
 Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
 Route::apiResource('products', ProductController::class);
 
 // Stock Adjustments & Transfers
+Route::get('adjustments/export', [AdjustmentController::class, 'export']);
 Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateCode']);
 Route::apiResource('adjustments', AdjustmentController::class);
+Route::get('transfers/export', [TransferController::class, 'export']);
 Route::get('transfers/generate-code', [TransferController::class, 'generateCode']);
 Route::post('transfers/{id}/receive', [TransferController::class, 'receiveTransfer']);
 Route::get('transfers/{id}/payments', [TransferController::class, 'getPayments']);
@@ -114,10 +120,14 @@ Route::get('processings/generate-code', [ProcessingController::class, 'generateC
 Route::apiResource('processings', ProcessingController::class);
 
 // Purchases & Purchase Returns
+Route::get('purchases/export', [PurchaseController::class, 'export']);
+Route::get('purchases/generate-code', [PurchaseController::class, 'generateCode']);
 Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']);
 Route::delete('purchases/{id}/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
 Route::delete('purchases/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
 Route::apiResource('purchases', PurchaseController::class);
+Route::get('purchase-returns/generate-code', [PurchaseReturnController::class, 'generateCode']);
+Route::get('purchase-returns/export', [PurchaseReturnController::class, 'export']);
 Route::post('purchase-returns/{id}/payments', [PurchaseReturnController::class, 'addPayment']);
 Route::delete('purchase-returns/{returnId}/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
 Route::delete('purchase-returns/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
@@ -130,22 +140,30 @@ Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'detai
 Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
 
 // Sales, POS Checkout & Sales Returns
+Route::get('sales/export', [SaleController::class, 'export']);
+Route::get('sales/generate-code', [SaleController::class, 'generateCode']);
+Route::post('sales/bulk-sync', [SaleController::class, 'bulkSync']);
 Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
 Route::delete('sales/{saleId}/payments/{paymentId}', [SaleController::class, 'deletePayment']);
 Route::delete('sales/payments/{paymentId}', [SaleController::class, 'deletePayment']);
 Route::post('sales/{id}/void', [SaleController::class, 'voidSale'])->middleware('permission:sales.void');
 Route::apiResource('sales', SaleController::class);
+Route::get('sale-returns/export', [SaleReturnController::class, 'export']);
 Route::post('sale-returns/{id}/payments', [SaleReturnController::class, 'addPayment']);
 Route::delete('sale-returns/{returnId}/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
 Route::delete('sale-returns/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
+Route::get('sale-returns/generate-code', [SaleReturnController::class, 'generateCode']);
 Route::apiResource('sale-returns', SaleReturnController::class);
 
 // Quotations
+Route::get('quotations/export', [QuotationController::class, 'export']);
+Route::get('quotations/generate-code', [QuotationController::class, 'generateCode']);
 Route::post('quotations/{id}/convert-to-sale', [QuotationController::class, 'convertToSale']);
 Route::apiResource('quotations', QuotationController::class);
 
 // Expenses & Expense Categories
 Route::apiResource('expense-categories', ExpenseCategoryController::class);
+Route::get('expenses/export', [ExpenseController::class, 'export']);
 Route::get('expenses/generate-code', [ExpenseController::class, 'generateCode']);
 Route::post('expenses/{id}/payments', [ExpenseController::class, 'addPayment']);
 Route::delete('expenses/{expenseId}/payments/{paymentId}', [ExpenseController::class, 'deletePayment']);
@@ -238,9 +256,9 @@ Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'detai
 Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
 Route::post('cash-register/transaction', [CashRegisterController::class, 'recordTransaction']);
 
-// General Settings & Multi-Currency
-Route::get('settings', [SettingController::class, 'getSettings'])->middleware('permission:general_settings.view');
-Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update');
+// General Settings, Multi-Currency, Voucher & Prefix Settings
+Route::get('settings', [SettingController::class, 'getSettings'])->middleware('permission:general_settings.view,voucher_settings.view,prefix_settings.view');
+Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update,voucher_settings.update,prefix_settings.update');
 Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault']);
 Route::apiResource('currencies', CurrencyController::class);
 

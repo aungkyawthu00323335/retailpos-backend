@@ -100,6 +100,12 @@ class CurrencyController extends Controller
         if (!$currency) {
             return response()->json(['status' => 'error', 'message' => 'Currency not found'], 404);
         }
+        if ($currency->is_default) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Default system currency cannot be deleted. Please set another currency as default first.',
+            ], 422);
+        }
         $currency->delete();
         return response()->json(['status' => 'success', 'message' => 'Currency deleted']);
     }
