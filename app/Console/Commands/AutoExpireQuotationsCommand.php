@@ -2,9 +2,9 @@
 
 namespace App\Console\Commands;
 
-use Illuminate\Console\Command;
 use App\Models\Quotation;
 use Carbon\Carbon;
+use Illuminate\Console\Command;
 
 class AutoExpireQuotationsCommand extends Command
 {
@@ -16,8 +16,9 @@ class AutoExpireQuotationsCommand extends Command
         $today = Carbon::today()->toDateString();
 
         $expiredCount = Quotation::whereNotNull('expiry_date')
-            ->where('expiry_date', '<', $today)
-            ->whereNotIn('status', ['Ordered', 'Expired'])
+            ->where('expiry_date', '!=', '')
+            ->whereDate('expiry_date', '<', $today)
+            ->whereNotIn('status', ['Ordered', 'Declined', 'Expired'])
             ->update([
                 'status' => 'Expired',
                 'updated_at' => now(),

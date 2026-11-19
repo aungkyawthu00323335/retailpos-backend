@@ -24,6 +24,29 @@ class Setting extends Model
     protected static ?array $allSettingsCache = null;
     protected static float $allSettingsLoadedAt = 0.0;
     protected static ?string $settingsVersion = null;
+    protected static ?string $bootedTimezone = null;
+
+    /**
+     * Single-column fast timezone lookup used on request boot/middleware
+     * so we avoid loading all rows (including large logos/templates) from settings.
+     */
+    public static function getTimezoneFast(string $default = 'Asia/Yangon'): string
+    {
+        if (!app()->runningUnitTests() && static::$bootedTimezone !== null) {
+            return static::$bootedTimezone;
+        }
+
+        try {
+            $tz = static::where('key', 'timezone')->value('value');
+            $resolved = !empty($tz) ? (string)$tz : $default;
+            if (!app()->runningUnitTests()) {
+                static::$bootedTimezone = $resolved;
+            }
+            return $resolved;
+        } catch (\Throwable $e) {
+            return $default;
+        }
+    }
 
     public static function get(string $key, $default = null)
     {
@@ -97,17 +120,13 @@ class Setting extends Model
         if (static::$allSettingsCache !== null) {
             static::$allSettingsCache[$key] = $encoded;
         }
+        if ($key === 'timezone') {
+            static::$bootedTimezone = null;
+        }
         unset(static::$runtimeCache[$key]);
         Cache::forget("sys_setting_{$key}");
-        if (str_starts_with($key, 'telegram_') || str_starts_with($key, 'tg_')) {
-            Cache::forget('tg_bot_api_settings_data');
-            Cache::forget('tg_bot_active_categories_v2');
-            Cache::forget('tg_bot_active_categories');
-            Cache::forget('tg_bot_active_brands_v2');
-            Cache::forget('tg_bot_active_brands');
-        }
 
-        // Bump global settings version to instantly notify background daemons (telegram:poll, queue workers)
+        // Bump global settings version to notify runtime workers
         $newVersion = uniqid('set_', true);
         static::$settingsVersion = $newVersion;
         Cache::forever('sys_settings_version', $newVersion);
@@ -125,9 +144,6 @@ class Setting extends Model
         }
         unset(static::$runtimeCache[$key]);
         Cache::forget("sys_setting_{$key}");
-        if (str_starts_with($key, 'telegram_') || str_starts_with($key, 'tg_')) {
-            Cache::forget('tg_bot_api_settings_data');
-        }
         static::where('key', $key)->delete();
     }
 
@@ -136,5 +152,6 @@ class Setting extends Model
         static::$allSettingsCache = null;
         static::$allSettingsLoadedAt = 0.0;
         static::$runtimeCache = [];
+        static::$bootedTimezone = null;
     }
 }

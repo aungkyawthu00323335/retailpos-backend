@@ -20,9 +20,8 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         try {
-            $tz = \App\Models\Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
-            if (!empty($tz) && in_array($tz, timezone_identifiers_list(), true)) {
-                date_default_timezone_set($tz);
+            $tz = \App\Models\Setting::getTimezoneFast(config('app.timezone', 'Asia/Yangon'));
+            if (!empty($tz) && @date_default_timezone_set($tz)) {
                 config(['app.timezone' => $tz]);
             }
         } catch (\Throwable $e) {

@@ -5,29 +5,127 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Brand;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class BrandController extends Controller
 {
+    private const CACHE_KEY = 'api_brands_list';
+
+    /**
+     * Shared query builder joining aggregated product counts in one pass
+     * instead of correlated Eloquent withCount subqueries.
+     */
+    private function buildListingQuery()
+    {
+        $productCountsSub = DB::table('products')
+            ->select('brand_id', DB::raw('COUNT(*) as cnt'))
+            ->whereNull('deleted_at')
+            ->whereNotNull('brand_id')
+            ->groupBy('brand_id');
+
+        return DB::table('brands as b')
+            ->leftJoinSub($productCountsSub, 'pc', function ($join) {
+                $join->on('pc.brand_id', '=', 'b.id');
+            })
+            ->select([
+                'b.id',
+                'b.name',
+                'b.code',
+                'b.image_url',
+                'b.description',
+                'b.status',
+                'b.created_at',
+                'b.updated_at',
+                DB::raw('COALESCE(pc.cnt, 0) as products_count'),
+            ]);
+    }
+
+    /**
+     * Normalize integer and nullable string fields for API consumers.
+     */
+    private function formatListingRows($rows): array
+    {
+        return $rows->map(function ($row) {
+            return [
+                'id' => (int) $row->id,
+                'name' => $row->name,
+                'code' => $row->code ?? '',
+                'image_url' => $row->image_url,
+                'description' => $row->description ?? '',
+                'status' => $row->status ?? 'Active',
+                'products_count' => (int) $row->products_count,
+                'created_at' => $row->created_at,
+                'updated_at' => $row->updated_at,
+            ];
+        })->all();
+    }
+
+    private function clearListCache(): void
+    {
+        Cache::forget(self::CACHE_KEY);
+        Cache::forget('tg_bot_active_brands_v2');
+        Cache::forget('tg_bot_active_brands');
+    }
+
     public function index(Request $request)
     {
-        $query = Brand::withCount('products');
+        $noStoreHeader = 'no-store, no-cache, must-revalidate, private';
+
+        if ($request->boolean('compact')) {
+            $compactQuery = DB::table('brands')
+                ->select(['id', 'name', 'status']);
+
+            if ($request->filled('search')) {
+                $search = trim((string) $request->input('search'));
+                $compactQuery->where('name', 'like', "%{$search}%");
+            }
+            if ($request->filled('status') && $request->input('status') !== 'All') {
+                $compactQuery->where('status', $request->input('status'));
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $compactQuery->orderByDesc('id')->get(),
+            ])->header('Cache-Control', $noStoreHeader);
+        }
+
+        $hasFilters = $request->filled('search') ||
+            ($request->filled('status') && $request->input('status') !== 'All');
+
+        if (!$hasFilters) {
+            $brands = $this->formatListingRows(
+                $this->buildListingQuery()
+                    ->orderBy('b.id', 'desc')
+                    ->get()
+            );
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $brands,
+            ])->header('Cache-Control', $noStoreHeader);
+        }
+
+        $query = $this->buildListingQuery();
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
-            $query->where('name', 'like', "%{$search}%")
-                  ->orWhere('code', 'like', "%{$search}%");
+            $query->where(function ($q) use ($search) {
+                $q->where('b.name', 'like', "%{$search}%")
+                  ->orWhere('b.code', 'like', "%{$search}%");
+            });
         }
 
         if ($request->filled('status') && $request->input('status') !== 'All') {
-            $query->where('status', $request->input('status'));
+            $query->where('b.status', $request->input('status'));
         }
 
-        $brands = $query->orderBy('id', 'desc')->get();
+        $brands = $this->formatListingRows($query->orderBy('b.id', 'desc')->get());
 
         return response()->json([
             'status' => 'success',
             'data' => $brands,
-        ]);
+        ])->header('Cache-Control', $noStoreHeader);
     }
 
     public function toggleStatus($id)
@@ -39,6 +137,7 @@ class BrandController extends Controller
 
         $brand->status = ($brand->status === 'Active') ? 'Inactive' : 'Active';
         $brand->save();
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -64,6 +163,7 @@ class BrandController extends Controller
             'description' => $validated['description'] ?? null,
             'status' => $validated['status'] ?? 'Active',
         ]);
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -97,6 +197,7 @@ class BrandController extends Controller
         ]);
 
         $brand->update($validated);
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -120,6 +221,7 @@ class BrandController extends Controller
         }
 
         $brand->delete();
+        $this->clearListCache();
         return response()->json(['status' => 'success', 'message' => 'Brand deleted successfully']);
     }
 }

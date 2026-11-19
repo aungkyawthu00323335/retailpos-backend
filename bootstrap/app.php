@@ -14,6 +14,7 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->append(\App\Http\Middleware\SetAppTimezone::class);
+        $middleware->append(\App\Http\Middleware\CompressJsonResponse::class);
         $middleware->alias([
             'permission' => \App\Http\Middleware\CheckPermission::class,
         ]);

@@ -3,35 +3,131 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\SaleUnit;
 use App\Models\ProductUnit;
+use App\Models\SaleUnit;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class SaleUnitController extends Controller
 {
+    private const CACHE_KEY = 'api_sale_units_list';
+    private const CACHE_TTL_SECONDS = 300;
+
     public function index(Request $request)
     {
-        $query = SaleUnit::with('baseUnit')->withCount(['products', 'saleItems'])->orderBy('id', 'desc');
+        $hasSearch = $request->filled('search');
+        $hasStatus = $request->filled('status') && $request->input('status') !== 'All';
 
-        if ($request->filled('search')) {
-            $search = $request->search;
+        if (! $hasSearch && ! $hasStatus) {
+            $units = $this->formatListingRows(
+                $this->buildListingQuery()->get()
+            );
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $units,
+            ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        }
+
+        $query = $this->buildListingQuery();
+
+        if ($hasSearch) {
+            $search = trim((string) $request->input('search'));
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
-                  ->orWhere('base_unit_name', 'like', "%{$search}%")
-                  ->orWhere('description', 'like', "%{$search}%");
+                $q->where('su.name', 'like', "%{$search}%")
+                    ->orWhere('su.base_unit_name', 'like', "%{$search}%")
+                    ->orWhere('bu.name', 'like', "%{$search}%")
+                    ->orWhere('su.description', 'like', "%{$search}%");
             });
         }
 
-        if ($request->filled('status') && $request->status !== 'All') {
-            $query->where('status', $request->status);
+        if ($hasStatus) {
+            $query->where('su.status', $request->input('status'));
         }
-
-        $units = $query->get();
 
         return response()->json([
             'status' => 'success',
-            'data' => $units,
+            'data' => $this->formatListingRows($query->get()),
         ]);
+    }
+
+    private function buildListingQuery()
+    {
+        $productCountsSub = DB::table('products')
+            ->selectRaw('sale_unit_id, COUNT(*) as products_count')
+            ->whereNull('deleted_at')
+            ->whereNotNull('sale_unit_id')
+            ->groupBy('sale_unit_id');
+
+        $linkCountsSub = DB::table('product_unit_links')
+            ->selectRaw('unit_id, COUNT(DISTINCT product_id) as links_count')
+            ->where('unit_type', 'sale')
+            ->groupBy('unit_id');
+
+        $saleItemCountsSub = DB::table('sale_items')
+            ->selectRaw('unit_id, COUNT(*) as sales_count')
+            ->whereNotNull('unit_id')
+            ->groupBy('unit_id');
+
+        return DB::table('sale_units as su')
+            ->leftJoin('product_units as bu', 'su.base_unit_id', '=', 'bu.id')
+            ->leftJoinSub($productCountsSub, 'p_counts', function ($join) {
+                $join->on('su.id', '=', 'p_counts.sale_unit_id');
+            })
+            ->leftJoinSub($linkCountsSub, 'pul_counts', function ($join) {
+                $join->on('su.id', '=', 'pul_counts.unit_id');
+            })
+            ->leftJoinSub($saleItemCountsSub, 'si_counts', function ($join) {
+                $join->on('su.id', '=', 'si_counts.unit_id');
+            })
+            ->select([
+                'su.id',
+                'su.name',
+                'su.base_unit_id',
+                'su.base_unit_name',
+                'bu.name as base_unit_rel_name',
+                'su.description',
+                'su.status',
+                'su.created_at',
+                'su.updated_at',
+                DB::raw('GREATEST(COALESCE(p_counts.products_count, 0), COALESCE(pul_counts.links_count, 0)) as products_count'),
+                DB::raw('COALESCE(si_counts.sales_count, 0) as sales_count'),
+            ])
+            ->orderByDesc('su.id');
+    }
+
+    private function formatListingRows($rows): array
+    {
+        return collect($rows)->map(static function ($row) {
+            $baseUnitId = $row->base_unit_id !== null ? (int) $row->base_unit_id : null;
+            $baseUnitName = $row->base_unit_name ?? $row->base_unit_rel_name;
+            $salesCount = (int) ($row->sales_count ?? 0);
+
+            return [
+                'id' => (int) $row->id,
+                'name' => $row->name,
+                'base_unit_id' => $baseUnitId,
+                'base_unit_name' => $baseUnitName,
+                'base_unit' => $baseUnitId !== null ? [
+                    'id' => $baseUnitId,
+                    'name' => $row->base_unit_rel_name ?? $baseUnitName,
+                ] : null,
+                'description' => $row->description,
+                'status' => $row->status,
+                'products_count' => (int) ($row->products_count ?? 0),
+                'sales_count' => $salesCount,
+                'sale_items_count' => $salesCount,
+                'created_at' => $row->created_at,
+                'updated_at' => $row->updated_at,
+            ];
+        })->all();
+    }
+
+    private function clearListCache(): void
+    {
+        Cache::forget(self::CACHE_KEY);
+        Cache::forget('api_product_units_list');
     }
 
     public function store(Request $request)
@@ -60,6 +156,8 @@ class SaleUnitController extends Controller
         ]);
 
         $unit->load('baseUnit');
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -116,6 +214,8 @@ class SaleUnitController extends Controller
         $unit->update($validated);
         $unit->load('baseUnit');
 
+        $this->clearListCache();
+
         return response()->json([
             'status' => 'success',
             'message' => 'Sale unit updated successfully',
@@ -138,6 +238,8 @@ class SaleUnitController extends Controller
         $unit->status = $nextStatus;
         $unit->save();
         $unit->load('baseUnit');
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -172,6 +274,8 @@ class SaleUnitController extends Controller
         }
 
         $unit->delete();
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',

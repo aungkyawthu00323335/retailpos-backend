@@ -73,17 +73,13 @@ class Customer extends Model
 
     /**
      * Restricts a sales query to genuine Accounts Receivable:
-     * excludes voided / cancelled / draft sales and Telegram bot orders
-     * that are still awaiting approval or were rejected (no revenue recognised yet).
+     * excludes voided / cancelled / draft sales (no revenue recognised yet).
      */
     public static function applyReceivableScope($query)
     {
         return $query
             ->where(function ($q) {
                 $q->whereNull('status')->orWhereNotIn('status', ['Voided', 'Cancelled', 'Draft']);
-            })
-            ->where(function ($q) {
-                $q->whereNull('bot_approval_status')->orWhereNotIn('bot_approval_status', ['pending', 'rejected']);
             });
     }
 }

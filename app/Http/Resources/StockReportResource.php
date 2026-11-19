@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Services\PurchaseAccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -14,6 +15,7 @@ class StockReportResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
+        $canViewCost = app(PurchaseAccountingService::class)->canViewCost($request);
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
@@ -71,7 +73,8 @@ class StockReportResource extends JsonResource
                     'id' => (int)$v->id,
                     'name' => (string)$v->name,
                     'sku' => (string)($v->sku ?? ''),
-                    'cost_price' => (float)$v->cost_price,
+                    'cost_price' => $canViewCost ? (float)$v->cost_price : null,
+                    'cost_masked' => !$canViewCost,
                     'retail_price' => (float)($v->selling_price ?? 0.0),
                     'stock_quantity' => $vStock,
                     'values' => $vals,
@@ -92,7 +95,8 @@ class StockReportResource extends JsonResource
             'alternative_name' => (string)($this->alternative_name ?? ''),
             'category_name' => (string)($this->category_name ?? ''),
             'unit_name' => (string)($this->unit_name ?? ''),
-            'cost_price' => $costPrice,
+            'cost_price' => $canViewCost ? $costPrice : null,
+            'cost_masked' => !$canViewCost,
             'retail_price' => $retailPrice,
             'stock_quantity' => $stockQty,
             'stockQuantity' => $stockQty,

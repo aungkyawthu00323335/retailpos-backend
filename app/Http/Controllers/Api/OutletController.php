@@ -11,8 +11,20 @@ class OutletController extends Controller
     /**
      * Display a listing of outlets with summary statistics.
      */
-    public function index()
+    public function index(Request $request)
     {
+        if ($request->boolean('compact')) {
+            $outlets = Outlet::query()
+                ->select(['id', 'name', 'is_active'])
+                ->orderBy('id', 'desc')
+                ->get();
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $outlets,
+            ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        }
+
         $outlets = Outlet::orderBy('id', 'desc')->get();
 
         $totalOutlets = $outlets->count();

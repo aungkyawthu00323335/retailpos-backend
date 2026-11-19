@@ -14,6 +14,7 @@ class SalePayment extends Model
         'reference_no',
         'payment_date',
         'payment_type',
+        'cash_register_id',
         'amount',
         'received_amount',
         'change_amount',
@@ -28,6 +29,7 @@ class SalePayment extends Model
         'amount' => 'float',
         'received_amount' => 'float',
         'change_amount' => 'float',
+        'cash_register_id' => 'integer',
         'user_id' => 'integer',
     ];
 

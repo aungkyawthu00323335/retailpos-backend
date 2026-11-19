@@ -49,6 +49,7 @@ class SettingController extends Controller
             'tax_type' => 'percentage',
             'default_tax_type' => 'percentage',
             'default_tax_value' => '5',
+            'tax_is_recoverable' => '0',
             'discount_type' => 'fixed',
             'default_discount_type' => 'fixed',
             'default_discount_value' => '0',
@@ -77,21 +78,6 @@ class SettingController extends Controller
             'show_voucher_footer' => '1',
             'voucher_footer_text' => 'ကျေးဇူးတင်ပါသည်၊ နောက်လည်း လာရောက်အားပေးပါရန် ဖိတ်ခေါ်အပ်ပါသည်။',
             'voucher_paper_size' => '80mm',
-            // 🤖 Telegram Bot Commerce Settings
-            'telegram_bot_enabled' => '0',
-            'telegram_bot_token' => '',
-            'telegram_bot_username' => '',
-            'telegram_bot_warehouse_id' => '1',
-            'telegram_bot_warehouse_name' => '',
-            'telegram_bot_auto_approve' => '0',
-            'telegram_bot_allow_unpaid' => '1',
-            'telegram_bot_allow_paid' => '1',
-            'telegram_bot_allow_partial' => '0',
-            'telegram_bot_min_partial_pct' => '30',
-            'telegram_bot_payment_methods' => json_encode(['Cash on Delivery', 'KBZPay', 'WavePay']),
-            'telegram_bot_payment_info' => "KBZPay: 09123456789 (U Tin Win)\nWavePay: 09123456789 (U Tin Win)\nCB Bank: 001234567890 (Ah Linn Thit)",
-            'telegram_bot_welcome_msg' => 'မင်္ဂလာပါရှင်။ အလင်းသစ် (Ah Linn Thit) မှ ကြိုဆိုပါသည်ရှင်။ အောက်ပါ Menu မှတဆင့် ကုန်ပစ္စည်းများအား စိတ်ကြိုက် ရွေးချယ်ဝယ်ယူနိုင်ပါသည်ရှင်။',
-            'telegram_admin_chat_ids' => '',
         ];
 
         $settings = Setting::all()->pluck('value', 'key')->toArray();
@@ -147,10 +133,8 @@ class SettingController extends Controller
 
             Setting::set($key, $strVal);
 
-            // If a prefix actually changed, cascade the new prefix to existing transaction records
-            if (isset($prefixModelMap[$key]) && !empty($strVal) && $hasPrefixChanged) {
-                $this->updateModelPrefixes($prefixModelMap[$key], trim($strVal));
-            }
+            // Historical posted voucher reference numbers are immutable accounting audit trail identifiers.
+            // Updating prefix settings applies to future sequential documents only.
 
             // If timezone changed, dynamically set PHP and Laravel timezone immediately
             if ($key === 'timezone' && !empty($strVal) && in_array($strVal, timezone_identifiers_list(), true)) {
@@ -166,61 +150,10 @@ class SettingController extends Controller
     }
 
     /**
-     * Updates all existing records of a model with the new prefix via fast bulk updates
+     * Deprecated no-op: mutating historical voucher reference numbers destroys accounting audit links.
      */
     protected function updateModelPrefixes($modelClass, string $newPrefix): void
     {
-        if (empty($newPrefix)) return;
-        try {
-            $instance = new $modelClass();
-            $table = $instance->getTable();
-
-            // Fetch only id and reference_no in chunks of 500 without hydrating full Eloquent models
-            DB::table($table)
-                ->whereNotNull('reference_no')
-                ->where('reference_no', '!=', '')
-                ->select(['id', 'reference_no'])
-                ->orderBy('id')
-                ->chunk(500, function ($records) use ($table, $newPrefix) {
-                    $updates = [];
-                    foreach ($records as $record) {
-                        $ref = (string) ($record->reference_no ?? '');
-                        if (empty($ref)) continue;
-
-                        // Extract pure numeric or sequential suffix starting from first digit (e.g. "2026-00976", "1114187")
-                        if (preg_match('/(\d.*)$/', $ref, $matches)) {
-                            $suffix = $matches[1];
-                        } else {
-                            // Fallback: strip all leading alpha-separator chunks
-                            $suffix = preg_replace('/^([A-Za-z]+[_\-\/:]*)+/', '', $ref);
-                            if (empty($suffix)) {
-                                $suffix = (string) ($record->id ?? '1');
-                            }
-                        }
-                        $newRef = $newPrefix . $suffix;
-                        if ($newRef !== $ref) {
-                            $updates[$record->id] = $newRef;
-                        }
-                    }
-
-                    if (!empty($updates)) {
-                        // Fast batch update via single SQL CASE WHEN statement
-                        $cases = [];
-                        $ids = [];
-                        foreach ($updates as $id => $val) {
-                            $escapedVal = addslashes($val);
-                            $cases[] = "WHEN id = {$id} THEN '{$escapedVal}'";
-                            $ids[] = (int) $id;
-                        }
-                        $idsList = implode(',', $ids);
-                        $casesSql = implode(' ', $cases);
-                        DB::statement(
-                            "UPDATE `{$table}` SET `reference_no` = CASE {$casesSql} END WHERE `id` IN ({$idsList})"
-                        );
-                    }
-                });
-        } catch (\Throwable $e) {
-            Log::warning("Error cascading prefix update for {$modelClass}: " . $e->getMessage());
-        }
+        // Intentionally disabled: prefix changes affect future generated numbers only.
     }
 }

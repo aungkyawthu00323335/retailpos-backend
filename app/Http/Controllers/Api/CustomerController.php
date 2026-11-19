@@ -14,6 +14,43 @@ class CustomerController extends Controller
      */
     public function index(Request $request)
     {
+        $noStoreHeader = 'no-store, no-cache, must-revalidate, private';
+
+        if ($request->boolean('compact')) {
+            $compactQuery = Customer::query()
+                ->select(['id', 'customer_id', 'name', 'phone', 'tier', 'status']);
+
+            if ($request->filled('search')) {
+                $search = trim((string) $request->input('search'));
+                $compactQuery->where(function ($q) use ($search) {
+                    $q->where('name', 'like', "%{$search}%")
+                      ->orWhere('customer_id', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                });
+            }
+            if ($request->filled('status') && $request->input('status') !== 'All') {
+                $compactQuery->where('status', $request->input('status'));
+            }
+
+            $limit = (int) $request->input('per_page', 1000);
+            if ($limit <= 0 || $limit > 5000) {
+                $limit = 1000;
+            }
+            $rows = $compactQuery->orderBy('id', 'desc')->limit($limit)->get();
+            $count = $rows->count();
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $rows,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => max(1, $count),
+                    'total' => $count,
+                    'last_page' => 1,
+                ],
+            ])->header('Cache-Control', $noStoreHeader);
+        }
+
         $query = Customer::withCount(['sales'])
             ->withSum(['sales as receivable_due_sum' => function ($q) {
                 Customer::applyReceivableScope($q);
@@ -77,7 +114,7 @@ class CustomerController extends Controller
                 'total' => $paginated->total(),
                 'last_page' => $paginated->lastPage(),
             ],
-        ]);
+        ])->header('Cache-Control', $noStoreHeader);
     }
 
     /**

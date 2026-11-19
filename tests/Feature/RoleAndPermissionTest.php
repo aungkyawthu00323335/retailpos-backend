@@ -532,4 +532,163 @@ class RoleAndPermissionTest extends TestCase
         $resTax = $this->withToken($reportViewer->api_token)->getJson('/api/reports/commercial-tax');
         $resTax->assertStatus(403);
     }
+
+    public function test_unauthenticated_request_is_rejected_with_401_when_rbac_users_exist(): void
+    {
+        $this->getJson('/api/products')->assertStatus(401);
+        $this->getJson('/api/sales')->assertStatus(401);
+        $this->getJson('/api/settings')->assertStatus(401);
+    }
+
+    public function test_granular_crud_and_special_module_routes_enforce_rbac_across_all_modules(): void
+    {
+        // Cashier cannot access catalog mutations, inventory ops, procurement, accounting, settings, or bot ops
+        $forbiddenForCashier = [
+            ['GET', '/api/purchases'],
+            ['POST', '/api/purchases'],
+            ['GET', '/api/purchase-returns'],
+            ['POST', '/api/adjustments'],
+            ['GET', '/api/transfers'],
+            ['GET', '/api/processings'],
+            ['GET', '/api/expenses'],
+            ['GET', '/api/expense-categories'],
+            ['POST', '/api/quotations'],
+            ['GET', '/api/suppliers'],
+            ['GET', '/api/supplier-categories'],
+            ['POST', '/api/customer-groups'],
+            ['POST', '/api/brands'],
+            ['POST', '/api/product-categories'],
+            ['POST', '/api/sub-categories'],
+            ['POST', '/api/variations'],
+            ['POST', '/api/product-units'],
+            ['POST', '/api/currencies'],
+            ['POST', '/api/payment-methods'],
+            ['POST', '/api/outlets'],
+            ['GET', '/api/reports/stock'],
+            ['GET', '/api/reports/stock/export'],
+            ['GET', '/api/reports/profit-loss'],
+            ['GET', '/api/reports/commercial-tax'],
+        ];
+
+        foreach ($forbiddenForCashier as [$method, $uri]) {
+            $res = $this->withToken($this->cashier->api_token)->json($method, $uri);
+            $this->assertSame(
+                403,
+                $res->status(),
+                "Expected 403 for Cashier calling {$method} {$uri}, got {$res->status()}."
+            );
+        }
+
+        // Custom role with explicit special action permissions succeeds for its granted routes
+        $specialistRole = Role::create([
+            'name' => 'Transfer & Currency Officer',
+            'slug' => 'transfer_currency_officer',
+            'permissions' => [
+                'transfers.view',
+                'transfers.pay',
+                'currencies.view',
+                'outlets.view',
+                'report_stock.view',
+            ],
+            'status' => 'active',
+        ]);
+
+        $specialist = User::create([
+            'user_id' => 'USR-SPEC-01',
+            'name' => 'Specialist Staff',
+            'email' => 'specialist@retailpos.test',
+            'role' => 'Transfer & Currency Officer',
+            'role_id' => $specialistRole->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'specialist_test_token_999',
+        ]);
+
+        $this->withToken($specialist->api_token)->getJson('/api/transfers')->assertStatus(200);
+        $this->withToken($specialist->api_token)->getJson('/api/currencies')->assertStatus(200);
+        $this->withToken($specialist->api_token)->getJson('/api/outlets')->assertStatus(200);
+        $this->withToken($specialist->api_token)->getJson('/api/reports/stock')->assertStatus(200);
+
+        // Still blocked on ungranted write/delete/confidential actions
+        $this->withToken($specialist->api_token)->postJson('/api/currencies', ['code' => 'MMK'])->assertStatus(403);
+        $this->withToken($specialist->api_token)->getJson('/api/reports/stock/export')->assertStatus(403);
+        $this->withToken($specialist->api_token)->getJson('/api/reports/profit-loss')->assertStatus(403);
+    }
+
+    public function test_user_permission_cache_respects_o1_aliases_and_live_role_updates(): void
+    {
+        $role = Role::create([
+            'name' => 'Dynamic Tester',
+            'slug' => 'dynamic_tester',
+            'permissions' => ['processing:view', 'report_sales.view', 'sale_return.update'],
+            'status' => 'active',
+        ]);
+
+        $user = User::create([
+            'user_id' => 'USR-DYN-01',
+            'name' => 'Dynamic User',
+            'email' => 'dynamic@retailpos.test',
+            'role' => 'Dynamic Tester',
+            'role_id' => $role->id,
+            'status' => 'active',
+            'password' => bcrypt('password123'),
+            'api_token' => 'dynamic_token_123',
+        ]);
+
+        // Verify colon & singular/plural & report aliases work cleanly
+        $this->assertTrue($user->hasPermission('processings.view'));
+        $this->assertTrue($user->hasPermission('reports.sales'));
+        $this->assertTrue($user->hasPermission('sale_returns.update'));
+        $this->assertFalse($user->hasPermission('transfers.pay'));
+
+        // Update role permissions in DB and reload relation; cache must invalidate immediately
+        $role->update(['permissions' => ['transfers.pay', 'pos.discount']]);
+        $user->load('roleModel');
+
+        $this->assertFalse($user->hasPermission('processings.view'));
+        $this->assertTrue($user->hasPermission('transfers.pay'));
+        $this->assertTrue($user->hasPermission('pos.discount'));
+    }
+
+    public function test_role_permission_catalog_includes_all_granular_actions(): void
+    {
+        $res = $this->withToken($this->superAdmin->api_token)->getJson('/api/roles/permissions');
+        $res->assertStatus(200);
+
+        $flatKeys = [];
+        foreach (($res->json('data') ?? []) as $item) {
+            $id = $item['id'] ?? '';
+            foreach (($item['actions'] ?? []) as $act) {
+                $flatKeys[] = "{$id}.{$act}";
+            }
+            foreach (($item['special_actions'] ?? []) as $sp) {
+                if (is_array($sp) && !empty($sp['key'])) {
+                    $flatKeys[] = "{$id}.{$sp['key']}";
+                }
+            }
+        }
+
+        $this->assertNotEmpty($flatKeys);
+        $this->assertContains('pos.discount', $flatKeys);
+        $this->assertContains('transfers.pay', $flatKeys);
+    }
+
+    public function test_role_and_user_seeder_populates_complete_rbac_roles_with_sod(): void
+    {
+        $this->seed(\Database\Seeders\RoleAndUserSeeder::class);
+
+        $manager = Role::where('slug', 'store_manager')->first();
+        $accountant = Role::where('slug', 'accountant')->first();
+        $inventory = Role::where('slug', 'inventory_clerk')->first();
+
+        $this->assertNotNull($manager);
+        $this->assertNotNull($accountant);
+        $this->assertNotNull($inventory);
+
+        $this->assertContains('pos.discount', $manager->permissions ?? []);
+        $this->assertContains('transfers.pay', $accountant->permissions ?? []);
+        $this->assertContains('sales.pay', $accountant->permissions ?? []);
+        $this->assertNotContains('products.view_cost', $inventory->permissions ?? []);
+        $this->assertContains('processings.view', $inventory->permissions ?? []);
+    }
 }

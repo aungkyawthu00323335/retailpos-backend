@@ -2,12 +2,14 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\TracksRegisterSplitFlag;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class PurchaseReturn extends Model
 {
     use HasFactory;
+    use TracksRegisterSplitFlag;
 
     protected $fillable = [
         'reference_no',
@@ -22,11 +24,15 @@ class PurchaseReturn extends Model
         'grand_total',
         'paid_amount',
         'due_amount',
+        'return_cost_total',
+        'cost_variance',
         'payment_status',
         'payment_type',     // New: how supplier refunds (Cash, Bank Transfer, Credit Note, Cheque)
+        'cash_register_id',
         'subtotal',         // New: line items subtotal before tax/discount
         'tax_rate',         // New: tax rate %
         'tax_amount',       // New: calculated tax amount
+        'is_tax_recoverable',
         'discount',         // New: order-level discount
         'shipping',         // New: shipping/handling fee
         'notes',
@@ -40,18 +46,26 @@ class PurchaseReturn extends Model
     ];
 
     protected $casts = [
-        'grand_total'  => 'float',
-        'paid_amount'  => 'float',
-        'due_amount'   => 'float',
-        'subtotal'     => 'float',
-        'tax_rate'     => 'float',
-        'tax_amount'   => 'float',
-        'discount'     => 'float',
-        'shipping'     => 'float',
-        'warehouse_id' => 'integer',
-        'outlet_id'    => 'integer',
-        'supplier_id'  => 'integer',
-        'user_id'      => 'integer',
+        'grand_total'        => 'float',
+        'paid_amount'        => 'float',
+        'due_amount'         => 'float',
+        'return_cost_total'  => 'float',
+        'cost_variance'      => 'float',
+        'subtotal'           => 'float',
+        'tax_rate'           => 'float',
+        'tax_amount'         => 'float',
+        'is_tax_recoverable' => 'boolean',
+        'discount'           => 'float',
+        'shipping'           => 'float',
+        'warehouse_id'       => 'integer',
+        'outlet_id'          => 'integer',
+        'supplier_id'        => 'integer',
+        'cash_register_id'   => 'integer',
+        'user_id'            => 'integer',
+    ];
+
+    protected $attributes = [
+        'is_tax_recoverable' => false,
     ];
 
     protected $appends = ['items', 'payments'];
@@ -111,6 +125,16 @@ class PurchaseReturn extends Model
     public function purchase()
     {
         return $this->belongsTo(Purchase::class, 'purchase_reference_no', 'reference_no');
+    }
+
+    public function allocations()
+    {
+        return $this->hasMany(PurchaseReturnAllocation::class, 'purchase_return_id');
+    }
+
+    public function costLayers()
+    {
+        return $this->hasMany(PurchaseReturnCostLayer::class, 'purchase_return_id');
     }
 
     public function supplier()

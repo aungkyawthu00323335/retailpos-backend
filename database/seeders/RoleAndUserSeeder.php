@@ -41,14 +41,12 @@ class RoleAndUserSeeder extends Seeder
 
             // 6. Sales & POS
             'sales.view', 'sales.create', 'sales.update', 'sales.delete', 'sales.void', 'sales.refund', 'sales.pay', 'sales.export',
-            'pos.view', 'pos.create', 'pos.checkout',
+            'pos.view', 'pos.create', 'pos.checkout', 'pos.discount',
             'cash_register.view', 'cash_register.open_close', 'cash_register.safe_drop', 'cash_register.view_expected',
             'sale_returns.view', 'sale_returns.create', 'sale_returns.update', 'sale_returns.delete', 'sale_returns.pay', 'sale_returns.export',
-            'bot_orders.view', 'bot_orders.update', 'bot_orders.delete', 'bot_orders.approve', 'bot_orders.dispatch',
-            'bot_chat.view', 'bot_chat.create',
 
             // 7. Transfers
-            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.export',
+            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.pay', 'transfers.export',
 
             // 8. Expenses
             'expenses.view', 'expenses.create', 'expenses.update', 'expenses.delete', 'expenses.pay', 'expenses.export',
@@ -92,12 +90,10 @@ class RoleAndUserSeeder extends Seeder
             // 12. Settings / System
             'outlets.view', 'outlets.create', 'outlets.update', 'outlets.delete', 'outlets.manage',
             'currencies.view', 'currencies.create', 'currencies.update', 'currencies.delete', 'currencies.manage',
-            'delivery_zones.view', 'delivery_zones.create', 'delivery_zones.update', 'delivery_zones.delete',
             'payment_methods.view', 'payment_methods.create', 'payment_methods.update', 'payment_methods.delete', 'payment_methods.manage',
             'prefix_settings.view', 'prefix_settings.update',
             'voucher_settings.view', 'voucher_settings.update',
             'general_settings.view', 'general_settings.update',
-            'telegram_bot.view', 'telegram_bot.create', 'telegram_bot.update', 'telegram_bot.delete',
         ];
 
         // Legacy compatibility aliases for Super Admin
@@ -112,7 +108,7 @@ class RoleAndUserSeeder extends Seeder
             'Expense Categories', 'Customers List', 'Customer Groups', 'Suppliers List',
             'Supplier Categories', 'Payment Methods', 'Currencies', 'Executive Reports',
             'Warehouses & Outlets', 'General Settings', 'Prefix Settings', 'Voucher Settings',
-            'Telegram Bot Settings', 'Delivery Fees', 'Users & Staff', 'Roles & Permissions',
+            'Users & Staff', 'Roles & Permissions',
         ];
 
         // 1. Super Admin Role (Fully Access)
@@ -143,12 +139,10 @@ class RoleAndUserSeeder extends Seeder
             'purchases.view', 'purchases.create', 'purchases.update', 'purchases.delete', 'purchases.pay', 'purchases.export',
             'purchase_returns.view', 'purchase_returns.create', 'purchase_returns.update', 'purchase_returns.delete', 'purchase_returns.pay', 'purchase_returns.export',
             'sales.view', 'sales.create', 'sales.update', 'sales.delete', 'sales.void', 'sales.refund', 'sales.pay', 'sales.export',
-            'pos.view', 'pos.create', 'pos.checkout',
+            'pos.view', 'pos.create', 'pos.checkout', 'pos.discount',
             'cash_register.view', 'cash_register.open_close', 'cash_register.safe_drop', 'cash_register.view_expected',
             'sale_returns.view', 'sale_returns.create', 'sale_returns.update', 'sale_returns.delete', 'sale_returns.pay', 'sale_returns.export',
-            'bot_orders.view', 'bot_orders.update', 'bot_orders.approve', 'bot_orders.dispatch',
-            'bot_chat.view', 'bot_chat.create',
-            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.export',
+            'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.pay', 'transfers.export',
             'expenses.view', 'expenses.create', 'expenses.update', 'expenses.pay', 'expenses.export',
             'expense_categories.view', 'expense_categories.create', 'expense_categories.update',
             'processings.view', 'processings.create', 'processings.update', 'processings.export',
@@ -208,6 +202,7 @@ class RoleAndUserSeeder extends Seeder
             'units.view', 'units.create', 'units.update',
             'adjustments.view', 'adjustments.create', 'adjustments.update',
             'transfers.view', 'transfers.create', 'transfers.update', 'transfers.receive',
+            'processings.view', 'processings.create', 'processings.update',
             'purchases.view', 'purchases.create', 'purchases.update',
             'purchase_returns.view', 'purchase_returns.create',
             'suppliers.view', 'suppliers.create', 'suppliers.update',
@@ -229,16 +224,24 @@ class RoleAndUserSeeder extends Seeder
         // 5. Accountant Role
         $accountantPermissions = [
             'dashboard.view',
+            'products.view', 'products.view_cost', 'products.export',
             'expenses.view', 'expenses.create', 'expenses.update', 'expenses.pay', 'expenses.export',
             'expense_categories.view', 'expense_categories.create', 'expense_categories.update',
-            'sales.view', 'sales.export',
-            'purchases.view', 'purchases.export',
-            'customers.view', 'suppliers.view',
+            'sales.view', 'sales.pay', 'sales.export',
+            'sale_returns.view', 'sale_returns.pay', 'sale_returns.export',
+            'purchases.view', 'purchases.pay', 'purchases.export',
+            'purchase_returns.view', 'purchase_returns.pay', 'purchase_returns.export',
+            'transfers.view', 'transfers.pay', 'transfers.export',
+            'cash_register.view', 'cash_register.view_expected',
+            'customers.view', 'customers.export', 'suppliers.view', 'suppliers.export',
+            'currencies.view', 'payment_methods.view',
             'reports.view', 'reports.export',
             'report_sales.view', 'report_purchases.view', 'report_expense.view',
             'report_profit_loss.view', 'report_cash_flow.view',
-            'report_ar_aging.view', 'report_ap_aging.view',
-            'report_commercial_tax.view',
+            'report_ar_aging.view', 'report_ap_aging.view', 'report_product_margins.view',
+            'report_cashier_audit.view', 'report_register.view', 'report_z_report.view',
+            'report_sales_return.view', 'report_purchase_return.view',
+            'report_commercial_tax.view', 'report_customer.view', 'report_supplier.view',
         ];
         Role::updateOrCreate(
             ['slug' => 'accountant'],

@@ -220,7 +220,7 @@ class Phase5EnterpriseFeaturesTest extends TestCase
             'payment_type' => 'Cash',
         ]);
 
-        // Create a Purchase with 5% tax (250 Ks tax on 5,000 Ks)
+        // Create a Purchase with 5% recoverable input tax (250 Ks tax on 5,000 Ks)
         Purchase::create([
             'reference_no' => 'PO-TAX-01',
             'supplier_name' => 'Supplier A',
@@ -231,6 +231,7 @@ class Phase5EnterpriseFeaturesTest extends TestCase
             'subtotal' => 5000.0,
             'tax_rate' => 5.0,
             'tax_amount' => 250.0,
+            'is_tax_recoverable' => true,
             'discount' => 0.0,
             'grand_total' => 5250.0,
             'paid_amount' => 5250.0,

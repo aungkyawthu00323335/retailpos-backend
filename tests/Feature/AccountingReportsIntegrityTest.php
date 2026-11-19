@@ -273,4 +273,73 @@ class AccountingReportsIntegrityTest extends TestCase
         // Net Cash Flow = 1250 - 150 = 1100
         $this->assertEquals(1100.0, (float)$summary['net_cash_flow']);
     }
+
+    public function test_p2_cash_flow_iso_dates_and_negative_expected_cash_till_visibility(): void
+    {
+        $outlet = Outlet::create([
+            'name' => 'Till Shortfall Outlet',
+            'code' => 'OUT-SHORT-1',
+        ]);
+
+        $adminRole = \App\Models\Role::create([
+            'name' => 'Cash Admin',
+            'slug' => 'cash_admin_p2',
+            'permissions' => ['cash_register.view', 'cash_register.view_expected', 'reports.register', 'reports.cash_flow', 'reports.view'],
+            'status' => 'active',
+        ]);
+        $admin = \App\Models\User::create([
+            'name' => 'Cash Admin',
+            'email' => 'cashadmin-p2@test.local',
+            'password' => bcrypt('Secret123!'),
+            'role_id' => $adminRole->id,
+            'status' => 'active',
+            'api_token' => 'cash_admin_p2_tok',
+        ]);
+
+        $register = \App\Models\CashRegister::create([
+            'reference_no' => 'CR-SHORT-1',
+            'user_id' => $admin->id,
+            'user_name' => $admin->name,
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'opening_cash' => 100.0,
+            'expected_cash' => 100.0,
+            'status' => 'open',
+            'opened_at' => Carbon::now()->subHour(),
+        ]);
+
+        \App\Models\CashRegisterTransaction::create([
+            'cash_register_id' => $register->id,
+            'user_id' => $admin->id,
+            'type' => 'drop',
+            'amount' => 300.0,
+            'reason' => 'Supplier cash payout exceeding opening float',
+        ]);
+
+        // Unclamped expected_cash surfaces negative till shortage (-200.0) instead of hiding at 0.0
+        $statusRes = $this->withToken($admin->api_token)
+            ->getJson("/api/cash-register/status?cash_register_id={$register->id}")
+            ->assertStatus(200);
+        $this->assertEqualsWithDelta(-200.0, (float)$statusRes->json('register.expected_cash'), 0.01);
+
+        // Cash flow report normalizes ISO UTC filter boundaries cleanly
+        $today = Carbon::today()->toDateString();
+        Sale::create([
+            'reference_no' => 'SL-ISO-CF-1',
+            'customer_name' => 'ISO Client',
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'date' => $today . ' 12:00:00',
+            'status' => 'Completed',
+            'grand_total' => 450.0,
+            'paid_amount' => 450.0,
+            'due_amount' => 0.0,
+            'payment_type' => 'Cash',
+            'payment_status' => 'Paid',
+        ]);
+        $cf = $this->withToken($admin->api_token)
+            ->getJson('/api/reports/cash-flow?start_date=' . urlencode($today . 'T00:00:00.000Z') . '&end_date=' . urlencode($today . 'T23:59:59.000Z') . '&force_refresh=1')
+            ->assertStatus(200);
+        $this->assertEqualsWithDelta(450.0, (float)$cf->json('summary.sales_cash_received'), 0.01);
+    }
 }

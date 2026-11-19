@@ -132,8 +132,16 @@ class RetailPosTest extends TestCase
      */
     public function test_sales_and_pos_checkout(): void
     {
+        $customer = Customer::create([
+            'name' => 'Retail POS Test Customer',
+            'phone' => '09999888777',
+            'status' => 'Active',
+            'credit_limit' => 50000.00,
+        ]);
+
         $saleData = [
-            'customer_name' => 'Walk-in Customer',
+            'customer_id' => $customer->id,
+            'customer_name' => $customer->name,
             'warehouse_name' => 'Main Warehouse Branch',
             'date' => date('Y-m-d'),
             'status' => 'Completed',
@@ -143,9 +151,9 @@ class RetailPosTest extends TestCase
             'discount' => 10.00,
             'shipping' => 0.00,
             'grand_total' => 200.00,
-            'paid_amount' => 200.00,
-            'due_amount' => 0.00,
-            'payment_status' => 'Paid',
+            'paid_amount' => 50.00,
+            'due_amount' => 150.00,
+            'payment_status' => 'Partial',
             'payment_type' => 'Cash',
             'pos_flag' => true,
             'items' => [
@@ -162,8 +170,8 @@ class RetailPosTest extends TestCase
             'payments' => [
                 [
                     'payment_type' => 'Cash',
-                    'amount' => 200.00,
-                    'received_amount' => 200.00,
+                    'amount' => 50.00,
+                    'received_amount' => 50.00,
                     'change_amount' => 0.00,
                 ]
             ]
@@ -172,14 +180,20 @@ class RetailPosTest extends TestCase
         $res = $this->postJson('/api/sales', $saleData);
         $res->assertStatus(201);
         $saleId = $res->json('data.id');
+        $remainingDue = (float)$res->json('data.due_amount');
 
-        // Add partial payment endpoint test
+        // Settle remaining balance; subsequent overpayment must be rejected (422)
         $payRes = $this->postJson("/api/sales/{$saleId}/payments", [
-            'amount' => 50.00,
+            'amount' => $remainingDue > 0 ? $remainingDue : 50.00,
             'payment_type' => 'KBZPay',
             'notes' => 'Additional deposit',
         ]);
         $payRes->assertStatus(200);
+
+        $this->postJson("/api/sales/{$saleId}/payments", [
+            'amount' => 10.00,
+            'payment_type' => 'Cash',
+        ])->assertStatus(422);
 
         // Fetch sales list
         $list = $this->getJson('/api/sales');

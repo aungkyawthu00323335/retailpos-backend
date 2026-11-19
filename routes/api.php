@@ -33,9 +33,6 @@ use App\Http\Controllers\Api\CurrencyController;
 use App\Http\Controllers\Api\VariationController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\CashRegisterController;
-use App\Http\Controllers\Api\BotOrderController;
-use App\Http\Controllers\Api\DeliveryRegionController;
-use App\Http\Controllers\Api\DeliveryTownshipController;
 
 /*
 |--------------------------------------------------------------------------
@@ -54,6 +51,30 @@ Route::get('ping', function () {
 });
 
 // Authentication & Session
+$crudResource = static function (string $uri, string $controller, string $permModule, string $extraReadPerms = '', array $only = ['index', 'store', 'show', 'update', 'destroy']): void {
+    $readMiddleware = $extraReadPerms !== ''
+        ? "permission:{$permModule}.view,{$extraReadPerms}"
+        : "permission:{$permModule}.view";
+    $has = array_flip($only);
+
+    if (isset($has['index'])) {
+        Route::get($uri, [$controller, 'index'])->middleware($readMiddleware);
+    }
+    if (isset($has['store'])) {
+        Route::post($uri, [$controller, 'store'])->middleware("permission:{$permModule}.create");
+    }
+    if (isset($has['show'])) {
+        Route::get("{$uri}/{id}", [$controller, 'show'])->middleware($readMiddleware);
+    }
+    if (isset($has['update'])) {
+        Route::put("{$uri}/{id}", [$controller, 'update'])->middleware("permission:{$permModule}.update");
+        Route::patch("{$uri}/{id}", [$controller, 'update'])->middleware("permission:{$permModule}.update");
+    }
+    if (isset($has['destroy'])) {
+        Route::delete("{$uri}/{id}", [$controller, 'destroy'])->middleware("permission:{$permModule}.delete");
+    }
+};
+
 Route::post('login', [AuthController::class, 'login'])->middleware('throttle:15,1');
 Route::post('logout', [AuthController::class, 'logout']);
 Route::get('me', [AuthController::class, 'me']);
@@ -61,146 +82,147 @@ Route::post('change-password', [AuthController::class, 'changePassword']);
 Route::post('update-profile', [AuthController::class, 'updateProfile']);
 
 // Outlets & Warehouses
-Route::apiResource('outlets', OutletController::class);
-Route::patch('outlets/{id}/toggle-status', [OutletController::class, 'toggleStatus']);
+$outletReadPerms = 'dashboard.view,pos.view,cash_register.view,sales.view,sales.create,purchases.view,purchases.create,purchase_returns.view,sale_returns.view,adjustments.view,adjustments.create,transfers.view,transfers.create,processings.view,processings.create,quotations.view,quotations.create,expenses.view,expenses.create,products.view,products.create,products.update,users.view,users.create,users.update,reports.view,report_sales.view,report_purchases.view,report_stock.view,report_stock_alert.view,report_stock_ledger.view,report_profit_loss.view,report_cashier_audit.view,report_expense.view,report_top_selling.view,report_dead_stock.view,report_cash_flow.view,report_register.view,report_z_report.view,report_ar_aging.view,report_ap_aging.view,report_product_margins.view,report_sales_return.view,report_purchase_return.view,report_commercial_tax.view,report_customer.view,report_supplier.view';
+$crudResource('outlets', OutletController::class, 'outlets', $outletReadPerms);
+Route::patch('outlets/{id}/toggle-status', [OutletController::class, 'toggleStatus'])->middleware('permission:outlets.update');
 
 // Brands
-Route::patch('brands/{id}/toggle-status', [BrandController::class, 'toggleStatus']);
-Route::apiResource('brands', BrandController::class);
+$catalogReadPerms = 'products.view,products.create,products.update,pos.view,barcode.view,purchases.create,sales.create,adjustments.create,transfers.create,processings.create,quotations.create,reports.view,report_stock.view,report_stock_alert.view,report_dead_stock.view,report_top_selling.view,report_product_margins.view';
+Route::patch('brands/{id}/toggle-status', [BrandController::class, 'toggleStatus'])->middleware('permission:brands.update');
+$crudResource('brands', BrandController::class, 'brands', $catalogReadPerms);
 
 // Product Categories, Sub Categories, Variations & Units
-Route::apiResource('product-categories', ProductCategoryController::class);
-Route::patch('sub-categories/{id}/toggle-status', [SubCategoryController::class, 'toggleStatus']);
-Route::apiResource('sub-categories', SubCategoryController::class);
-Route::patch('product-units/{id}/toggle-status', [ProductUnitController::class, 'toggleStatus']);
-Route::apiResource('product-units', ProductUnitController::class);
-Route::patch('sale-units/{id}/toggle-status', [SaleUnitController::class, 'toggleStatus']);
-Route::apiResource('sale-units', SaleUnitController::class);
-Route::patch('purchase-units/{id}/toggle-status', [PurchaseUnitController::class, 'toggleStatus']);
-Route::apiResource('purchase-units', PurchaseUnitController::class);
-Route::patch('variations/{id}/toggle-status', [VariationController::class, 'toggleStatus']);
-Route::apiResource('variations', VariationController::class);
+$crudResource('product-categories', ProductCategoryController::class, 'product_categories', $catalogReadPerms);
+Route::patch('sub-categories/{id}/toggle-status', [SubCategoryController::class, 'toggleStatus'])->middleware('permission:sub_categories.update');
+$crudResource('sub-categories', SubCategoryController::class, 'sub_categories', $catalogReadPerms);
+Route::patch('product-units/{id}/toggle-status', [ProductUnitController::class, 'toggleStatus'])->middleware('permission:units.update');
+$crudResource('product-units', ProductUnitController::class, 'units', $catalogReadPerms);
+Route::patch('sale-units/{id}/toggle-status', [SaleUnitController::class, 'toggleStatus'])->middleware('permission:units.update');
+$crudResource('sale-units', SaleUnitController::class, 'units', $catalogReadPerms);
+Route::patch('purchase-units/{id}/toggle-status', [PurchaseUnitController::class, 'toggleStatus'])->middleware('permission:units.update');
+$crudResource('purchase-units', PurchaseUnitController::class, 'units', $catalogReadPerms);
+Route::patch('variations/{id}/toggle-status', [VariationController::class, 'toggleStatus'])->middleware('permission:variations.update');
+$crudResource('variations', VariationController::class, 'variations', $catalogReadPerms);
 
 // Products & Barcode
-Route::get('products/create-options', [ProductController::class, 'createOptions']);
-Route::get('products/check-identifier', [ProductController::class, 'checkIdentifier']);
-Route::post('products/generate-sku', [ProductController::class, 'generateSku']);
-Route::post('products/generate-barcode', [ProductController::class, 'generateBarcode']);
-Route::post('products/upload-image', [ProductController::class, 'uploadImage']);
-Route::post('upload-image', [ProductController::class, 'uploadImage']);
-Route::get('products/template', [ProductController::class, 'downloadTemplate']);
-Route::get('products/export', [ProductController::class, 'export']);
-Route::post('products/bulk-import', [ProductController::class, 'bulkImport']);
-Route::get('products/excel-template', [ProductExcelController::class, 'downloadTemplate']);
-Route::get('products/excel-export', [ProductExcelController::class, 'exportProducts']);
-Route::post('products/excel-import', [ProductExcelController::class, 'importNewProducts']);
-Route::post('products/price-change-import', [ProductExcelController::class, 'importPriceChanges']);
-Route::get('products/quick-search', [ProductController::class, 'quickSearch']);
-Route::get('products/barcode', [ProductController::class, 'findByBarcode']);
-Route::get('products/sync', [ProductController::class, 'sync']);
-Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus']);
-Route::patch('products/{id}/toggle-bot-status', [ProductController::class, 'toggleBotStatus']);
-Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index']);
-Route::apiResource('products', ProductController::class);
+$productReadPerms = 'pos.view,barcode.view,sales.create,sales.update,purchases.create,purchases.update,sale_returns.create,sale_returns.update,purchase_returns.create,purchase_returns.update,quotations.create,quotations.update,adjustments.create,adjustments.update,transfers.create,transfers.update,processings.create';
+Route::get('products/create-options', [ProductController::class, 'createOptions'])->middleware('permission:products.view,products.create,products.update');
+Route::get('products/check-identifier', [ProductController::class, 'checkIdentifier'])->middleware('permission:products.view,products.create,products.update');
+Route::post('products/generate-sku', [ProductController::class, 'generateSku'])->middleware('permission:products.create,products.update');
+Route::post('products/generate-barcode', [ProductController::class, 'generateBarcode'])->middleware('permission:products.create,products.update');
+Route::post('products/upload-image', [ProductController::class, 'uploadImage'])->middleware('permission:products.create,products.update,brands.create,brands.update,product_categories.create,product_categories.update,users.create,users.update,payment_methods.create,payment_methods.update,general_settings.update');
+Route::post('upload-image', [ProductController::class, 'uploadImage'])->middleware('permission:products.create,products.update,brands.create,brands.update,product_categories.create,product_categories.update,users.create,users.update,payment_methods.create,payment_methods.update,general_settings.update');
+Route::get('products/template', [ProductController::class, 'downloadTemplate'])->middleware('permission:products.import');
+Route::get('products/export', [ProductController::class, 'export'])->middleware('permission:products.export');
+Route::post('products/bulk-import', [ProductController::class, 'bulkImport'])->middleware('permission:products.import');
+Route::get('products/excel-template', [ProductExcelController::class, 'downloadTemplate'])->middleware('permission:products.import,products.update');
+Route::get('products/excel-export', [ProductExcelController::class, 'exportProducts'])->middleware('permission:products.export');
+Route::post('products/excel-import', [ProductExcelController::class, 'importNewProducts'])->middleware('permission:products.import');
+Route::post('products/price-change-import', [ProductExcelController::class, 'importPriceChanges'])->middleware('permission:products.update');
+Route::get('products/quick-search', [ProductController::class, 'quickSearch'])->middleware("permission:products.view,{$productReadPerms}");
+Route::get('products/barcode', [ProductController::class, 'findByBarcode'])->middleware("permission:products.view,{$productReadPerms}");
+Route::get('products/sync', [ProductController::class, 'sync'])->middleware("permission:products.view,{$productReadPerms}");
+Route::patch('products/{id}/toggle-status', [ProductController::class, 'toggleStatus'])->middleware('permission:products.update');
+Route::get('categories/{category}/subcategories', [SubCategoryController::class, 'index'])->middleware("permission:sub_categories.view,{$catalogReadPerms}");
+$crudResource('products', ProductController::class, 'products', $productReadPerms);
 
 // Stock Adjustments & Transfers
-Route::get('adjustments/export', [AdjustmentController::class, 'export']);
-Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateCode']);
-Route::apiResource('adjustments', AdjustmentController::class);
-Route::get('transfers/export', [TransferController::class, 'export']);
-Route::get('transfers/generate-code', [TransferController::class, 'generateCode']);
-Route::post('transfers/{id}/receive', [TransferController::class, 'receiveTransfer']);
-Route::get('transfers/{id}/payments', [TransferController::class, 'getPayments']);
-Route::post('transfers/{id}/payments', [TransferController::class, 'addPayment']);
-Route::delete('transfers/{id}/payments/{paymentId}', [TransferController::class, 'deletePayment']);
-Route::apiResource('transfers', TransferController::class);
+Route::get('adjustments/reasons', [AdjustmentController::class, 'reasonCatalog'])->middleware('permission:adjustments.view,adjustments.create,adjustments.update,report_profit_loss.view');
+Route::get('adjustments/export', [AdjustmentController::class, 'export'])->middleware('permission:adjustments.export');
+Route::get('adjustments/generate-code', [AdjustmentController::class, 'generateCode'])->middleware('permission:adjustments.create');
+Route::get('adjustments', [AdjustmentController::class, 'index'])->middleware('permission:adjustments.view');
+Route::post('adjustments', [AdjustmentController::class, 'store'])->middleware('permission:adjustments.create');
+Route::get('adjustments/{id}', [AdjustmentController::class, 'show'])->middleware('permission:adjustments.view');
+Route::put('adjustments/{id}', [AdjustmentController::class, 'update'])->middleware('permission:adjustments.update,adjustments.approve');
+Route::patch('adjustments/{id}', [AdjustmentController::class, 'update'])->middleware('permission:adjustments.update,adjustments.approve');
+Route::delete('adjustments/{id}', [AdjustmentController::class, 'destroy'])->middleware('permission:adjustments.delete');
+
+Route::get('transfers/export', [TransferController::class, 'export'])->middleware('permission:transfers.export');
+Route::get('transfers/generate-code', [TransferController::class, 'generateCode'])->middleware('permission:transfers.create');
+Route::post('transfers/{id}/receive', [TransferController::class, 'receiveTransfer'])->middleware('permission:transfers.receive');
+Route::get('transfers/{id}/payments', [TransferController::class, 'getPayments'])->middleware('permission:transfers.view,transfers.pay');
+Route::post('transfers/{id}/payments', [TransferController::class, 'addPayment'])->middleware('permission:transfers.pay');
+Route::delete('transfers/{id}/payments/{paymentId}', [TransferController::class, 'deletePayment'])->middleware('permission:transfers.delete');
+$crudResource('transfers', TransferController::class, 'transfers');
 
 // Stock Processing / Repackaging (ထုတ်လုပ်/ခွဲထုတ်ပြုပြင်ခြင်း)
-Route::get('processings/generate-code', [ProcessingController::class, 'generateCode']);
-Route::apiResource('processings', ProcessingController::class);
+Route::get('processings/export', [ProcessingController::class, 'export'])->middleware('permission:processings.export');
+Route::get('processings/generate-code', [ProcessingController::class, 'generateCode'])->middleware('permission:processings.create');
+$crudResource('processings', ProcessingController::class, 'processings', '', ['index', 'store', 'show', 'destroy']);
 
 // Purchases & Purchase Returns
-Route::get('purchases/export', [PurchaseController::class, 'export']);
-Route::get('purchases/generate-code', [PurchaseController::class, 'generateCode']);
-Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment']);
-Route::delete('purchases/{id}/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
-Route::delete('purchases/payments/{paymentId}', [PurchaseController::class, 'deletePayment']);
-Route::apiResource('purchases', PurchaseController::class);
-Route::get('purchase-returns/generate-code', [PurchaseReturnController::class, 'generateCode']);
-Route::get('purchase-returns/export', [PurchaseReturnController::class, 'export']);
-Route::post('purchase-returns/{id}/payments', [PurchaseReturnController::class, 'addPayment']);
-Route::delete('purchase-returns/{returnId}/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
-Route::delete('purchase-returns/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment']);
-Route::apiResource('purchase-returns', PurchaseReturnController::class);
-
-// Cash Register & POS Shift Management
-Route::get('cash-register/status', [CashRegisterController::class, 'status']);
-Route::post('cash-register/open', [CashRegisterController::class, 'open']);
-Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'details']);
-Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
+Route::get('purchases/export', [PurchaseController::class, 'export'])->middleware('permission:purchases.export');
+Route::get('purchases/generate-code', [PurchaseController::class, 'generateCode'])->middleware('permission:purchases.create');
+Route::post('purchases/{id}/payments', [PurchaseController::class, 'addPayment'])->middleware('permission:purchases.pay');
+Route::delete('purchases/{id}/payments/{paymentId}', [PurchaseController::class, 'deletePayment'])->middleware('permission:purchases.delete');
+Route::delete('purchases/payments/{paymentId}', [PurchaseController::class, 'deletePayment'])->middleware('permission:purchases.delete');
+$crudResource('purchases', PurchaseController::class, 'purchases', 'purchase_returns.create,purchase_returns.update');
+Route::get('purchase-returns/generate-code', [PurchaseReturnController::class, 'generateCode'])->middleware('permission:purchase_returns.create');
+Route::get('purchase-returns/export', [PurchaseReturnController::class, 'export'])->middleware('permission:purchase_returns.export');
+Route::post('purchase-returns/{id}/payments', [PurchaseReturnController::class, 'addPayment'])->middleware('permission:purchase_returns.pay');
+Route::delete('purchase-returns/{returnId}/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment'])->middleware('permission:purchase_returns.delete');
+Route::delete('purchase-returns/payments/{paymentId}', [PurchaseReturnController::class, 'deletePayment'])->middleware('permission:purchase_returns.delete');
+$crudResource('purchase-returns', PurchaseReturnController::class, 'purchase_returns');
 
 // Sales, POS Checkout & Sales Returns
-Route::get('sales/export', [SaleController::class, 'export']);
-Route::get('sales/generate-code', [SaleController::class, 'generateCode']);
-Route::post('sales/bulk-sync', [SaleController::class, 'bulkSync']);
-Route::post('sales/{id}/payments', [SaleController::class, 'addPayment']);
-Route::delete('sales/{saleId}/payments/{paymentId}', [SaleController::class, 'deletePayment']);
-Route::delete('sales/payments/{paymentId}', [SaleController::class, 'deletePayment']);
+Route::get('sales/export', [SaleController::class, 'export'])->middleware('permission:sales.export');
+Route::get('sales/generate-code', [SaleController::class, 'generateCode'])->middleware('permission:sales.create,pos.create,pos.checkout');
+Route::post('sales/bulk-sync', [SaleController::class, 'bulkSync'])->middleware('permission:sales.create,pos.create,pos.checkout');
+Route::post('sales/{id}/payments', [SaleController::class, 'addPayment'])->middleware('permission:sales.pay');
+Route::delete('sales/{saleId}/payments/{paymentId}', [SaleController::class, 'deletePayment'])->middleware('permission:sales.delete');
+Route::delete('sales/payments/{paymentId}', [SaleController::class, 'deletePayment'])->middleware('permission:sales.delete');
 Route::post('sales/{id}/void', [SaleController::class, 'voidSale'])->middleware('permission:sales.void');
-Route::apiResource('sales', SaleController::class);
-Route::get('sale-returns/export', [SaleReturnController::class, 'export']);
-Route::post('sale-returns/{id}/payments', [SaleReturnController::class, 'addPayment']);
-Route::delete('sale-returns/{returnId}/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
-Route::delete('sale-returns/payments/{paymentId}', [SaleReturnController::class, 'deletePayment']);
-Route::get('sale-returns/generate-code', [SaleReturnController::class, 'generateCode']);
-Route::apiResource('sale-returns', SaleReturnController::class);
+$crudResource('sales', SaleController::class, 'sales', 'sale_returns.create,sale_returns.update', ['index', 'show', 'update', 'destroy']);
+Route::post('sales', [SaleController::class, 'store'])->middleware('permission:sales.create,pos.create,pos.checkout,quotations.convert_sale');
+
+Route::get('sale-returns/export', [SaleReturnController::class, 'export'])->middleware('permission:sale_returns.export');
+Route::post('sale-returns/{id}/payments', [SaleReturnController::class, 'addPayment'])->middleware('permission:sale_returns.pay,sales.refund');
+Route::delete('sale-returns/{returnId}/payments/{paymentId}', [SaleReturnController::class, 'deletePayment'])->middleware('permission:sale_returns.delete');
+Route::delete('sale-returns/payments/{paymentId}', [SaleReturnController::class, 'deletePayment'])->middleware('permission:sale_returns.delete');
+Route::get('sale-returns/generate-code', [SaleReturnController::class, 'generateCode'])->middleware('permission:sale_returns.create');
+$crudResource('sale-returns', SaleReturnController::class, 'sale_returns');
 
 // Quotations
-Route::get('quotations/export', [QuotationController::class, 'export']);
-Route::get('quotations/generate-code', [QuotationController::class, 'generateCode']);
-Route::post('quotations/{id}/convert-to-sale', [QuotationController::class, 'convertToSale']);
-Route::apiResource('quotations', QuotationController::class);
+Route::get('quotations/export', [QuotationController::class, 'export'])->middleware('permission:quotations.export');
+Route::get('quotations/generate-code', [QuotationController::class, 'generateCode'])->middleware('permission:quotations.create');
+Route::post('quotations/{id}/convert-to-sale', [QuotationController::class, 'convertToSale'])->middleware('permission:quotations.convert_sale');
+$crudResource('quotations', QuotationController::class, 'quotations');
 
 // Expenses & Expense Categories
-Route::apiResource('expense-categories', ExpenseCategoryController::class);
-Route::get('expenses/export', [ExpenseController::class, 'export']);
-Route::get('expenses/generate-code', [ExpenseController::class, 'generateCode']);
-Route::post('expenses/{id}/payments', [ExpenseController::class, 'addPayment']);
-Route::delete('expenses/{expenseId}/payments/{paymentId}', [ExpenseController::class, 'deletePayment']);
-Route::delete('expenses/payments/{paymentId}', [ExpenseController::class, 'deletePayment']);
-Route::apiResource('expenses', ExpenseController::class);
+$crudResource('expense-categories', ExpenseCategoryController::class, 'expense_categories', 'expenses.view,expenses.create,expenses.update,report_expense.view,reports.view', ['index', 'store', 'update', 'destroy']);
+Route::get('expenses/export', [ExpenseController::class, 'export'])->middleware('permission:expenses.export');
+Route::get('expenses/generate-code', [ExpenseController::class, 'generateCode'])->middleware('permission:expenses.create');
+Route::post('expenses/{id}/payments', [ExpenseController::class, 'addPayment'])->middleware('permission:expenses.pay');
+Route::delete('expenses/{expenseId}/payments/{paymentId}', [ExpenseController::class, 'deletePayment'])->middleware('permission:expenses.delete');
+Route::delete('expenses/payments/{paymentId}', [ExpenseController::class, 'deletePayment'])->middleware('permission:expenses.delete');
+$crudResource('expenses', ExpenseController::class, 'expenses');
 
 // Payment Methods (InfyPOS /app/payment-methods)
-Route::post('payment-methods/upload-image', [PaymentMethodController::class, 'uploadQrImage']);
-Route::patch('payment-methods/{id}/toggle-status', [PaymentMethodController::class, 'toggleStatus']);
-Route::patch('payment-methods/{id}/toggle-bot', [PaymentMethodController::class, 'toggleBot']);
-Route::apiResource('payment-methods', PaymentMethodController::class);
-
-// Delivery Regions & Townships (Delivery Zones)
-Route::patch('delivery-regions/{id}/toggle-status', [DeliveryRegionController::class, 'toggleStatus']);
-Route::apiResource('delivery-regions', DeliveryRegionController::class);
-Route::patch('delivery-townships/{id}/toggle-status', [DeliveryTownshipController::class, 'toggleStatus']);
-Route::patch('delivery-townships/{id}/toggle-cod', [DeliveryTownshipController::class, 'toggleCod']);
-Route::apiResource('delivery-townships', DeliveryTownshipController::class);
+$paymentMethodReadPerms = 'pos.view,sales.view,sales.create,sales.pay,purchases.view,purchases.create,purchases.pay,sale_returns.view,sale_returns.create,sale_returns.pay,purchase_returns.view,purchase_returns.create,purchase_returns.pay,expenses.view,expenses.create,expenses.pay,transfers.view,transfers.create,transfers.pay,reports.view';
+Route::post('payment-methods/upload-image', [PaymentMethodController::class, 'uploadQrImage'])->middleware('permission:payment_methods.create,payment_methods.update');
+Route::patch('payment-methods/{id}/toggle-status', [PaymentMethodController::class, 'toggleStatus'])->middleware('permission:payment_methods.update');
+$crudResource('payment-methods', PaymentMethodController::class, 'payment_methods', $paymentMethodReadPerms, ['index', 'store', 'update', 'destroy']);
 
 // Customers & Customer Groups (CRM)
-Route::get('customers/generate-id', [CustomerController::class, 'generateCustomerId']);
-Route::get('customers/template', [CustomerController::class, 'downloadTemplate']);
-Route::get('customers/export', [CustomerController::class, 'export']);
-Route::post('customers/bulk-import', [CustomerController::class, 'bulkImport']);
-Route::patch('customers/{id}/toggle-status', [CustomerController::class, 'toggleStatus']);
-Route::apiResource('customers', CustomerController::class);
-Route::patch('customer-groups/{id}/toggle-status', [CustomerGroupController::class, 'toggleStatus']);
-Route::apiResource('customer-groups', CustomerGroupController::class);
+$customerReadPerms = 'pos.view,pos.checkout,sales.view,sales.create,sales.update,sale_returns.view,sale_returns.create,quotations.view,quotations.create,report_customer.view,report_ar_aging.view,reports.view';
+Route::get('customers/generate-id', [CustomerController::class, 'generateCustomerId'])->middleware('permission:customers.create,customers.view');
+Route::get('customers/template', [CustomerController::class, 'downloadTemplate'])->middleware('permission:customers.import');
+Route::get('customers/export', [CustomerController::class, 'export'])->middleware('permission:customers.export');
+Route::post('customers/bulk-import', [CustomerController::class, 'bulkImport'])->middleware('permission:customers.import');
+Route::patch('customers/{id}/toggle-status', [CustomerController::class, 'toggleStatus'])->middleware('permission:customers.update');
+$crudResource('customers', CustomerController::class, 'customers', $customerReadPerms);
+Route::patch('customer-groups/{id}/toggle-status', [CustomerGroupController::class, 'toggleStatus'])->middleware('permission:customer_groups.update');
+$crudResource('customer-groups', CustomerGroupController::class, 'customer_groups', 'customers.view,customers.create,customers.update,pos.view,sales.create,quotations.create');
 
 // Suppliers & Supplier Categories
-Route::get('suppliers/template', [SupplierController::class, 'downloadTemplate']);
-Route::get('suppliers/export', [SupplierController::class, 'export']);
-Route::post('suppliers/bulk-import', [SupplierController::class, 'bulkImport']);
-Route::patch('suppliers/{id}/toggle-status', [SupplierController::class, 'toggleStatus']);
-Route::apiResource('suppliers', SupplierController::class);
-Route::patch('supplier-categories/{id}/toggle-status', [SupplierCategoryController::class, 'toggleStatus']);
-Route::apiResource('supplier-categories', SupplierCategoryController::class);
+$supplierReadPerms = 'purchases.view,purchases.create,purchases.update,purchase_returns.view,purchase_returns.create,products.create,products.update,report_supplier.view,report_ap_aging.view,reports.view';
+Route::get('suppliers/template', [SupplierController::class, 'downloadTemplate'])->middleware('permission:suppliers.import');
+Route::get('suppliers/export', [SupplierController::class, 'export'])->middleware('permission:suppliers.export');
+Route::post('suppliers/bulk-import', [SupplierController::class, 'bulkImport'])->middleware('permission:suppliers.import');
+Route::patch('suppliers/{id}/toggle-status', [SupplierController::class, 'toggleStatus'])->middleware('permission:suppliers.update');
+$crudResource('suppliers', SupplierController::class, 'suppliers', $supplierReadPerms);
+Route::patch('supplier-categories/{id}/toggle-status', [SupplierCategoryController::class, 'toggleStatus'])->middleware('permission:supplier_categories.update');
+$crudResource('supplier-categories', SupplierCategoryController::class, 'supplier_categories', 'suppliers.view,suppliers.create,suppliers.update');
 
 // Users & RBAC Roles
 Route::get('users/generate-id', [UserController::class, 'generateUserId'])->middleware('permission:users.create,users.view');
@@ -222,82 +244,45 @@ Route::patch('roles/{id}', [RoleController::class, 'update'])->middleware('permi
 Route::delete('roles/{id}', [RoleController::class, 'destroy'])->middleware('permission:roles.delete');
 
 // Reports & Executive Analytics (InfyPOS Reports Suite)
-Route::get('reports/profit-loss', [ReportController::class, 'profitLoss'])->middleware('permission:reports.profit_loss');
-Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport'])->middleware('permission:reports.commercial_tax');
-Route::get('reports/dashboard-summary', [ReportController::class, 'dashboardSummary']);
-Route::get('reports/stock', [ReportController::class, 'stockReport']);
-Route::get('reports/stock/export', [ReportController::class, 'exportStock']);
-Route::get('reports/stock/{id}/details', [ReportController::class, 'stockProductDetails']);
-Route::get('reports/stock-alert', [ReportController::class, 'stockAlertReport']);
-Route::get('reports/sales', [ReportController::class, 'salesReport']);
-Route::get('reports/purchases', [ReportController::class, 'purchasesReport']);
-Route::get('reports/sale-returns', [ReportController::class, 'saleReturnsReport']);
-Route::get('reports/purchase-returns', [ReportController::class, 'purchaseReturnsReport']);
-Route::get('reports/top-selling', [ReportController::class, 'topSellingReport']);
-Route::get('reports/customers', [ReportController::class, 'customerReport']);
-Route::get('reports/customers/{id}/statement', [ReportController::class, 'customerStatement']);
-Route::get('reports/suppliers', [ReportController::class, 'supplierReport']);
-Route::get('reports/suppliers/{id}/statement', [ReportController::class, 'supplierStatement']);
-Route::get('reports/expenses', [ReportController::class, 'expenseReport']);
-Route::get('reports/register', [ReportController::class, 'registerReport']);
-Route::get('reports/z-report', [ReportController::class, 'zReport']);
-Route::get('reports/ar-aging', [ReportController::class, 'arAgingReport']);
-Route::get('reports/ap-aging', [ReportController::class, 'apAgingReport']);
-Route::get('reports/cash-flow', [ReportController::class, 'cashFlowReport']);
-Route::get('reports/stock-ledger', [ReportController::class, 'stockLedgerReport']);
-Route::get('reports/product-margins', [ReportController::class, 'productMarginsReport']);
-Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport']);
-Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport']);
+Route::get('reports/profit-loss', [ReportController::class, 'profitLoss'])->middleware('permission:report_profit_loss.view,reports.profit_loss');
+Route::get('reports/commercial-tax', [ReportController::class, 'commercialTaxReport'])->middleware('permission:report_commercial_tax.view,reports.commercial_tax');
+Route::get('reports/dashboard-summary', [ReportController::class, 'dashboardSummary'])->middleware('permission:dashboard.view,reports.view');
+Route::get('reports/stock', [ReportController::class, 'stockReport'])->middleware('permission:report_stock.view,reports.view');
+Route::get('reports/stock/export', [ReportController::class, 'exportStock'])->middleware('permission:report_stock.export,reports.export');
+Route::get('reports/stock/{id}/details', [ReportController::class, 'stockProductDetails'])->middleware('permission:report_stock.view,reports.view');
+Route::get('reports/stock-alert', [ReportController::class, 'stockAlertReport'])->middleware('permission:report_stock_alert.view,reports.view');
+Route::get('reports/sales', [ReportController::class, 'salesReport'])->middleware('permission:report_sales.view,reports.view');
+Route::get('reports/purchases', [ReportController::class, 'purchasesReport'])->middleware('permission:report_purchases.view,reports.view');
+Route::get('reports/sale-returns', [ReportController::class, 'saleReturnsReport'])->middleware('permission:report_sales_return.view,reports.view');
+Route::get('reports/purchase-returns', [ReportController::class, 'purchaseReturnsReport'])->middleware('permission:report_purchase_return.view,reports.view');
+Route::get('reports/top-selling', [ReportController::class, 'topSellingReport'])->middleware('permission:report_top_selling.view,reports.view');
+Route::get('reports/customers', [ReportController::class, 'customerReport'])->middleware('permission:report_customer.view,reports.view');
+Route::get('reports/customers/{id}/statement', [ReportController::class, 'customerStatement'])->middleware('permission:report_customer.view,reports.view');
+Route::get('reports/suppliers', [ReportController::class, 'supplierReport'])->middleware('permission:report_supplier.view,reports.view');
+Route::get('reports/suppliers/{id}/statement', [ReportController::class, 'supplierStatement'])->middleware('permission:report_supplier.view,reports.view');
+Route::get('reports/expenses', [ReportController::class, 'expenseReport'])->middleware('permission:report_expense.view,reports.view');
+Route::get('reports/register', [ReportController::class, 'registerReport'])->middleware('permission:report_register.view,reports.view');
+Route::get('reports/z-report', [ReportController::class, 'zReport'])->middleware('permission:report_z_report.view,reports.view');
+Route::get('reports/ar-aging', [ReportController::class, 'arAgingReport'])->middleware('permission:report_ar_aging.view,reports.view');
+Route::get('reports/ap-aging', [ReportController::class, 'apAgingReport'])->middleware('permission:report_ap_aging.view,reports.view');
+Route::get('reports/cash-flow', [ReportController::class, 'cashFlowReport'])->middleware('permission:report_cash_flow.view,reports.view');
+Route::get('reports/stock-ledger', [ReportController::class, 'stockLedgerReport'])->middleware('permission:report_stock_ledger.view,reports.view');
+Route::get('reports/inventory-reconciliation', [ReportController::class, 'inventoryReconciliation'])->middleware('permission:report_stock.view,report_stock_ledger.view,report_profit_loss.view,adjustments.view,reports.view');
+Route::get('reports/product-margins', [ReportController::class, 'productMarginsReport'])->middleware('permission:report_product_margins.view,reports.view');
+Route::get('reports/dead-stock', [ReportController::class, 'deadStockReport'])->middleware('permission:report_dead_stock.view,reports.view');
+Route::get('reports/cashier-audit', [ReportController::class, 'cashierAuditReport'])->middleware('permission:report_cashier_audit.view,reports.view');
 
 // Cash Register Till & Shift Management
-Route::get('cash-register/status', [CashRegisterController::class, 'status']);
-Route::post('cash-register/open', [CashRegisterController::class, 'open']);
-Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'details']);
-Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close']);
-Route::post('cash-register/transaction', [CashRegisterController::class, 'recordTransaction']);
+Route::get('cash-register/status', [CashRegisterController::class, 'status'])->middleware('permission:cash_register.view,cash_register.open_close,pos.view,pos.checkout');
+Route::post('cash-register/open', [CashRegisterController::class, 'open'])->middleware('permission:cash_register.open_close');
+Route::get('cash-register/details/{id?}', [CashRegisterController::class, 'details'])->middleware('permission:cash_register.view');
+Route::post('cash-register/close/{id?}', [CashRegisterController::class, 'close'])->middleware('permission:cash_register.open_close');
+Route::post('cash-register/transaction', [CashRegisterController::class, 'recordTransaction'])->middleware('permission:cash_register.safe_drop');
 
 // General Settings, Multi-Currency, Voucher & Prefix Settings
 Route::get('settings', [SettingController::class, 'getSettings'])->middleware('permission:general_settings.view,voucher_settings.view,prefix_settings.view');
 Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update,voucher_settings.update,prefix_settings.update');
-Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault']);
-Route::apiResource('currencies', CurrencyController::class);
-
-// 🤖 Telegram Bot Channel & Mini App (Public)
-Route::prefix('bot')->group(function () {
-    Route::get('config', [BotOrderController::class, 'getBotConfig']);
-    Route::get('products', [BotOrderController::class, 'getProducts']);
-    Route::post('orders', [BotOrderController::class, 'submitOrder']);
-    Route::post('upload-slip', [BotOrderController::class, 'uploadSlip']);
-    Route::post('webhook', [BotOrderController::class, 'handleWebhook']);
-    Route::post('restock-subscribe', [BotOrderController::class, 'subscribeRestock']);
-});
-
-// 🤖 Telegram Bot Orders Management & Settings (Staff / POS)
-Route::get('bot-orders', [BotOrderController::class, 'listBotOrders']);
-Route::get('bot-orders/{id}', [BotOrderController::class, 'getBotOrder']);
-Route::get('bot-orders/{id}/voucher', [BotOrderController::class, 'getVoucherImage']);
-Route::post('bot-orders/{id}/approve', [BotOrderController::class, 'approveOrder']);
-Route::post('bot-orders/{id}/reject', [BotOrderController::class, 'rejectOrder']);
-Route::post('bot-orders/{id}/dispatch', [BotOrderController::class, 'dispatchOrder']);
-Route::get('bot-settings', [BotOrderController::class, 'getBotSettings']);
-Route::post('bot-settings', [BotOrderController::class, 'updateBotSettings']);
-Route::post('bot-settings/test-token', [BotOrderController::class, 'testBotToken']);
-Route::post('bot-settings/sync-commands', [BotOrderController::class, 'syncBotCommands']);
-Route::post('bot-settings/sync-menu-button', [BotOrderController::class, 'syncMenuButton']);
-Route::post('bot-settings/set-webhook', [BotOrderController::class, 'setWebhook']);
-Route::post('bot-settings/delete-webhook', [BotOrderController::class, 'deleteWebhook']);
-Route::get('bot-settings/webhook-info', [BotOrderController::class, 'getWebhookInfo']);
-Route::get('bot-restock-subscribers', [BotOrderController::class, 'listRestockSubscribers']);
-
-// 🤖 AI Agent & POS Live Customer Chat Routes
-Route::post('bot-settings/test-ai', [BotOrderController::class, 'testAiAgent']);
-Route::post('bot-settings/simulate-ai', [BotOrderController::class, 'simulateAiChat']);
-Route::get('bot-chats', [BotOrderController::class, 'listBotChats']);
-Route::get('bot-chats/{chatId}/messages', [BotOrderController::class, 'getChatMessages']);
-Route::post('bot-chats/{chatId}/send', [BotOrderController::class, 'sendStaffChatMessage']);
-Route::post('bot-chats/{chatId}/toggle-mode', [BotOrderController::class, 'toggleChatAiMode']);
-Route::post('bot-chats/{chatId}/mark-read', [BotOrderController::class, 'markChatAsRead']);
-Route::post('bot-chats/{chatId}/mark-unread', [BotOrderController::class, 'markChatAsUnread']);
-Route::post('bot-chats/{chatId}/toggle-needs-human', [BotOrderController::class, 'toggleChatNeedsHuman']);
+Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault'])->middleware('permission:currencies.update');
+$crudResource('currencies', CurrencyController::class, 'currencies', 'dashboard.view,pos.view,sales.view,purchases.view,expenses.view,quotations.view,general_settings.view,reports.view,products.view', ['index', 'store', 'update', 'destroy']);
 
 

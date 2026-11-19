@@ -127,87 +127,133 @@ class User extends Authenticatable
         return $this->outlets()->where('is_active', true)->orderBy('outlets.id', 'asc')->get();
     }
 
+    /**
+     * Bidirectional module aliases between singular/plural RBAC identifiers.
+     *
+     * @var array<string, string>
+     */
+    private const MODULE_ALIASES = [
+        'processing' => 'processings',
+        'processings' => 'processing',
+        'outlet' => 'outlets',
+        'outlets' => 'outlet',
+        'currency' => 'currencies',
+        'currencies' => 'currency',
+        'voucher_setting' => 'voucher_settings',
+        'voucher_settings' => 'voucher_setting',
+        'sale_return' => 'sale_returns',
+        'sale_returns' => 'sale_return',
+        'purchase_return' => 'purchase_returns',
+        'purchase_returns' => 'purchase_return',
+    ];
+
+    /**
+     * Reports restricted from generic `reports.view` inheritance.
+     *
+     * @var array<int, string>
+     */
+    private const SENSITIVE_REPORTS = ['profit_loss', 'commercial_tax'];
+
+    /**
+     * Request-local cached O(1) lookup set of normalized permission keys.
+     *
+     * @var array<string, bool>|null
+     */
+    protected ?array $resolvedPermissionMap = null;
+    protected ?int $resolvedPermissionRoleId = null;
+    protected ?array $resolvedRawPermissions = null;
+
+    /**
+     * Build or return the cached normalized permission map for O(1) lookups.
+     *
+     * @return array<string, bool>
+     */
+    public function getNormalizedPermissionMap(): array
+    {
+        $roleModel = $this->relationLoaded('roleModel') ? $this->roleModel : $this->roleModel()->first();
+        $userPermissions = $roleModel ? ($roleModel->permissions ?? []) : [];
+        if (!is_array($userPermissions)) {
+            $userPermissions = [];
+        }
+
+        if (
+            $this->resolvedPermissionMap !== null
+            && $this->resolvedPermissionRoleId === $this->role_id
+            && $this->resolvedRawPermissions === $userPermissions
+        ) {
+            return $this->resolvedPermissionMap;
+        }
+
+        $map = [];
+        foreach ($userPermissions as $raw) {
+            $norm = strtolower(trim((string) $raw));
+            if ($norm === '') {
+                continue;
+            }
+            $map[$norm] = true;
+
+            $dotForm = str_contains($norm, ':') ? str_replace(':', '.', $norm) : $norm;
+            $map[$dotForm] = true;
+
+            $parts = explode('.', $dotForm, 2);
+            if (count($parts) === 2) {
+                [$mod, $act] = $parts;
+                if (isset(self::MODULE_ALIASES[$mod])) {
+                    $map[self::MODULE_ALIASES[$mod] . '.' . $act] = true;
+                }
+                if (str_starts_with($mod, 'report_') && ($act === 'view' || $act === '*')) {
+                    $map['reports.' . substr($mod, 7)] = true;
+                } elseif ($mod === 'reports' && $act !== 'view' && $act !== 'export' && $act !== '*') {
+                    $map['report_' . $act . '.view'] = true;
+                }
+            }
+        }
+
+        $this->resolvedPermissionMap = $map;
+        $this->resolvedPermissionRoleId = $this->role_id;
+        $this->resolvedRawPermissions = $userPermissions;
+
+        return $map;
+    }
+
+    /**
+     * Check whether this user is authorized for the given permission key in O(1) time.
+     */
     public function hasPermission(string $permission): bool
     {
         if ($this->isSuperAdmin()) {
             return true;
         }
 
-        $userPermissions = $this->roleModel ? ($this->roleModel->permissions ?? []) : [];
-        if (!is_array($userPermissions)) {
+        $map = $this->getNormalizedPermissionMap();
+        if (empty($map)) {
             return false;
         }
 
-        if (in_array('*', $userPermissions, true)) {
+        if (isset($map['*'])) {
             return true;
         }
 
-        if (in_array($permission, $userPermissions, true)) {
+        $req = strtolower(trim($permission));
+        if ($req === '') {
+            return false;
+        }
+
+        $dotReq = str_contains($req, ':') ? str_replace(':', '.', $req) : $req;
+        if (isset($map[$req]) || isset($map[$dotReq])) {
             return true;
         }
 
-        $parts = explode('.', $permission);
+        $parts = explode('.', $dotReq, 2);
         if (count($parts) === 2) {
-            $wildcard = $parts[0] . '.*';
-            if (in_array($wildcard, $userPermissions, true)) {
+            [$reqMod, $reqAct] = $parts;
+            if (isset($map["{$reqMod}.*"])) {
                 return true;
             }
-            $colonFormat = $parts[0] . ':' . $parts[1];
-            if (in_array($colonFormat, $userPermissions, true)) {
-                return true;
-            }
-
-            // Singular/plural alias support
-            $altModule = match ($parts[0]) {
-                'processing' => 'processings',
-                'processings' => 'processing',
-                'outlet' => 'outlets',
-                'outlets' => 'outlet',
-                'currency' => 'currencies',
-                'currencies' => 'currency',
-                'delivery_zone' => 'delivery_zones',
-                'delivery_zones' => 'delivery_zone',
-                'voucher_setting' => 'voucher_settings',
-                'voucher_settings' => 'voucher_setting',
-                'bot_order' => 'bot_orders',
-                'bot_orders' => 'bot_order',
-                'bot_chat' => 'bot_chats',
-                'bot_chats' => 'bot_chat',
-                'sale_return' => 'sale_returns',
-                'sale_returns' => 'sale_return',
-                'purchase_return' => 'purchase_returns',
-                'purchase_returns' => 'purchase_return',
-                default => null,
-            };
-            if ($altModule) {
-                if (in_array("{$altModule}.{$parts[1]}", $userPermissions, true) ||
-                    in_array("{$altModule}:{$parts[1]}", $userPermissions, true) ||
-                    in_array("{$altModule}.*", $userPermissions, true)) {
+            if ($reqMod === 'reports' && !in_array($reqAct, self::SENSITIVE_REPORTS, true)) {
+                if (isset($map['reports.view'])) {
                     return true;
                 }
-            }
-
-            // Report permissions fallback: e.g. reports.view covers reports.sales
-            if ($parts[0] === 'reports') {
-                $sensitiveReports = ['profit_loss', 'commercial_tax'];
-                if (!in_array($parts[1], $sensitiveReports, true)) {
-                    if (in_array('reports.view', $userPermissions, true) || in_array('reports:view', $userPermissions, true)) {
-                        return true;
-                    }
-                }
-                // Specific report screen format: report_sales.view matches reports.sales
-                $reportScreen = "report_{$parts[1]}";
-                if (in_array("{$reportScreen}.view", $userPermissions, true) ||
-                    in_array("{$reportScreen}:view", $userPermissions, true) ||
-                    in_array("{$reportScreen}.*", $userPermissions, true)) {
-                    return true;
-                }
-            }
-        }
-
-        foreach ($userPermissions as $p) {
-            if (strcasecmp((string)$p, $permission) === 0) {
-                return true;
             }
         }
 
@@ -236,9 +282,31 @@ class User extends Authenticatable
         return false;
     }
 
+    public static function resolveRequestSignature(Request $request): string
+    {
+        $token = $request->bearerToken();
+        $boundUserId = $request->user()?->id ?? '';
+        return (string)$token . '|' . (string)$boundUserId;
+    }
+
+    public static function attachResolvedToRequest(Request $request, ?User $user): void
+    {
+        $request->setUserResolver(fn () => $user);
+        $request->attributes->set('_resolved_api_user_sig', static::resolveRequestSignature($request));
+        $request->attributes->set('_resolved_api_user', $user);
+    }
+
     public static function resolveFromRequest(Request $request): ?User
     {
         $token = $request->bearerToken();
+        $sig = static::resolveRequestSignature($request);
+        if ($request->attributes->has('_resolved_api_user')
+            && $request->attributes->get('_resolved_api_user_sig') === $sig
+        ) {
+            return $request->attributes->get('_resolved_api_user');
+        }
+
+        $resolved = null;
         if ($token) {
             $user = static::with('roleModel')->where('api_token', $token)->first();
             if ($user) {
@@ -246,17 +314,19 @@ class User extends Authenticatable
                     $user->api_token = null;
                     $user->api_token_created_at = null;
                     $user->save();
+                    $request->attributes->set('_resolved_api_user_sig', $sig);
+                    $request->attributes->set('_resolved_api_user', null);
                     return null;
                 }
-                return $user;
+                $resolved = $user;
             }
         }
 
-        if ($request->user()) {
-            return $request->user()->loadMissing('roleModel');
+        if ($resolved === null && $request->user()) {
+            $resolved = $request->user()->loadMissing('roleModel');
         }
 
-        if (app()->environment('testing') && !$token) {
+        if ($resolved === null && app()->environment('testing') && !$token) {
             $testUser = static::with('roleModel')->where('role', 'Super Admin')->first()
                 ?: static::with('roleModel')->first();
             if (!$testUser) {
@@ -269,9 +339,11 @@ class User extends Authenticatable
                     'password' => bcrypt('secret123'),
                 ]);
             }
-            return $testUser;
+            $resolved = $testUser;
         }
 
-        return null;
+        $request->attributes->set('_resolved_api_user_sig', $sig);
+        $request->attributes->set('_resolved_api_user', $resolved);
+        return $resolved;
     }
 }

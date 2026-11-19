@@ -34,7 +34,7 @@ class Quotation extends Model
         'date' => 'datetime:Y-m-d H:i:s',
         'warehouse_id' => 'integer',
         'user_id' => 'integer',
-        'expiry_date' => 'date',
+        'expiry_date' => 'date:Y-m-d',
         'tax_rate' => 'float',
         'tax_amount' => 'float',
         'discount' => 'float',
@@ -44,7 +44,7 @@ class Quotation extends Model
 
     public function items()
     {
-        return $this->hasMany(QuotationItem::class, 'quotation_id');
+        return $this->hasMany(QuotationItem::class, 'quotation_id')->orderBy('id');
     }
 
     public function customer()
@@ -59,6 +59,7 @@ class Quotation extends Model
 
     public function sale()
     {
-        return $this->hasOne(Sale::class, 'quotation_id');
+        return $this->hasOne(Sale::class, 'quotation_id')
+            ->whereNotIn('sales.status', ['Voided', 'Cancelled']);
     }
 }

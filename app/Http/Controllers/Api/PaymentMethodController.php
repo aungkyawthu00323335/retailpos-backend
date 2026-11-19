@@ -14,23 +14,9 @@ class PaymentMethodController extends Controller
 
     public function index(Request $request)
     {
-        $hasFilters = $request->filled('search') || ($request->filled('status') && $request->input('status') !== 'All');
-
-        // Fast Cache hit if unfiltered and clean array
-        if (!$hasFilters && Cache::has(self::CACHE_KEY)) {
-            $cached = Cache::get(self::CACHE_KEY);
-            if (is_array($cached) && !empty($cached) && !isset($cached['__PHP_Incomplete_Class_Name'])) {
-                return response()->json([
-                    'status' => 'success',
-                    'data' => $cached,
-                ], 200, ['X-Cache' => 'HIT']);
-            }
-            Cache::forget(self::CACHE_KEY);
-        }
-
         $query = PaymentMethod::query()->select([
-            'id', 'name', 'code', 'icon', 'qr_code_image', 'is_active', 'is_default', 'description', 
-            'account_number', 'account_name', 'is_bot_available', 'created_at', 'updated_at'
+            'id', 'name', 'code', 'icon', 'qr_code_image', 'is_active', 'is_default', 'description',
+            'account_number', 'account_name', 'created_at', 'updated_at'
         ]);
 
         if ($request->filled('search')) {
@@ -48,21 +34,12 @@ class PaymentMethodController extends Controller
             $query->where('is_active', $isActive);
         }
 
-        if ($request->has('bot_only') && $request->boolean('bot_only')) {
-            $query->where('is_bot_available', true);
-        }
-
-        $methods = $query->orderBy('id', 'desc')->get();
-        $methodsArray = $methods->toArray();
-
-        if (!$hasFilters && !$request->has('bot_only')) {
-            Cache::put(self::CACHE_KEY, $methodsArray, 3600);
-        }
+        $methodsArray = $query->orderBy('id', 'desc')->get()->toArray();
 
         return response()->json([
             'status' => 'success',
             'data' => $methodsArray,
-        ], 200, ['X-Cache' => 'MISS']);
+        ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
 
     /**
@@ -101,7 +78,6 @@ class PaymentMethodController extends Controller
             'description' => 'nullable|string',
             'account_number' => 'nullable|string|max:255',
             'account_name' => 'nullable|string|max:255',
-            'is_bot_available' => 'nullable|boolean',
         ]);
 
         $name = trim($validated['name']);
@@ -146,7 +122,6 @@ class PaymentMethodController extends Controller
                 'description' => $validated['description'] ?? null,
                 'account_number' => $validated['account_number'] ?? null,
                 'account_name' => $validated['account_name'] ?? null,
-                'is_bot_available' => $validated['is_bot_available'] ?? true,
             ]);
         });
 
@@ -176,7 +151,6 @@ class PaymentMethodController extends Controller
             'description' => 'nullable|string',
             'account_number' => 'nullable|string|max:255',
             'account_name' => 'nullable|string|max:255',
-            'is_bot_available' => 'nullable|boolean',
         ]);
 
         DB::transaction(function () use ($method, $validated) {
@@ -186,9 +160,8 @@ class PaymentMethodController extends Controller
             $method->update($validated);
         });
 
-        // Instant Cache Invalidation: Invalidate API cache and Telegram Bot file_id cache
+        // Instant Cache Invalidation
         Cache::forget(self::CACHE_KEY);
-        Cache::forget("tg_pm_file_id_{$id}");
 
         return response()->json([
             'status' => 'success',
@@ -212,25 +185,6 @@ class PaymentMethodController extends Controller
         return response()->json([
             'status' => 'success',
             'message' => 'Status updated to ' . ($method->is_active ? 'Active' : 'Inactive'),
-            'data' => $method,
-        ]);
-    }
-
-    public function toggleBot($id)
-    {
-        $method = PaymentMethod::find($id);
-        if (!$method) {
-            return response()->json(['status' => 'error', 'message' => 'Payment method not found'], 404);
-        }
-
-        $method->is_bot_available = !$method->is_bot_available;
-        $method->save();
-
-        Cache::forget(self::CACHE_KEY);
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Telegram Bot availability updated to ' . ($method->is_bot_available ? 'Available' : 'Disabled'),
             'data' => $method,
         ]);
     }

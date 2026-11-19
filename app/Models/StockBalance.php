@@ -9,6 +9,8 @@ class StockBalance extends Model
 {
     use HasFactory;
 
+    protected $touches = ['product'];
+
     protected $fillable = [
         'warehouse_id',
         'product_id',

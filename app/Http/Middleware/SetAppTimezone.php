@@ -21,16 +21,13 @@ class SetAppTimezone
     public function handle(Request $request, Closure $next)
     {
         try {
-            if (static::$cachedTimezone === null) {
-                $tz = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
-                if (!empty($tz) && in_array($tz, timezone_identifiers_list(), true)) {
-                    static::$cachedTimezone = $tz;
-                } else {
-                    static::$cachedTimezone = config('app.timezone', 'Asia/Yangon');
-                }
+            $tz = app()->runningUnitTests()
+                ? Setting::getTimezoneFast(config('app.timezone', 'Asia/Yangon'))
+                : (static::$cachedTimezone ??= Setting::getTimezoneFast(config('app.timezone', 'Asia/Yangon')));
+
+            if (!empty($tz) && @date_default_timezone_set($tz)) {
+                config(['app.timezone' => $tz]);
             }
-            date_default_timezone_set(static::$cachedTimezone);
-            config(['app.timezone' => static::$cachedTimezone]);
         } catch (\Throwable $e) {
             // Silently fall back to default during initial setup/migration
         }

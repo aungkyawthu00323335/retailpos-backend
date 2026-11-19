@@ -22,8 +22,6 @@ class DatabaseSeeder extends Seeder
             SupplierSeeder::class,
             PaymentMethodSeeder::class,
             ComprehensiveRetailProductSeeder::class,
-            // DeliveryRegionAndTownshipSeeder::class,
-            TelegramBotCatalog100Seeder::class,
             TenThousandRecordsEnterpriseSeeder::class,
         ]);
     }

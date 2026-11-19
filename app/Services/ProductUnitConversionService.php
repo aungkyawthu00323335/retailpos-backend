@@ -7,6 +7,7 @@ use App\Models\Product;
 use App\Models\ProductUnitLink;
 use App\Models\StockBalance;
 use App\Models\StockMovement;
+use Carbon\Carbon;
 use Illuminate\Support\Arr;
 use InvalidArgumentException;
 use RuntimeException;
@@ -286,28 +287,30 @@ class ProductUnitConversionService
         return round($unitPrice / $conversionRate, 8);
     }
 
-    protected static array $warehouseCache = [];
-
     public function warehouseId(?int $warehouseId, ?string $warehouseName): ?int
     {
-        if ($warehouseId && $warehouseId > 0) {
-            return $warehouseId;
+        $hasOutlets = Outlet::query()->exists();
+
+        if ($warehouseId !== null && $warehouseId > 0) {
+            if (!$hasOutlets) {
+                return $warehouseId;
+            }
+            return Outlet::whereKey($warehouseId)->exists() ? $warehouseId : null;
         }
 
         $name = trim((string)$warehouseName);
         if ($name === '') {
-            return Outlet::orderBy('id')->value('id');
+            return $hasOutlets ? Outlet::orderBy('id')->value('id') : null;
         }
 
-        if (isset(self::$warehouseCache[$name])) {
-            return self::$warehouseCache[$name];
+        if (!$hasOutlets) {
+            return null;
         }
 
         $warehouse = Outlet::where('name', $name)->first()
             ?? Outlet::where('name', 'LIKE', '%' . $name . '%')->first();
-        $id = $warehouse?->id ?? Outlet::orderBy('id')->value('id');
-        self::$warehouseCache[$name] = $id;
-        return $id;
+
+        return $warehouse?->id;
     }
 
     public function applyStock(
@@ -322,7 +325,9 @@ class ProductUnitConversionService
         ?string $note = null,
         bool $notifyRestock = true,
         bool $allowOverdraft = false,
-        bool $syncAggregates = true
+        bool $syncAggregates = true,
+        ?float $unitCost = null,
+        ?string $movementDate = null
     ): float {
         if (!$warehouseId) {
             throw new RuntimeException('A valid warehouse is required for stock movement.');
@@ -360,7 +365,16 @@ class ProductUnitConversionService
         }
         $balance->update(['quantity' => $next]);
 
-        StockMovement::create([
+        $movementTimestamp = now();
+        if ($movementDate !== null && trim($movementDate) !== '') {
+            try {
+                $movementTimestamp = Carbon::parse($movementDate)->setTimezone(config('app.timezone'));
+            } catch (\Throwable $e) {
+                $movementTimestamp = now();
+            }
+        }
+
+        $movementPayload = [
             'warehouse_id' => $warehouseId,
             'product_id' => $product->id,
             'product_variant_id' => $variantId,
@@ -372,37 +386,26 @@ class ProductUnitConversionService
             'balance_after' => $next,
             'created_by' => auth()->id() ?? 1,
             'note' => $note,
-            'created_at' => now(),
-        ]);
+            'created_at' => $movementTimestamp,
+        ];
+        if ($unitCost !== null && app(PurchaseAccountingService::class)->schemaHasColumn('stock_movements', 'unit_cost')) {
+            $movementPayload['unit_cost'] = round(max(0.0, $unitCost), 4);
+        }
+        StockMovement::create($movementPayload);
 
         if ($syncAggregates) {
             $aggregate = (float)StockBalance::where('product_id', $product->id)->sum('quantity');
-            Product::whereKey($product->id)->update(['stock_quantity' => $aggregate]);
+            Product::whereKey($product->id)->update(['stock_quantity' => $aggregate, 'updated_at' => now()]);
 
             // 🛡️ Sync variant-level stock_quantity on the product_variants table if column exists
             if ($variantId) {
-                static $hasVariantStockCol = null;
-                if ($hasVariantStockCol === null) {
-                    $hasVariantStockCol = \Illuminate\Support\Facades\Schema::hasColumn('product_variants', 'stock_quantity');
-                }
-                if ($hasVariantStockCol) {
+                if (app(PurchaseAccountingService::class)->schemaHasColumn('product_variants', 'stock_quantity')) {
                     $variantAggregate = (float)StockBalance::where('product_id', $product->id)
                         ->where('product_variant_id', $variantId)
                         ->sum('quantity');
-                    \App\Models\ProductVariant::whereKey($variantId)->update(['stock_quantity' => $variantAggregate]);
+                    \App\Models\ProductVariant::whereKey($variantId)->update(['stock_quantity' => $variantAggregate, 'updated_at' => now()]);
                 }
             }
-        }
-
-        // 🔔 Trigger Telegram Restock Notifications if items were replenished
-        if ($notifyRestock && strtolower($direction) === 'in' && $next > 0) {
-            \Illuminate\Support\Facades\DB::afterCommit(function () use ($product, $variantId) {
-                try {
-                    app(\App\Services\TelegramBotService::class)->notifyRestockSubscribers($product->id, $variantId);
-                } catch (\Throwable $e) {
-                    \Illuminate\Support\Facades\Log::warning("Telegram restock alert dispatch error: " . $e->getMessage());
-                }
-            });
         }
 
         return $next;
@@ -410,6 +413,7 @@ class ProductUnitConversionService
 
     public function syncAggregatesForProducts(array $productIds, array $variantIds = []): void
     {
+        $now = now();
         $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
         if (!empty($productIds)) {
             $sums = StockBalance::whereIn('product_id', $productIds)
@@ -419,17 +423,13 @@ class ProductUnitConversionService
 
             foreach ($productIds as $pid) {
                 $agg = (float)($sums[$pid] ?? 0.0);
-                Product::whereKey($pid)->update(['stock_quantity' => $agg]);
+                Product::whereKey($pid)->update(['stock_quantity' => $agg, 'updated_at' => $now]);
             }
         }
 
         $variantIds = array_values(array_unique(array_filter(array_map('intval', $variantIds))));
         if (!empty($variantIds)) {
-            static $hasVariantStockCol = null;
-            if ($hasVariantStockCol === null) {
-                $hasVariantStockCol = \Illuminate\Support\Facades\Schema::hasColumn('product_variants', 'stock_quantity');
-            }
-            if ($hasVariantStockCol) {
+            if (app(PurchaseAccountingService::class)->schemaHasColumn('product_variants', 'stock_quantity')) {
                 $vSums = StockBalance::whereIn('product_variant_id', $variantIds)
                     ->selectRaw('product_variant_id, COALESCE(SUM(quantity), 0) as total_qty')
                     ->groupBy('product_variant_id')
@@ -437,7 +437,7 @@ class ProductUnitConversionService
 
                 foreach ($variantIds as $vid) {
                     $vAgg = (float)($vSums[$vid] ?? 0.0);
-                    \App\Models\ProductVariant::whereKey($vid)->update(['stock_quantity' => $vAgg]);
+                    \App\Models\ProductVariant::whereKey($vid)->update(['stock_quantity' => $vAgg, 'updated_at' => $now]);
                 }
             }
         }

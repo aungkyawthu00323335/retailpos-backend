@@ -48,8 +48,6 @@ class Product extends Model
         'stock_alert',
         'low_qty',
         'has_variants',
-        'is_bot_available',
-        'bot_price',
         'image_url',
         'description',
         'note',
@@ -61,21 +59,19 @@ class Product extends Model
     ];
 
     protected $casts = [
-        'cost_price' => 'decimal:2',
+        'cost_price' => 'decimal:4',
         'selling_price' => 'decimal:2',
-        'purchase_price' => 'decimal:2',
+        'purchase_price' => 'decimal:4',
         'retail_price' => 'decimal:2',
         'retail_prices' => 'array',
         'wholesale_price' => 'decimal:2',
         'wholesale_prices' => 'array',
-        'bot_price' => 'decimal:2',
         'stock_quantity' => 'decimal:4',
         'alert_quantity' => 'decimal:4',
         'stock_alert' => 'decimal:4',
         'low_qty' => 'decimal:4',
         'has_variants' => 'boolean',
         'is_active' => 'boolean',
-        'is_bot_available' => 'boolean',
     ];
 
     protected $appends = [];
@@ -135,11 +131,6 @@ class Product extends Model
     public function unitLinks()
     {
         return $this->hasMany(ProductUnitLink::class);
-    }
-
-    public function restockSubscribers()
-    {
-        return $this->hasMany(BotRestockSubscriber::class, 'product_id');
     }
 
     public function category()

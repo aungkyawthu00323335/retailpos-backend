@@ -39,7 +39,7 @@ return new class extends Migration {
                     $table->index(['date', 'warehouse_name']);
                 }
                 if (!Schema::hasIndex('sales', 'sales_cust_ar_idx')) {
-                    $table->index(['customer_id', 'status', 'bot_approval_status', 'due_amount'], 'sales_cust_ar_idx');
+                    $table->index(['customer_id', 'status', 'due_amount'], 'sales_cust_ar_idx');
                 }
             });
         }

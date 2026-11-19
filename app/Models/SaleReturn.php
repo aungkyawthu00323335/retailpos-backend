@@ -2,22 +2,41 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\TracksRegisterSplitFlag;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class SaleReturn extends Model
 {
     use HasFactory;
+    use TracksRegisterSplitFlag;
+
+    protected static function booted(): void
+    {
+        static::saving(function (self $ret): void {
+            if (empty($ret->sale_id) && !empty($ret->sale_reference_no)) {
+                $clean = trim((string)$ret->sale_reference_no);
+                if ($clean !== '') {
+                    $ret->sale_id = Sale::whereIn('reference_no', [
+                        $clean,
+                        str_replace('-', '_', $clean),
+                        str_replace('_', '-', $clean),
+                    ])->value('id');
+                }
+            }
+        });
+    }
 
     protected $fillable = [
         'reference_no',
+        'sale_id',
         'sale_reference_no',
         'customer_id',
         'customer_name',
         'warehouse_id',       // Fixed: was missing from $fillable — critical bug
         'warehouse_name',
         'date',
-        'status', // Completed, Pending
+        'status', // Completed, Pending, Voided
         'tax_rate',
         'tax_amount',
         'discount',
@@ -26,8 +45,12 @@ class SaleReturn extends Model
         'grand_total',
         'paid_amount',
         'due_amount',
+        'applied_credit_amount',
+        'return_cost_total',
+        'cost_variance',
         'payment_status',
         'payment_type',
+        'cash_register_id',
         'notes',
         'return_reason',      // New: reason for the return
         'refund_tender',      // New: how refund is given (Cash, KBZPay, Store Credit, etc.)
@@ -48,7 +71,12 @@ class SaleReturn extends Model
         'grand_total'  => 'float',
         'paid_amount'  => 'float',
         'due_amount'   => 'float',
+        'applied_credit_amount' => 'float',
+        'return_cost_total' => 'float',
+        'cost_variance' => 'float',
+        'sale_id'      => 'integer',
         'warehouse_id' => 'integer',
+        'cash_register_id' => 'integer',
         'user_id'      => 'integer',
     ];
 
@@ -121,27 +149,19 @@ class SaleReturn extends Model
             }
         }
 
-        // Fallback synthetic item representation for legacy returns
-        return [
-            [
-                'id'                 => $this->id ?? 1,
-                'product_id'         => 1,
-                'product_variant_id' => null,
-                'product_name'       => 'Returned Item / Goods (' . ($this->reference_no ?: 'Voucher') . ')',
-                'product_code'       => 'RET-' . str_pad($this->id ?? 1, 5, '0', STR_PAD_LEFT),
-                'unit_name'          => 'Pcs',
-                'unit_price'         => (float)($this->subtotal > 0 ? $this->subtotal : $this->grand_total),
-                'quantity'           => 1.0,
-                'discount'           => (float)$this->discount,
-                'tax'                => (float)$this->tax_amount,
-                'subtotal'           => (float)($this->subtotal > 0 ? $this->subtotal : $this->grand_total),
-                'unit_cost'          => (float)($this->subtotal > 0 ? $this->subtotal : $this->grand_total),
-            ]
-        ];
+        return [];
     }
 
     public function sale()
     {
+        if (!empty($this->sale_id)) {
+            return $this->belongsTo(Sale::class, 'sale_id');
+        }
         return $this->belongsTo(Sale::class, 'sale_reference_no', 'reference_no');
+    }
+
+    public function costLayers()
+    {
+        return $this->hasMany(SaleReturnCostLayer::class, 'sale_return_id');
     }
 }

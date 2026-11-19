@@ -7,9 +7,57 @@ use App\Models\SubCategory;
 use App\Models\ProductCategory;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class SubCategoryController extends Controller
 {
+    /**
+     * Shared query builder joining aggregated product counts in one pass
+     * instead of correlated Eloquent withCount subqueries.
+     */
+    private function buildListingQuery()
+    {
+        $productCountsSub = DB::table('products')
+            ->select('sub_category_id', DB::raw('COUNT(*) as cnt'))
+            ->whereNull('deleted_at')
+            ->whereNotNull('sub_category_id')
+            ->groupBy('sub_category_id');
+
+        return DB::table('sub_categories as sc')
+            ->leftJoinSub($productCountsSub, 'pc', function ($join) {
+                $join->on('pc.sub_category_id', '=', 'sc.id');
+            })
+            ->select([
+                'sc.id',
+                'sc.parent_category_id',
+                'sc.parent_category_name',
+                'sc.name',
+                'sc.description',
+                'sc.status',
+                'sc.created_at',
+                DB::raw('COALESCE(pc.cnt, 0) as products_count'),
+            ]);
+    }
+
+    /**
+     * Normalize integer types cleanly for JSON serialization.
+     */
+    private function formatListingRows($rows): array
+    {
+        return $rows->map(function ($row) {
+            return [
+                'id' => (int) $row->id,
+                'parent_category_id' => $row->parent_category_id !== null ? (int) $row->parent_category_id : null,
+                'parent_category_name' => $row->parent_category_name ?? 'General',
+                'name' => $row->name,
+                'description' => $row->description ?? '',
+                'status' => $row->status ?? 'Active',
+                'products_count' => (int) $row->products_count,
+                'created_at' => $row->created_at,
+            ];
+        })->all();
+    }
+
     /**
      * Display a listing of sub categories.
      */
@@ -21,46 +69,46 @@ class SubCategoryController extends Controller
             $request->filled('sort_by');
 
         if (!$hasFilters) {
-            $items = Cache::remember('api_sub_categories_list', 60, function () {
-                return SubCategory::withCount('products')
-                    ->orderBy('id', 'desc')
-                    ->get();
-            });
+            $items = $this->formatListingRows(
+                $this->buildListingQuery()
+                    ->orderByDesc('sc.id')
+                    ->get()
+            );
 
             return response()->json([
                 'status' => 'success',
                 'data' => $items,
-            ]);
+            ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
         }
 
-        $query = SubCategory::withCount('products');
+        $query = $this->buildListingQuery();
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
-                  ->orWhere('parent_category_name', 'like', "%{$search}%")
-                  ->orWhere('description', 'like', "%{$search}%");
+                $q->where('sc.name', 'like', "%{$search}%")
+                  ->orWhere('sc.parent_category_name', 'like', "%{$search}%")
+                  ->orWhere('sc.description', 'like', "%{$search}%");
             });
         }
 
         if ($request->filled('parent_category') && $request->input('parent_category') !== 'All') {
-            $query->where('parent_category_name', $request->input('parent_category'));
+            $query->where('sc.parent_category_name', $request->input('parent_category'));
         }
 
         if ($request->filled('status') && $request->input('status') !== 'All') {
-            $query->where('status', $request->input('status'));
+            $query->where('sc.status', $request->input('status'));
         }
 
         $sortBy = $request->input('sort_by', 'id');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
         if (in_array($sortBy, ['id', 'name', 'parent_category_name', 'status', 'created_at'])) {
-            $query->orderBy($sortBy, $sortOrder);
+            $query->orderBy("sc.{$sortBy}", $sortOrder);
         } else {
-            $query->orderBy('id', 'desc');
+            $query->orderByDesc('sc.id');
         }
 
-        $items = $query->get();
+        $items = $this->formatListingRows($query->get());
 
         return response()->json([
             'status' => 'success',

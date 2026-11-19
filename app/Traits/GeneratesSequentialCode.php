@@ -92,21 +92,29 @@ trait GeneratesSequentialCode
         // 1. Check max('id') as baseline
         $maxId = (int)$modelClass::max('id');
 
-        // 2. Fetch recent records with this prefix or general pattern to extract maximum numeric sequence
-        $latestRecords = $modelClass::where('reference_no', 'like', $prefix . '%')
-            ->orWhere('reference_no', 'like', '%' . substr($prefix, 0, 2) . '%')
-            ->orderBy('id', 'desc')
-            ->take(500)
+        // 2. Fetch records strictly starting with this exact prefix (ordered by length & lexicographical value + recent IDs)
+        //    Never match arbitrary substrings, which would corrupt sequence counters with dates or custom suffixes.
+        $prefixedHigh = $modelClass::where('reference_no', 'like', $prefix . '%')
+            ->orderByRaw('LENGTH(reference_no) DESC')
+            ->orderBy('reference_no', 'desc')
+            ->take(200)
             ->pluck('reference_no');
 
-        $maxSeq = max($maxId, 10000);
+        $prefixedRecent = $modelClass::where('reference_no', 'like', $prefix . '%')
+            ->orderBy('id', 'desc')
+            ->take(200)
+            ->pluck('reference_no');
 
-        foreach ($latestRecords as $ref) {
+        $candidates = $prefixedHigh->merge($prefixedRecent)->unique();
+
+        $maxSeq = max($maxId, 10000);
+        $pattern = '/^' . preg_quote($prefix, '/') . '0*(\d+)$/';
+
+        foreach ($candidates as $ref) {
             if (empty($ref)) {
                 continue;
             }
-            // Extract trailing sequence digits
-            if (preg_match('/(\d+)$/', (string)$ref, $m)) {
+            if (preg_match($pattern, trim((string)$ref), $m)) {
                 $num = (int)$m[1];
                 if ($num > $maxSeq && $num < 99999999) {
                     $maxSeq = $num;
@@ -226,6 +234,23 @@ trait GeneratesSequentialCode
                             ->where('outlet_id', $outletId ?: 0)
                             ->lockForUpdate()
                             ->first();
+                        if (!$counter) {
+                            $baseline = $this->findMaxExistingSeq($type, $prefix);
+                            try {
+                                $counter = ReferenceCounter::create([
+                                    'type' => $type,
+                                    'prefix' => $prefix,
+                                    'outlet_id' => $outletId ?: 0,
+                                    'last_seq' => max($baseline, $num),
+                                ]);
+                            } catch (\Throwable $e) {
+                                $counter = ReferenceCounter::where('type', $type)
+                                    ->where('prefix', $prefix)
+                                    ->where('outlet_id', $outletId ?: 0)
+                                    ->lockForUpdate()
+                                    ->first();
+                            }
+                        }
                         if ($counter && $num > $counter->last_seq) {
                             $counter->last_seq = $num;
                             $counter->save();

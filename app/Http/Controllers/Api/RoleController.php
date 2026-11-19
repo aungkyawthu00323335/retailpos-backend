@@ -188,6 +188,7 @@ class RoleController extends Controller
                 'actions' => ['view', 'create'],
                 'special_actions' => [
                     ['key' => 'checkout', 'label' => 'POS Checkout', 'description' => 'Process point of sale checkout & submit transactions'],
+                    ['key' => 'discount', 'label' => 'Discount & Price Override', 'description' => 'Apply discounts and override unit prices above cashier threshold without manager PIN'],
                 ],
             ],
             [
@@ -211,23 +212,6 @@ class RoleController extends Controller
                     ['key' => 'export', 'label' => 'Export Sales Returns', 'description' => 'Export customer sales returns log'],
                 ],
             ],
-            [
-                'id' => 'bot_orders',
-                'name' => 'Manage Bot Orders',
-                'module' => 'Sales & POS',
-                'actions' => ['view', 'update', 'delete'],
-                'special_actions' => [
-                    ['key' => 'approve', 'label' => 'Approve/Reject Orders', 'description' => 'Approve or reject customer orders from Telegram Bot'],
-                    ['key' => 'dispatch', 'label' => 'Dispatch Order', 'description' => 'Dispatch orders for fulfillment/delivery'],
-                ],
-            ],
-            [
-                'id' => 'bot_chat',
-                'name' => 'Manage Customer Live Chat',
-                'module' => 'Sales & POS',
-                'actions' => ['view', 'create'],
-                'special_actions' => [],
-            ],
 
             // 7. Transfers
             [
@@ -237,6 +221,7 @@ class RoleController extends Controller
                 'actions' => ['view', 'create', 'update', 'delete'],
                 'special_actions' => [
                     ['key' => 'receive', 'label' => 'Receive Inbound', 'description' => 'Acknowledge and restock inter-branch shipments'],
+                    ['key' => 'pay', 'label' => 'Record Payment', 'description' => 'Post transfer shipping/handling payment settlements'],
                     ['key' => 'export', 'label' => 'Export Transfers', 'description' => 'Export inter-branch transfer logs'],
                 ],
             ],
@@ -539,13 +524,6 @@ class RoleController extends Controller
                 'special_actions' => [],
             ],
             [
-                'id' => 'delivery_zones',
-                'name' => 'Manage Delivery Zones',
-                'module' => 'Settings',
-                'actions' => ['view', 'create', 'update', 'delete'],
-                'special_actions' => [],
-            ],
-            [
                 'id' => 'payment_methods',
                 'name' => 'Manage Payment Methods',
                 'module' => 'Settings',
@@ -571,13 +549,6 @@ class RoleController extends Controller
                 'name' => 'Manage General Settings',
                 'module' => 'Settings',
                 'actions' => ['view', 'update'],
-                'special_actions' => [],
-            ],
-            [
-                'id' => 'telegram_bot',
-                'name' => 'Manage Telegram Bot',
-                'module' => 'Settings',
-                'actions' => ['view', 'create', 'update', 'delete'],
                 'special_actions' => [],
             ],
         ];

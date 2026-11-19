@@ -13,6 +13,7 @@ use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\Setting;
 use App\Services\ProductUnitConversionService;
+use App\Support\ListCursorHelper;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -20,6 +21,11 @@ use Illuminate\Validation\Rule;
 class QuotationController extends Controller
 {
     use \App\Traits\GeneratesSequentialCode;
+
+    private const CURSOR_SORT_COLUMNS = [
+        'id', 'reference_no', 'customer_name', 'warehouse_name', 'date',
+        'status', 'grand_total', 'user_name', 'user_role', 'created_by',
+    ];
     /**
      * Generate next sequential quotation code and formatted reference number.
      */
@@ -31,94 +37,186 @@ class QuotationController extends Controller
     /**
      * Build filtered quotation query based on request parameters
      */
+    protected function accounting(): \App\Services\QuotationAccountingService
+    {
+        return app(\App\Services\QuotationAccountingService::class);
+    }
+
+    protected function purchaseAccounting(): \App\Services\PurchaseAccountingService
+    {
+        return app(\App\Services\PurchaseAccountingService::class);
+    }
+
+    private function attachQuotationItemAggregates($items): void
+    {
+        $ids = $items->pluck('id')->filter()->values()->all();
+        if (empty($ids)) {
+            return;
+        }
+        $aggs = DB::table('quotation_items')
+            ->selectRaw('quotation_id, COUNT(*) as items_count, COALESCE(SUM(quantity), 0) as total_quantity')
+            ->whereIn('quotation_id', $ids)
+            ->groupBy('quotation_id')
+            ->get()
+            ->keyBy('quotation_id');
+
+        foreach ($items as $q) {
+            $agg = $aggs->get($q->id);
+            $q->setAttribute('items_count', (int) ($agg->items_count ?? 0));
+            $q->setAttribute('total_quantity', (float) ($agg->total_quantity ?? 0));
+        }
+    }
+
     protected function buildFilteredQuery(Request $request, bool $includeItems = false)
     {
-        $withRelations = ['customer:id,name,phone,email,credit_limit'];
-        if ($includeItems) {
-            $withRelations[] = 'items:id,quotation_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,variant_name,unit_price,base_unit_price,quantity,base_quantity,tax,discount,subtotal';
-        }
+        $withRelations = $includeItems
+            ? [
+                'customer:id,name,phone,email,credit_limit',
+                'sale:id,quotation_id,reference_no',
+                'items:id,quotation_id,product_id,product_variant_id,unit_id,unit_name,conversion_rate,product_code,product_name,variant_name,unit_price,base_unit_price,quantity,base_quantity,tax,discount,subtotal',
+            ]
+            : ['customer:id,name', 'sale:id,quotation_id,reference_no'];
 
         $query = Quotation::select([
             'id', 'reference_no', 'customer_id', 'customer_name', 'warehouse_id', 'warehouse_name',
             'date', 'expiry_date', 'tax_rate', 'tax_amount', 'discount', 'shipping', 'grand_total',
             'status', 'notes', 'created_by', 'user_id', 'user_name', 'user_role', 'created_at', 'updated_at'
         ])
-        ->withCount('items')
-        ->withSum('items as total_quantity', 'quantity')
         ->with($withRelations);
+
+        $purchaseAccounting = $this->purchaseAccounting();
+        $purchaseAccounting->applyOutletScope(
+            $query,
+            $purchaseAccounting->extractAllowedOutletIds($request),
+            'quotations.warehouse_id'
+        );
 
         // Filter: Warehouse / Outlet
         if ($request->filled('warehouse') && $request->input('warehouse') !== 'All') {
             $warehouse = $request->input('warehouse');
             $query->where(function ($q) use ($warehouse) {
-                $q->where('warehouse_name', $warehouse);
+                $q->where('quotations.warehouse_name', $warehouse);
                 if (is_numeric($warehouse)) {
-                    $q->orWhere('warehouse_id', (int)$warehouse);
+                    $q->orWhere('quotations.warehouse_id', (int)$warehouse);
                 }
             });
         }
         if ($request->filled('warehouse_id')) {
-            $query->where('warehouse_id', (int)$request->input('warehouse_id'));
+            $query->where('quotations.warehouse_id', (int)$request->input('warehouse_id'));
         }
 
-        // Filter: Status
+        // Filter: Status (evaluating expiry_date for Expired & active Pipeline statuses)
         if ($request->filled('status') && $request->input('status') !== 'All') {
-            $query->where('status', $request->input('status'));
+            $statusParam = trim((string)$request->input('status'));
+            $todayDate = now()->toDateString();
+            if (strcasecmp($statusParam, 'Expired') === 0) {
+                $query->where(function ($q) use ($todayDate) {
+                    $q->where('quotations.status', 'Expired')
+                      ->orWhere(function ($sub) use ($todayDate) {
+                          $sub->whereNotIn('quotations.status', ['Ordered', 'Declined', 'Expired'])
+                              ->whereNotNull('quotations.expiry_date')
+                              ->where('quotations.expiry_date', '!=', '')
+                              ->where('quotations.expiry_date', '<', $todayDate);
+                      });
+                });
+            } elseif (in_array(strtolower($statusParam), ['pending', 'sent', 'accepted'], true)) {
+                $query->where('quotations.status', $statusParam)
+                      ->where(function ($q) use ($todayDate) {
+                          $q->whereNull('quotations.expiry_date')
+                            ->orWhere('quotations.expiry_date', '')
+                            ->orWhere('quotations.expiry_date', '>=', $todayDate);
+                      });
+            } else {
+                $query->where('quotations.status', $statusParam);
+            }
         }
 
         // Filter: Search (Reference #, Customer, Staff Name, Role, Notes, Product Name/Code)
         if ($request->filled('search')) {
             $search = trim($request->input('search'));
-            $query->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('customer_name', 'like', "%{$search}%")
-                  ->orWhere('user_name', 'like', "%{$search}%")
-                  ->orWhere('user_role', 'like', "%{$search}%")
-                  ->orWhere('created_by', 'like', "%{$search}%")
-                  ->orWhere('notes', 'like', "%{$search}%")
-                  ->orWhereHas('items', function ($iq) use ($search) {
-                      $iq->where('product_name', 'like', "%{$search}%")
-                         ->orWhere('product_code', 'like', "%{$search}%");
-                  });
-            });
+            if (preg_match('/^QUO[-_]/i', $search)) {
+                $altHyphen = str_replace('_', '-', $search);
+                $altUnderscore = str_replace('-', '_', $search);
+                $query->where(function ($q) use ($search, $altHyphen, $altUnderscore) {
+                    $q->where('quotations.reference_no', 'like', "{$search}%");
+                    if ($altHyphen !== $search) {
+                        $q->orWhere('quotations.reference_no', 'like', "{$altHyphen}%");
+                    }
+                    if ($altUnderscore !== $search) {
+                        $q->orWhere('quotations.reference_no', 'like', "{$altUnderscore}%");
+                    }
+                });
+            } else {
+                $query->where(function ($q) use ($search) {
+                    $q->where('quotations.reference_no', 'like', "%{$search}%")
+                      ->orWhere('quotations.customer_name', 'like', "%{$search}%")
+                      ->orWhere('quotations.user_name', 'like', "%{$search}%")
+                      ->orWhere('quotations.user_role', 'like', "%{$search}%")
+                      ->orWhere('quotations.created_by', 'like', "%{$search}%")
+                      ->orWhere('quotations.notes', 'like', "%{$search}%")
+                      ->orWhereHas('items', function ($iq) use ($search) {
+                          $iq->where('product_name', 'like', "%{$search}%")
+                             ->orWhere('product_code', 'like', "%{$search}%");
+                      });
+                });
+            }
         }
 
         // Filter: Created By / Staff
-        if ($request->filled('created_by') && $request->input('created_by') !== 'All') {
-            $filterUser = $request->input('created_by');
+        $filterUser = $request->input('created_by');
+        if (empty($filterUser) || $filterUser === 'All') {
+            $filterUser = $request->input('user');
+        }
+        if (!empty($filterUser) && $filterUser !== 'All') {
             $query->where(function ($q) use ($filterUser) {
-                $q->where('created_by', $filterUser)
-                  ->orWhere('user_name', $filterUser);
+                $q->where('quotations.created_by', $filterUser)
+                  ->orWhere('quotations.user_name', $filterUser);
+                if (is_numeric($filterUser)) {
+                    $q->orWhere('quotations.user_id', (int)$filterUser);
+                }
             });
         }
+        if ($request->filled('user_id') && $request->input('user_id') !== 'All') {
+            $query->where('quotations.user_id', (int)$request->input('user_id'));
+        }
         if ($request->filled('user_role') && $request->input('user_role') !== 'All') {
-            $query->where('user_role', $request->input('user_role'));
+            $query->where('quotations.user_role', $request->input('user_role'));
         }
 
         // Filter: Customer
         if ($request->filled('customer') && $request->input('customer') !== 'All') {
             $customer = $request->input('customer');
             $query->where(function ($q) use ($customer) {
-                $q->where('customer_name', $customer);
+                $q->where('quotations.customer_name', $customer);
                 if (is_numeric($customer)) {
-                    $q->orWhere('customer_id', (int)$customer);
+                    $q->orWhere('quotations.customer_id', (int)$customer);
                 }
             });
         }
         if ($request->filled('customer_id')) {
-            $query->where('customer_id', (int)$request->input('customer_id'));
+            $query->where('quotations.customer_id', (int)$request->input('customer_id'));
         }
 
         // Filter: Date Range (Optimized for MySQL Index Usage)
         $fromDate = $request->input('from_date') ?? $request->input('date_from');
         if (!empty($fromDate)) {
             $from = trim($fromDate);
-            $query->where('date', '>=', str_contains($from, ':') ? $from : $from . ' 00:00:00');
+            $query->where('quotations.date', '>=', str_contains($from, ':') ? $from : $from . ' 00:00:00');
         }
         $toDate = $request->input('to_date') ?? $request->input('date_to');
         if (!empty($toDate)) {
             $to = trim($toDate);
-            $query->where('date', '<=', str_contains($to, ':') ? $to : $to . ' 23:59:59');
+            if (str_contains($to, ':')) {
+                $query->where('quotations.date', '<=', $to);
+            } else {
+                // Exclusive upper bound handles both 'YYYY-MM-DD HH:MM:SS' and ISO 'YYYY-MM-DDTHH:MM:SS' timestamps.
+                try {
+                    $nextDay = \Carbon\Carbon::parse($to)->addDay()->format('Y-m-d');
+                    $query->where('quotations.date', '<', $nextDay);
+                } catch (\Throwable $e) {
+                    $query->where('quotations.date', '<=', $to . ' 23:59:59');
+                }
+            }
         }
 
         return $query;
@@ -148,25 +246,33 @@ class QuotationController extends Controller
             'user_name' => 'user_name',
             'user_role' => 'user_role',
             'created_by' => 'created_by',
+            'creator' => 'user_name',
         ];
 
         $sortByInput = strtolower(trim((string)$request->input('sort_by', 'id')));
         $sortBy = $allowedSortCols[$sortByInput] ?? 'id';
         $sortOrder = strtolower((string)$request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
 
+        $cacheControl = 'no-store, no-cache, must-revalidate, private';
         $isAll = $request->boolean('all') || $request->input('per_page') === 'all';
         if ($isAll) {
             $totalCount = (clone $query)->count();
             $limit = min(1000, max(1, (int)$request->input('limit', 500)));
-            $items = $query->orderBy($sortBy, $sortOrder)->take($limit)->get();
+            $items = $query->orderBy($sortBy, $sortOrder)
+                ->when($sortBy !== 'quotations.id' && $sortBy !== 'id', fn ($q) => $q->orderBy('id', $sortOrder))
+                ->take($limit)
+                ->get();
+            $accounting = $this->accounting();
+            $canViewCost = $accounting->canViewCost($request);
+            $this->attachQuotationItemAggregates($items);
+            $items->each(fn($q) => $accounting->enrichQuotationResponse($q, $canViewCost));
+            $summary = $accounting->computeSummaryStats($query);
+
             return response()->json([
                 'status' => 'success',
                 'data' => $items,
                 'total' => $totalCount,
-                'summary' => [
-                    'total_records' => $totalCount,
-                    'total_grand_total' => (float)(clone $query)->sum('grand_total'),
-                ],
+                'summary' => $summary,
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => $items->count(),
@@ -174,43 +280,106 @@ class QuotationController extends Controller
                     'last_page' => (int)ceil($totalCount / max(1, $limit)),
                 ],
             ])
-            ->header('Cache-Control', 'private, max-age=60');
+            ->header('Cache-Control', $cacheControl);
         }
 
-        $perPage = min(1000, max(1, (int)$request->input('per_page', 25)));
-        $page = (int)$request->input('page', 1);
+        $perPage = min(1000, max(1, (int)$request->input('per_page', 50)));
+        $page = max(1, (int)$request->input('page', 1));
+        $skipSummary = $request->boolean('skip_summary');
+        $cursorData = ListCursorHelper::decode(
+            (string)$request->input('cursor', ''),
+            $sortBy,
+            $sortOrder,
+            self::CURSOR_SORT_COLUMNS,
+            ['id'],
+            ['grand_total']
+        );
+        $isScrollPage = ($page > 1 || $cursorData !== null);
 
-        $quotations = $query->orderBy($sortBy, $sortOrder)->paginate($perPage, ['*'], 'page', $page);
-
-        // HTTP ETag & Cache-Control for fast conditional responses with filter & update awareness
-        $total = $quotations->total();
-        $maxUpdated = (clone $query)->max('quotations.updated_at') ?? 'none';
-        $filterSig = http_build_query($request->only(['warehouse', 'warehouse_id', 'status', 'search', 'customer', 'customer_id', 'created_by', 'user_role', 'date_from', 'date_to', 'from_date', 'to_date']));
-        $etag = md5("quo|{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|{$maxUpdated}|{$filterSig}");
-
-        if ($request->header('If-None-Match') === '"' . $etag . '"') {
-            return response()->noContent(304)->header('ETag', '"' . $etag . '"');
+        $accounting = $this->accounting();
+        if ($skipSummary && $request->filled('known_total')) {
+            $total = max(0, (int)$request->input('known_total'));
+            $summary = [
+                'total_records' => $total,
+                'pipeline_total' => 0.0,
+                'pipeline_count' => 0,
+                'converted_total' => 0.0,
+                'converted_count' => 0,
+                'lost_total' => 0.0,
+                'lost_count' => 0,
+                'gross_total' => 0.0,
+                'total_grand_total' => 0.0,
+            ];
+        } else {
+            $aggQuery = (clone $query)->setEagerLoads([]);
+            $aggQuery->getQuery()->columns = null;
+            $aggQuery->getQuery()->orders = null;
+            if ($skipSummary) {
+                $total = (int) $aggQuery->count();
+                $summary = [
+                    'total_records' => $total,
+                    'pipeline_total' => 0.0,
+                    'pipeline_count' => 0,
+                    'converted_total' => 0.0,
+                    'converted_count' => 0,
+                    'lost_total' => 0.0,
+                    'lost_count' => 0,
+                    'gross_total' => 0.0,
+                    'total_grand_total' => 0.0,
+                ];
+            } else {
+                $summary = $accounting->computeSummaryStats($aggQuery);
+                $total = $summary['total_records'];
+            }
         }
 
-        $summary = [
-            'total_records' => $total,
-            'total_grand_total' => (float)(clone $query)->sum('grand_total'),
+        $canViewCost = $accounting->canViewCost($request);
+
+        $items = collect();
+        $hasMore = false;
+        if ($total > 0 || $cursorData !== null) {
+            $listQuery = (clone $query);
+            if ($cursorData !== null) {
+                ListCursorHelper::apply($listQuery, $sortBy, $sortOrder, $cursorData);
+            }
+            $listQuery->orderBy($sortBy, $sortOrder);
+            if ($sortBy !== 'id') {
+                $listQuery->orderBy('id', $sortOrder);
+            }
+            $offset = $cursorData !== null ? 0 : (($page - 1) * $perPage);
+            $fetched = $listQuery->offset($offset)->limit($perPage + 1)->get();
+            $hasMore = $fetched->count() > $perPage;
+            $items = $hasMore ? $fetched->slice(0, $perPage)->values() : $fetched;
+        }
+
+        $lastRowObj = $items->last();
+        $nextCursor = ($hasMore && $lastRowObj !== null)
+            ? ListCursorHelper::encode((object)$lastRowObj, $sortBy, $sortOrder, self::CURSOR_SORT_COLUMNS)
+            : null;
+
+        $this->attachQuotationItemAggregates($items);
+        $items->each(fn($q) => $accounting->enrichQuotationResponse($q, $canViewCost));
+
+        $lastPage = max(1, (int)ceil($total / max(1, $perPage)));
+        $pagination = [
+            'current_page' => $page,
+            'per_page' => $perPage,
+            'total' => $total,
+            'last_page' => $lastPage,
+            'has_more' => $hasMore,
         ];
+        if ($nextCursor !== null) {
+            $pagination['next_cursor'] = $nextCursor;
+        }
 
         return response()->json([
             'status' => 'success',
-            'data' => $quotations->items(),
+            'data' => $items->values(),
             'total' => $total,
             'summary' => $summary,
-            'pagination' => [
-                'current_page' => $quotations->currentPage(),
-                'per_page' => $quotations->perPage(),
-                'total' => $total,
-                'last_page' => $quotations->lastPage(),
-            ],
+            'pagination' => $pagination,
         ])
-        ->header('Cache-Control', 'private, max-age=60')
-        ->header('ETag', '"' . $etag . '"');
+        ->header('Cache-Control', $cacheControl);
     }
 
     /**
@@ -237,6 +406,7 @@ class QuotationController extends Controller
             'grand_total' => 'quotations.grand_total',
             'total' => 'quotations.grand_total',
             'user_name' => 'quotations.user_name',
+            'creator' => 'quotations.user_name',
             'user_role' => 'quotations.user_role',
             'created_by' => 'quotations.created_by',
         ];
@@ -262,15 +432,22 @@ class QuotationController extends Controller
         $toDate = $request->input('to_date') ?? $request->input('date_to');
         $searchQuery = $request->input('search');
 
-        // Join customer phone directly with explicit column qualification to avoid ambiguity
+        // Join customer phone & item count aggregates cleanly
         $query->leftJoin('customers', 'quotations.customer_id', '=', 'customers.id')
+              ->leftJoin(
+                  DB::raw('(SELECT quotation_id, COUNT(*) as items_count FROM quotation_items GROUP BY quotation_id) qi'),
+                  'quotations.id',
+                  '=',
+                  'qi.quotation_id'
+              )
               ->select([
                   'quotations.id', 'quotations.reference_no', 'quotations.customer_name',
-                  'quotations.warehouse_name', 'quotations.date', 'quotations.tax_rate',
-                  'quotations.tax_amount', 'quotations.discount', 'quotations.shipping',
-                  'quotations.grand_total', 'quotations.status', 'quotations.notes',
-                  'quotations.created_by', 'quotations.user_name', 'quotations.user_role',
-                  'customers.phone as customer_phone'
+                  'quotations.warehouse_name', 'quotations.date', 'quotations.expiry_date',
+                  'quotations.tax_rate', 'quotations.tax_amount', 'quotations.discount',
+                  'quotations.shipping', 'quotations.grand_total', 'quotations.status',
+                  'quotations.notes', 'quotations.created_by', 'quotations.user_name',
+                  'quotations.user_role', 'customers.phone as customer_phone',
+                  DB::raw('COALESCE(qi.items_count, 0) as items_count'),
               ]);
 
         $callback = function () use (
@@ -289,28 +466,42 @@ class QuotationController extends Controller
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
 
+            $sanitizeCsv = static function ($val): string {
+                if ($val === null) {
+                    return '';
+                }
+                $str = (string) $val;
+                if ($str !== '' && in_array($str[0], ['=', '+', '-', '@', "\t", "\r"], true)) {
+                    return "'" . $str;
+                }
+                return $str;
+            };
+
             // 1. Metadata Header
             fputcsv($file, ['Quotations / Estimates Export']);
             fputcsv($file, ['Generated At', date('c')]);
-            fputcsv($file, ['Warehouse Filter', $warehouseFilter ?: 'All']);
-            fputcsv($file, ['Status Filter', $statusFilter ?: 'All']);
+            fputcsv($file, ['Warehouse Filter', $sanitizeCsv($warehouseFilter ?: 'All')]);
+            fputcsv($file, ['Status Filter', $sanitizeCsv($statusFilter ?: 'All')]);
             if (!empty($customerFilter) && $customerFilter !== 'All') {
-                fputcsv($file, ['Customer Filter', $customerFilter]);
+                fputcsv($file, ['Customer Filter', $sanitizeCsv($customerFilter)]);
             }
             if (!empty($userFilter) && $userFilter !== 'All') {
-                fputcsv($file, ['Created By Filter', $userFilter]);
+                fputcsv($file, ['Created By Filter', $sanitizeCsv($userFilter)]);
             }
             if (!empty($fromDate) || !empty($toDate)) {
                 $fromStr = !empty($fromDate) ? explode(' ', $fromDate)[0] : 'Beginning';
                 $toStr = !empty($toDate) ? explode(' ', $toDate)[0] : 'Present';
-                fputcsv($file, ['Date Range', "$fromStr to $toStr"]);
+                fputcsv($file, ['Date Range', $sanitizeCsv("$fromStr to $toStr")]);
             }
             if (!empty($searchQuery)) {
-                fputcsv($file, ['Search Filter', $searchQuery]);
+                fputcsv($file, ['Search Filter', $sanitizeCsv($searchQuery)]);
             }
             fwrite($file, "\r\n");
 
-            // 2. Column Headers
+            $accounting = $this->accounting();
+            $currency = $accounting->resolveDefaultCurrencyCode();
+
+            // 2. Column Headers (18 columns: 16 core columns + Items Count + Expiry Date)
             $columns = [
                 'SN',
                 'Quotation Reference',
@@ -318,16 +509,18 @@ class QuotationController extends Controller
                 'Customer Phone',
                 'Warehouse / Outlet',
                 'Tax Rate (%)',
-                'Tax Amount (MMK)',
-                'Discount (MMK)',
-                'Shipping (MMK)',
-                'Grand Total (MMK)',
+                "Tax Amount ({$currency})",
+                "Discount ({$currency})",
+                "Shipping ({$currency})",
+                "Grand Total ({$currency})",
                 'Status',
                 'Created By',
                 'User Role',
                 'Date',
                 'Time',
                 'Notes',
+                'Items Count',
+                'Expiry Date',
             ];
             fputcsv($file, $columns);
 
@@ -337,9 +530,12 @@ class QuotationController extends Controller
                 return (fmod($floatVal, 1.0) == 0.0) ? (string)((int)$floatVal) : (string)number_format($floatVal, 2, '.', '');
             };
 
-            $formatPhone = function ($phone) {
+            $formatPhone = function ($phone) use ($sanitizeCsv) {
                 $phone = trim((string)$phone);
                 if ($phone === '') return '';
+                if (!preg_match('/^[0-9+\s().-]+$/', $phone)) {
+                    return $sanitizeCsv($phone);
+                }
                 if (str_starts_with($phone, '0') || str_starts_with($phone, '+') || str_contains($phone, ' ')) {
                     return '="' . $phone . '"';
                 }
@@ -347,22 +543,67 @@ class QuotationController extends Controller
             };
 
             $totalCount = 0;
+            $totalItemsCount = 0;
             $totalTax = 0.0;
             $totalDiscount = 0.0;
             $totalShipping = 0.0;
             $totalGrandTotal = 0.0;
 
+            $pipelineCount = 0;
+            $pipelineTotal = 0.0;
+            $convertedCount = 0;
+            $convertedTotal = 0.0;
+            $lostCount = 0;
+            $lostTotal = 0.0;
+            $todayDate = \Carbon\Carbon::today()->toDateString();
+
             $flushCount = 0;
-            foreach ($query->orderBy($sortBy, $sortOrder)->toBase()->cursor() as $q) {
+            $orderedExportQuery = $query->orderBy($sortBy, $sortOrder);
+            if ($sortBy !== 'quotations.id') {
+                $orderedExportQuery->orderBy('quotations.id', $sortOrder);
+            }
+            foreach ($orderedExportQuery->toBase()->cursor() as $q) {
                 $totalCount++;
+                $totalItemsCount += (int)($q->items_count ?? 0);
                 $totalTax += (float)$q->tax_amount;
                 $totalDiscount += (float)$q->discount;
                 $totalShipping += (float)$q->shipping;
-                $totalGrandTotal += (float)$q->grand_total;
+                $rowGrandTotal = (float)$q->grand_total;
+                $totalGrandTotal += $rowGrandTotal;
 
-                $dateParts = explode(' ', (string)$q->date);
-                $dateOnly = $dateParts[0] ?? '';
-                $timeStr = $dateParts[1] ?? '';
+                $rowStatus = (string)($q->status ?? 'Sent');
+                $rowExpiry = !empty($q->expiry_date) ? substr(trim((string)$q->expiry_date), 0, 10) : '';
+                $effectiveRowStatus = $rowStatus;
+                if ($rowStatus === 'Ordered') {
+                    $convertedCount++;
+                    $convertedTotal += $rowGrandTotal;
+                } elseif (in_array($rowStatus, ['Declined', 'Expired'], true) || ($rowExpiry !== '' && $rowExpiry < $todayDate)) {
+                    $lostCount++;
+                    $lostTotal += $rowGrandTotal;
+                    if (in_array($rowStatus, \App\Services\QuotationAccountingService::OPEN_PIPELINE_STATUSES, true) && $rowExpiry !== '' && $rowExpiry < $todayDate) {
+                        $effectiveRowStatus = 'Expired';
+                    }
+                } else {
+                    $pipelineCount++;
+                    $pipelineTotal += $rowGrandTotal;
+                }
+
+                $rawDate = trim((string)($q->date ?? ''));
+                if ($rawDate !== '' && (str_ends_with($rawDate, 'Z') || str_ends_with($rawDate, 'z') || preg_match('/[+-]\d{2}:?\d{2}$/', $rawDate))) {
+                    try {
+                        $dt = \Carbon\Carbon::parse($rawDate)->setTimezone(config('app.timezone', 'UTC'));
+                        $dateOnly = $dt->format('Y-m-d');
+                        $timeStr = $dt->format('H:i:s');
+                    } catch (\Throwable $e) {
+                        $dateParts = preg_split('/[T ]/', $rawDate, 2);
+                        $dateOnly = $dateParts[0] ?? '';
+                        $timeStr = isset($dateParts[1]) ? preg_replace('/(?:\.\d+)?Z$/i', '', $dateParts[1]) : '';
+                    }
+                } else {
+                    $dateParts = $rawDate !== '' ? preg_split('/[T ]/', $rawDate, 2) : [];
+                    $dateOnly = $dateParts[0] ?? '';
+                    $timeStr = isset($dateParts[1]) ? preg_replace('/\.\d+$/', '', $dateParts[1]) : '';
+                }
 
                 $phone = $q->customer_phone ?? '';
 
@@ -377,21 +618,23 @@ class QuotationController extends Controller
 
                 $row = [
                     $sn++,
-                    $q->reference_no,
-                    $q->customer_name,
+                    $sanitizeCsv($q->reference_no),
+                    $sanitizeCsv($q->customer_name),
                     $formatPhone($phone),
-                    $q->warehouse_name,
+                    $sanitizeCsv($q->warehouse_name),
                     $formatNum($q->tax_rate),
                     $formatNum($q->tax_amount),
                     $formatNum($q->discount),
                     $formatNum($q->shipping),
                     $formatNum($q->grand_total),
-                    $q->status,
-                    $userName,
-                    $userRole,
+                    $sanitizeCsv($effectiveRowStatus),
+                    $sanitizeCsv($userName),
+                    $sanitizeCsv($userRole),
                     $dateOnly,
                     $timeStr,
-                    $q->notes ?? '',
+                    $sanitizeCsv($q->notes ?? ''),
+                    (string)((int)($q->items_count ?? 0)),
+                    $rowExpiry !== '' ? $rowExpiry : '—',
                 ];
                 fputcsv($file, $row);
 
@@ -400,25 +643,87 @@ class QuotationController extends Controller
                 }
             }
 
-            // Summary row
+            // Summary rows (18 columns aligned with headers & CsvHelper)
             fputcsv($file, []);
             fputcsv($file, [
-                'TOTALS',
+                'TOTAL',
                 "$totalCount Quotations",
-                '',
-                '',
-                '',
-                '',
+                '—',
+                '—',
+                '—',
+                '—',
                 $formatNum($totalTax),
                 $formatNum($totalDiscount),
                 $formatNum($totalShipping),
                 $formatNum($totalGrandTotal),
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                (string)$totalItemsCount,
+                '—',
+            ]);
+            fputcsv($file, [
+                'PIPELINE (Active Open)',
+                "$pipelineCount Quotations",
+                'Sent / Pending / Accepted',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                $formatNum($pipelineTotal),
+                'Open',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+            ]);
+            fputcsv($file, [
+                'ORDERED (Converted)',
+                "$convertedCount Quotations",
+                'Converted to Sale',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                $formatNum($convertedTotal),
+                'Ordered',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+            ]);
+            fputcsv($file, [
+                'CLOSED LOST',
+                "$lostCount Quotations",
+                'Declined / Expired',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                $formatNum($lostTotal),
+                'Declined / Expired',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
             ]);
 
             fclose($file);
@@ -430,10 +735,128 @@ class QuotationController extends Controller
     /**
      * Store a newly created quotation with its line items.
      */
+    /**
+     * Build normalized quotation item rows with Product/Unit resolution & strict product_id validation.
+     */
+    protected function buildQuotationItemRows(
+        int $quotationId,
+        array $rawItems,
+        \App\Services\QuotationAccountingService $accounting,
+        ProductUnitConversionService $unitService
+    ): array {
+        $productIds = collect($rawItems)->pluck('product_id')->filter(fn($id) => !empty($id))->map(fn($id) => (int) $id)->unique()->values()->all();
+        $productCodes = collect($rawItems)->pluck('product_code')->filter(fn($c) => trim((string) $c) !== '')->unique()->values()->all();
+
+        $productsMap = Product::with(['unitLinks.unit', 'variants:id,product_id'])
+            ->where(function ($q) use ($productIds, $productCodes) {
+                if (!empty($productIds)) {
+                    $q->whereIn('id', $productIds);
+                    if (!empty($productCodes)) {
+                        $q->orWhereIn('code', $productCodes);
+                    }
+                } elseif (!empty($productCodes)) {
+                    $q->whereIn('code', $productCodes);
+                }
+            })
+            ->get();
+
+        $productsById = $productsMap->keyBy('id');
+        $productsByCode = $productsMap->keyBy('code');
+
+        $rows = [];
+        $now = now();
+        foreach ($rawItems as $index => $item) {
+            $explicitProductId = !empty($item['product_id']) ? (int) $item['product_id'] : null;
+            if ($explicitProductId !== null && !isset($productsById[$explicitProductId])) {
+                $val = \Illuminate\Support\Facades\Validator::make([], []);
+                $msg = "Selected product (ID {$explicitProductId}) for item '" . ($item['product_name'] ?? 'Unknown') . "' does not exist.";
+                $val->errors()->add("items.{$index}.product_id", $msg);
+                throw new \Illuminate\Validation\ValidationException(
+                    validator: $val,
+                    response: response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ["items.{$index}.product_id" => [$msg]],
+                    ], 422)
+                );
+            }
+
+            $product = $explicitProductId !== null
+                ? $productsById[$explicitProductId]
+                : ($productsByCode[$item['product_code']] ?? null);
+
+            $variantId = !empty($item['product_variant_id']) ? (int) $item['product_variant_id'] : null;
+            if ($product) {
+                $hasVariants = (bool) $product->has_variants || ($product->relationLoaded('variants') && $product->variants->isNotEmpty());
+                if ($variantId !== null && (!$product->relationLoaded('variants') || !$product->variants->contains('id', $variantId))) {
+                    $val = \Illuminate\Support\Facades\Validator::make([], []);
+                    $msg = "Selected variant does not belong to product '{$product->name}'.";
+                    $val->errors()->add("items.{$index}.product_variant_id", $msg);
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: $val,
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ["items.{$index}.product_variant_id" => [$msg]],
+                        ], 422)
+                    );
+                }
+                if ($hasVariants && $variantId === null) {
+                    $val = \Illuminate\Support\Facades\Validator::make([], []);
+                    $msg = "Product '{$product->name}' has variations. Please select a concrete variation.";
+                    $val->errors()->add("items.{$index}.product_variant_id", $msg);
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: $val,
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ["items.{$index}.product_variant_id" => [$msg]],
+                        ], 422)
+                    );
+                }
+            }
+
+            $unitMeta = $accounting->resolveItemUnitFields($item, $product, $unitService);
+            $qty = max(0.0, (float) $item['quantity']);
+            $unitPrice = max(0.0, (float) $item['unit_price']);
+            $itemTax = max(0.0, (float) ($item['tax'] ?? 0));
+            $itemDiscount = max(0.0, (float) ($item['discount'] ?? 0));
+            $lineSubtotal = round(max(0.0, ($qty * $unitPrice) - $itemDiscount + $itemTax), 2);
+
+            $rows[] = [
+                'quotation_id' => $quotationId,
+                'product_id' => $unitMeta['product_id'],
+                'product_variant_id' => $unitMeta['product_variant_id'],
+                'unit_id' => $unitMeta['unit_id'],
+                'unit_name' => $unitMeta['unit_name'],
+                'conversion_rate' => $unitMeta['conversion_rate'],
+                'product_code' => $item['product_code'],
+                'product_name' => $item['product_name'],
+                'variant_name' => $item['variant_name'] ?? null,
+                'unit_price' => $unitPrice,
+                'base_unit_price' => $unitMeta['base_unit_price'],
+                'quantity' => $qty,
+                'base_quantity' => $unitMeta['base_quantity'],
+                'tax' => $itemTax,
+                'discount' => $itemDiscount,
+                'subtotal' => $lineSubtotal,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Store a newly created quotation in the database.
+     */
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'reference_no'       => 'nullable|string|max:100|unique:quotations,reference_no',
+            // Allow concurrent requests carrying the same previewed sequential reference_no
+            // to be atomically reallocated inside acquireUniqueReference() under DB lock.
+            'reference_no'       => 'nullable|string|max:100',
             'customer_id'        => 'nullable|integer',
             'customer_name'      => 'required|string|max:255',
             'warehouse_id'       => 'nullable|integer',
@@ -443,12 +866,13 @@ class QuotationController extends Controller
             'user_role'          => 'nullable|string|max:255',
             'date'               => 'required|string',
             'expiry_date'        => 'nullable|date',
-            'tax_rate'           => 'nullable|numeric|min:0',
+            'tax_rate'           => 'nullable|numeric|min:0|max:100',
             'tax_amount'         => 'nullable|numeric|min:0',
             'discount'           => 'nullable|numeric|min:0',
             'shipping'           => 'nullable|numeric|min:0',
             'grand_total'        => 'required|numeric|min:0',
-            'status'             => 'nullable|string|in:Sent,Pending,Accepted,Ordered,Declined,Expired',
+            // 'Ordered' cannot be spoofed manually via CRUD; it is strictly reserved for atomic Sale conversion.
+            'status'             => 'nullable|string|in:Sent,Pending,Accepted,Declined,Expired',
             'notes'              => 'nullable|string',
             'created_by'         => 'nullable|string|max:255',
             'items'              => 'required|array|min:1',
@@ -473,47 +897,55 @@ class QuotationController extends Controller
         try {
             $refNo = $this->acquireUniqueReference('quotation', $request->input('reference_no'));
 
-            $user = $request->user();
-            $userId = $validated['user_id'] ?? $user?->id;
-            $userName = $validated['user_name'] ?? $user?->name;
-            $userRole = $validated['user_role'] ?? $user?->role ?? 'Sales Staff';
-            $creator = $validated['created_by'] ?? ($userName ?: ($user?->name ?: 'Sales Staff'));
-
-            $txDate = trim($validated['date']);
-            if (!str_contains($txDate, ':')) {
-                $txDate .= ' ' . now()->format('H:i:s');
+            $authUser = \App\Models\User::resolveFromRequest($request) ?? $request->user() ?? auth()->user();
+            if ($authUser && $authUser->exists) {
+                $userId = $authUser->id;
+                $userName = $authUser->name;
+                $userRole = $authUser->role ?: ($authUser->roleModel?->name ?? 'Sales Staff');
+                $creator = $authUser->name ?: 'Sales Staff';
+            } else {
+                $userId = $validated['user_id'] ?? null;
+                $userName = $validated['user_name'] ?? null;
+                $userRole = $validated['user_role'] ?? 'Sales Staff';
+                $creator = $validated['created_by'] ?? ($userName ?: 'Sales Staff');
             }
+
+            $txDate = app(\App\Services\PurchaseAccountingService::class)
+                ->normalizeTransactionDate($validated['date']);
 
             // Determine status — if expiry_date is in the past, set to Expired automatically
             $expiryDate  = $validated['expiry_date'] ?? null;
             $autoStatus  = $validated['status'] ?? 'Sent';
-            if ($expiryDate && \Carbon\Carbon::parse($expiryDate)->endOfDay()->isPast() && $autoStatus !== 'Ordered') {
+            if ($expiryDate && \Carbon\Carbon::parse($expiryDate)->endOfDay()->isPast()) {
                 $autoStatus = 'Expired';
             }
 
-            // Server-side financial integrity calculation (Prevents client manipulation)
-            $itemsSubtotal = 0.0;
-            foreach ($validated['items'] as $it) {
-                $q = (float)$it['quantity'];
-                $up = (float)$it['unit_price'];
-                $t = (float)($it['tax'] ?? 0);
-                $d = (float)($it['discount'] ?? 0);
-                $itemsSubtotal += round(($q * $up) - $d + $t, 2);
-            }
-            $discount = (float)($validated['discount'] ?? 0);
-            $taxRate = (float)($validated['tax_rate'] ?? 0);
-            $taxableBase = max(0.0, $itemsSubtotal - $discount);
-            $taxAmount = $taxRate > 0
-                ? round($taxableBase * ($taxRate / 100), 2)
-                : (isset($validated['tax_amount']) ? round((float)$validated['tax_amount'], 2) : 0.0);
-            $shipping = (float)($validated['shipping'] ?? 0);
-            $grandTotal = round(max(0.0, $itemsSubtotal - $discount + $taxAmount + $shipping), 2);
+            // Server-side financial integrity calculation (Tax-Exclusive Parity with SaleController)
+            $unitService = app(ProductUnitConversionService::class);
+            $accounting = $this->accounting();
+            $purchaseAccounting = $this->purchaseAccounting();
+            $resolvedWarehouseId = $accounting->resolveWarehouseId(
+                !empty($validated['warehouse_id']) ? (int) $validated['warehouse_id'] : null,
+                $validated['warehouse_name'] ?? null,
+                $unitService
+            );
+            $purchaseAccounting->assertOutletAccess($request, $resolvedWarehouseId, $validated['warehouse_name'] ?? null);
+
+            $discount = (float) ($validated['discount'] ?? 0);
+            $taxRate = (float) ($validated['tax_rate'] ?? 0);
+            $flatTax = isset($validated['tax_amount']) ? (float) $validated['tax_amount'] : null;
+            $shipping = (float) ($validated['shipping'] ?? 0);
+            $totals = $accounting->calculateDocumentTotals($validated['items'], $discount, $taxRate, $flatTax, $shipping);
+            $itemsSubtotal = $totals['items_subtotal'];
+            $discount = $totals['discount'];
+            $taxAmount = $totals['tax_amount'];
+            $grandTotal = $totals['grand_total'];
 
             $quotation = Quotation::create([
                 'reference_no' => $refNo,
                 'customer_id'  => $validated['customer_id'] ?? null,
                 'customer_name'=> $validated['customer_name'],
-                'warehouse_id' => $validated['warehouse_id'] ?? null,
+                'warehouse_id' => $resolvedWarehouseId,
                 'warehouse_name'=> $validated['warehouse_name'],
                 'date'         => $txDate,
                 'expiry_date'  => $expiryDate,
@@ -530,52 +962,26 @@ class QuotationController extends Controller
                 'user_role'    => $userRole,
             ]);
 
-
-            $itemsData = [];
-            $now = now();
-            foreach ($validated['items'] as $item) {
-                $convRate = (float)($item['conversion_rate'] ?? 1.0);
-                if ($convRate <= 0) $convRate = 1.0;
-                $qty = (float)$item['quantity'];
-                $unitPrice = (float)$item['unit_price'];
-                $baseQty = isset($item['base_quantity']) ? (float)$item['base_quantity'] : ($qty * $convRate);
-                $basePrice = isset($item['base_unit_price']) ? (float)$item['base_unit_price'] : ($unitPrice / $convRate);
-
-                $itemTax = (float)($item['tax'] ?? 0);
-                $itemDiscount = (float)($item['discount'] ?? 0);
-                $lineSubtotal = round(max(0.0, ($qty * $unitPrice) - $itemDiscount + $itemTax), 2);
-
-                $itemsData[] = [
-                    'quotation_id' => $quotation->id,
-                    'product_id' => $item['product_id'] ?? null,
-                    'product_variant_id' => $item['product_variant_id'] ?? null,
-                    'unit_id' => $item['unit_id'] ?? null,
-                    'unit_name' => $item['unit_name'] ?? null,
-                    'conversion_rate' => $convRate,
-                    'product_code' => $item['product_code'],
-                    'product_name' => $item['product_name'],
-                    'variant_name' => $item['variant_name'] ?? null,
-                    'unit_price' => $unitPrice,
-                    'base_unit_price' => $basePrice,
-                    'quantity' => $qty,
-                    'base_quantity' => $baseQty,
-                    'tax' => $itemTax,
-                    'discount' => $itemDiscount,
-                    'subtotal' => $lineSubtotal,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ];
-            }
-
+            $itemsData = $this->buildQuotationItemRows($quotation->id, $validated['items'], $accounting, $unitService);
             QuotationItem::insert($itemsData);
 
             DB::commit();
+            $this->clearQuotationRelatedCaches();
+
+            $quotation->load(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer', 'sale:id,quotation_id,reference_no']);
+            $accounting->enrichQuotationResponse($quotation, $accounting->canViewCost($request));
 
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation created successfully',
-                'data' => $quotation->load(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']),
+                'data' => $quotation,
             ], 201);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            DB::rollBack();
+            return $e->getResponse();
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage() ?: 'Forbidden'], $e->getStatusCode());
         } catch (\Throwable $e) {
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
@@ -585,12 +991,19 @@ class QuotationController extends Controller
     /**
      * Display the specified quotation with all child items.
      */
-    public function show($id)
+    public function show(Request $request, $id)
     {
-        $quotation = Quotation::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer'])->find($id);
+        $quotation = Quotation::with(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer', 'sale:id,quotation_id,reference_no'])->find($id);
         if (!$quotation) {
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
+        $this->purchaseAccounting()->assertOutletAccess(
+            $request,
+            $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
+            $quotation->warehouse_name
+        );
+        $accounting = $this->accounting();
+        $accounting->enrichQuotationResponse($quotation, $accounting->canViewCost($request));
         return response()->json(['status' => 'success', 'data' => $quotation]);
     }
 
@@ -603,6 +1016,11 @@ class QuotationController extends Controller
         if (!$quotation) {
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
+        $this->purchaseAccounting()->assertOutletAccess(
+            $request,
+            $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
+            $quotation->warehouse_name
+        );
 
         // Commercial Audit Guard: Prevent modifying already converted quotation
         if ($quotation->status === 'Ordered') {
@@ -623,12 +1041,13 @@ class QuotationController extends Controller
             'user_role'                  => 'nullable|string|max:255',
             'date'                       => 'required|string',
             'expiry_date'                => 'nullable|date',
-            'tax_rate'                   => 'nullable|numeric|min:0',
+            'tax_rate'                   => 'nullable|numeric|min:0|max:100',
             'tax_amount'                 => 'nullable|numeric|min:0',
             'discount'                   => 'nullable|numeric|min:0',
             'shipping'                   => 'nullable|numeric|min:0',
             'grand_total'                => 'required|numeric|min:0',
-            'status'                     => 'nullable|string|in:Sent,Pending,Accepted,Ordered,Declined,Expired',
+            // 'Ordered' cannot be spoofed manually via CRUD; it is strictly reserved for atomic Sale conversion.
+            'status'                     => 'nullable|string|in:Sent,Pending,Accepted,Declined,Expired',
             'notes'                      => 'nullable|string',
             'created_by'                 => 'nullable|string|max:255',
             'items'                      => 'required|array|min:1',
@@ -651,40 +1070,48 @@ class QuotationController extends Controller
 
         DB::beginTransaction();
         try {
-            $expiryDate = $validated['expiry_date'] ?? $quotation->expiry_date;
+            $expiryDate = array_key_exists('expiry_date', $validated)
+                ? ($validated['expiry_date'] !== '' ? $validated['expiry_date'] : null)
+                : $quotation->expiry_date;
             $newStatus  = $validated['status'] ?? $quotation->status;
-            // Auto-expire if expiry_date is in the past (and not already Ordered)
-            if ($expiryDate && $newStatus !== 'Ordered' && \Carbon\Carbon::parse($expiryDate)->endOfDay()->isPast()) {
+            // Auto-expire if expiry_date is in the past
+            if ($expiryDate && \Carbon\Carbon::parse($expiryDate)->endOfDay()->isPast()) {
                 $newStatus = 'Expired';
+            } elseif (array_key_exists('expiry_date', $validated) && $expiryDate === null && $newStatus === 'Expired' && !array_key_exists('status', $validated)) {
+                $newStatus = 'Sent';
             }
 
-            // Server-side financial integrity calculation
-            $itemsSubtotal = 0.0;
-            foreach ($validated['items'] as $it) {
-                $q = (float)$it['quantity'];
-                $up = (float)$it['unit_price'];
-                $t = (float)($it['tax'] ?? 0);
-                $d = (float)($it['discount'] ?? 0);
-                $itemsSubtotal += round(($q * $up) - $d + $t, 2);
-            }
-            $discount = (float)($validated['discount'] ?? 0);
-            $taxRate = (float)($validated['tax_rate'] ?? 0);
-            $taxableBase = max(0.0, $itemsSubtotal - $discount);
-            $taxAmount = $taxRate > 0
-                ? round($taxableBase * ($taxRate / 100), 2)
-                : (isset($validated['tax_amount']) ? round((float)$validated['tax_amount'], 2) : 0.0);
-            $shipping = (float)($validated['shipping'] ?? 0);
-            $grandTotal = round(max(0, $itemsSubtotal - $discount + $taxAmount + $shipping), 2);
+            // Server-side financial integrity calculation (Tax-Exclusive Parity with SaleController)
+            $unitService = app(ProductUnitConversionService::class);
+            $accounting = $this->accounting();
+            $purchaseAccounting = $this->purchaseAccounting();
+            $resolvedWarehouseId = $accounting->resolveWarehouseId(
+                !empty($validated['warehouse_id']) ? (int) $validated['warehouse_id'] : ($quotation->warehouse_id ? (int) $quotation->warehouse_id : null),
+                $validated['warehouse_name'] ?? $quotation->warehouse_name,
+                $unitService
+            );
+            $purchaseAccounting->assertOutletAccess(
+                $request,
+                $resolvedWarehouseId,
+                $validated['warehouse_name'] ?? $quotation->warehouse_name
+            );
 
-            $txDate = trim($validated['date']);
-            if (!str_contains($txDate, ':')) {
-                $txDate .= ' ' . now()->format('H:i:s');
-            }
+            $discount = (float) ($validated['discount'] ?? 0);
+            $taxRate = (float) ($validated['tax_rate'] ?? 0);
+            $flatTax = isset($validated['tax_amount']) ? (float) $validated['tax_amount'] : null;
+            $shipping = (float) ($validated['shipping'] ?? 0);
+            $totals = $accounting->calculateDocumentTotals($validated['items'], $discount, $taxRate, $flatTax, $shipping);
+            $discount = $totals['discount'];
+            $taxAmount = $totals['tax_amount'];
+            $grandTotal = $totals['grand_total'];
+
+            $txDate = app(\App\Services\PurchaseAccountingService::class)
+                ->normalizeTransactionDate($validated['date'], (string)$quotation->date);
 
             $updateData = [
                 'customer_id'   => $validated['customer_id'] ?? null,
                 'customer_name' => $validated['customer_name'],
-                'warehouse_id'  => $validated['warehouse_id'] ?? $quotation->warehouse_id,
+                'warehouse_id'  => $resolvedWarehouseId,
                 'warehouse_name'=> $validated['warehouse_name'],
                 'date'          => $txDate,
                 'expiry_date'   => $expiryDate,
@@ -698,81 +1125,63 @@ class QuotationController extends Controller
             ];
 
 
-            $user = $request->user();
+            $authUser = \App\Models\User::resolveFromRequest($request) ?? $request->user() ?? auth()->user();
             if (!empty($validated['reference_no'])) {
                 $updateData['reference_no'] = $validated['reference_no'];
             }
-            if (!empty($validated['created_by'])) {
-                $updateData['created_by'] = $validated['created_by'];
-            } elseif (empty($quotation->created_by) && $user?->name) {
-                $updateData['created_by'] = $user->name;
-            }
-            if (!empty($validated['user_id'])) {
-                $updateData['user_id'] = $validated['user_id'];
-            } elseif (empty($quotation->user_id) && $user?->id) {
-                $updateData['user_id'] = $user->id;
-            }
-            if (!empty($validated['user_name'])) {
-                $updateData['user_name'] = $validated['user_name'];
-            } elseif (empty($quotation->user_name) && $user?->name) {
-                $updateData['user_name'] = $user->name;
-            }
-            if (!empty($validated['user_role'])) {
-                $updateData['user_role'] = $validated['user_role'];
-            } elseif (empty($quotation->user_role) && $user?->role) {
-                $updateData['user_role'] = $user->role;
+            if ($authUser && $authUser->exists) {
+                $effectiveRole = $authUser->role ?: ($authUser->roleModel?->name ?? 'Sales Staff');
+                if (empty($quotation->created_by) && $authUser->name) {
+                    $updateData['created_by'] = $authUser->name;
+                }
+                if (empty($quotation->user_id)) {
+                    $updateData['user_id'] = $authUser->id;
+                }
+                if (empty($quotation->user_name) && $authUser->name) {
+                    $updateData['user_name'] = $authUser->name;
+                }
+                if (empty($quotation->user_role) && $effectiveRole) {
+                    $updateData['user_role'] = $effectiveRole;
+                }
+            } else {
+                if (!empty($validated['created_by'])) {
+                    $updateData['created_by'] = $validated['created_by'];
+                }
+                if (!empty($validated['user_id'])) {
+                    $updateData['user_id'] = $validated['user_id'];
+                }
+                if (!empty($validated['user_name'])) {
+                    $updateData['user_name'] = $validated['user_name'];
+                }
+                if (!empty($validated['user_role'])) {
+                    $updateData['user_role'] = $validated['user_role'];
+                }
             }
 
             $quotation->update($updateData);
 
             // Replace items in batch
             $quotation->items()->delete();
-
-            $itemsData = [];
-            $now = now();
-            foreach ($validated['items'] as $item) {
-                $convRate = (float)($item['conversion_rate'] ?? 1.0);
-                if ($convRate <= 0) $convRate = 1.0;
-                $qty = (float)$item['quantity'];
-                $unitPrice = (float)$item['unit_price'];
-                $baseQty = isset($item['base_quantity']) ? (float)$item['base_quantity'] : ($qty * $convRate);
-                $basePrice = isset($item['base_unit_price']) ? (float)$item['base_unit_price'] : ($unitPrice / $convRate);
-
-                $itemTax = (float)($item['tax'] ?? 0);
-                $itemDiscount = (float)($item['discount'] ?? 0);
-                $lineSubtotal = round(max(0.0, ($qty * $unitPrice) - $itemDiscount + $itemTax), 2);
-
-                $itemsData[] = [
-                    'quotation_id' => $quotation->id,
-                    'product_id' => $item['product_id'] ?? null,
-                    'product_variant_id' => $item['product_variant_id'] ?? null,
-                    'unit_id' => $item['unit_id'] ?? null,
-                    'unit_name' => $item['unit_name'] ?? null,
-                    'conversion_rate' => $convRate,
-                    'product_code' => $item['product_code'],
-                    'product_name' => $item['product_name'],
-                    'variant_name' => $item['variant_name'] ?? null,
-                    'unit_price' => $unitPrice,
-                    'base_unit_price' => $basePrice,
-                    'quantity' => $qty,
-                    'base_quantity' => $baseQty,
-                    'tax' => $itemTax,
-                    'discount' => $itemDiscount,
-                    'subtotal' => $lineSubtotal,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ];
-            }
-
+            $itemsData = $this->buildQuotationItemRows($quotation->id, $validated['items'], $accounting, $unitService);
             QuotationItem::insert($itemsData);
 
             DB::commit();
+            $this->clearQuotationRelatedCaches();
+
+            $fresh = $quotation->fresh(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer', 'sale:id,quotation_id,reference_no']);
+            $accounting->enrichQuotationResponse($fresh, $accounting->canViewCost($request));
 
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation updated successfully',
-                'data' => $quotation->fresh(['items.variant.values', 'items.variant.attributeValues', 'items.product', 'customer']),
+                'data' => $fresh,
             ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            DB::rollBack();
+            return $e->getResponse();
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage() ?: 'Forbidden'], $e->getStatusCode());
         } catch (\Throwable $e) {
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
@@ -782,12 +1191,17 @@ class QuotationController extends Controller
     /**
      * Remove the specified quotation and all its child items.
      */
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
         $quotation = Quotation::find($id);
         if (!$quotation) {
             return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
         }
+        $this->purchaseAccounting()->assertOutletAccess(
+            $request,
+            $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
+            $quotation->warehouse_name
+        );
 
         // Commercial Audit Guard: Prevent deleting already converted quotation
         if ($quotation->status === 'Ordered') {
@@ -802,11 +1216,15 @@ class QuotationController extends Controller
             $quotation->items()->delete();
             $quotation->delete();
             DB::commit();
+            $this->clearQuotationRelatedCaches();
 
             return response()->json([
                 'status' => 'success',
                 'message' => 'Quotation deleted successfully',
             ]);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage() ?: 'Forbidden'], $e->getStatusCode());
         } catch (\Throwable $e) {
             DB::rollBack();
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
@@ -827,6 +1245,32 @@ class QuotationController extends Controller
      */
     public function convertToSale(Request $request, $id)
     {
+        $request->validate([
+            'sale_reference_no'          => 'nullable|string|max:100',
+            'payment_type'               => 'nullable|string|max:100',
+            'payment_status'             => 'nullable|string|in:Paid,Partial,Unpaid',
+            'paid_amount'                => 'nullable|numeric|min:0',
+            'received_amount'            => 'nullable|numeric|min:0',
+            'change_amount'              => 'nullable|numeric|min:0',
+            'cash_register_id'           => 'nullable|integer|min:1',
+            'manager_pin'                => 'nullable|string|max:50',
+            'payments'                   => 'nullable|array',
+            'payments.*.amount'          => 'required_with:payments|numeric|min:0.01',
+            'payments.*.payment_type'    => 'nullable|string|max:100',
+            'payments.*.received_amount' => 'nullable|numeric|min:0',
+            'payments.*.change_amount'   => 'nullable|numeric|min:0',
+            'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.notes'           => 'nullable|string',
+        ]);
+
+        if ($request->has('paid_amount') && $request->input('paid_amount') === null && $request->input('payment_status') !== 'Unpaid') {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'paid_amount cannot be null when provided. Pass 0 for Unpaid sales or omit the field to pay in full.',
+                'errors'  => ['paid_amount' => ['paid_amount cannot be null.']],
+            ], 422);
+        }
+
         DB::beginTransaction();
         try {
             // Pessimistic locking prevents race conditions / double conversion fraud
@@ -836,89 +1280,119 @@ class QuotationController extends Controller
                 return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
             }
 
+            // Guard against empty quotations with zero line items
+            if ($quotation->items->isEmpty()) {
+                DB::rollBack();
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Cannot convert an empty quotation with no line items.',
+                    'errors'  => ['items' => ['At least one quotation line item is required before converting to a Sale.']],
+                ], 422);
+            }
+
             // ── Commercial & Accounting Guards ────────────────────────────────────
-            // 1. Prevent duplicate conversion
-            if ($quotation->status === 'Ordered') {
+            $accounting = $this->accounting();
+            $purchaseAccounting = $this->purchaseAccounting();
+            $purchaseAccounting->assertOutletAccess(
+                $request,
+                $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
+                $quotation->warehouse_name
+            );
+            $blockReason = $accounting->conversionBlockReason($quotation);
+            if ($blockReason !== null) {
                 DB::rollBack();
                 return response()->json([
-                    'status'  => 'error',
-                    'message' => 'This quotation has already been converted to a sale and cannot be converted again.',
+                    'status' => 'error',
+                    'message' => $blockReason,
                 ], 422);
-            }
-
-            // 2. Prevent converting declined quotation
-            if ($quotation->status === 'Declined') {
-                DB::rollBack();
-                return response()->json([
-                    'status'  => 'error',
-                    'message' => 'Cannot convert a declined quotation to a sale.',
-                ], 422);
-            }
-
-            // 3. Prevent converting expired quotation (Financial Leakage prevention)
-            if ($quotation->status === 'Expired' || ($quotation->expiry_date && \Carbon\Carbon::parse($quotation->expiry_date)->endOfDay()->isPast())) {
-                DB::rollBack();
-                return response()->json([
-                    'status'  => 'error',
-                    'message' => 'Cannot convert an expired quotation to a sale. Please issue a new quotation with updated pricing.',
-                ], 422);
-            }
-
-            $salePrefix = Setting::get('sale_prefix', 'SA-');
-            if (empty($salePrefix)) {
-                $salePrefix = 'SA-';
-            }
-            if (!str_ends_with($salePrefix, '-') && !str_ends_with($salePrefix, '_')) {
-                $salePrefix .= '-';
-            }
-            $maxNum = (int)Sale::count();
-            $recent = Sale::where('reference_no', 'like', $salePrefix . '%')
-                ->orWhere('reference_no', 'like', 'SA-%')
-                ->orderBy('id', 'desc')->take(100)->get();
-            foreach ($recent as $s) {
-                if (preg_match('/(?:' . preg_quote($salePrefix, '/') . '|SA-)(\d+)/', (string)$s->reference_no, $m)) {
-                    $val = (int)$m[1];
-                    if ($val > $maxNum && $val < 99999999) {
-                        $maxNum = $val;
-                    }
-                }
-            }
-            $nextNum = $maxNum + 1;
-            $refNo = $salePrefix . sprintf('%07d', $nextNum);
-            while (Sale::where('reference_no', $refNo)->exists()) {
-                $nextNum++;
-                $refNo = $salePrefix . sprintf('%07d', $nextNum);
-            }
-            $paymentType = $request->input('payment_type', 'Cash');
-
-            // 🛡️ Financial Integrity: Overpayment handling & Change Amount
-            $grandTotal     = (float)$quotation->grand_total;
-            $rawPaid        = (float)($request->input('paid_amount', $grandTotal));
-            $receivedAmount = (float)($request->input('received_amount', $rawPaid));
-            $paidAmount     = min($grandTotal, max(0.0, $rawPaid));
-            $changeAmount   = (float)($request->input('change_amount', max(0.0, round($receivedAmount - $grandTotal, 2))));
-            $dueAmount      = max(0.0, round($grandTotal - $paidAmount, 2));
-            $paymentStatus  = $dueAmount <= 0.001 ? 'Paid' : ($paidAmount > 0.001 ? 'Partial' : 'Unpaid');
-
-            $subtotal = 0;
-            foreach ($quotation->items as $item) {
-                $subtotal += (float)$item->subtotal;
             }
 
             $unitService = app(ProductUnitConversionService::class);
             $fifoService = app(\App\Services\FifoInventoryService::class);
             $warehouseId = $unitService->warehouseId($quotation->warehouse_id, $quotation->warehouse_name);
 
-            // User & Cash Register Resolution
-            $authUser = \App\Models\User::resolveFromRequest($request) ?? $request->user();
-            $currentUserId = $authUser?->id ?? ($request->input('user_id') ?? $quotation->user_id);
-            $currentUserName = $request->input('created_by') ?? ($authUser?->name ?? ($quotation->user_name ?? ($quotation->created_by ?? 'Sales Staff')));
-            $currentUserRole = $authUser?->role ?? ($quotation->user_role ?? 'Cashier');
+            // Atomic sequential Sale reference code via shared ReferenceCounter trait
+            $refNo = $this->acquireUniqueReference(
+                'sale',
+                $request->input('sale_reference_no'),
+                $warehouseId ? (int)$warehouseId : ($quotation->warehouse_id ? (int)$quotation->warehouse_id : 0)
+            );
+            $paymentType = (string) $request->input('payment_type', 'Cash');
+            $paymentsInput = $request->input('payments');
+            $hasPaymentsArray = is_array($paymentsInput) && count($paymentsInput) > 0;
 
-            // 🛡️ Guard 1: Walk-in Customer Credit Policy Guard
+            // Server-side recalculation of quotation totals from stored line items (never trust stale header totals)
+            $explicitFlatTax = ((float)$quotation->tax_rate <= 0.0001 && (float)$quotation->tax_amount > 0)
+                ? (float)$quotation->tax_amount
+                : null;
+            $recalcTotals = $accounting->calculateDocumentTotals(
+                $quotation->items->map(fn($it) => [
+                    'quantity'   => (float)$it->quantity,
+                    'unit_price' => (float)$it->unit_price,
+                    'discount'   => (float)($it->discount ?? 0),
+                    'tax'        => (float)($it->tax ?? 0),
+                ])->all(),
+                (float)($quotation->discount ?? 0),
+                (float)($quotation->tax_rate ?? 0),
+                $explicitFlatTax,
+                (float)($quotation->shipping ?? 0)
+            );
+            $subtotal = $recalcTotals['items_subtotal'];
+            $recalcTaxAmount = $recalcTotals['tax_amount'];
+            $recalcDiscount = $recalcTotals['discount'];
+            $grandTotal = $recalcTotals['grand_total'];
+
+            // Financial Integrity: Overpayment handling, Split Payment reconciliation & non-negative Change Amount
+            if ($hasPaymentsArray) {
+                $paymentsSum = round(array_sum(array_map(
+                    fn ($p) => max(0.0, (float) ($p['amount'] ?? 0)),
+                    $paymentsInput
+                )), 2);
+                if ($request->filled('paid_amount')) {
+                    $explicitPaid = (float) $request->input('paid_amount');
+                    $clampedExplicitPaid = min($grandTotal, max(0.0, $explicitPaid));
+                    if (abs($paymentsSum - $explicitPaid) > 0.01 && abs($paymentsSum - $clampedExplicitPaid) > 0.01) {
+                        DB::rollBack();
+                        $msg = "Payments array total ({$paymentsSum}) does not match paid_amount ({$explicitPaid}).";
+                        return response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422);
+                    }
+                }
+                $rawPaid = $paymentsSum;
+            } elseif ($request->input('payment_status') === 'Unpaid') {
+                $rawPaid = 0.0;
+            } else {
+                $rawPaid = ($request->has('paid_amount') && $request->input('paid_amount') !== null)
+                    ? (float) $request->input('paid_amount')
+                    : $grandTotal;
+            }
+            $paidAmount     = min($grandTotal, max(0.0, $rawPaid));
+            $receivedAmount = ($request->has('received_amount') && $request->input('received_amount') !== null)
+                ? max($paidAmount, (float) $request->input('received_amount'))
+                : max($paidAmount, $rawPaid);
+            $changeAmount   = max(0.0, round($receivedAmount - $paidAmount, 2));
+            $dueAmount      = max(0.0, round($grandTotal - $paidAmount, 2));
+            $paymentStatus  = $dueAmount <= 0.001 ? 'Paid' : ($paidAmount > 0.001 ? 'Partial' : 'Unpaid');
+
+            // User & Cash Register Resolution (prioritize authenticated actor over request-body hints)
+            $authUser = \App\Models\User::resolveFromRequest($request) ?? $request->user() ?? auth()->user();
+            if ($authUser && $authUser->exists) {
+                $currentUserId = $authUser->id;
+                $currentUserName = $authUser->name ?: ($quotation->user_name ?? ($quotation->created_by ?? 'Sales Staff'));
+                $currentUserRole = $authUser->role ?: ($authUser->roleModel?->name ?? ($quotation->user_role ?? 'Cashier'));
+            } else {
+                $currentUserId = $request->input('user_id') ?? $quotation->user_id;
+                $currentUserName = $request->input('created_by') ?? ($quotation->user_name ?? ($quotation->created_by ?? 'Sales Staff'));
+                $currentUserRole = $request->input('user_role') ?? ($quotation->user_role ?? 'Cashier');
+            }
+
+            // 🛡️ Guard 1: Walk-in / Anonymous Customer Credit Policy Guard
             $cId = $quotation->customer_id;
             $cName = strtolower(trim((string)($quotation->customer_name ?? '')));
-            $isWalkIn = str_contains($cName, 'walk-in') || str_contains($cName, 'walk in');
+            $isWalkIn = str_contains($cName, 'walk-in') || str_contains($cName, 'walk in') || empty($cId);
             if (!$isWalkIn && $cId) {
                 $cObj = Customer::find($cId);
                 if ($cObj && (str_contains(strtolower($cObj->name), 'walk-in') || str_contains(strtolower($cObj->name), 'walk in'))) {
@@ -927,7 +1401,7 @@ class QuotationController extends Controller
             }
             if ($isWalkIn && ($paymentStatus === 'Unpaid' || $paymentStatus === 'Partial' || $dueAmount > 0.01)) {
                 DB::rollBack();
-                $msg = 'Walk-in Customer များအတွက် အကြွေး (Unpaid / Partial) ဖြင့် ရောင်းချခွင့်မပြုပါ။ ငွေအပြည့်အကျေ ပေးချေရပါမည်။';
+                $msg = 'Walk-in / unregistered customer များအတွက် အကြွေး (Unpaid / Partial) ဖြင့် ရောင်းချခွင့်မပြုပါ။ ငွေအပြည့်အကျေ ပေးချေရပါမည်။';
                 return response()->json([
                     'status' => 'error',
                     'message' => $msg,
@@ -935,9 +1409,9 @@ class QuotationController extends Controller
                 ], 422);
             }
 
-            // 🛡️ Guard 2: Customer Credit Limit Guard (for non-walk-in credit sales)
+            // 🛡️ Guard 2: Customer Credit Limit Guard (locked to prevent concurrent credit limit breaches)
             if (!$isWalkIn && $cId && $dueAmount > 0.01) {
-                $custObj = Customer::find($cId);
+                $custObj = Customer::where('id', $cId)->lockForUpdate()->first();
                 if ($custObj && $custObj->credit_limit !== null && (float)$custObj->credit_limit > 0) {
                     $existingDueQuery = Sale::where('customer_id', $custObj->id);
                     Customer::applyReceivableScope($existingDueQuery);
@@ -960,18 +1434,46 @@ class QuotationController extends Controller
                 }
             }
 
-            $cashRegisterId = $request->input('cash_register_id');
-            if (!$cashRegisterId && $warehouseId) {
-                $regQuery = CashRegister::where('status', 'open')->where('warehouse_id', $warehouseId);
-                if ($currentUserId) {
-                    $userReg = (clone $regQuery)->where('user_id', $currentUserId)->latest()->first();
-                    if ($userReg) {
-                        $cashRegisterId = $userReg->id;
-                    }
+            $cashRegisterId = $request->filled('cash_register_id') ? (int) $request->input('cash_register_id') : null;
+            if ($cashRegisterId !== null) {
+                $explicitRegister = CashRegister::where('id', $cashRegisterId)->lockForUpdate()->first();
+                if (!$explicitRegister || !in_array(strtolower(trim((string) $explicitRegister->status)), ['open', 'opened'], true)) {
+                    DB::rollBack();
+                    $msg = 'Selected cash register is closed or does not exist. Please select an open cash register.';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['cash_register_id' => [$msg]],
+                    ], 422);
                 }
-                if (!$cashRegisterId) {
-                    $anyReg = $regQuery->latest()->first();
-                    $cashRegisterId = $anyReg?->id;
+                if ($warehouseId && $explicitRegister->warehouse_id && (int)$explicitRegister->warehouse_id !== (int)$warehouseId) {
+                    DB::rollBack();
+                    $msg = 'Selected cash register belongs to a different warehouse/branch than the quotation.';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['cash_register_id' => [$msg]],
+                    ], 422);
+                }
+                $isManagerActor = in_array(strtolower((string)$currentUserRole), ['super admin', 'admin', 'manager'], true)
+                    || ($authUser?->isSuperAdmin() ?? false);
+                if (!$isManagerActor && $explicitRegister->user_id && $currentUserId && (int)$explicitRegister->user_id !== (int)$currentUserId) {
+                    DB::rollBack();
+                    $msg = 'You cannot post transactions to another staff member\'s open cash register.';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['cash_register_id' => [$msg]],
+                    ], 422);
+                }
+            } elseif ($warehouseId && $currentUserId) {
+                $userReg = CashRegister::whereIn('status', ['open', 'Open', 'opened'])
+                    ->where('warehouse_id', $warehouseId)
+                    ->where('user_id', $currentUserId)
+                    ->latest()
+                    ->first();
+                if ($userReg) {
+                    $cashRegisterId = $userReg->id;
                 }
             }
 
@@ -994,6 +1496,33 @@ class QuotationController extends Controller
                 ->get();
             $productsById = $productsMap->keyBy('id');
             $productsByCode = $productsMap->keyBy('code');
+
+            // 🛡️ Guard 2b: Strictly require every converted line item to map to a real catalog Product & concrete Variant
+            foreach ($quotation->items as $it) {
+                $prod = (!empty($it->product_id) && isset($productsById[$it->product_id]))
+                    ? $productsById[$it->product_id]
+                    : ($productsByCode[$it->product_code] ?? null);
+                if (!$prod) {
+                    $msg = "Cannot convert quotation item '{$it->product_name}': linked catalog product was not found (would cause missing COGS and un-tracked stock).";
+                    DB::rollBack();
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['items' => [$msg]],
+                    ], 422);
+                }
+                $vId = !empty($it->product_variant_id) ? (int) $it->product_variant_id : null;
+                $hasAnyVariants = $prod->has_variants || ($prod->relationLoaded('variants') ? $prod->variants->isNotEmpty() : $prod->variants()->exists());
+                if ($hasAnyVariants && empty($vId)) {
+                    $msg = "Product '{$prod->name}' has variants. Please select a specific variation before converting to a Sale.";
+                    DB::rollBack();
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['items' => [$msg], 'product_variant_id' => [$msg]],
+                    ], 422);
+                }
+            }
 
             // 🛡️ Guard 3: Below-Cost Selling Guard
             $managerPin = $request->input('manager_pin');
@@ -1018,7 +1547,9 @@ class QuotationController extends Controller
 
                     $cRate = (float)($it->conversion_rate ?? 1.0);
                     if ($cRate <= 0) $cRate = 1.0;
-                    $bQty = (float)$it->quantity * $cRate;
+                    $bQty = ($it->base_quantity !== null && (float)$it->base_quantity > 0)
+                        ? (float)$it->base_quantity
+                        : round((float)$it->quantity * $cRate, 4);
                     $totalEstimatedBaseCost += ($bQty * $costPrice);
 
                     $sub = (float)$it->subtotal;
@@ -1040,10 +1571,15 @@ class QuotationController extends Controller
                     }
                 }
 
-                // Check Order-Level Discount Below-Cost
+                // Check Order-Level Discount Below-Cost (exclude both order tax and item-level taxes from net merchandise revenue)
                 $orderDiscount = (float)($quotation->discount ?? 0);
-                $taxExclusiveBaseTotal = max(0.0, (float)$quotation->grand_total - (float)$quotation->tax_amount - (float)$quotation->shipping + $orderDiscount);
-                $orderNetRevenue = max(0.0, $taxExclusiveBaseTotal - $orderDiscount);
+                // Sum tax-exclusive net line revenues directly (excluding item-level taxes & shipping).
+                $taxExclusiveBaseTotal = (float)$quotation->items->sum(function ($it) {
+                    $gross = (float)$it->quantity * (float)$it->unit_price;
+                    $itemDisc = max(0.0, (float)($it->discount ?? 0));
+                    return round(max(0.0, $gross - $itemDisc), 2);
+                });
+                $orderNetRevenue = max(0.0, round($taxExclusiveBaseTotal - $orderDiscount, 2));
                 if ($totalEstimatedBaseCost > 0 && $orderNetRevenue < ($totalEstimatedBaseCost - 0.01)) {
                     $costStr = number_format($totalEstimatedBaseCost, 2);
                     $revStr = number_format($orderNetRevenue, 2);
@@ -1068,7 +1604,9 @@ class QuotationController extends Controller
 
                     $cRate = (float)($it->conversion_rate ?? 1.0);
                     if ($cRate <= 0) $cRate = 1.0;
-                    $bQty = (float)$it->quantity * $cRate;
+                    $bQty = ($it->base_quantity !== null && (float)$it->base_quantity > 0)
+                        ? (float)$it->base_quantity
+                        : round((float)$it->quantity * $cRate, 4);
                     $vId = !empty($it->product_variant_id) ? (int)$it->product_variant_id : null;
                     $aggKey = $prod->id . '_' . ($vId ?? '0');
 
@@ -1091,6 +1629,12 @@ class QuotationController extends Controller
                     ->get()
                     ->keyBy(fn($sb) => $sb->product_id . '_' . ($sb->product_variant_id ?? '0'));
 
+                $existingBalanceProductIds = \App\Models\StockBalance::whereIn('product_id', $reqProductIds)
+                    ->distinct()
+                    ->pluck('product_id')
+                    ->flip()
+                    ->all();
+
                 foreach ($requiredStockByItem as $req) {
                     $prod = $req['product'];
                     $vId = $req['variant_id'];
@@ -1098,7 +1642,10 @@ class QuotationController extends Controller
 
                     $balKey = $prod->id . '_' . ($vId ?? '0');
                     $sb = $stockBalances->get($balKey);
-                    $available = $sb !== null ? (float)$sb->quantity : (float)$prod->stock_quantity;
+                    $hasAnyWarehouseBalance = isset($existingBalanceProductIds[$prod->id]);
+                    $available = $sb !== null
+                        ? (float)$sb->quantity
+                        : ($vId === null && !$hasAnyWarehouseBalance ? (float)$prod->stock_quantity : 0.0);
 
                     if ($totalBaseNeeded > $available + 0.0001) {
                         $varName = '';
@@ -1127,10 +1674,10 @@ class QuotationController extends Controller
                 'date'             => date('Y-m-d H:i:s'),
                 'status'           => 'Completed',
                 'tax_rate'         => (float)$quotation->tax_rate,
-                'tax_amount'       => (float)$quotation->tax_amount,
-                'discount'         => (float)$quotation->discount,
+                'tax_amount'       => $recalcTaxAmount,
+                'discount'         => $recalcDiscount,
                 'shipping'         => (float)$quotation->shipping,
-                'subtotal'         => $subtotal > 0 ? $subtotal : $grandTotal,
+                'subtotal'         => $subtotal,
                 'grand_total'      => $grandTotal,
                 'paid_amount'      => $paidAmount,
                 'due_amount'       => $dueAmount,
@@ -1166,6 +1713,7 @@ class QuotationController extends Controller
                 $basePrice = $item->base_unit_price !== null && (float)$item->base_unit_price > 0
                     ? (float)$item->base_unit_price
                     : ($unitPrice / $convRate);
+                $lineSubtotal = round(max(0.0, ($unitPrice * $qty) - (float)$item->discount + (float)$item->tax), 2);
 
                 $saleItem = SaleItem::create([
                     'sale_id'            => $sale->id,
@@ -1183,7 +1731,7 @@ class QuotationController extends Controller
                     'quantity'           => $qty,
                     'tax'                => (float)$item->tax,
                     'discount'           => (float)$item->discount,
-                    'subtotal'           => (float)$item->subtotal,
+                    'subtotal'           => $lineSubtotal,
                     'base_unit_cost'     => 0,
                     'total_cogs'         => 0,
                 ]);
@@ -1250,29 +1798,98 @@ class QuotationController extends Controller
                 $sale->update(['total_cogs' => round($totalSaleCogs, 2)]);
             }
 
-            // Record Sale Payment transaction
-            if ($paidAmount > 0) {
+            // Record Sale Payment transaction(s) — allocate non-cash legs before cash so cash excess never displaces card/digital tenders
+            $cashAddedToRegister = 0.0;
+            if ($hasPaymentsArray) {
+                $runningRemainingDue = (float) $grandTotal;
+                $nonCashIndices = [];
+                $cashIndices = [];
+                foreach ($paymentsInput as $idx => $p) {
+                    $pTypeTmp = (string)($p['payment_type'] ?? $paymentType);
+                    if ($purchaseAccounting->isCashPaymentType($pTypeTmp)) {
+                        $cashIndices[] = $idx;
+                    } else {
+                        $nonCashIndices[] = $idx;
+                    }
+                }
+                $allocatedLines = [];
+                foreach (array_merge($nonCashIndices, $cashIndices) as $idx) {
+                    $p = $paymentsInput[$idx];
+                    $rawAmount = (float) ($p['amount'] ?? 0);
+                    if ($rawAmount <= 0) {
+                        continue;
+                    }
+                    $netAmount = min($runningRemainingDue, $rawAmount);
+                    $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmount, 2));
+                    $pType = (string) ($p['payment_type'] ?? $paymentType);
+                    $recAmt = isset($p['received_amount']) ? max($netAmount, (float) $p['received_amount']) : $rawAmount;
+                    $chgAmt = max(0.0, round($recAmt - $netAmount, 2));
+                    if ($netAmount <= 0 && count($paymentsInput) > 1 && $chgAmt <= 0.001) {
+                        continue;
+                    }
+                    $allocatedLines[$idx] = [
+                        'p' => $p,
+                        'payment_type' => $pType,
+                        'amount' => $netAmount,
+                        'received_amount' => $recAmt,
+                        'change_amount' => $chgAmt,
+                    ];
+                }
+                ksort($allocatedLines);
+                foreach ($allocatedLines as $idx => $line) {
+                    $p = $line['p'];
+                    $lineIsCash = $purchaseAccounting->isCashPaymentType($line['payment_type']);
+                    $lineRegId = !empty($p['cash_register_id'])
+                        ? (int)$p['cash_register_id']
+                        : ($lineIsCash ? $cashRegisterId : null);
+                    SalePayment::create([
+                        'sale_id'          => $sale->id,
+                        'cash_register_id' => $lineRegId,
+                        'reference_no'     => 'PAY-' . date('YmdHis') . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT) . '-' . ($idx + 1),
+                        'payment_date'     => $p['payment_date'] ?? $sale->date,
+                        'payment_type'     => $line['payment_type'],
+                        'amount'           => $line['amount'],
+                        'received_amount'  => $line['received_amount'],
+                        'change_amount'    => $line['change_amount'],
+                        'notes'            => $p['notes'] ?? 'Quotation conversion (' . ($paymentType === 'Split Payment' ? 'Split payment line' : $line['payment_type']) . '): ' . $quotation->reference_no,
+                        'created_by'       => $currentUserName,
+                        'user_id'          => $currentUserId,
+                        'user_name'        => $currentUserName,
+                        'user_role'        => $currentUserRole,
+                    ]);
+
+                    if ($lineIsCash) {
+                        $cashAddedToRegister += $line['amount'];
+                    }
+                }
+            } elseif ($paidAmount > 0) {
+                $singleIsCash = $purchaseAccounting->isCashPaymentType($paymentType);
                 SalePayment::create([
-                    'sale_id'         => $sale->id,
-                    'reference_no'    => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
-                    'payment_date'    => $sale->date,
-                    'payment_type'    => $paymentType,
-                    'amount'          => $paidAmount,
-                    'received_amount' => $receivedAmount,
-                    'change_amount'   => $changeAmount,
-                    'notes'           => 'Quotation conversion: ' . $quotation->reference_no,
-                    'created_by'      => $currentUserName,
-                    'user_id'         => $currentUserId,
-                    'user_name'       => $currentUserName,
-                    'user_role'       => $currentUserRole,
+                    'sale_id'          => $sale->id,
+                    'cash_register_id' => $singleIsCash ? $cashRegisterId : null,
+                    'reference_no'     => 'PAY-' . date('YmdHis') . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT),
+                    'payment_date'     => $sale->date,
+                    'payment_type'     => $paymentType,
+                    'amount'           => $paidAmount,
+                    'received_amount'  => $receivedAmount,
+                    'change_amount'    => $changeAmount,
+                    'notes'            => 'Quotation conversion: ' . $quotation->reference_no,
+                    'created_by'       => $currentUserName,
+                    'user_id'          => $currentUserId,
+                    'user_name'        => $currentUserName,
+                    'user_role'        => $currentUserRole,
                 ]);
 
-                // Increment Cash Register only with actual net cash paid (not inflated by customer change)
-                if (strtolower(trim($paymentType)) === 'cash' && $cashRegisterId) {
-                    $register = CashRegister::find($cashRegisterId);
-                    if ($register && $register->status === 'open') {
-                        $register->increment('expected_cash', $paidAmount);
-                    }
+                if ($singleIsCash) {
+                    $cashAddedToRegister += $paidAmount;
+                }
+            }
+
+            // Increment Cash Register strictly by net Cash tender received (never inflated by change or non-cash tenders)
+            if ($cashAddedToRegister > 0.001 && $cashRegisterId) {
+                $register = CashRegister::where('id', $cashRegisterId)->lockForUpdate()->first();
+                if ($register && in_array(strtolower(trim((string) $register->status)), ['open', 'opened'], true)) {
+                    $register->increment('expected_cash', round($cashAddedToRegister, 2));
                 }
             }
 
@@ -1290,19 +1907,41 @@ class QuotationController extends Controller
 
             DB::commit();
 
-            $this->clearQuotationRelatedCaches();
+            $this->clearQuotationRelatedCaches(true);
+
+            $canViewCost = $accounting->canViewCost($request);
+            $loadedSale = $sale->load(['items.product', 'items.variant', 'payments']);
+            if (!$canViewCost) {
+                $loadedSale->makeHidden(['total_cogs']);
+                foreach ($loadedSale->items as $sItem) {
+                    $sItem->makeHidden(['base_unit_cost', 'total_cogs']);
+                    if ($sItem->relationLoaded('product') && $sItem->product) {
+                        $sItem->product->makeHidden(['cost_price', 'purchase_price']);
+                    }
+                    if ($sItem->relationLoaded('variant') && $sItem->variant) {
+                        $sItem->variant->makeHidden(['cost_price', 'purchase_price', 'cost']);
+                    }
+                }
+            }
+            $loadedQuo = $accounting->enrichQuotationResponse(
+                $quotation->fresh(['items.variant.values', 'items.variant.attributeValues', 'items.product']),
+                $canViewCost
+            );
 
             return response()->json([
                 'status'  => 'success',
                 'message' => 'Quotation successfully converted to Sale ' . $sale->reference_no,
                 'data'    => [
-                    'sale'      => $sale->load('items'),
-                    'quotation' => $quotation->fresh('items'),
+                    'sale'      => $loadedSale,
+                    'quotation' => $loadedQuo,
                 ],
             ], 201);
         } catch (\Illuminate\Validation\ValidationException $e) {
             DB::rollBack();
             return $e->getResponse();
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            DB::rollBack();
+            return response()->json(['status' => 'error', 'message' => $e->getMessage() ?: 'Forbidden'], $e->getStatusCode());
         } catch (\Throwable $e) {
             DB::rollBack();
             $statusCode = 500;
@@ -1320,15 +1959,9 @@ class QuotationController extends Controller
     }
 
     /**
-     * Clear application caches related to quotations, inventory, and sales.
+     * Zero-cache mode compatibility hook: quotations, sales, and reports query live DB.
      */
-    private function clearQuotationRelatedCaches(): void
+    private function clearQuotationRelatedCaches(bool $convertedToSale = false): void
     {
-        try {
-            \Illuminate\Support\Facades\Cache::forget('pos_init_data');
-            \Illuminate\Support\Facades\Cache::forget('products_cache');
-            \Illuminate\Support\Facades\Cache::forget('dashboard_kpi');
-            \Illuminate\Support\Facades\Cache::forget('sales_reports');
-        } catch (\Throwable $e) {}
     }
 }

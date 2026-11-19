@@ -340,10 +340,7 @@ class ProductExcelController extends Controller
                 }
             });
 
-            // Flush product search cache so newly imported items are immediately searchable
-            try {
-                \Illuminate\Support\Facades\Cache::store('file')->flush();
-            } catch (\Throwable $e) {}
+            \App\Http\Resources\ProductListResource::clearStaticCache();
         } catch (\Throwable $e) {
             return response()->json([
                 'status' => 'error',
@@ -642,10 +639,7 @@ class ProductExcelController extends Controller
             }
         });
 
-        // Flush product cache so new prices reflect immediately on POS searches
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
+        \App\Http\Resources\ProductListResource::clearStaticCache();
 
         return response()->json([
             'status' => 'success',
@@ -714,6 +708,9 @@ class ProductExcelController extends Controller
         $sheet->getRowDimension(1)->setRowHeight(28);
         $sheet->freezePane('A2'); // Freeze top row
 
+        $authUser = \App\Models\User::resolveFromRequest($request);
+        $canViewCost = $authUser ? $authUser->hasPermission('products.view_cost') : false;
+
         $currentRow = 2;
 
         foreach ($products as $p) {
@@ -762,7 +759,7 @@ class ProductExcelController extends Controller
                     $sheet->setCellValue("I{$currentRow}", $saleUnit);
                     $sheet->setCellValue("J{$currentRow}", $purchLinks);
                     $sheet->setCellValue("K{$currentRow}", $saleLinks);
-                    $sheet->setCellValue("L{$currentRow}", $vCost);
+                    $sheet->setCellValue("L{$currentRow}", $canViewCost ? $vCost : '');
                     $sheet->setCellValue("M{$currentRow}", $vRetail);
                     $sheet->setCellValue("N{$currentRow}", $vWholesale);
                     $sheet->setCellValue("O{$currentRow}", (float)($p->stock_alert ?: 10));
@@ -786,7 +783,7 @@ class ProductExcelController extends Controller
                 $sheet->setCellValue("I{$currentRow}", $saleUnit);
                 $sheet->setCellValue("J{$currentRow}", $purchLinks);
                 $sheet->setCellValue("K{$currentRow}", $saleLinks);
-                $sheet->setCellValue("L{$currentRow}", (float)$p->cost_price);
+                $sheet->setCellValue("L{$currentRow}", $canViewCost ? (float)$p->cost_price : '');
                 $sheet->setCellValue("M{$currentRow}", (float)$p->retail_price);
                 $sheet->setCellValue("N{$currentRow}", (float)$p->wholesale_price);
                 $sheet->setCellValue("O{$currentRow}", (float)($p->stock_alert ?: 10));
@@ -825,7 +822,7 @@ class ProductExcelController extends Controller
         $type = $request->input('type', 'import');
 
         if ($type === 'price_change') {
-            $format = strtolower((string)$request->input('format', 'csv'));
+            $format = strtolower((string)$request->input('format', 'xlsx'));
             $headers = [
                 'Product Code',
                 'Product Name',
@@ -942,6 +939,9 @@ class ProductExcelController extends Controller
 
             // Option to prefill with current products catalog
             $prefill = $request->boolean('prefill', true);
+            $authUser = \App\Models\User::resolveFromRequest($request);
+            $canViewCost = $authUser ? $authUser->hasPermission('products.view_cost') : false;
+
             $currentRow = 2;
 
             if ($prefill) {
@@ -969,8 +969,8 @@ class ProductExcelController extends Controller
                             $sheet->setCellValue("B{$currentRow}", $p->name);
                             $sheet->setCellValue("C{$currentRow}", $varName);
                             $sheet->setCellValue("D{$currentRow}", $varType);
-                            $sheet->setCellValue("E{$currentRow}", $vCost);
-                            $sheet->setCellValue("F{$currentRow}", $vCost);
+                            $sheet->setCellValue("E{$currentRow}", $canViewCost ? $vCost : '');
+                            $sheet->setCellValue("F{$currentRow}", $canViewCost ? $vCost : '');
                             $sheet->setCellValue("G{$currentRow}", $vRetail);
                             $sheet->setCellValue("H{$currentRow}", $vRetail);
                             $sheet->setCellValue("I{$currentRow}", $vWholesale);
@@ -986,8 +986,8 @@ class ProductExcelController extends Controller
                         $sheet->setCellValue("B{$currentRow}", $p->name);
                         $sheet->setCellValue("C{$currentRow}", '-');
                         $sheet->setCellValue("D{$currentRow}", '-');
-                        $sheet->setCellValue("E{$currentRow}", $cost);
-                        $sheet->setCellValue("F{$currentRow}", $cost);
+                        $sheet->setCellValue("E{$currentRow}", $canViewCost ? $cost : '');
+                        $sheet->setCellValue("F{$currentRow}", $canViewCost ? $cost : '');
                         $sheet->setCellValue("G{$currentRow}", $retail);
                         $sheet->setCellValue("H{$currentRow}", $retail);
                         $sheet->setCellValue("I{$currentRow}", $wholesale);
@@ -1190,7 +1190,7 @@ class ProductExcelController extends Controller
                 $map['variation_type'] = $index;
             } elseif (in_array($clean, ['current cost', 'current cost price', 'old cost'])) {
                 $map['current_cost'] = $index;
-            } elseif (in_array($clean, ['new cost price', 'new cost', 'cost price', 'cost'])) {
+            } elseif (in_array($clean, ['new cost price', 'new cost', 'cost price', 'cost', 'product cost', 'product_cost'])) {
                 $map['new_cost'] = $index;
             } elseif (in_array($clean, ['current retail price', 'current price', 'old price', 'current retail'])) {
                 $map['current_retail'] = $index;

@@ -85,8 +85,6 @@ class SampleProductSeeder extends Seeder
                     'stock_quantity' => $pData['stock'],
                     'is_active' => true,
                     'status' => 'Active',
-                    'is_bot_available' => true,
-                    'bot_price' => $pData['bot_price'],
                     'description' => $pData['desc'],
                 ]
             );

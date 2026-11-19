@@ -44,6 +44,28 @@ class UserController extends Controller
      */
     public function index(Request $request)
     {
+        if ($request->boolean('compact')) {
+            $users = User::query()
+                ->select(['id', 'user_id', 'name', 'role', 'branch', 'status'])
+                ->when($request->filled('search'), function ($q) use ($request) {
+                    $search = $request->input('search');
+                    $q->where(function ($sub) use ($search) {
+                        $sub->where('name', 'like', "%{$search}%")
+                            ->orWhere('user_id', 'like', "%{$search}%")
+                            ->orWhere('role', 'like', "%{$search}%");
+                    });
+                })
+                ->when($request->filled('role'), fn ($q) => $q->where('role', $request->input('role')))
+                ->when($request->filled('branch'), fn ($q) => $q->where('branch', $request->input('branch')))
+                ->orderBy('id', 'asc')
+                ->get();
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $users,
+            ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        }
+
         $query = User::with(['roleModel', 'outlets'])
             ->withCount(['sales', 'purchases', 'expenses', 'cashRegisters', 'stockAdjustments']);
 

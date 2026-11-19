@@ -9,6 +9,13 @@ class StockAdjustmentItem extends Model
 {
     use HasFactory;
 
+    protected static function booted(): void
+    {
+        $invalidate = static fn () => StockAdjustment::invalidateListCache();
+        static::saved($invalidate);
+        static::deleted($invalidate);
+    }
+
     protected $fillable = [
         'stock_adjustment_id',
         'product_id',
@@ -52,5 +59,10 @@ class StockAdjustmentItem extends Model
     public function variant()
     {
         return $this->belongsTo(ProductVariant::class, 'product_variant_id');
+    }
+
+    public function costLayers()
+    {
+        return $this->hasMany(AdjustmentItemCostLayer::class, 'stock_adjustment_item_id');
     }
 }

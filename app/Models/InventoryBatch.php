@@ -59,4 +59,14 @@ class InventoryBatch extends Model
     {
         return $this->hasMany(SaleItemCostLayer::class, 'inventory_batch_id');
     }
+
+    public function adjustmentCostLayers(): HasMany
+    {
+        return $this->hasMany(AdjustmentItemCostLayer::class, 'inventory_batch_id');
+    }
+
+    public function processingCostLayers(): HasMany
+    {
+        return $this->hasMany(ProcessingItemCostLayer::class, 'inventory_batch_id');
+    }
 }

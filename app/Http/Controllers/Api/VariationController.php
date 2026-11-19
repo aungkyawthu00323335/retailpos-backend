@@ -3,50 +3,110 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\ProductVariant;
+use App\Models\ProductVariantValue;
 use App\Models\Variation;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class VariationController extends Controller
 {
+    private const CACHE_KEY = 'api_variations_list';
+    private const CACHE_TTL_SECONDS = 300;
+
     /**
      * Display a listing of variations.
      */
     public function index(Request $request)
     {
-        $query = Variation::query();
-
-        if ($request->filled('search')) {
-            $search = trim($request->input('search'));
-            $query->where('name', 'like', "%{$search}%");
-        }
-
-        if ($request->filled('status') && $request->input('status') !== 'All') {
-            $query->where('status', $request->input('status'));
-        }
-
+        $hasSearch = $request->filled('search');
+        $hasStatus = $request->filled('status') && $request->input('status') !== 'All';
         $sortBy = $request->input('sort_by', 'id');
-        $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
-        if (in_array($sortBy, ['id', 'name', 'status', 'created_at'])) {
-            $query->orderBy($sortBy, $sortOrder);
-        } else {
-            $query->orderBy('id', 'desc');
+        $sortOrder = strtolower((string) $request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $isDefaultSort = $sortBy === 'id' && $sortOrder === 'desc';
+
+        if (! $hasSearch && ! $hasStatus && $isDefaultSort) {
+            $variations = $this->formatListingRows(
+                $this->buildListingQuery('id', 'desc')->get()
+            );
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $variations,
+            ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
         }
 
-        $variations = $query->get();
+        $query = $this->buildListingQuery($sortBy, $sortOrder);
 
-        $productCounts = \App\Models\ProductVariantValue::join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
-            ->select('product_variant_values.attribute_name', \DB::raw('COUNT(DISTINCT product_variants.product_id) as count'))
-            ->groupBy('product_variant_values.attribute_name')
-            ->pluck('count', 'attribute_name');
+        if ($hasSearch) {
+            $search = trim((string) $request->input('search'));
+            $query->where('v.name', 'like', "%{$search}%");
+        }
 
-        foreach ($variations as $v) {
-            $v->products_count = (int)($productCounts[$v->name] ?? 0);
+        if ($hasStatus) {
+            $query->where('v.status', $request->input('status'));
         }
 
         return response()->json([
             'status' => 'success',
-            'data' => $variations,
+            'data' => $this->formatListingRows($query->get()),
         ]);
+    }
+
+    private function buildListingQuery(string $sortBy, string $sortOrder)
+    {
+        $productCountsSub = DB::table('product_variant_values as pvv')
+            ->join('product_variants as pv', 'pvv.product_variant_id', '=', 'pv.id')
+            ->selectRaw('pvv.attribute_name, COUNT(DISTINCT pv.product_id) as products_count')
+            ->whereNull('pv.deleted_at')
+            ->groupBy('pvv.attribute_name');
+
+        $query = DB::table('variations as v')
+            ->leftJoinSub($productCountsSub, 'var_counts', function ($join) {
+                $join->on('v.name', '=', 'var_counts.attribute_name');
+            })
+            ->select([
+                'v.id',
+                'v.name',
+                'v.variation_types',
+                'v.status',
+                'v.created_at',
+                'v.updated_at',
+                DB::raw('COALESCE(var_counts.products_count, 0) as products_count'),
+            ]);
+
+        if (in_array($sortBy, ['id', 'name', 'status', 'created_at'], true)) {
+            $query->orderBy("v.{$sortBy}", $sortOrder);
+        } else {
+            $query->orderByDesc('v.id');
+        }
+
+        return $query;
+    }
+
+    private function formatListingRows($rows): array
+    {
+        return collect($rows)->map(static function ($row) {
+            $types = is_array($row->variation_types)
+                ? $row->variation_types
+                : (json_decode((string) ($row->variation_types ?? '[]'), true) ?: []);
+
+            return [
+                'id' => (int) $row->id,
+                'name' => $row->name,
+                'variation_types' => array_values($types),
+                'status' => $row->status,
+                'products_count' => (int) ($row->products_count ?? 0),
+                'created_at' => $row->created_at,
+                'updated_at' => $row->updated_at,
+            ];
+        })->all();
+    }
+
+    private function clearListCache(): void
+    {
+        Cache::forget(self::CACHE_KEY);
     }
 
     /**
@@ -66,6 +126,8 @@ class VariationController extends Controller
             'variation_types' => array_values(array_unique(array_map('trim', $validated['variation_types']))),
             'status' => $validated['status'] ?? 'Active',
         ]);
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -223,6 +285,8 @@ class VariationController extends Controller
             }
         });
 
+        $this->clearListCache();
+
         return response()->json([
             'status' => 'success',
             'message' => 'Variation and connected product variants updated successfully',
@@ -242,6 +306,8 @@ class VariationController extends Controller
 
         $variation->status = ($variation->status === 'Active') ? 'Inactive' : 'Active';
         $variation->save();
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',
@@ -270,6 +336,8 @@ class VariationController extends Controller
         }
 
         $variation->delete();
+
+        $this->clearListCache();
 
         return response()->json([
             'status' => 'success',

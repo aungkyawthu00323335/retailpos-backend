@@ -18,21 +18,59 @@ use App\Http\Requests\StoreProductRequest;
 use App\Http\Resources\ProductResource;
 use App\Http\Resources\ProductListResource;
 use App\Services\ProductCreateService;
+use App\Support\ListCursorHelper;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
 class ProductController extends Controller
 {
+    private function invalidateProductCaches(): void
+    {
+        \App\Http\Resources\ProductListResource::clearStaticCache();
+    }
+
     public function index(Request $request)
     {
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
             : null;
+        $isPos = $request->boolean('is_pos') || $request->filled('for_pos') || $request->boolean('all_pages');
+        $isCompactList = !$isPos && $request->boolean('compact_list', false);
 
         // The list only needs summary fields and the primary image. Full
         // variants/images/unit links are loaded by show() for Details/Edit.
+        $relations = [
+            'primaryImage:id,product_id,disk,path,is_primary,sort_order',
+        ];
+        if ($isCompactList) {
+            $relations['variants'] = fn ($q) => $q->select([
+                'id', 'product_id', 'name', 'sku', 'barcode',
+                'cost_price', 'selling_price', 'wholesale_price',
+                'is_active', 'sort_order', 'image_url',
+            ]);
+            $relations[] = 'variants.values:id,product_variant_id,attribute_name,attribute_value';
+        } else {
+            $relations['variants'] = fn ($q) => $q->select(['id', 'product_id', 'name', 'sku', 'barcode', 'cost_price', 'selling_price', 'retail_prices', 'wholesale_price', 'wholesale_prices', 'is_active', 'sort_order', 'image_url']);
+            $relations[] = 'variants.values:id,product_variant_id,attribute_name,attribute_value';
+            $filterSingleOutlet = !$isPos && !$request->boolean('all_warehouses') && $warehouseId !== null;
+            $relations['variants.stockBalances'] = function ($q) use ($warehouseId, $filterSingleOutlet) {
+                $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
+                if ($filterSingleOutlet) {
+                    $q->where('warehouse_id', $warehouseId);
+                }
+            };
+            $relations['stockBalances'] = function ($q) use ($warehouseId, $filterSingleOutlet) {
+                $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                if ($filterSingleOutlet) {
+                    $q->where('warehouse_id', $warehouseId);
+                }
+            };
+            $relations[] = 'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active';
+        }
+
         $query = Product::query()
             ->select([
                 'id', 'uuid', 'code', 'sku', 'barcode', 'barcode_symbology',
@@ -43,31 +81,9 @@ class ProductController extends Controller
                 'cost_price', 'selling_price', 'purchase_price', 'retail_price',
                 'retail_prices', 'wholesale_price', 'wholesale_prices', 'stock_quantity',
                 'alert_quantity', 'stock_alert', 'low_qty', 'has_variants',
-                'is_bot_available', 'bot_price',
                 'image_url', 'status', 'is_active', 'added_by',
             ])
-            // Only load the primaryImage relation when image_url is empty.
-            // Products that already have image_url set do not need the extra
-            // JOIN on product_images — this eliminates N eager-load queries for
-            // catalogs that were migrated with the legacy image_url column.
-            ->with([
-                'primaryImage:id,product_id,disk,path,is_primary,sort_order',
-                'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
-                'variants.values:id,product_variant_id,attribute_name,attribute_value',
-                'variants.stockBalances' => function ($q) use ($warehouseId) {
-                    $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId);
-                    }
-                },
-                'stockBalances' => function ($q) use ($warehouseId) {
-                    $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId);
-                    }
-                },
-                'unitLinks:id,product_id,product_variant_id,unit_type,unit_id,unit_name,conversion_rate,is_default,is_active',
-            ]);
+            ->with($relations);
 
         if ($warehouseId !== null) {
             $query->withSum(['stockBalances as warehouse_stock' => function ($q) use ($warehouseId) {
@@ -192,10 +208,6 @@ class ProductController extends Controller
             $query->where('status', $request->input('status'));
         }
 
-        if ($request->has('is_bot_available')) {
-            $query->where('is_bot_available', $request->boolean('is_bot_available'));
-        }
-
         if ($request->has('has_variants')) {
             $query->where('has_variants', $request->boolean('has_variants'));
         }
@@ -208,92 +220,129 @@ class ProductController extends Controller
             'cost_price', 'stock_quantity', 'alert_quantity', 'low_qty',
             'added_by',
         ];
-        if (in_array($sortBy, $allowedSorts)) {
-            $query->orderBy($sortBy, $sortOrder);
-        } else {
-            $query->orderBy('id', 'desc');
+        if (!in_array($sortBy, $allowedSorts, true)) {
+            $sortBy = 'id';
+            $sortOrder = 'desc';
         }
 
         $isPos = $request->boolean('is_pos') || $request->filled('for_pos') || $request->boolean('all_pages');
+        $isCompactList = !$isPos && $request->boolean('compact_list', false);
         $maxAllowedPerPage = $isPos ? 250 : 100;
         $perPage = (int)$request->input('per_page', 50);
         if ($perPage <= 0) $perPage = 50;
         if ($perPage > $maxAllowedPerPage) $perPage = $maxAllowedPerPage;
 
-        $page = (int)$request->input('page', 1);
-        if ($page <= 0) $page = 1;
-
+        $page = max(1, (int)$request->input('page', 1));
         $search = trim((string)$request->input('search', ''));
-        $category = (string)$request->input('category', '');
-        $brand = (string)$request->input('brand', '');
 
-        $user = \App\Models\User::resolveFromRequest($request);
-        $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
-        $costScope = $canViewCost ? 'with_cost' : 'masked_cost';
+        $canViewCost = app(\App\Services\PurchaseAccountingService::class)->canViewCost($request);
+        $request->attributes->set('_can_view_cost', $canViewCost);
 
-        $cacheVersion = \Illuminate\Support\Facades\Cache::get('products_cache_version', 1);
-        $hasVariantsParam = $request->has('has_variants') ? ($request->boolean('has_variants') ? '1' : '0') : 'all';
-        $cacheKey = 'pos_prod_list_v' . $cacheVersion . '_' . md5("{$page}|{$perPage}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|" . ($isPos ? '1' : '0') . "|{$costScope}|{$hasVariantsParam}");
+        $inStockFirst = $isPos && $warehouseId !== null && $request->boolean('in_stock_first');
+        $cursorData = $inStockFirst ? null : ListCursorHelper::decode(
+            (string)$request->input('cursor', ''),
+            $sortBy,
+            $sortOrder,
+            $allowedSorts,
+            ['id'],
+            ['retail_price', 'selling_price', 'purchase_price', 'cost_price', 'stock_quantity', 'alert_quantity', 'low_qty']
+        );
+        $isScrollPage = ($page > 1 || $cursorData !== null);
+        $knownTotal = $request->filled('known_total') ? max(0, (int)$request->input('known_total')) : null;
+        $skipCount = ($request->boolean('skip_count') || $request->boolean('skip_summary')) && $isScrollPage && $knownTotal !== null && $knownTotal > 0;
 
-        if (!$request->boolean('force_refresh') && \Illuminate\Support\Facades\Cache::store('file')->has($cacheKey)) {
-            $cached = \Illuminate\Support\Facades\Cache::store('file')->get($cacheKey);
-            return response()->json($cached)
-                ->header('Cache-Control', 'private, max-age=60')
-                ->header('ETag', '"' . md5("{$cacheVersion}|{$page}|{$perPage}|" . ($cached['pagination']['total'] ?? 0) . "|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}|{$hasVariantsParam}") . '"')
-                ->header('X-Cache', 'HIT');
+        if ($cursorData !== null) {
+            ListCursorHelper::apply($query, $sortBy, $sortOrder, $cursorData, 'id');
+        }
+        if ($inStockFirst) {
+            $query->orderByRaw(
+                'CASE WHEN COALESCE((SELECT SUM(quantity) FROM stock_balances WHERE stock_balances.product_id = products.id AND stock_balances.warehouse_id = ?), 0) > 0 THEN 0 ELSE 1 END ASC',
+                [$warehouseId]
+            );
+        }
+        $query->orderBy($sortBy, $sortOrder);
+        if ($sortBy !== 'id') {
+            $query->orderBy('id', $sortOrder);
         }
 
-        // Optimized pagination for search: if page 1 search results are <= perPage,
-        // we can skip the expensive COUNT(*) scan entirely.
-        if ($page === 1 && $search !== '') {
-            $cloned = clone $query;
-            $fetched = $cloned->forPage(1, $perPage + 1)->get();
-            if ($fetched->count() <= $perPage) {
+        $hasMore = false;
+        if ($page === 1 && $search !== '' && $cursorData === null) {
+            $fetched = (clone $query)->forPage(1, $perPage + 1)->get();
+            $hasMore = $fetched->count() > $perPage;
+            if (!$hasMore) {
                 $total = $fetched->count();
                 $lastPage = 1;
                 $items = $fetched;
             } else {
-                $items = $fetched->take($perPage);
-                $total = $query->count();
-                $lastPage = (int)ceil($total / $perPage);
+                $items = $fetched->take($perPage)->values();
+                $total = (int)(clone $query)->toBase()->getCountForPagination();
+                $lastPage = (int)ceil($total / max(1, $perPage));
             }
-        } else {
-            // Cache the total count for 60 seconds to eliminate repeated full-table COUNT(*) scans on every progressive page
-            $countKey = 'pos_prod_count_v' . $cacheVersion . '_' . md5(($warehouseId ?? 'all') . "|{$search}|{$category}|{$brand}|{$hasVariantsParam}");
-            $total = (int)\Illuminate\Support\Facades\Cache::store('file')->remember($countKey, 60, function () use ($query) {
-                return (clone $query)->toBase()->getCountForPagination();
-            });
+        } elseif ($skipCount) {
+            $total = $knownTotal;
             $lastPage = (int)ceil($total / max(1, $perPage));
-            $items = $query->forPage($page, $perPage)->get();
+            $offset = $cursorData !== null ? 0 : (($page - 1) * $perPage);
+            $fetched = $query->offset($offset)->limit($perPage + 1)->get();
+            $hasMore = $fetched->count() > $perPage;
+            $items = $hasMore ? $fetched->take($perPage)->values() : $fetched;
+        } else {
+            $total = (int)(clone $query)->toBase()->getCountForPagination();
+            $lastPage = max(1, (int)ceil($total / max(1, $perPage)));
+            $offset = $cursorData !== null ? 0 : (($page - 1) * $perPage);
+            $fetched = $query->offset($offset)->limit($perPage + 1)->get();
+            $hasMore = $fetched->count() > $perPage;
+            $items = $hasMore ? $fetched->take($perPage)->values() : $fetched;
         }
 
-        // ── HTTP caching headers ───────────────────────────────────────────
-        // ETag: changes whenever total count, page, per_page, warehouse filter or costScope changes.
-        // Cache-Control: private (user-specific data), max-age matches the
-        //   Flutter client's _pageCacheTtl so downstream caches stay in sync.
-        $etag = '"' . md5("{$cacheVersion}|{$page}|{$perPage}|{$total}|{$sortBy}|{$sortOrder}|" . ($warehouseId ?? 'all') . "|{$costScope}|{$hasVariantsParam}") . '"';
+        // Replace correlated per-variant stock subqueries with a single batched GROUP BY query
+        if ($isCompactList && $items->isNotEmpty()) {
+            $variantIds = [];
+            foreach ($items as $p) {
+                if ($p->relationLoaded('variants')) {
+                    foreach ($p->variants as $v) {
+                        $variantIds[] = (int)$v->id;
+                    }
+                }
+            }
+            if (!empty($variantIds)) {
+                $variantSums = DB::table('stock_balances')
+                    ->selectRaw('product_variant_id, COALESCE(SUM(quantity), 0) as qty')
+                    ->whereIn('product_variant_id', array_values(array_unique($variantIds)))
+                    ->when($warehouseId !== null, fn ($q) => $q->where('warehouse_id', $warehouseId))
+                    ->groupBy('product_variant_id')
+                    ->pluck('qty', 'product_variant_id');
 
-        if (!$request->boolean('force_refresh') && $request->header('If-None-Match') === $etag) {
-            return response(null, 304)->header('ETag', $etag);
+                foreach ($items as $p) {
+                    if ($p->relationLoaded('variants')) {
+                        foreach ($p->variants as $v) {
+                            $v->setAttribute('warehouse_stock', (float)($variantSums[$v->id] ?? 0.0));
+                        }
+                    }
+                }
+            }
         }
 
-        $responseData = [
+        $lastRow = $items->last();
+        $nextCursor = ($hasMore && $lastRow)
+            ? ListCursorHelper::encode($lastRow, $sortBy, $sortOrder, $allowedSorts, 'id')
+            : null;
+
+        $pagination = [
+            'current_page' => $page,
+            'per_page'     => $perPage,
+            'total'        => $total,
+            'last_page'    => max(1, $lastPage),
+            'has_more'     => $hasMore,
+        ];
+        if ($nextCursor !== null) {
+            $pagination['next_cursor'] = $nextCursor;
+        }
+
+        return response()->json([
             'status'     => 'success',
             'data'       => ProductListResource::collection($items)->resolve($request),
-            'pagination' => [
-                'current_page' => $page,
-                'per_page'     => $perPage,
-                'total'        => $total,
-                'last_page'    => $lastPage,
-            ],
-        ];
-
-        \Illuminate\Support\Facades\Cache::store('file')->put($cacheKey, $responseData, 60);
-
-        return response()->json($responseData)
-            ->header('Cache-Control', 'private, max-age=60')
-            ->header('ETag', $etag)
-            ->header('X-Cache', 'MISS');
+            'pagination' => $pagination,
+        ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
 
     /**
@@ -308,7 +357,9 @@ class ProductController extends Controller
             : null;
 
         $sinceParam = $request->input('updated_since') ?? $request->input('since');
-        $limit = min((int)($request->input('limit', 1000)), 5000);
+        $cursorParam = trim((string)$request->input('cursor', ''));
+        $limit = max(1, min((int)($request->input('limit', 1000)), 5000));
+        $singleWarehouseOnly = $request->boolean('single_warehouse_only', false);
 
         $query = Product::query()
             ->select([
@@ -320,22 +371,21 @@ class ProductController extends Controller
                 'cost_price', 'selling_price', 'purchase_price', 'retail_price',
                 'retail_prices', 'wholesale_price', 'wholesale_prices', 'stock_quantity',
                 'alert_quantity', 'stock_alert', 'low_qty', 'has_variants',
-                'is_bot_available', 'bot_price',
                 'image_url', 'status', 'is_active', 'added_by', 'updated_at',
             ])
             ->with([
                 'primaryImage:id,product_id,disk,path,is_primary,sort_order',
                 'variants:id,product_id,name,sku,barcode,cost_price,selling_price,retail_prices,wholesale_price,wholesale_prices,is_active,sort_order,image_url',
                 'variants.values:id,product_variant_id,attribute_name,attribute_value',
-                'variants.stockBalances' => function ($q) use ($warehouseId) {
+                'variants.stockBalances' => function ($q) use ($warehouseId, $singleWarehouseOnly) {
                     $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
-                    if ($warehouseId !== null) {
+                    if ($singleWarehouseOnly && $warehouseId !== null) {
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
-                'stockBalances' => function ($q) use ($warehouseId) {
+                'stockBalances' => function ($q) use ($warehouseId, $singleWarehouseOnly) {
                     $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
-                    if ($warehouseId !== null) {
+                    if ($singleWarehouseOnly && $warehouseId !== null) {
                         $q->where('warehouse_id', $warehouseId);
                     }
                 },
@@ -353,33 +403,69 @@ class ProductController extends Controller
             try {
                 $since = Carbon::parse($sinceParam);
                 $query->where(function ($q) use ($since) {
-                    $q->where('updated_at', '>', $since)
+                    $q->where('updated_at', '>=', $since)
                       ->orWhereHas('variants', function ($vq) use ($since) {
-                          $vq->where('updated_at', '>', $since);
+                          $vq->where('updated_at', '>=', $since);
                       });
                 });
 
-                $deletedIds = Product::onlyTrashed()
-                    ->where('deleted_at', '>', $since)
-                    ->pluck('id')
-                    ->toArray();
+                if ($cursorParam === '') {
+                    $deletedIds = Product::onlyTrashed()
+                        ->where('deleted_at', '>=', $since)
+                        ->pluck('id')
+                        ->toArray();
+                }
             } catch (\Exception $e) {
                 // If timestamp parsing fails, ignore updated_since filter
             }
         }
 
-        $items = $query->orderBy('updated_at', 'asc')->limit($limit)->get();
+        if ($cursorParam !== '') {
+            $decodedCursor = json_decode(base64_decode($cursorParam, true) ?: '', true);
+            if (is_array($decodedCursor) && !empty($decodedCursor['u']) && isset($decodedCursor['i'])) {
+                try {
+                    $cUpdated = Carbon::parse((string)$decodedCursor['u']);
+                    $cId = (int)$decodedCursor['i'];
+                    $query->where(function ($q) use ($cUpdated, $cId) {
+                        $q->where('updated_at', '>', $cUpdated)
+                          ->orWhere(function ($eq) use ($cUpdated, $cId) {
+                              $eq->where('updated_at', '=', $cUpdated)->where('id', '>', $cId);
+                          });
+                    });
+                } catch (\Throwable $e) {
+                    // Ignore invalid cursor token
+                }
+            }
+        }
+
+        $fetched = $query->orderBy('updated_at', 'asc')->orderBy('id', 'asc')->limit($limit + 1)->get();
+        $hasMore = $fetched->count() > $limit;
+        $items = $hasMore ? $fetched->take($limit)->values() : $fetched;
+
+        $nextCursor = null;
+        if ($hasMore && $items->isNotEmpty()) {
+            $last = $items->last();
+            $lastUpdatedStr = $last->updated_at instanceof Carbon
+                ? $last->updated_at->toIso8601String()
+                : (string)$last->updated_at;
+            $nextCursor = base64_encode(json_encode([
+                'u' => $lastUpdatedStr,
+                'i' => (int)$last->id,
+            ]));
+        }
 
         return response()->json([
             'status' => 'success',
             'server_time' => now()->toIso8601String(),
             'count' => $items->count(),
+            'has_more' => $hasMore,
+            'next_cursor' => $nextCursor,
             'products' => ProductListResource::collection($items)->resolve($request),
             'deleted_ids' => $deletedIds,
         ])->header('Cache-Control', 'no-cache, no-store, must-revalidate');
     }
 
-    public function createOptions(Request $request)
+    public function createOptions(Request $request, ProductCreateService $service)
     {
         // Product Create only needs lightweight option data. Avoid loading
         // descriptions, images and other unused columns for every form open.
@@ -442,6 +528,7 @@ class ProductController extends Controller
                 'suppliers' => $suppliers,
                 'variation_attributes' => $variations,
                 'warehouses' => $warehouses,
+                'suggested_sku' => $service->generateNextSku(),
                 'barcode_symbologies' => [
                     'CODE128',
                     'CODE39',
@@ -597,10 +684,7 @@ class ProductController extends Controller
             ]);
         }
 
-        $cacheVersion = \Illuminate\Support\Facades\Cache::get('products_cache_version', 1);
-        $cacheKey = 'quick_search_v' . $cacheVersion . '_' . md5("{$rawQuery}|" . ($warehouseId ?? 'all') . "|{$limit}");
-
-        $result = \Illuminate\Support\Facades\Cache::store('file')->remember($cacheKey, 120, function () use ($rawQuery, $limit, $warehouseId) {
+        $result = (function () use ($rawQuery, $limit, $warehouseId, $request) {
             $isNumeric = ctype_digit($rawQuery);
             $intVal = $isNumeric ? (int)$rawQuery : null;
             $padded6 = $isNumeric ? sprintf('%06d', $intVal) : null;
@@ -670,8 +754,8 @@ class ProductController extends Controller
 
             $allIds = array_values(array_unique(array_merge($exactProductIds, $exactVariantProductIds)));
 
-            // EARLY EXIT: If exact match found (e.g., barcode scanner or direct code match), satisfy immediately
-            if (!empty($allIds) && count($allIds) >= $limit) {
+            // EARLY EXIT: If exact barcode/SKU/code/ID match found (>= 3 chars or limit reached), satisfy immediately
+            if (!empty($allIds) && (mb_strlen($rawQuery) >= 3 || count($allIds) >= $limit)) {
                 return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
             }
 
@@ -722,72 +806,107 @@ class ProductController extends Controller
                 }
             }
 
-            // 5. Variant SKU prefix or name match
-            $variantFuzzyIds = ProductVariant::where(function ($q) use ($rawQuery) {
-                    $q->where('sku', 'like', "{$rawQuery}%")
-                      ->orWhere('barcode', 'like', "{$rawQuery}%")
-                      ->orWhere('name', 'like', "{$rawQuery}%");
-                })
-                ->whereHas('product', $activeProductScope)
-                ->limit(10)
-                ->pluck('product_id')
-                ->toArray();
-
-            $allIds = array_values(array_unique(array_merge($allIds, $variantFuzzyIds)));
-            if (count($allIds) >= $limit) {
-                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
-            }
-
-            // 6. Name / Alternative name fallback (prefix first, then contains)
-            $fallbackProductIds = Product::tap($activeProductScope)
-                ->where(function ($q) use ($rawQuery) {
-                    $q->where('name', 'like', "{$rawQuery}%")
-                      ->orWhere('alternative_name', 'like', "{$rawQuery}%")
-                      ->orWhere('name', 'like', "%{$rawQuery}%");
-                })
+            // 5. Fast B-Tree prefix match on active product names / alternative names and indexed variant columns
+            $namePrefixIds = Product::tap($activeProductScope)
+                ->where('name', 'like', "{$rawQuery}%")
                 ->limit($limit)
                 ->pluck('id')
                 ->toArray();
 
-            $allIds = array_values(array_unique(array_merge($allIds, $fallbackProductIds)));
-            if (count($allIds) >= $limit) {
-                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
-            }
+            $altNamePrefixIds = Product::tap($activeProductScope)
+                ->where('alternative_name', 'like', "{$rawQuery}%")
+                ->limit(10)
+                ->pluck('id')
+                ->toArray();
 
-            // 7. Variant attribute match only if still under limit
-            $variantAttrIds = \DB::table('product_variant_values')
-                ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+            $variantPrefixIds = \DB::table('product_variants')
                 ->join('products', 'product_variants.product_id', '=', 'products.id')
+                ->whereNull('products.deleted_at')
+                ->whereNull('product_variants.deleted_at')
                 ->where(function ($q) {
                     $q->where('products.status', 'Active')->orWhere('products.is_active', true);
                 })
-                ->whereNull('products.deleted_at')
-                ->whereNull('product_variants.deleted_at')
                 ->where(function ($q) use ($rawQuery) {
-                    $q->where('product_variant_values.attribute_value', 'like', "%{$rawQuery}%")
-                      ->orWhere('product_variant_values.attribute_name', 'like', "%{$rawQuery}%");
+                    $q->where('product_variants.sku', 'like', "{$rawQuery}%")
+                      ->orWhere('product_variants.barcode', 'like', "{$rawQuery}%")
+                      ->orWhere('product_variants.name', 'like', "{$rawQuery}%");
                 })
                 ->limit(10)
                 ->pluck('product_variants.product_id')
                 ->toArray();
 
-            $allIds = array_values(array_unique(array_merge($allIds, $variantAttrIds)));
+            $allIds = array_values(array_unique(array_merge($allIds, $namePrefixIds, $altNamePrefixIds, $variantPrefixIds)));
+            if (count($allIds) >= $limit) {
+                return $this->loadProductsForQuickSearch(array_slice($allIds, 0, $limit), $warehouseId);
+            }
+
+            // 6. Fast indexed variant attribute prefix lookup (e.g. searching "Red", "XL")
+            if (empty($allIds)) {
+                $variantAttrPrefixIds = \DB::table('product_variant_values')
+                    ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+                    ->join('products', 'product_variants.product_id', '=', 'products.id')
+                    ->where(function ($q) {
+                        $q->where('products.status', 'Active')->orWhere('products.is_active', true);
+                    })
+                    ->whereNull('products.deleted_at')
+                    ->whereNull('product_variants.deleted_at')
+                    ->where('product_variant_values.attribute_value', 'like', "{$rawQuery}%")
+                    ->limit(10)
+                    ->pluck('product_variants.product_id')
+                    ->toArray();
+
+                $allIds = array_values(array_unique(array_merge($allIds, $variantAttrPrefixIds)));
+            }
+
+            // 7. Only run full-table contains (%q%) scans when fast exact/prefix/FULLTEXT lookups found nothing
+            if (empty($allIds)) {
+                $fallbackProductIds = Product::tap($activeProductScope)
+                    ->where(function ($q) use ($rawQuery) {
+                        $q->where('name', 'like', "%{$rawQuery}%")
+                          ->orWhere('alternative_name', 'like', "%{$rawQuery}%");
+                    })
+                    ->limit($limit)
+                    ->pluck('id')
+                    ->toArray();
+
+                $allIds = array_values(array_unique(array_merge($allIds, $fallbackProductIds)));
+            }
+
+            if (empty($allIds)) {
+                $variantAttrIds = \DB::table('product_variant_values')
+                    ->join('product_variants', 'product_variant_values.product_variant_id', '=', 'product_variants.id')
+                    ->join('products', 'product_variants.product_id', '=', 'products.id')
+                    ->where(function ($q) {
+                        $q->where('products.status', 'Active')->orWhere('products.is_active', true);
+                    })
+                    ->whereNull('products.deleted_at')
+                    ->whereNull('product_variants.deleted_at')
+                    ->where(function ($q) use ($rawQuery) {
+                        $q->where('product_variant_values.attribute_value', 'like', "%{$rawQuery}%")
+                          ->orWhere('product_variant_values.attribute_name', 'like', "%{$rawQuery}%");
+                    })
+                    ->limit(10)
+                    ->pluck('product_variants.product_id')
+                    ->toArray();
+
+                $allIds = array_values(array_unique(array_merge($allIds, $variantAttrIds)));
+            }
             $targetIds = array_slice($allIds, 0, $limit);
 
             if (empty($targetIds)) {
                 return [];
             }
 
-            return $this->loadProductsForQuickSearch($targetIds, $warehouseId);
-        });
+            return $this->loadProductsForQuickSearch($targetIds, $warehouseId, $request);
+        })();
 
         return response()->json([
             'status' => 'success',
             'data' => $result,
-        ]);
+        ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
 
-    protected function loadProductsForQuickSearch(array $targetIds, ?int $warehouseId): array
+    protected function loadProductsForQuickSearch(array $targetIds, ?int $warehouseId, ?Request $request = null): array
     {
         if (empty($targetIds)) {
             return [];
@@ -820,7 +939,7 @@ class ProductController extends Controller
             return $pos === false ? 999 : $pos;
         })->values();
 
-        return \App\Http\Resources\ProductListResource::collection($sorted)->resolve();
+        return \App\Http\Resources\ProductListResource::collection($sorted)->resolve($request ?? request());
     }
 
     public function findByBarcode(Request $request)
@@ -853,12 +972,16 @@ class ProductController extends Controller
             ->first();
 
         if (!$product) {
-            $variant = ProductVariant::with('product.unitLinks')->where('barcode', $code)->orWhere('sku', $code)->first();
+            $variant = ProductVariant::with([
+                'product' => fn ($q) => $q->with($this->productDetailRelations()),
+                'stockBalances',
+                'values',
+            ])->where('barcode', $code)->orWhere('sku', $code)->first();
             if ($variant && $variant->product) {
                 return response()->json([
                     'status' => 'success',
                     'data' => new ProductResource($variant->product),
-                    'variant' => $variant,
+                    'variant' => new \App\Http\Resources\ProductVariantResource($variant),
                 ]);
             }
             return response()->json(['status' => 'error', 'message' => 'Product not found'], 404);
@@ -889,9 +1012,7 @@ class ProductController extends Controller
 
         $product = $createService->create($data, $images);
 
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
+        $this->invalidateProductCaches();
 
         return response()->json([
             'success' => true,
@@ -1041,9 +1162,7 @@ class ProductController extends Controller
 
         $updated = $updateService->update($product, $validated);
 
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
+        $this->invalidateProductCaches();
 
         return response()->json([
             'success' => true,
@@ -1070,9 +1189,7 @@ class ProductController extends Controller
         $product->is_active = ($newStatus === 'Active');
         $product->save();
 
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
+        $this->invalidateProductCaches();
 
         return response()->json([
             'success' => true,
@@ -1082,36 +1199,6 @@ class ProductController extends Controller
                 'id' => $product->id,
                 'status' => $newStatus,
                 'is_active' => $product->is_active,
-            ],
-        ]);
-    }
-
-    public function toggleBotStatus(Request $request, $id)
-    {
-        $product = Product::find($id);
-
-        if (!$product) {
-            return response()->json([
-                'success' => false,
-                'status' => 'error',
-                'message' => 'Product not found',
-            ], 404);
-        }
-
-        $product->is_bot_available = !$product->is_bot_available;
-        $product->save();
-
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
-
-        return response()->json([
-            'success' => true,
-            'status' => 'success',
-            'message' => $product->is_bot_available ? 'Product enabled for Telegram Bot' : 'Product disabled for Telegram Bot',
-            'data' => [
-                'id' => $product->id,
-                'is_bot_available' => $product->is_bot_available,
             ],
         ]);
     }
@@ -1142,9 +1229,7 @@ class ProductController extends Controller
 
         $product->delete();
 
-        try {
-            \Illuminate\Support\Facades\Cache::store('file')->flush();
-        } catch (\Throwable $e) {}
+        $this->invalidateProductCaches();
 
         return response()->json([
             'success' => true,
@@ -1291,7 +1376,10 @@ class ProductController extends Controller
             'X-Accel-Buffering' => 'no',
         ];
 
-        $callback = function () use ($query, $columns, $formatNum, $formatPriceList, $formatBarcode) {
+        $authUser = \App\Models\User::resolveFromRequest($request);
+        $canViewCost = $authUser ? $authUser->hasPermission('products.view_cost') : false;
+
+        $callback = function () use ($query, $columns, $formatNum, $formatPriceList, $formatBarcode, $canViewCost) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
@@ -1299,7 +1387,7 @@ class ProductController extends Controller
 
             $rowCount = 0;
             $query->orderBy('id', 'asc')->chunk(500, function ($products) use (
-                &$rowCount, $file, $formatBarcode, $formatNum, $formatPriceList
+                &$rowCount, $file, $formatBarcode, $formatNum, $formatPriceList, $canViewCost
             ) {
                 foreach ($products as $product) {
                 $baseUnit = $product->unit_name ?: 'Piece';
@@ -1330,7 +1418,7 @@ class ProductController extends Controller
                 if ($product->has_variants && $product->variants->isNotEmpty()) {
                     foreach ($product->variants as $variant) {
                         $vCost = (float)($variant->cost_price ?: $product->cost_price);
-                        $vCostStr = $formatNum($vCost);
+                        $vCostStr = $canViewCost ? $formatNum($vCost) : '';
 
                         $vRetailStr = $formatPriceList(
                             $variant->retail_prices,
@@ -1384,7 +1472,7 @@ class ProductController extends Controller
                         ]);
                     }
                 } else {
-                    $pCostStr = $formatNum($product->cost_price);
+                    $pCostStr = $canViewCost ? $formatNum($product->cost_price) : '';
                     $pRetailStr = $formatPriceList($product->retail_prices, $product->retail_price);
                     $pWholesaleStr = $formatPriceList($product->wholesale_prices, $product->wholesale_price);
                     $pStockStr = $formatNum($product->stock_quantity);

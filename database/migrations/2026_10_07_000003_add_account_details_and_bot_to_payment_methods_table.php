@@ -18,9 +18,6 @@ return new class extends Migration
             if (!Schema::hasColumn('payment_methods', 'account_name')) {
                 $table->string('account_name')->nullable()->after('account_number');
             }
-            if (!Schema::hasColumn('payment_methods', 'is_bot_available')) {
-                $table->boolean('is_bot_available')->default(true)->after('account_name');
-            }
         });
     }
 
@@ -36,9 +33,6 @@ return new class extends Migration
             }
             if (Schema::hasColumn('payment_methods', 'account_name')) {
                 $columnsToDrop[] = 'account_name';
-            }
-            if (Schema::hasColumn('payment_methods', 'is_bot_available')) {
-                $columnsToDrop[] = 'is_bot_available';
             }
             if (!empty($columnsToDrop)) {
                 $table->dropColumn($columnsToDrop);

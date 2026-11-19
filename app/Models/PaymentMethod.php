@@ -19,7 +19,6 @@ class PaymentMethod extends Model
         'description',
         'account_number',
         'account_name',
-        'is_bot_available',
     ];
 
     protected $appends = [
@@ -29,7 +28,6 @@ class PaymentMethod extends Model
     protected $casts = [
         'is_active' => 'boolean',
         'is_default' => 'boolean',
-        'is_bot_available' => 'boolean',
     ];
 
     /**
@@ -47,7 +45,7 @@ class PaymentMethod extends Model
     }
 
     /**
-     * Get local file path for Telegram Bot sendPhoto upload
+     * Get local storage file path for the payment method QR code image
      */
     public function getQrCodeLocalPath(): ?string
     {

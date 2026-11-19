@@ -21,6 +21,7 @@ class StockMovement extends Model
         'quantity_in',
         'quantity_out',
         'balance_after',
+        'unit_cost',
         'created_by',
         'note',
         'created_at',
@@ -30,6 +31,7 @@ class StockMovement extends Model
         'quantity_in' => 'decimal:4',
         'quantity_out' => 'decimal:4',
         'balance_after' => 'decimal:4',
+        'unit_cost' => 'decimal:4',
         'created_at' => 'datetime',
     ];
 

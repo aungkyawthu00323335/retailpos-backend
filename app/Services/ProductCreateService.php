@@ -12,8 +12,11 @@ use App\Models\Outlet;
 use App\Models\Purchase;
 use App\Models\PurchaseItem;
 use App\Models\Setting;
+use App\Services\FifoInventoryService;
 use App\Services\ProductUnitConversionService;
+use App\Services\PurchaseAccountingService;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -121,8 +124,6 @@ class ProductCreateService
                     'stock_alert' => $stockAlert,
                     'low_qty' => $stockAlert,
                     'has_variants' => $hasVariants,
-                    'is_bot_available' => array_key_exists('is_bot_available', $data) ? (bool)$data['is_bot_available'] : true,
-                    'bot_price' => (isset($data['bot_price']) && $data['bot_price'] !== '') ? (float)$data['bot_price'] : null,
                     'image_url' => $data['image_url'] ?? '',
                     'description' => $data['note'] ?? $data['description'] ?? '',
                     'note' => $data['note'] ?? $data['description'] ?? '',
@@ -470,7 +471,7 @@ class ProductCreateService
                         'supplier_name'  => $supplierName,
                         'warehouse_id'   => $wGroup['warehouse_id'],
                         'warehouse_name' => $wGroup['warehouse_name'],
-                        'date'           => date('Y-m-d'),
+                        'date'           => date('Y-m-d H:i:s'),
                         'status'         => 'Received',
                         'tax_rate'       => 0.0,
                         'tax_amount'     => 0.0,
@@ -485,8 +486,9 @@ class ProductCreateService
                         'created_by'     => $product->added_by ?: (auth()->user()?->name ?: 'Admin User'),
                     ]);
 
+                    $fifoService = app(FifoInventoryService::class);
                     foreach ($wGroup['items'] as $itemData) {
-                        PurchaseItem::create([
+                        $purchaseItem = PurchaseItem::create([
                             'purchase_id'        => $purchase->id,
                             'product_id'         => $itemData['product_id'],
                             'product_variant_id' => $itemData['product_variant_id'],
@@ -504,7 +506,23 @@ class ProductCreateService
                             'subtotal'           => $itemData['subtotal'],
                         ]);
 
-                        StockMovement::create([
+                        if ((float)$itemData['base_quantity'] > 0.0001) {
+                            $fifoService->recordBatch(
+                                warehouseId:     (int)$wGroup['warehouse_id'],
+                                productId:       (int)$itemData['product_id'],
+                                variantId:       !empty($itemData['product_variant_id']) ? (int)$itemData['product_variant_id'] : null,
+                                baseQuantity:    (float)$itemData['base_quantity'],
+                                baseUnitCost:    (float)$itemData['base_unit_cost'],
+                                sourceType:      'opening_stock',
+                                sourceReference: $refNo,
+                                receivedDate:    date('Y-m-d H:i:s'),
+                                purchaseItemId:  (int)$purchaseItem->id,
+                                createdBy:       auth()->id(),
+                                notes:           'Initial Opening Stock from Product Creation: ' . $product->name
+                            );
+                        }
+
+                        $smData = [
                             'warehouse_id'       => $wGroup['warehouse_id'],
                             'product_id'         => $itemData['product_id'],
                             'product_variant_id' => $itemData['product_variant_id'],
@@ -517,12 +535,22 @@ class ProductCreateService
                             'created_by'         => auth()->id(),
                             'note'               => 'Initial Opening Stock from Product Create (PO: ' . $refNo . ')',
                             'created_at'         => now(),
-                        ]);
+                        ];
+                        if (Schema::hasColumn('stock_movements', 'unit_cost')) {
+                            $smData['unit_cost'] = round((float)$itemData['base_unit_cost'], 4);
+                        }
+                        StockMovement::create($smData);
                     }
                 }
 
                 $product->stock_quantity = $totalStock;
                 $product->save();
+
+                if (!empty($warehouseGroups)) {
+                    DB::afterCommit(static function () {
+                        app(PurchaseAccountingService::class)->invalidateAllCaches();
+                    });
+                }
 
                 return $product->load(['variants.values', 'images', 'unitLinks']);
             });
@@ -559,16 +587,9 @@ class ProductCreateService
                 'cost_price', 'selling_price', 'purchase_price', 'retail_price',
                 'retail_prices', 'wholesale_price', 'wholesale_prices', 'alert_quantity',
                 'stock_alert', 'low_qty', 'has_variants', 'description', 'note',
-                'image_url', 'status', 'is_active', 'is_bot_available', 'bot_price', 'added_by',
+                'image_url', 'status', 'is_active', 'added_by',
             ];
             $updates = array_intersect_key($data, array_flip($fillable));
-
-            if (array_key_exists('is_bot_available', $data)) {
-                $updates['is_bot_available'] = (bool)$data['is_bot_available'];
-            }
-            if (array_key_exists('bot_price', $data)) {
-                $updates['bot_price'] = ($data['bot_price'] !== null && $data['bot_price'] !== '') ? (float)$data['bot_price'] : null;
-            }
 
             if (array_key_exists('cost_price', $data)) {
                 $updates['cost_price'] = (float)$data['cost_price'];
@@ -758,6 +779,8 @@ class ProductCreateService
             if (!empty($data['opening_stocks']) && is_array($data['opening_stocks'])) {
                 $defaultWarehouse = Outlet::orderBy('id')->first();
                 $defaultWarehouseId = $defaultWarehouse?->id;
+                $fifoService = app(FifoInventoryService::class);
+                $recordedVariantOpening = false;
 
                 foreach ($data['opening_stocks'] as $stockEntry) {
                     $qty = (float) ($stockEntry['quantity'] ?? 0);
@@ -770,8 +793,10 @@ class ProductCreateService
 
                     $variantSku = $stockEntry['variant_sku'] ?? null;
                     $vId = null;
+                    $variantModel = null;
                     if ($variantSku && isset($createdVariants[$variantSku])) {
-                        $vId = $createdVariants[$variantSku]->id;
+                        $variantModel = $createdVariants[$variantSku];
+                        $vId = $variantModel->id;
                     }
 
                     $unitService = app(ProductUnitConversionService::class);
@@ -782,7 +807,8 @@ class ProductCreateService
                         $stockEntry['unit_name'] ?? null,
                         $vId
                     );
-                    $baseQty = $unitService->baseQuantity($qty, (float)$resolvedUnit['conversion_rate']);
+                    $conversionRate = (float)($resolvedUnit['conversion_rate'] > 0 ? $resolvedUnit['conversion_rate'] : 1.0);
+                    $baseQty = $unitService->baseQuantity($qty, $conversionRate);
 
                     $balance = StockBalance::where('warehouse_id', $wId)
                         ->where('product_id', $product->id)
@@ -801,7 +827,29 @@ class ProductCreateService
                         ]);
                     }
 
-                    StockMovement::create([
+                    if ($baseQty > 0.0001) {
+                        $unitCost = (float)($variantModel && $variantModel->cost_price > 0
+                            ? $variantModel->cost_price
+                            : ($product->cost_price ?: ($product->purchase_price ?: 0.0)));
+                        $baseUnitCost = $conversionRate > 0 ? ($unitCost / $conversionRate) : $unitCost;
+
+                        $fifoService->recordBatch(
+                            warehouseId:     (int)$wId,
+                            productId:       (int)$product->id,
+                            variantId:       $vId ? (int)$vId : null,
+                            baseQuantity:    (float)$baseQty,
+                            baseUnitCost:    (float)$baseUnitCost,
+                            sourceType:      'opening_stock',
+                            sourceReference: 'PROD-' . $product->id,
+                            receivedDate:    now()->toDateTimeString(),
+                            purchaseItemId:  null,
+                            createdBy:       auth()->id(),
+                            notes:           'Opening stock recorded from variant addition'
+                        );
+                        $recordedVariantOpening = true;
+                    }
+
+                    $smVariantData = [
                         'warehouse_id' => $wId,
                         'product_id' => $product->id,
                         'product_variant_id' => $vId,
@@ -814,7 +862,20 @@ class ProductCreateService
                         'created_by' => auth()->id(),
                         'note' => 'Opening stock recorded from variant addition',
                         'created_at' => now(),
-                    ]);
+                    ];
+                    if (Schema::hasColumn('stock_movements', 'unit_cost')) {
+                        $smVariantCost = (float)($variantModel && $variantModel->cost_price > 0
+                            ? $variantModel->cost_price
+                            : ($product->cost_price ?: ($product->purchase_price ?: 0.0)));
+                        $smVariantData['unit_cost'] = round($conversionRate > 0 ? ($smVariantCost / $conversionRate) : $smVariantCost, 4);
+                    }
+                    StockMovement::create($smVariantData);
+                }
+
+                if ($recordedVariantOpening) {
+                    DB::afterCommit(static function () {
+                        app(PurchaseAccountingService::class)->invalidateAllCaches();
+                    });
                 }
             }
 
@@ -843,58 +904,62 @@ class ProductCreateService
 
     public function generateNextSku(): string
     {
-        $lastProduct = Product::withTrashed()->orderBy('id', 'desc')->first();
-        $nextBase = ($lastProduct ? $lastProduct->id : 0) + 10000;
+        $lastId = (int) (DB::table('products')->max('id') ?? 0);
+        $nextBase = $lastId + 10000;
         $candidate = max($nextBase + 1, 10001);
 
         try {
             $driver = DB::connection()->getDriverName();
             if ($driver === 'sqlite') {
-                $maxCode = Product::withTrashed()
+                $maxCode = DB::table('products')
                     ->whereRaw("code GLOB '[0-9]*' AND code NOT GLOB '*[^0-9]*'")
                     ->selectRaw("MAX(CAST(code AS INTEGER)) as max_val")
                     ->value('max_val');
-                $maxVariantSku = ProductVariant::withTrashed()
+                $maxVariantSku = DB::table('product_variants')
                     ->whereRaw("sku GLOB '[0-9]*' AND sku NOT GLOB '*[^0-9]*'")
                     ->selectRaw("MAX(CAST(sku AS INTEGER)) as max_val")
                     ->value('max_val');
             } else {
-                $maxCode = Product::withTrashed()
+                $maxCode = DB::table('products')
                     ->whereRaw("code REGEXP '^[0-9]+$'")
                     ->selectRaw("MAX(CAST(code AS UNSIGNED)) as max_val")
                     ->value('max_val');
-                $maxVariantSku = ProductVariant::withTrashed()
+                $maxVariantSku = DB::table('product_variants')
                     ->whereRaw("sku REGEXP '^[0-9]+$'")
                     ->selectRaw("MAX(CAST(sku AS UNSIGNED)) as max_val")
                     ->value('max_val');
             }
 
             if ($maxCode) {
-                $candidate = max($candidate, (int)$maxCode + 1);
+                $candidate = max($candidate, (int) $maxCode + 1);
             }
             if ($maxVariantSku) {
-                $candidate = max($candidate, (int)$maxVariantSku + 1);
+                $candidate = max($candidate, (int) $maxVariantSku + 1);
             }
         } catch (\Throwable $e) {
             // Gracefully fall back to candidate
         }
 
-        $sku = (string)$candidate;
+        $sku = (string) $candidate;
 
         while (
-            Product::withTrashed()
-                ->where('code', $sku)
-                ->orWhere('sku', $sku)
-                ->orWhere('barcode', $sku)
-                ->orWhere('id', (int)$sku)
+            DB::table('products')
+                ->where(function ($q) use ($sku, $candidate) {
+                    $q->where('code', $sku)
+                        ->orWhere('sku', $sku)
+                        ->orWhere('barcode', $sku)
+                        ->orWhere('id', $candidate);
+                })
                 ->exists() ||
-            ProductVariant::withTrashed()
-                ->where('sku', $sku)
-                ->orWhere('barcode', $sku)
+            DB::table('product_variants')
+                ->where(function ($q) use ($sku) {
+                    $q->where('sku', $sku)
+                        ->orWhere('barcode', $sku);
+                })
                 ->exists()
         ) {
             $candidate++;
-            $sku = (string)$candidate;
+            $sku = (string) $candidate;
         }
 
         return $sku;

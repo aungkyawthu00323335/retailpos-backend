@@ -9,8 +9,16 @@ class ProductVariantResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
-        $user = \App\Models\User::resolveFromRequest($request);
-        $canViewCost = $user ? $user->hasPermission('products.view_cost') : false;
+        if ($request->attributes->has('_can_view_cost')) {
+            $canViewCost = (bool)$request->attributes->get('_can_view_cost');
+        } else {
+            $canViewCost = app(\App\Services\PurchaseAccountingService::class)->canViewCost($request);
+        }
+
+        $isCompactList = $request->boolean('compact_list')
+            && !$request->boolean('is_pos')
+            && !$request->filled('for_pos')
+            && !$request->boolean('all_pages');
 
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
@@ -18,7 +26,9 @@ class ProductVariantResource extends JsonResource
             : null;
 
         $stockQty = 0.0;
-        if ($this->relationLoaded('stockBalances')) {
+        if (array_key_exists('warehouse_stock', $this->resource->getAttributes()) && $this->warehouse_stock !== null) {
+            $stockQty = (float) $this->warehouse_stock;
+        } elseif ($this->relationLoaded('stockBalances')) {
             if ($warehouseId !== null) {
                 $stockQty = (float) $this->stockBalances->where('warehouse_id', $warehouseId)->sum('quantity');
             } else {
@@ -26,7 +36,7 @@ class ProductVariantResource extends JsonResource
             }
         }
 
-        return [
+        $base = [
             'id' => $this->id,
             'product_id' => $this->product_id,
             'name' => $this->name,
@@ -34,23 +44,11 @@ class ProductVariantResource extends JsonResource
             'barcode' => $this->barcode,
             'cost_price' => $canViewCost ? (float) $this->cost_price : null,
             'selling_price' => (float) $this->selling_price,
-            'retail_price' => (float) ($this->selling_price ?? 0.0),
-            'retail_prices' => $this->retail_prices ?? ($this->selling_price ? [(float)$this->selling_price] : []),
-            'selling_prices' => $this->retail_prices ?? ($this->selling_price ? [(float)$this->selling_price] : []),
             'wholesale_price' => (float) ($this->wholesale_price ?? 0.0),
-            'wholesale_prices' => $this->wholesale_prices ?? ($this->wholesale_price ? [(float)$this->wholesale_price] : []),
             'is_active' => (bool) $this->is_active,
             'sort_order' => $this->sort_order,
             'image_url' => $this->image_url,
-            'imageUrl' => $this->image_url,
             'stock_quantity' => $stockQty,
-            'stockQuantity' => $stockQty,
-            'warehouse_stocks' => $this->relationLoaded('stockBalances')
-                ? $this->stockBalances->map(fn ($sb) => [
-                    'warehouse_id' => (int)$sb->warehouse_id,
-                    'quantity' => (float)$sb->quantity,
-                ])->values()
-                : [],
             'values' => $this->relationLoaded('values') && $this->values ? $this->values->map(function ($val) {
                 return [
                     'attribute_name' => $val->attribute_name,
@@ -58,5 +56,24 @@ class ProductVariantResource extends JsonResource
                 ];
             }) : [],
         ];
+
+        if ($isCompactList) {
+            return $base;
+        }
+
+        return array_merge($base, [
+            'retail_price' => (float) ($this->selling_price ?? 0.0),
+            'retail_prices' => $this->retail_prices ?? ($this->selling_price ? [(float)$this->selling_price] : []),
+            'selling_prices' => $this->retail_prices ?? ($this->selling_price ? [(float)$this->selling_price] : []),
+            'wholesale_prices' => $this->wholesale_prices ?? ($this->wholesale_price ? [(float)$this->wholesale_price] : []),
+            'imageUrl' => $this->image_url,
+            'stockQuantity' => $stockQty,
+            'warehouse_stocks' => $this->relationLoaded('stockBalances')
+                ? $this->stockBalances->map(fn ($sb) => [
+                    'warehouse_id' => (int)$sb->warehouse_id,
+                    'quantity' => (float)$sb->quantity,
+                ])->values()
+                : [],
+        ]);
     }
 }

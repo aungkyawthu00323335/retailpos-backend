@@ -15,6 +15,7 @@ class ExpensePayment extends Model
         'payment_date',
         'payment_time',
         'payment_type',
+        'cash_register_id',
         'amount',
         'received_amount',
         'change_amount',
@@ -31,6 +32,7 @@ class ExpensePayment extends Model
         'change_amount'   => 'float',
         'user_id'         => 'integer',
         'expense_id'      => 'integer',
+        'cash_register_id' => 'integer',
     ];
 
     public function expense()
@@ -41,5 +43,23 @@ class ExpensePayment extends Model
     public function user()
     {
         return $this->belongsTo(User::class, 'user_id');
+    }
+
+    public function cashRegister()
+    {
+        return $this->belongsTo(CashRegister::class, 'cash_register_id');
+    }
+
+    protected static function booted(): void
+    {
+        $invalidate = function (self $payment): void {
+            \App\Services\PurchaseAccountingService::bumpListPrefix('expense_list_summary_v1');
+            if ($payment->expense_id) {
+                Expense::where('id', $payment->expense_id)->update(['updated_at' => now()]);
+            }
+        };
+
+        static::saved($invalidate);
+        static::deleted($invalidate);
     }
 }

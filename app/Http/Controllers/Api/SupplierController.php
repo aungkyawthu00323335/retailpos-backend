@@ -3,18 +3,65 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Purchase;
 use App\Models\Supplier;
 use App\Models\SupplierCategory;
+use App\Services\PurchaseAccountingService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class SupplierController extends Controller
 {
+    protected function accounting(): PurchaseAccountingService
+    {
+        return app(PurchaseAccountingService::class);
+    }
+
     /**
      * Display a listing of suppliers.
      */
     public function index(Request $request)
     {
-        $query = Supplier::withCount(['purchases']);
+        $noStoreHeader = 'no-store, no-cache, must-revalidate, private';
+
+        if ($request->boolean('compact')) {
+            $compactQuery = Supplier::query()
+                ->select(['id', 'name', 'phone', 'category', 'status']);
+
+            if ($request->filled('search')) {
+                $search = trim((string) $request->input('search'));
+                $compactQuery->where(function ($q) use ($search) {
+                    $q->where('name', 'like', "%{$search}%")
+                      ->orWhere('phone', 'like', "%{$search}%");
+                });
+            }
+            if ($request->filled('status') && $request->input('status') !== 'All') {
+                $compactQuery->where('status', $request->input('status'));
+            }
+
+            $limit = (int) $request->input('per_page', 1000);
+            if ($limit <= 0 || $limit > 5000) {
+                $limit = 1000;
+            }
+            $rows = $compactQuery->orderBy('id', 'desc')->limit($limit)->get();
+            $count = $rows->count();
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $rows,
+                'pagination' => [
+                    'current_page' => 1,
+                    'per_page' => max(1, $count),
+                    'total' => $count,
+                    'last_page' => 1,
+                ],
+            ])->header('Cache-Control', $noStoreHeader);
+        }
+
+        $accounting = $this->accounting();
+        $query = Supplier::withCount([
+            'purchases' => fn($q) => $accounting->excludeOpeningStockPurchases($q),
+        ]);
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -48,7 +95,16 @@ class SupplierController extends Controller
         if ($perPage <= 0) $perPage = 25;
         if ($perPage > 100) $perPage = 100;
 
+        $canViewCost = $accounting->canViewCost($request);
         $paginated = $query->paginate($perPage);
+
+        $rows = collect($paginated->items())->map(function ($sup) use ($canViewCost) {
+            if (!$canViewCost) {
+                $sup->setAttribute('balance_due', null);
+                $sup->setAttribute('cost_masked', true);
+            }
+            return $sup;
+        })->all();
 
         $summaryData = Supplier::selectRaw("
             COUNT(*) as total_suppliers,
@@ -59,20 +115,22 @@ class SupplierController extends Controller
 
         return response()->json([
             'status' => 'success',
+            'cost_masked' => !$canViewCost,
             'summary' => [
                 'total_suppliers' => (int)($summaryData->total_suppliers ?? 0),
                 'active_suppliers' => (int)($summaryData->active_suppliers ?? 0),
-                'total_balance_due' => (float)($summaryData->total_balance_due ?? 0),
+                'total_balance_due' => $canViewCost ? (float)($summaryData->total_balance_due ?? 0) : 0.0,
                 'total_categories' => (int)($summaryData->total_categories ?? 0),
+                'cost_masked' => !$canViewCost,
             ],
-            'data' => $paginated->items(),
+            'data' => $rows,
             'pagination' => [
                 'current_page' => $paginated->currentPage(),
                 'per_page' => $paginated->perPage(),
                 'total' => $paginated->total(),
                 'last_page' => $paginated->lastPage(),
             ],
-        ]);
+        ])->header('Cache-Control', $noStoreHeader);
     }
 
     /**
@@ -120,7 +178,7 @@ class SupplierController extends Controller
     /**
      * Display the specified supplier.
      */
-    public function show($id)
+    public function show(Request $request, $id)
     {
         $supplier = Supplier::find($id);
 
@@ -131,8 +189,15 @@ class SupplierController extends Controller
             ], 404);
         }
 
+        $canViewCost = $this->accounting()->canViewCost($request);
+        if (!$canViewCost) {
+            $supplier->setAttribute('balance_due', null);
+            $supplier->setAttribute('cost_masked', true);
+        }
+
         return response()->json([
             'status' => 'success',
+            'cost_masked' => !$canViewCost,
             'data' => $supplier,
         ]);
     }
@@ -165,6 +230,25 @@ class SupplierController extends Controller
             'status' => 'nullable|string|in:Active,Inactive',
             'notes' => 'nullable|string',
         ]);
+
+        if (array_key_exists('balance_due', $validated)) {
+            $requestedBalance = round((float)($validated['balance_due'] ?? 0.0), 2);
+            $currentBalance = round((float)($supplier->balance_due ?? 0.0), 2);
+            if (abs($requestedBalance - $currentBalance) > 0.01) {
+                $purchCheckQuery = $supplier->purchases();
+                $this->accounting()->excludeOpeningStockPurchases($purchCheckQuery);
+                $hasLedgerActivity = $purchCheckQuery->exists()
+                    || $supplier->purchaseReturns()->exists();
+                if ($hasLedgerActivity) {
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => 'Cannot modify balance_due directly when purchase or return ledger transactions exist. Use payments or credit notes to settle supplier balances.',
+                    ], 422);
+                }
+            } else {
+                unset($validated['balance_due']);
+            }
+        }
 
         $supplier->update($validated);
 
@@ -204,7 +288,11 @@ class SupplierController extends Controller
      */
     public function destroy($id)
     {
-        $supplier = Supplier::withCount(['purchases', 'purchaseReturns'])->find($id);
+        $accounting = $this->accounting();
+        $supplier = Supplier::withCount([
+            'purchases' => fn($q) => $accounting->excludeOpeningStockPurchases($q),
+            'purchaseReturns',
+        ])->find($id);
 
         if (!$supplier) {
             return response()->json([
@@ -217,17 +305,22 @@ class SupplierController extends Controller
         $returnsCount = (int)($supplier->purchase_returns_count ?? 0);
         $balanceDue = (float)($supplier->balance_due ?? 0.0);
 
-        if ($purchasesCount > 0 || $returnsCount > 0 || $balanceDue > 0) {
+        if ($purchasesCount > 0 || $returnsCount > 0 || abs($balanceDue) > 0.01) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Cannot delete supplier because they have ' . $purchasesCount . ' active purchase invoice(s), ' . $returnsCount . ' return(s), or outstanding Accounts Payable due debt ($' . number_format($balanceDue, 2) . '). This is protected by accounting safeguards to prevent ledger corruption. Please deactivate the supplier instead.',
+                'message' => 'Cannot delete supplier because they have ' . $purchasesCount . ' active purchase invoice(s), ' . $returnsCount . ' return(s), or outstanding Accounts Payable balance ($' . number_format($balanceDue, 2) . '). This is protected by accounting safeguards to prevent ledger corruption. Please deactivate the supplier instead.',
                 'purchases_count' => $purchasesCount,
                 'purchase_returns_count' => $returnsCount,
                 'balance_due' => $balanceDue,
             ], 422);
         }
 
-        $supplier->delete();
+        DB::transaction(function () use ($supplier) {
+            Purchase::where('supplier_id', $supplier->id)
+                ->where('payment_type', 'Opening Stock')
+                ->update(['supplier_id' => null]);
+            $supplier->delete();
+        });
 
         return response()->json([
             'status' => 'success',
@@ -425,7 +518,8 @@ class SupplierController extends Controller
             'X-Accel-Buffering' => 'no',
         ];
 
-        $callback = function () use ($query, $columns, $formatPhone, $formatNum) {
+        $canViewCost = $this->accounting()->canViewCost($request);
+        $callback = function () use ($query, $columns, $formatPhone, $formatNum, $canViewCost) {
             $file = fopen('php://output', 'w');
             // Write UTF-8 BOM for Microsoft Excel on Windows
             fwrite($file, "\xEF\xBB\xBF");
@@ -443,7 +537,7 @@ class SupplierController extends Controller
                     $supplier->country ?? '',
                     $supplier->city ?? '',
                     $supplier->address ?? '',
-                    $formatNum($supplier->balance_due ?? 0),
+                    $canViewCost ? $formatNum($supplier->balance_due ?? 0) : 'Protected',
                     $supplier->payment_terms ?? 'Net 30 Days',
                     $supplier->status ?? 'Active',
                     $supplier->notes ?? '',
@@ -535,6 +629,15 @@ class SupplierController extends Controller
                     continue;
                 }
 
+                // Preserve live AP balance when supplier already has ledger history or CSV omitted balance_due
+                $hasImpLedger = false;
+                if (array_key_exists('balance_due', $item)) {
+                    $impPurchQuery = $existing->purchases();
+                    $this->accounting()->excludeOpeningStockPurchases($impPurchQuery);
+                    $hasImpLedger = $impPurchQuery->exists() || $existing->purchaseReturns()->exists();
+                }
+                $preserveExistingBalance = !array_key_exists('balance_due', $item) || $hasImpLedger;
+
                 // Update existing supplier
                 $existing->update([
                     'name' => $name,
@@ -545,7 +648,7 @@ class SupplierController extends Controller
                     'country' => $country ?? $existing->country,
                     'city' => $city ?? $existing->city,
                     'address' => $address ?? $existing->address,
-                    'balance_due' => $balanceDue,
+                    'balance_due' => $preserveExistingBalance ? $existing->balance_due : $balanceDue,
                     'payment_terms' => $paymentTerms ?: $existing->payment_terms,
                     'status' => $status,
                     'notes' => $notes ?? $existing->notes,

@@ -559,8 +559,8 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 $wPrices = [round($sell * 0.85), round($sell * 0.80), round($sell * 0.75)];
 
                 $productStock = 0.0;
-                // Add stock for primary and secondary outlet
-                foreach (array_slice($outlets, 0, 2) as $o) {
+                // Add stock across all active outlets (including branch stores such as Hledan)
+                foreach ($outlets as $o) {
                     $qty = 20.0 + (($i * 3 + $o->id * 7) % 60);
                     $productStock += $qty;
                     $stockBalancesBatch[] = [
@@ -643,32 +643,33 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                         'updated_at' => $now,
                     ];
 
-                    // Primary outlet stock balance for variant
-                    $o = $outlets[0];
-                    $vQty = 15.0 + (($vId * 7) % 35);
-                    $productStock += $vQty;
-                    $stockBalancesBatch[] = [
-                        'warehouse_id' => $o->id,
-                        'product_id' => $i,
-                        'product_variant_id' => $vId,
-                        'quantity' => $vQty,
-                        'created_at' => $startDate,
-                        'updated_at' => $now,
-                    ];
-                    $stockMovementsBatch[] = [
-                        'warehouse_id' => $o->id,
-                        'product_id' => $i,
-                        'product_variant_id' => $vId,
-                        'movement_type' => 'opening_stock',
-                        'reference_type' => 'initial_seed',
-                        'reference_id' => (string)$vId,
-                        'quantity_in' => $vQty,
-                        'quantity_out' => 0.0,
-                        'balance_after' => $vQty,
-                        'created_by' => 1,
-                        'note' => "Opening stock for variant {$varValue} at {$o->name}",
-                        'created_at' => $startDate,
-                    ];
+                    // Multi-outlet stock balance for variant across all active outlets
+                    foreach ($outlets as $o) {
+                        $vQty = 15.0 + (($vId * 7 + $o->id * 5) % 35);
+                        $productStock += $vQty;
+                        $stockBalancesBatch[] = [
+                            'warehouse_id' => $o->id,
+                            'product_id' => $i,
+                            'product_variant_id' => $vId,
+                            'quantity' => $vQty,
+                            'created_at' => $startDate,
+                            'updated_at' => $now,
+                        ];
+                        $stockMovementsBatch[] = [
+                            'warehouse_id' => $o->id,
+                            'product_id' => $i,
+                            'product_variant_id' => $vId,
+                            'movement_type' => 'opening_stock',
+                            'reference_type' => 'initial_seed',
+                            'reference_id' => (string)$vId,
+                            'quantity_in' => $vQty,
+                            'quantity_out' => 0.0,
+                            'balance_after' => $vQty,
+                            'created_by' => 1,
+                            'note' => "Opening stock for variant {$varValue} at {$o->name}",
+                            'created_at' => $startDate,
+                        ];
+                    }
                 }
             }
             // Category 3: Multi-Unit Linked Products (8001 to 10000)
@@ -719,7 +720,7 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 }
 
                 $productStock = 0.0;
-                foreach (array_slice($outlets, 0, 2) as $o) {
+                foreach ($outlets as $o) {
                     $qty = 40.0 + (($i * 7 + $o->id * 11) % 80);
                     $productStock += $qty;
                     $stockBalancesBatch[] = [
@@ -792,8 +793,6 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 'note' => 'Enterprise seeded inventory record.',
                 'status' => 'Active',
                 'is_active' => 1,
-                'is_bot_available' => 1,
-                'bot_price' => $sell,
                 'added_by' => 'Super Admin',
                 'created_at' => $startDate,
                 'updated_at' => $now,
@@ -1033,7 +1032,6 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 'payment_type' => $payMethod->name,
                 'notes' => 'Sale registered via POS Terminal / Online store.',
                 'pos_flag' => 1,
-                'order_source' => ($i % 5 === 0) ? 'online' : 'pos',
                 'created_by' => 'Admin POS',
                 'user_id' => 1,
                 'user_name' => 'Admin POS',

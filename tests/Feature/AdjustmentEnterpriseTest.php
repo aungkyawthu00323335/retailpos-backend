@@ -680,12 +680,12 @@ class AdjustmentEnterpriseTest extends TestCase
             'quantity' => 15.0,
         ]);
 
-        // 2. Stock adjustment addition: 10 units @ $12 (Total stock = 25)
+        // 2. Stock adjustment addition: 10 units @ $12 strictly between PO-TEST-01 (10:00) and PO-TEST-02 (12:00)
         $payload = [
             'reference_no' => 'ADJ-FIFO-ADD-01',
             'warehouse_id' => $outlet->id,
             'warehouse_name' => $outlet->name,
-            'date' => '2026-10-19',
+            'date' => '2026-10-19 11:00:00',
             'type' => 'Addition',
             'items' => [
                 [
@@ -727,30 +727,32 @@ class AdjustmentEnterpriseTest extends TestCase
         $product->decrement('stock_quantity', 19.0);
         \App\Models\StockBalance::where('warehouse_id', $outlet->id)->where('product_id', $product->id)->decrement('quantity', 19.0);
 
-        // Current stock balance: 35 - 19 = 16 units.
+        // Current stock balance: 35 - 19 = 16 units (6 left on ADJ-FIFO-ADD-01, 10 left on PO-TEST-02).
         $product->refresh();
         $this->assertEquals(16.0, (float)$product->stock_quantity);
 
-        // 5. Delete the Adjustment (+10).
-        // 10 units will be rolled back from stock balance (16 - 10 = 6).
-        // From FIFO batches: 6 units remain in the adjustment batch -> eliminated.
-        // Deficit of 4 units (10 - 6) is depleted from the subsequent batch (PO-TEST-02: 10 - 4 = 6).
+        // 5. Senior Accounting FIFO Protection:
+        // Deleting an Addition Adjustment whose batch has already been partially consumed (4 units) MUST be rejected with 422
+        // instead of mutating historical COGS or stealing inventory from PO-TEST-02.
         $delRes = $this->deleteJson("/api/adjustments/{$adjId}");
-        $delRes->assertStatus(200);
+        $delRes->assertStatus(422);
 
         $product->refresh();
         $balance = \App\Models\StockBalance::where('warehouse_id', $outlet->id)->where('product_id', $product->id)->first();
 
-        // Product stock and StockBalance must be 6.0 units
-        $this->assertEquals(6.0, (float)$product->stock_quantity);
-        $this->assertEquals(6.0, (float)$balance->quantity);
+        // Product stock and StockBalance remain cleanly preserved at 16.0 units
+        $this->assertEquals(16.0, (float)$product->stock_quantity);
+        $this->assertEquals(16.0, (float)$balance->quantity);
 
-        // Sum of all remaining FIFO batches must strictly equal 6.0 units
+        // PO-TEST-02 must remain untouched at 10.0 units, ADJ batch at 6.0 units, total batches == 16.0
+        $po2Batch = \App\Models\InventoryBatch::where('source_reference', 'PO-TEST-02')->first();
+        $this->assertEquals(10.0, (float)$po2Batch->remaining_quantity);
+
         $totalBatchQty = \App\Models\InventoryBatch::where('warehouse_id', $outlet->id)
             ->where('product_id', $product->id)
             ->where('status', 'active')
             ->sum('remaining_quantity');
-        $this->assertEquals(6.0, (float)$totalBatchQty);
+        $this->assertEquals(16.0, (float)$totalBatchQty);
     }
 
     /**
@@ -814,9 +816,8 @@ class AdjustmentEnterpriseTest extends TestCase
         $product->refresh();
         $this->assertEquals(6.0, (float)$product->stock_quantity);
 
-        // 3. Case A: User edits notes and unit_cost without changing quantity (10 units).
-        // In the past, this failed because rollback tried to subtract 10 from 6.
-        // Now it must succeed!
+        // 3. Case A1: User edits notes without changing unit_cost (10.0) or quantity (10 units).
+        // In-place FIFO batch update must succeed and preserve remaining 6 / consumed 4!
         $updatePayloadSameQty = [
             'reference_no' => 'ADJ-PARTIAL-001',
             'warehouse_id' => $outletA->id,
@@ -831,7 +832,7 @@ class AdjustmentEnterpriseTest extends TestCase
                     'product_name' => $product->name,
                     'quantity' => 10.0,
                     'type' => 'Addition',
-                    'unit_cost' => 11.0,
+                    'unit_cost' => 10.0,
                 ],
             ],
         ];
@@ -844,9 +845,26 @@ class AdjustmentEnterpriseTest extends TestCase
         $balanceA = \App\Models\StockBalance::where('warehouse_id', $outletA->id)->where('product_id', $product->id)->first();
         $this->assertEquals(6.0, (float)$balanceA->quantity);
 
-        // Verify date preserved time component
+        // Verify FIFO batch remaining == 6.0 and date preserved time component
+        $batchAfterA1 = \App\Models\InventoryBatch::where('warehouse_id', $outletA->id)
+            ->where('product_id', $product->id)
+            ->where('source_type', 'adjustment_addition')
+            ->first();
+        $this->assertNotNull($batchAfterA1);
+        $this->assertEquals(10.0, (float)$batchAfterA1->initial_quantity);
+        $this->assertEquals(6.0, (float)$batchAfterA1->remaining_quantity);
+
         $adjObj = StockAdjustment::find($adjId);
         $this->assertStringContainsString('09:30:00', $adjObj->date);
+
+        // 3b. Case A2: Attempting to mutate unit_cost (10 -> 11) after 4 units entered COGS MUST fail with 422!
+        $updatePayloadMutateCost = $updatePayloadSameQty;
+        $updatePayloadMutateCost['items'][0]['unit_cost'] = 11.0;
+        $updateResCostBlocked = $this->putJson("/api/adjustments/{$adjId}", $updatePayloadMutateCost);
+        $updateResCostBlocked->assertStatus(422);
+
+        $batchAfterA1->refresh();
+        $this->assertEquals(10.0, (float)$batchAfterA1->unit_cost);
 
         // 4. Case B: User reduces quantity from 10 to 8 (net change = -2 units).
         // Since current balance is 6, reducing by 2 leaves 4 units. Must succeed!

@@ -2,12 +2,14 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\TracksRegisterSplitFlag;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class Purchase extends Model
 {
     use HasFactory;
+    use TracksRegisterSplitFlag;
 
     protected $fillable = [
         'reference_no',
@@ -19,13 +21,16 @@ class Purchase extends Model
         'status', // Received, Pending, Ordered
         'tax_rate',
         'tax_amount',
+        'is_tax_recoverable',
         'discount',
         'shipping',
         'grand_total',
         'paid_amount',
         'due_amount',
-        'payment_status', // Paid, Unpaid, Partial
+        'returned_credit_amount',
+        'payment_status', // Paid, Unpaid, Partial, Credit Settled
         'payment_type', // Cash, Card, Bank Transfer, Cheque, etc.
+        'cash_register_id',
         'notes',
         'payments_payload',
         'created_by',
@@ -37,11 +42,18 @@ class Purchase extends Model
     protected $casts = [
         'tax_rate' => 'float',
         'tax_amount' => 'float',
+        'is_tax_recoverable' => 'boolean',
         'discount' => 'float',
         'shipping' => 'float',
         'grand_total' => 'float',
         'paid_amount' => 'float',
         'due_amount' => 'float',
+        'returned_credit_amount' => 'float',
+        'cash_register_id' => 'integer',
+    ];
+
+    protected $attributes = [
+        'is_tax_recoverable' => false,
     ];
 
     protected $appends = ['payments'];
@@ -83,12 +95,17 @@ class Purchase extends Model
 
     public function items()
     {
-        return $this->hasMany(PurchaseItem::class, 'purchase_id');
+        return $this->hasMany(PurchaseItem::class, 'purchase_id')->orderBy('id');
     }
 
     public function supplier()
     {
         return $this->belongsTo(Supplier::class, 'supplier_id');
+    }
+
+    public function allocations()
+    {
+        return $this->hasMany(PurchaseReturnAllocation::class, 'purchase_id');
     }
 
     public function user()

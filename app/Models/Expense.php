@@ -22,6 +22,8 @@ class Expense extends Model
         'payment_status',
         'payment_method',
         'payment_method_id',
+        'cash_register_id',
+        'transfer_id',
         'date',
         'details',
         'created_by',
@@ -33,6 +35,8 @@ class Expense extends Model
     protected $casts = [
         'warehouse_id' => 'integer',
         'payment_method_id' => 'integer',
+        'cash_register_id' => 'integer',
+        'transfer_id' => 'integer',
         'user_id' => 'integer',
         'amount' => 'float',
         'paid_amount' => 'float',
@@ -52,5 +56,24 @@ class Expense extends Model
     public function payments()
     {
         return $this->hasMany(ExpensePayment::class, 'expense_id');
+    }
+
+    public function transfer()
+    {
+        return $this->belongsTo(StockTransfer::class, 'transfer_id');
+    }
+
+    public function cashRegister()
+    {
+        return $this->belongsTo(CashRegister::class, 'cash_register_id');
+    }
+
+    protected static function booted(): void
+    {
+        $invalidate = static function (): void {
+            \App\Services\PurchaseAccountingService::bumpListPrefix('expense_list_summary_v1');
+        };
+        static::saved($invalidate);
+        static::deleted($invalidate);
     }
 }

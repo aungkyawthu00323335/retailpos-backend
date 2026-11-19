@@ -684,7 +684,7 @@ class SaleEnterpriseTest extends TestCase
     }
 
     /**
-     * 10. Destroying a pending sale that took cash decrements Cash Register expected cash.
+     * 10. Pending sales do NOT post cash into register upfront; legacy paid pending destroy safely reconciles.
      */
     public function test_pending_sale_destroy_decrements_cash_register_expected_cash(): void
     {
@@ -719,10 +719,16 @@ class SaleEnterpriseTest extends TestCase
         $createRes->assertStatus(201);
         $saleId = $createRes->json('data.id');
 
-        $this->register->refresh();
-        $this->assertEquals(66000.0, (float)$this->register->expected_cash);
+        // Strictly unposted until Completed
+        $this->assertEquals(0.0, (float)$createRes->json('data.paid_amount'));
+        $this->assertEquals(16000.0, (float)$createRes->json('data.due_amount'));
+        $this->assertEquals('Unpaid', $createRes->json('data.payment_status'));
+        $this->assertEquals(0, SalePayment::where('sale_id', $saleId)->count());
 
-        // Destroy the pending sale
+        $this->register->refresh();
+        $this->assertEquals(50000.0, (float)$this->register->expected_cash);
+
+        // Destroy the unposted pending sale leaves register untouched at 50000.0
         $delRes = $this->actingAs($this->user)->deleteJson("/api/sales/{$saleId}");
         $delRes->assertStatus(200);
 
@@ -1919,10 +1925,13 @@ class SaleEnterpriseTest extends TestCase
         $updateRes->assertStatus(422);
         $this->assertStringContainsString('အရင်းဈေး', $updateRes->json('message'));
 
-        // 3. Finalize with valid Manager PIN
+        // 3. Finalize with valid Manager PIN and settle payment for unregistered Draft customer
         $updateWithPinPayload = [
             'status' => 'Completed',
             'manager_pin' => '1234',
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+            'paid_amount' => 5000.0,
         ];
 
         $updateWithPinRes = $this->actingAs($cashierUser)->putJson("/api/sales/{$saleId}", $updateWithPinPayload);

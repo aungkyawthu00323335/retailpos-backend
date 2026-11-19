@@ -75,4 +75,9 @@ class Processing extends Model
     {
         return $this->belongsTo(User::class, 'user_id');
     }
+
+    public function costLayers()
+    {
+        return $this->hasMany(ProcessingItemCostLayer::class, 'processing_id');
+    }
 }

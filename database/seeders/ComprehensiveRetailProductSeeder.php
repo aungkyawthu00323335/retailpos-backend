@@ -528,13 +528,11 @@ class ComprehensiveRetailProductSeeder extends Seeder
                         'cost_price' => $item['cost_price'],
                         'retail_price' => $item['retail_price'],
                         'selling_price' => $item['retail_price'],
-                        'bot_price' => $item['bot_price'],
                         'stock_quantity' => $item['stock'],
                         'alert_quantity' => 5,
                         'stock_alert' => 5,
                         'low_qty' => 5,
                         'has_variants' => (bool)$item['has_variants'],
-                        'is_bot_available' => true,
                         'image_url' => $item['image_url'],
                         'description' => $item['description'],
                         'is_active' => true,
@@ -665,7 +663,6 @@ class ComprehensiveRetailProductSeeder extends Seeder
                     $bModel = $brandsMap[$exData['brand']] ?? null;
                     
                     $updatePayload = [
-                        'is_bot_available' => true,
                         'is_active' => true,
                         'status' => 'Active',
                     ];
