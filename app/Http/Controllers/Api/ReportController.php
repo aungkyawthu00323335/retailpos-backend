@@ -11709,13 +11709,14 @@ class ReportController extends Controller
         $month = $request->query('month', '');
         $search = trim((string)($request->input('search') ?? $request->query('search', '')));
         $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
 
         // Progressive Pagination & Filtering parameters
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
 
         $type = strtolower(trim((string)($request->input('type') ?? $request->query('type', 'all'))));
-        if (!in_array($type, ['all', 'sales', 'purchases'])) {
+        if (!in_array($type, ['all', 'sales', 'purchases'], true)) {
             $type = 'all';
         }
 
@@ -11745,224 +11746,340 @@ class ReportController extends Controller
         }
         $canViewCost = $accounting->canViewCost($request);
 
-        // 1. Output Tax from Sales (collected from customers)
-        $salesQuery = DB::table('sales');
-        $this->applyActiveDocumentFilter($salesQuery, 'status');
-        if (!empty($allowedOutlets)) {
-            $salesQuery->whereIn('warehouse_id', $allowedOutlets);
-        }
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where(function ($q) use ($warehouseId, $warehouse) {
+        $applyWhScope = function ($query, string $table = '') use ($warehouseId, $warehouse) {
+            if ($warehouse === 'All' || empty($warehouse)) {
+                return;
+            }
+            $idCol = $table !== '' ? "{$table}.warehouse_id" : 'warehouse_id';
+            $nameCol = $table !== '' ? "{$table}.warehouse_name" : 'warehouse_name';
+            $query->where(function ($q) use ($idCol, $nameCol, $warehouseId, $warehouse) {
                 if ($warehouseId !== null) {
-                    $q->where('sales.warehouse_id', $warehouseId)
-                      ->orWhere('sales.warehouse_name', $warehouse);
+                    $q->where($idCol, $warehouseId)
+                      ->orWhere(function ($legacy) use ($idCol, $nameCol, $warehouse) {
+                          $legacy->whereNull($idCol)->where($nameCol, $warehouse);
+                      });
                 } else {
-                    $q->where('sales.warehouse_name', $warehouse);
+                    $q->where($nameCol, $warehouse);
                 }
             });
+        };
+
+        // 1. Output Tax from Sales (collected from customers)
+        $salesQuery = DB::table('sales');
+        $this->applyActiveDocumentFilter($salesQuery, 'sales.status');
+        if (!empty($allowedOutlets)) {
+            $salesQuery->whereIn('sales.warehouse_id', $allowedOutlets);
         }
-        $this->applyReportDateRange($salesQuery, $startDate, $endDate, 'date');
+        $applyWhScope($salesQuery, 'sales');
+        $this->applyReportDateRange($salesQuery, $startDate, $endDate, 'sales.date');
         if (!empty($search)) {
             $salesQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('customer_name', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+                $q->where('sales.reference_no', 'like', "%{$search}%")
+                  ->orWhere('sales.customer_name', 'like', "%{$search}%")
+                  ->orWhere('sales.warehouse_name', 'like', "%{$search}%");
             });
         }
 
         // 3. Input Tax from Purchases (Received/Completed & Recoverable Input Tax only)
         $purchQuery = DB::table('purchases')
-            ->whereIn('status', ['Received', 'Completed'])
-            ->whereRaw('COALESCE(is_tax_recoverable, 0) = 1');
+            ->whereIn('purchases.status', ['Received', 'Completed'])
+            ->where('purchases.is_tax_recoverable', 1);
         if (!empty($allowedOutlets)) {
-            $purchQuery->whereIn('warehouse_id', $allowedOutlets);
+            $purchQuery->whereIn('purchases.warehouse_id', $allowedOutlets);
         }
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $purchQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                if ($warehouseId !== null) {
-                    $q->where('warehouse_id', $warehouseId)
-                      ->orWhere('warehouse_name', $warehouse);
-                } else {
-                    $q->where('warehouse_name', $warehouse);
-                }
-            });
-        }
-        $this->applyReportDateRange($purchQuery, $startDate, $endDate, 'date');
+        $applyWhScope($purchQuery, 'purchases');
+        $this->applyReportDateRange($purchQuery, $startDate, $endDate, 'purchases.date');
         if (!empty($search)) {
             $purchQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('supplier_name', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
+                $q->where('purchases.reference_no', 'like', "%{$search}%")
+                  ->orWhere('purchases.supplier_name', 'like', "%{$search}%")
+                  ->orWhere('purchases.warehouse_name', 'like', "%{$search}%");
             });
         }
 
-        $salesAgg = null;
-        $srAgg = null;
-        $purchAgg = null;
-        $prAgg = null;
+        $needSalesMeta = !$skipSummary || $type === 'all' || $type === 'sales';
+        $needPurchMeta = !$skipSummary || $type === 'all' || $type === 'purchases';
+
+        $hasAnySaleLineTax = $needSalesMeta
+            ? DB::table('sale_items')->where('tax', '>', 0)->limit(1)->exists()
+            : false;
+        $hasAnyPurchLineTax = $needPurchMeta
+            ? DB::table('purchase_items')->where('tax', '>', 0)->limit(1)->exists()
+            : false;
+
+        $saleLineRows = collect();
+        $saleLineIds = [];
+        $saleLineTaxById = [];
+        if ($hasAnySaleLineTax) {
+            $saleLineRows = (clone $salesQuery)
+                ->join('sale_items as si', 'si.sale_id', '=', 'sales.id')
+                ->where('si.tax', '>', 0)
+                ->selectRaw('sales.id, sales.tax_amount, sales.shipping, sales.grand_total, SUM(si.tax) as line_tax_sum')
+                ->groupBy('sales.id', 'sales.tax_amount', 'sales.shipping', 'sales.grand_total')
+                ->get();
+            foreach ($saleLineRows as $lr) {
+                $sid = (int)$lr->id;
+                $saleLineIds[] = $sid;
+                $saleLineTaxById[$sid] = (float)$lr->line_tax_sum;
+            }
+        }
+
+        $purchLineRows = collect();
+        $purchLineIds = [];
+        $purchLineTaxById = [];
+        if ($hasAnyPurchLineTax) {
+            $purchLineRows = (clone $purchQuery)
+                ->join('purchase_items as pi', 'pi.purchase_id', '=', 'purchases.id')
+                ->where('pi.tax', '>', 0)
+                ->selectRaw('purchases.id, purchases.tax_amount, purchases.shipping, purchases.grand_total, SUM(pi.tax) as line_tax_sum')
+                ->groupBy('purchases.id', 'purchases.tax_amount', 'purchases.shipping', 'purchases.grand_total')
+                ->get();
+            foreach ($purchLineRows as $pr) {
+                $pid = (int)$pr->id;
+                $purchLineIds[] = $pid;
+                $purchLineTaxById[$pid] = (float)$pr->line_tax_sum;
+            }
+        }
+
+        $salesCount = 0;
+        $taxableSales = 0.0;
         $grossOutputTax = 0.0;
         $refundedOutputTax = 0.0;
+        $srReturnedTaxable = 0.0;
         $netOutputTax = 0.0;
+
+        $purchCount = 0;
+        $taxablePurchases = 0.0;
         $grossInputTax = 0.0;
         $recoveredInputTax = 0.0;
+        $prTaxableTotal = 0.0;
         $netInputTax = 0.0;
+
         $netTaxPayable = 0.0;
         $taxCreditForward = 0.0;
 
+        $driver = DB::getDriverName();
+
         if (!$skipSummary) {
-            $saleLineTaxAgg = DB::table('sale_items')
-                ->select('sale_id', DB::raw('COALESCE(SUM(tax), 0) as line_tax_sum'))
-                ->groupBy('sale_id');
-            $saleLineTaxExpr = 'COALESCE(sit.line_tax_sum, 0)';
-            $netTaxableExpr = "(COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - (COALESCE(sales.tax_amount, 0) + {$saleLineTaxExpr}))";
-            $salesAgg = (clone $salesQuery)
-                ->leftJoinSub($saleLineTaxAgg, 'sit', 'sit.sale_id', '=', 'sales.id')
+            // Senior Accounting Fix: Aggregate ONLY taxable sales (header tax_amount > 0 OR line_tax > 0).
+            // Non-taxable 0% sales MUST NEVER inflate Taxable Sales Amount or Taxable Sales Count.
+            $hdrSalesQuery = (clone $salesQuery)->where('sales.tax_amount', '>', 0);
+            if (!empty($saleLineIds) && count($saleLineIds) <= 500) {
+                $hdrSalesQuery->whereNotIn('sales.id', $saleLineIds);
+            }
+            $hdrSalesAgg = $hdrSalesQuery
                 ->selectRaw("
-                    COUNT(sales.id) as total_sales_count,
-                    COALESCE(SUM(sales.subtotal), 0) as gross_sales,
-                    COALESCE(SUM(sales.discount), 0) as total_sales_discount,
-                    COALESCE(SUM(CASE WHEN {$netTaxableExpr} > 0 THEN {$netTaxableExpr} ELSE 0 END), 0) as taxable_sales,
-                    COALESCE(SUM(COALESCE(sales.tax_amount, 0) + {$saleLineTaxExpr}), 0) as output_tax_collected,
-                    COALESCE(SUM(sales.grand_total), 0) as total_sales_with_tax
+                    COUNT(*) as cnt,
+                    COALESCE(SUM(CASE WHEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - COALESCE(sales.tax_amount, 0)) > 0
+                        THEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - COALESCE(sales.tax_amount, 0)) ELSE 0 END), 0) as taxable_sales,
+                    COALESCE(SUM(COALESCE(sales.tax_amount, 0)), 0) as output_tax
                 ")
                 ->first();
 
-            // 2. Output Tax adjustment from Sale Returns (streamed with cursor)
-            $srQuery = DB::table('sale_returns');
-            $this->applyActiveDocumentFilter($srQuery, 'status');
-            if (!empty($allowedOutlets)) {
-                $srQuery->whereIn('warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $srQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId)->orWhere('warehouse_name', $warehouse);
-                    } else {
-                        $q->where('warehouse_name', $warehouse);
+            if (count($saleLineIds) > 500) {
+                // Edge case: >500 invoices have line-item taxes -> evaluate full scoped join
+                $lineTaxSub = DB::table('sale_items')
+                    ->where('tax', '>', 0)
+                    ->whereIn('sale_id', (clone $salesQuery)->select('sales.id'))
+                    ->select('sale_id', DB::raw('COALESCE(SUM(tax), 0) as line_tax_sum'))
+                    ->groupBy('sale_id');
+                $lineTaxExpr = 'COALESCE(sit.line_tax_sum, 0)';
+                $totalSaleTaxExpr = "(COALESCE(sales.tax_amount, 0) + {$lineTaxExpr})";
+                $netTaxableExpr = "(COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - {$totalSaleTaxExpr})";
+                $fullAgg = (clone $salesQuery)
+                    ->leftJoinSub($lineTaxSub, 'sit', 'sit.sale_id', '=', 'sales.id')
+                    ->whereRaw("{$totalSaleTaxExpr} > 0")
+                    ->selectRaw("
+                        COUNT(sales.id) as cnt,
+                        COALESCE(SUM(CASE WHEN {$netTaxableExpr} > 0 THEN {$netTaxableExpr} ELSE 0 END), 0) as taxable_sales,
+                        COALESCE(SUM({$totalSaleTaxExpr}), 0) as output_tax
+                    ")
+                    ->first();
+                $salesCount = (int)($fullAgg->cnt ?? 0);
+                $taxableSales = (float)($fullAgg->taxable_sales ?? 0);
+                $grossOutputTax = (float)($fullAgg->output_tax ?? 0);
+            } else {
+                $salesCount = (int)($hdrSalesAgg->cnt ?? 0);
+                $taxableSales = (float)($hdrSalesAgg->taxable_sales ?? 0);
+                $grossOutputTax = (float)($hdrSalesAgg->output_tax ?? 0);
+                foreach ($saleLineRows as $lr) {
+                    $rowTax = (float)($lr->tax_amount ?? 0) + (float)$lr->line_tax_sum;
+                    if ($rowTax > 0) {
+                        $salesCount++;
+                        $rowTaxable = max(0.0, (float)($lr->grand_total ?? 0) - (float)($lr->shipping ?? 0) - $rowTax);
+                        $taxableSales += $rowTaxable;
+                        $grossOutputTax += $rowTax;
                     }
-                });
+                }
             }
-            $this->applyReportDateRange($srQuery, $startDate, $endDate, 'date');
+
+            // 2. Output Tax adjustment from Sale Returns (ONLY tax-bearing returns reduce taxable turnover & output tax)
+            $srBaseQuery = DB::table('sale_returns');
+            $this->applyActiveDocumentFilter($srBaseQuery, 'status');
+            if (!empty($allowedOutlets)) {
+                $srBaseQuery->whereIn('warehouse_id', $allowedOutlets);
+            }
+            $applyWhScope($srBaseQuery);
+            $this->applyReportDateRange($srBaseQuery, $startDate, $endDate, 'date');
             if (!empty($search)) {
-                $srQuery->where(function ($q) use ($search) {
+                $srBaseQuery->where(function ($q) use ($search) {
                     $q->where('reference_no', 'like', "%{$search}%")
                       ->orWhere('customer_name', 'like', "%{$search}%")
                       ->orWhere('warehouse_name', 'like', "%{$search}%");
                 });
             }
 
-            $srCount = 0;
-            $srReturnedTaxable = 0.0;
-            $srOutputTaxRefunded = 0.0;
-            $srReturnedWithTax = 0.0;
-            foreach ((clone $srQuery)->select('id', 'tax_amount', 'shipping', 'grand_total', 'items_payload')->cursor() as $srT) {
-                $srCount++;
-                $lineTaxSum = 0.0;
-                $srItemsArr = !empty($srT->items_payload) ? json_decode((string)$srT->items_payload, true) : null;
-                if (is_array($srItemsArr)) {
-                    foreach ($srItemsArr as $sIt) {
-                        $lineTaxSum += max(0.0, (float)($sIt['tax'] ?? 0));
+            $sumReturnsTaxableAndTax = function ($rows, float &$taxableOut, float &$taxOut) {
+                foreach ($rows as $r) {
+                    $lineTaxSum = 0.0;
+                    if (!empty($r->items_payload)) {
+                        $arr = json_decode((string)$r->items_payload, true);
+                        if (is_array($arr)) {
+                            foreach ($arr as $it) {
+                                $lineTaxSum += max(0.0, (float)($it['tax'] ?? 0));
+                            }
+                        }
+                    }
+                    $rowTax = (float)($r->tax_amount ?? 0) + $lineTaxSum;
+                    if ($rowTax > 0) {
+                        $rowTaxable = max(0.0, (float)($r->grand_total ?? 0) - (float)($r->shipping ?? 0) - $rowTax);
+                        $taxableOut += $rowTaxable;
+                        $taxOut += $rowTax;
                     }
                 }
-                $rowTax = (float)($srT->tax_amount ?? 0) + $lineTaxSum;
-                $rowTaxable = max(0.0, (float)($srT->grand_total ?? 0) - (float)($srT->shipping ?? 0) - $rowTax);
-                $srReturnedTaxable += $rowTaxable;
-                $srOutputTaxRefunded += $rowTax;
-                $srReturnedWithTax += (float)($srT->grand_total ?? 0);
+            };
+
+            // Fast indexed scan for header-taxed Sale Returns
+            $srHdrRows = (clone $srBaseQuery)
+                ->where('tax_amount', '>', 0)
+                ->select('tax_amount', 'shipping', 'grand_total', 'items_payload')
+                ->get();
+            $sumReturnsTaxableAndTax($srHdrRows, $srReturnedTaxable, $refundedOutputTax);
+
+            // Narrow scan for returns with tax_amount = 0 that might hold item-level tax in JSON
+            $srJsonQuery = (clone $srBaseQuery)
+                ->where(function ($q) {
+                    $q->whereNull('tax_amount')->orWhere('tax_amount', '<=', 0);
+                })
+                ->where('items_payload', 'like', '%"tax":%');
+            if ($driver === 'mysql') {
+                $srJsonQuery->whereRaw('items_payload REGEXP ?', ['"tax":[[:space:]]*([1-9]|0\.[0-9]*[1-9])']);
             }
-            $srAgg = (object)[
-                'total_returns_count'     => $srCount,
-                'returned_taxable_amount' => round($srReturnedTaxable, 2),
-                'output_tax_refunded'     => round($srOutputTaxRefunded, 2),
-                'total_returned_with_tax' => round($srReturnedWithTax, 2),
-            ];
+            $sumReturnsTaxableAndTax(
+                $srJsonQuery->select('tax_amount', 'shipping', 'grand_total', 'items_payload')->cursor(),
+                $srReturnedTaxable,
+                $refundedOutputTax
+            );
 
-            $poLineTaxAgg = DB::table('purchase_items')
-                ->select('purchase_id', DB::raw('COALESCE(SUM(tax), 0) as line_tax_sum'))
-                ->groupBy('purchase_id');
-            $poTotalTaxExpr = '(COALESCE(purchases.tax_amount, 0) + COALESCE(pit.line_tax_sum, 0))';
-            $poTaxableExpr = "CASE WHEN (purchases.grand_total - COALESCE(purchases.shipping, 0) - {$poTotalTaxExpr}) < 0 THEN 0 ELSE (purchases.grand_total - COALESCE(purchases.shipping, 0) - {$poTotalTaxExpr}) END";
-
-            $purchAgg = (clone $purchQuery)
-                ->leftJoinSub($poLineTaxAgg, 'pit', 'pit.purchase_id', '=', 'purchases.id')
+            // 3. Input Tax from Taxable Recoverable Purchases (ONLY tax > 0)
+            $hdrPurchQuery = (clone $purchQuery)->where('purchases.tax_amount', '>', 0);
+            if (!empty($purchLineIds) && count($purchLineIds) <= 500) {
+                $hdrPurchQuery->whereNotIn('purchases.id', $purchLineIds);
+            }
+            $hdrPurchAgg = $hdrPurchQuery
                 ->selectRaw("
-                    COUNT(purchases.id) as total_purchases_count,
-                    COALESCE(SUM({$poTaxableExpr}), 0) as gross_purchases,
-                    COALESCE(SUM(purchases.discount), 0) as total_purchases_discount,
-                    COALESCE(SUM({$poTaxableExpr}), 0) as taxable_purchases,
-                    COALESCE(SUM({$poTotalTaxExpr}), 0) as input_tax_paid,
-                    COALESCE(SUM(purchases.grand_total), 0) as total_purchases_with_tax
+                    COUNT(*) as cnt,
+                    COALESCE(SUM(CASE WHEN (COALESCE(purchases.grand_total, 0) - COALESCE(purchases.shipping, 0) - COALESCE(purchases.tax_amount, 0)) > 0
+                        THEN (COALESCE(purchases.grand_total, 0) - COALESCE(purchases.shipping, 0) - COALESCE(purchases.tax_amount, 0)) ELSE 0 END), 0) as taxable_purchases,
+                    COALESCE(SUM(COALESCE(purchases.tax_amount, 0)), 0) as input_tax
                 ")
                 ->first();
 
-            // 4. Input Tax adjustment from Purchase Returns (streamed with cursor)
-            $prQuery = DB::table('purchase_returns')
-                ->whereIn('status', ['Completed', 'Received'])
-                ->whereRaw('COALESCE(is_tax_recoverable, 0) = 1');
-            if (!empty($allowedOutlets)) {
-                $prQuery->whereIn('warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $prQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId)->orWhere('warehouse_name', $warehouse);
-                    } else {
-                        $q->where('warehouse_name', $warehouse);
+            if (count($purchLineIds) > 500) {
+                $poLineSub = DB::table('purchase_items')
+                    ->where('tax', '>', 0)
+                    ->whereIn('purchase_id', (clone $purchQuery)->select('purchases.id'))
+                    ->select('purchase_id', DB::raw('COALESCE(SUM(tax), 0) as line_tax_sum'))
+                    ->groupBy('purchase_id');
+                $poTaxExpr = '(COALESCE(purchases.tax_amount, 0) + COALESCE(pit.line_tax_sum, 0))';
+                $poTaxableExpr = "(COALESCE(purchases.grand_total, 0) - COALESCE(purchases.shipping, 0) - {$poTaxExpr})";
+                $fullPurchAgg = (clone $purchQuery)
+                    ->leftJoinSub($poLineSub, 'pit', 'pit.purchase_id', '=', 'purchases.id')
+                    ->whereRaw("{$poTaxExpr} > 0")
+                    ->selectRaw("
+                        COUNT(purchases.id) as cnt,
+                        COALESCE(SUM(CASE WHEN {$poTaxableExpr} > 0 THEN {$poTaxableExpr} ELSE 0 END), 0) as taxable_purchases,
+                        COALESCE(SUM({$poTaxExpr}), 0) as input_tax
+                    ")
+                    ->first();
+                $purchCount = (int)($fullPurchAgg->cnt ?? 0);
+                $taxablePurchases = (float)($fullPurchAgg->taxable_purchases ?? 0);
+                $grossInputTax = (float)($fullPurchAgg->input_tax ?? 0);
+            } else {
+                $purchCount = (int)($hdrPurchAgg->cnt ?? 0);
+                $taxablePurchases = (float)($hdrPurchAgg->taxable_purchases ?? 0);
+                $grossInputTax = (float)($hdrPurchAgg->input_tax ?? 0);
+                foreach ($purchLineRows as $pr) {
+                    $rowTax = (float)($pr->tax_amount ?? 0) + (float)$pr->line_tax_sum;
+                    if ($rowTax > 0) {
+                        $purchCount++;
+                        $rowTaxable = max(0.0, (float)($pr->grand_total ?? 0) - (float)($pr->shipping ?? 0) - $rowTax);
+                        $taxablePurchases += $rowTaxable;
+                        $grossInputTax += $rowTax;
                     }
-                });
+                }
             }
-            $this->applyReportDateRange($prQuery, $startDate, $endDate, 'date');
+
+            // 4. Input Tax adjustment from Recoverable Purchase Returns (ONLY tax-bearing returns)
+            $prBaseQuery = DB::table('purchase_returns')
+                ->whereIn('status', ['Completed', 'Received'])
+                ->where('is_tax_recoverable', 1);
+            if (!empty($allowedOutlets)) {
+                $prBaseQuery->whereIn('warehouse_id', $allowedOutlets);
+            }
+            $applyWhScope($prBaseQuery);
+            $this->applyReportDateRange($prBaseQuery, $startDate, $endDate, 'date');
             if (!empty($search)) {
-                $prQuery->where(function ($q) use ($search) {
+                $prBaseQuery->where(function ($q) use ($search) {
                     $q->where('reference_no', 'like', "%{$search}%")
                       ->orWhere('supplier_name', 'like', "%{$search}%")
                       ->orWhere('warehouse_name', 'like', "%{$search}%");
                 });
             }
 
-            $prCount = 0;
-            $prTaxableTotal = 0.0;
-            $prInputTaxRecovered = 0.0;
-            foreach ((clone $prQuery)->select('id', 'tax_amount', 'shipping', 'grand_total', 'items_payload')->cursor() as $prTaxRow) {
-                $prCount++;
-                $lineTaxSum = 0.0;
-                $prItemsArr = !empty($prTaxRow->items_payload) ? json_decode((string)$prTaxRow->items_payload, true) : null;
-                if (is_array($prItemsArr)) {
-                    foreach ($prItemsArr as $pIt) {
-                        $lineTaxSum += max(0.0, (float)($pIt['tax'] ?? 0));
-                    }
-                }
-                $rowTax = (float)($prTaxRow->tax_amount ?? 0) + $lineTaxSum;
-                $rowTaxable = max(0.0, (float)($prTaxRow->grand_total ?? 0) - (float)($prTaxRow->shipping ?? 0) - $rowTax);
-                $prInputTaxRecovered += $rowTax;
-                $prTaxableTotal += $rowTaxable;
+            $prHdrRows = (clone $prBaseQuery)
+                ->where('tax_amount', '>', 0)
+                ->select('tax_amount', 'shipping', 'grand_total', 'items_payload')
+                ->get();
+            $sumReturnsTaxableAndTax($prHdrRows, $prTaxableTotal, $recoveredInputTax);
+
+            $prJsonQuery = (clone $prBaseQuery)
+                ->where(function ($q) {
+                    $q->whereNull('tax_amount')->orWhere('tax_amount', '<=', 0);
+                })
+                ->where('items_payload', 'like', '%"tax":%');
+            if ($driver === 'mysql') {
+                $prJsonQuery->whereRaw('items_payload REGEXP ?', ['"tax":[[:space:]]*([1-9]|0\.[0-9]*[1-9])']);
             }
-            $prAgg = (object)[
-                'total_pr_count' => $prCount,
-                'pr_taxable_amount' => round($prTaxableTotal, 2),
-                'input_tax_recovered' => round($prInputTaxRecovered, 2),
-            ];
+            $sumReturnsTaxableAndTax(
+                $prJsonQuery->select('tax_amount', 'shipping', 'grand_total', 'items_payload')->cursor(),
+                $prTaxableTotal,
+                $recoveredInputTax
+            );
 
-            // 5. Calculations
-            $grossOutputTax = (float)($salesAgg->output_tax_collected ?? 0);
-            $refundedOutputTax = (float)($srAgg->output_tax_refunded ?? 0);
+            // 5. Net Commercial Tax Reconciliation Calculations
             $netOutputTax = round($grossOutputTax - $refundedOutputTax, 2);
-
-            $grossInputTax = (float)($purchAgg->input_tax_paid ?? 0);
-            $recoveredInputTax = (float)($prAgg->input_tax_recovered ?? 0);
             $netInputTax = round($grossInputTax - $recoveredInputTax, 2);
-
             $signedTaxBalance = round($netOutputTax - $netInputTax, 2);
             $netTaxPayable = $signedTaxBalance >= 0 ? $signedTaxBalance : 0.0;
             $taxCreditForward = $signedTaxBalance < 0 ? abs($signedTaxBalance) : 0.0;
         }
 
-        // Taxable Invoices with Tax Breakdown (Progressive pagination per tab, batch line_tax lookup)
-        $taxableSaleScope = function ($q) {
-            $q->where(function ($tq) {
-                $tq->where('tax_amount', '>', 0)
-                   ->orWhereRaw('EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = sales.id AND si.tax > 0)');
-            });
+        // Taxable Invoices with Tax Breakdown (Progressive pagination per tab)
+        $applyTaxableSaleScope = function ($q) use ($hasAnySaleLineTax, $saleLineIds) {
+            if (!$hasAnySaleLineTax) {
+                $q->where('sales.tax_amount', '>', 0);
+            } elseif (!empty($saleLineIds) && count($saleLineIds) <= 500) {
+                $q->where(function ($tq) use ($saleLineIds) {
+                    $tq->where('sales.tax_amount', '>', 0)
+                       ->orWhereIn('sales.id', $saleLineIds);
+                });
+            } else {
+                $q->where(function ($tq) {
+                    $tq->where('sales.tax_amount', '>', 0)
+                       ->orWhereRaw('EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = sales.id AND si.tax > 0)');
+                });
+            }
         };
 
         $totalSales = 0;
@@ -11970,63 +12087,69 @@ class ReportController extends Controller
         $taxableSalesList = collect();
         if ($type === 'all' || $type === 'sales') {
             $salesListQuery = (clone $salesQuery);
-            $taxableSaleScope($salesListQuery);
-            if (!empty($search)) {
-                $salesListQuery->where(function ($q) use ($search) {
-                    $q->where('reference_no', 'like', "%{$search}%")
-                      ->orWhere('customer_name', 'like', "%{$search}%")
-                      ->orWhere('warehouse_name', 'like', "%{$search}%");
-                });
+            $applyTaxableSaleScope($salesListQuery);
+            if (!$skipSummary) {
+                $totalSales = $salesCount;
+            } elseif ($knownTotal !== null) {
+                $totalSales = $knownTotal;
+            } else {
+                $totalSales = (int)(clone $salesListQuery)->count();
             }
-            $totalSales = (int)(clone $salesListQuery)->count();
+
             $rawSaleRows = $salesListQuery
                 ->select(
-                    'id',
-                    'reference_no',
-                    'date',
-                    'customer_name',
-                    'warehouse_name',
-                    'tax_rate',
-                    'tax_amount',
-                    'subtotal',
-                    'discount',
-                    'shipping',
-                    'grand_total'
+                    'sales.id',
+                    'sales.reference_no',
+                    'sales.date',
+                    'sales.customer_name',
+                    'sales.warehouse_name',
+                    'sales.tax_rate',
+                    'sales.tax_amount',
+                    'sales.subtotal',
+                    'sales.discount',
+                    'sales.shipping',
+                    'sales.grand_total'
                 )
-                ->orderBy('date', 'desc')
-                ->orderBy('id', 'desc')
+                ->orderBy('sales.date', 'desc')
+                ->orderBy('sales.id', 'desc')
                 ->offset(($page - 1) * $perPage)
                 ->limit($perPage + 1)
                 ->get();
             $salesHasMore = $rawSaleRows->count() > $perPage;
             $pageSaleRows = $salesHasMore ? $rawSaleRows->slice(0, $perPage)->values() : $rawSaleRows->values();
-            $pageSaleIds = $pageSaleRows->pluck('id')->all();
-            $lineTaxBySale = [];
-            if (!empty($pageSaleIds)) {
-                foreach (array_chunk($pageSaleIds, 400) as $idChunk) {
+
+            $lineTaxForPage = $saleLineTaxById;
+            if (empty($lineTaxForPage) && $hasAnySaleLineTax && $pageSaleRows->isNotEmpty()) {
+                foreach (array_chunk($pageSaleRows->pluck('id')->all(), 400) as $idChunk) {
                     foreach (DB::table('sale_items')
                         ->whereIn('sale_id', $idChunk)
+                        ->where('tax', '>', 0)
                         ->selectRaw('sale_id, COALESCE(SUM(tax), 0) as lt')
                         ->groupBy('sale_id')
                         ->pluck('lt', 'sale_id') as $sid => $lt) {
-                        $lineTaxBySale[(int)$sid] = (float)$lt;
+                        $lineTaxForPage[(int)$sid] = (float)$lt;
                     }
                 }
             }
-            $taxableSalesList = $pageSaleRows->map(function ($row) use ($lineTaxBySale) {
+
+            $taxableSalesList = $pageSaleRows->map(function ($row) use ($lineTaxForPage) {
                 $subtotal = (float)($row->subtotal ?? 0);
                 $discount = (float)($row->discount ?? 0);
                 $shipping = (float)($row->shipping ?? 0);
                 $grandTotal = (float)($row->grand_total ?? 0);
-                $taxAmount = round((float)($row->tax_amount ?? 0) + (float)($lineTaxBySale[(int)$row->id] ?? 0.0), 2);
+                $taxAmount = round((float)($row->tax_amount ?? 0) + (float)($lineTaxForPage[(int)$row->id] ?? 0.0), 2);
                 $taxableAmount = round(max(0.0, $grandTotal - $shipping - $taxAmount), 2);
+                $taxRate = (float)($row->tax_rate ?? 0);
+                if ($taxRate <= 0 && $taxAmount > 0 && $taxableAmount > 0) {
+                    $taxRate = round(($taxAmount / $taxableAmount) * 100.0, 2);
+                }
                 return [
                     'id'             => $row->id,
                     'reference_no'   => $row->reference_no,
                     'date'           => $row->date,
                     'customer_name'  => $row->customer_name ?? 'Walk-in Customer',
                     'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
-                    'tax_rate'       => (float)($row->tax_rate ?? 0),
+                    'tax_rate'       => $taxRate,
                     'tax_amount'     => $taxAmount,
                     'taxable_amount' => $taxableAmount,
                     'subtotal'       => $subtotal,
@@ -12034,17 +12157,24 @@ class ReportController extends Controller
                     'grand_total'    => $grandTotal,
                 ];
             });
-        } else {
-            $countSaleQuery = (clone $salesQuery);
-            $taxableSaleScope($countSaleQuery);
-            $totalSales = (int)$countSaleQuery->count();
+        } elseif ($knownTotal !== null) {
+            $totalSales = $knownTotal;
         }
 
-        $taxablePurchaseScope = function ($q) {
-            $q->where(function ($tq) {
-                $tq->where('tax_amount', '>', 0)
-                   ->orWhereRaw('EXISTS (SELECT 1 FROM purchase_items pi WHERE pi.purchase_id = purchases.id AND pi.tax > 0)');
-            });
+        $applyTaxablePurchaseScope = function ($q) use ($hasAnyPurchLineTax, $purchLineIds) {
+            if (!$hasAnyPurchLineTax) {
+                $q->where('purchases.tax_amount', '>', 0);
+            } elseif (!empty($purchLineIds) && count($purchLineIds) <= 500) {
+                $q->where(function ($tq) use ($purchLineIds) {
+                    $tq->where('purchases.tax_amount', '>', 0)
+                       ->orWhereIn('purchases.id', $purchLineIds);
+                });
+            } else {
+                $q->where(function ($tq) {
+                    $tq->where('purchases.tax_amount', '>', 0)
+                       ->orWhereRaw('EXISTS (SELECT 1 FROM purchase_items pi WHERE pi.purchase_id = purchases.id AND pi.tax > 0)');
+                });
+            }
         };
 
         $totalPurchases = 0;
@@ -12052,70 +12182,74 @@ class ReportController extends Controller
         $taxablePurchasesList = collect();
         if ($type === 'all' || $type === 'purchases') {
             $purchListQuery = (clone $purchQuery);
-            $taxablePurchaseScope($purchListQuery);
-            if (!empty($search)) {
-                $purchListQuery->where(function ($q) use ($search) {
-                    $q->where('reference_no', 'like', "%{$search}%")
-                      ->orWhere('supplier_name', 'like', "%{$search}%")
-                      ->orWhere('warehouse_name', 'like', "%{$search}%");
-                });
+            $applyTaxablePurchaseScope($purchListQuery);
+            if (!$skipSummary) {
+                $totalPurchases = $purchCount;
+            } elseif ($knownTotal !== null) {
+                $totalPurchases = $knownTotal;
+            } else {
+                $totalPurchases = (int)(clone $purchListQuery)->count();
             }
-            $totalPurchases = (int)(clone $purchListQuery)->count();
+
             $rawPurchRows = $purchListQuery
                 ->select(
-                    'id',
-                    'reference_no',
-                    'date',
-                    'supplier_name',
-                    'warehouse_name',
-                    'tax_rate',
-                    'tax_amount',
-                    'discount',
-                    'shipping',
-                    'grand_total'
+                    'purchases.id',
+                    'purchases.reference_no',
+                    'purchases.date',
+                    'purchases.supplier_name',
+                    'purchases.warehouse_name',
+                    'purchases.tax_rate',
+                    'purchases.tax_amount',
+                    'purchases.discount',
+                    'purchases.shipping',
+                    'purchases.grand_total'
                 )
-                ->orderBy('date', 'desc')
-                ->orderBy('id', 'desc')
+                ->orderBy('purchases.date', 'desc')
+                ->orderBy('purchases.id', 'desc')
                 ->offset(($page - 1) * $perPage)
                 ->limit($perPage + 1)
                 ->get();
             $purchasesHasMore = $rawPurchRows->count() > $perPage;
             $pagePurchRows = $purchasesHasMore ? $rawPurchRows->slice(0, $perPage)->values() : $rawPurchRows->values();
-            $pagePurchIds = $pagePurchRows->pluck('id')->all();
-            $lineTaxByPurch = [];
-            if (!empty($pagePurchIds)) {
-                foreach (array_chunk($pagePurchIds, 400) as $idChunk) {
+
+            $lineTaxForPurchPage = $purchLineTaxById;
+            if (empty($lineTaxForPurchPage) && $hasAnyPurchLineTax && $pagePurchRows->isNotEmpty()) {
+                foreach (array_chunk($pagePurchRows->pluck('id')->all(), 400) as $idChunk) {
                     foreach (DB::table('purchase_items')
                         ->whereIn('purchase_id', $idChunk)
+                        ->where('tax', '>', 0)
                         ->selectRaw('purchase_id, COALESCE(SUM(tax), 0) as lt')
                         ->groupBy('purchase_id')
                         ->pluck('lt', 'purchase_id') as $pid => $lt) {
-                        $lineTaxByPurch[(int)$pid] = (float)$lt;
+                        $lineTaxForPurchPage[(int)$pid] = (float)$lt;
                     }
                 }
             }
-            $taxablePurchasesList = $pagePurchRows->map(function ($row) use ($lineTaxByPurch) {
+
+            $taxablePurchasesList = $pagePurchRows->map(function ($row) use ($lineTaxForPurchPage) {
                 $grandTotal = (float)($row->grand_total ?? 0);
-                $taxAmount = round((float)($row->tax_amount ?? 0) + (float)($lineTaxByPurch[(int)$row->id] ?? 0.0), 2);
+                $taxAmount = round((float)($row->tax_amount ?? 0) + (float)($lineTaxForPurchPage[(int)$row->id] ?? 0.0), 2);
                 $shipping = (float)($row->shipping ?? 0);
                 $taxableAmount = round(max(0.0, $grandTotal - $shipping - $taxAmount), 2);
+                $taxRate = (float)($row->tax_rate ?? 0);
+                if ($taxRate <= 0 && $taxAmount > 0 && $taxableAmount > 0) {
+                    $taxRate = round(($taxAmount / $taxableAmount) * 100.0, 2);
+                }
                 return [
                     'id'             => $row->id,
                     'reference_no'   => $row->reference_no,
                     'date'           => $row->date,
                     'supplier_name'  => $row->supplier_name ?? 'Default Supplier',
                     'warehouse_name' => $row->warehouse_name ?? 'Main Warehouse',
-                    'tax_rate'       => (float)($row->tax_rate ?? 0),
+                    'tax_rate'       => $taxRate,
                     'tax_amount'     => $taxAmount,
                     'taxable_amount' => $taxableAmount,
                     'discount'       => (float)($row->discount ?? 0),
                     'grand_total'    => $grandTotal,
                 ];
             });
-        } else {
-            $countQuery = (clone $purchQuery);
-            $taxablePurchaseScope($countQuery);
-            $totalPurchases = (int)$countQuery->count();
+        } elseif ($knownTotal !== null) {
+            $totalPurchases = $knownTotal;
         }
 
         $salesLastPage = max(1, (int)ceil($totalSales / max(1, $perPage)));
@@ -12145,16 +12279,16 @@ class ReportController extends Controller
                 'gross_sales_tax'      => round($grossOutputTax, 2),
                 'returns_tax_refund'   => round($refundedOutputTax, 2),
                 'net_output_tax'       => round($netOutputTax, 2),
-                'taxable_sales_amount' => round((float)($salesAgg->taxable_sales ?? 0) - (float)($srAgg->returned_taxable_amount ?? 0), 2),
-                'sales_count'          => (int)($salesAgg->total_sales_count ?? 0),
+                'taxable_sales_amount' => round($taxableSales - $srReturnedTaxable, 2),
+                'sales_count'          => $salesCount,
             ],
             'input_tax' => [
                 'cost_masked'              => !$canViewCost,
                 'gross_purchases_tax'      => $canViewCost ? round($grossInputTax, 2) : 0.0,
                 'returns_tax_recovered'    => $canViewCost ? round($recoveredInputTax, 2) : 0.0,
                 'net_input_tax'            => $canViewCost ? round($netInputTax, 2) : 0.0,
-                'taxable_purchases_amount' => $canViewCost ? round((float)($purchAgg->taxable_purchases ?? 0) - (float)($prAgg->pr_taxable_amount ?? 0), 2) : 0.0,
-                'purchases_count'          => (int)($purchAgg->total_purchases_count ?? 0),
+                'taxable_purchases_amount' => $canViewCost ? round($taxablePurchases - $prTaxableTotal, 2) : 0.0,
+                'purchases_count'          => $purchCount,
             ],
             'tax_reconciliation' => [
                 'cost_masked'            => !$canViewCost,

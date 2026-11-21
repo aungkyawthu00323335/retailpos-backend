@@ -261,4 +261,103 @@ class Phase5EnterpriseFeaturesTest extends TestCase
             ],
         ]);
     }
+
+    public function test_commercial_tax_excludes_non_taxable_sales_and_non_taxable_returns_from_taxable_turnover(): void
+    {
+        $outlet = Outlet::create(['name' => 'Tax Audit Branch', 'code' => 'OUT-AUD']);
+        $today = Carbon::now()->toDateTimeString();
+
+        // 1. One taxable sale: subtotal 20,000 + 5% tax (1,000) = 21,000
+        Sale::create([
+            'reference_no' => 'SA-AUD-TAX',
+            'customer_name' => 'Tax Customer',
+            'warehouse_name' => $outlet->name,
+            'warehouse_id' => $outlet->id,
+            'date' => $today,
+            'status' => 'Completed',
+            'subtotal' => 20000.0,
+            'tax_rate' => 5.0,
+            'tax_amount' => 1000.0,
+            'discount' => 0.0,
+            'grand_total' => 21000.0,
+            'paid_amount' => 21000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+        ]);
+
+        // 2. One non-taxable 0% sale: 100,000 (MUST NOT inflate taxable_sales_amount or sales_count)
+        Sale::create([
+            'reference_no' => 'SA-AUD-EXEMPT',
+            'customer_name' => 'Exempt Customer',
+            'warehouse_name' => $outlet->name,
+            'warehouse_id' => $outlet->id,
+            'date' => $today,
+            'status' => 'Completed',
+            'subtotal' => 100000.0,
+            'tax_rate' => 0.0,
+            'tax_amount' => 0.0,
+            'discount' => 0.0,
+            'grand_total' => 100000.0,
+            'paid_amount' => 100000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+        ]);
+
+        // 3. One non-taxable sale return: 50,000 (MUST NOT reduce taxable_sales_amount)
+        \App\Models\SaleReturn::create([
+            'reference_no' => 'SR-AUD-EXEMPT',
+            'customer_name' => 'Exempt Customer',
+            'warehouse_name' => $outlet->name,
+            'warehouse_id' => $outlet->id,
+            'date' => $today,
+            'status' => 'Completed',
+            'tax_rate' => 0.0,
+            'tax_amount' => 0.0,
+            'discount' => 0.0,
+            'shipping' => 0.0,
+            'grand_total' => 50000.0,
+            'paid_amount' => 50000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+            'items_payload' => json_encode([['product_id' => 1, 'quantity' => 1, 'tax' => 0, 'subtotal' => 50000]]),
+        ]);
+
+        // 4. One taxable sale return: base 4,000 + 5% tax (200) = 4,200 (MUST reduce both output tax and taxable base)
+        \App\Models\SaleReturn::create([
+            'reference_no' => 'SR-AUD-TAX',
+            'customer_name' => 'Tax Customer',
+            'warehouse_name' => $outlet->name,
+            'warehouse_id' => $outlet->id,
+            'date' => $today,
+            'status' => 'Completed',
+            'tax_rate' => 5.0,
+            'tax_amount' => 200.0,
+            'discount' => 0.0,
+            'shipping' => 0.0,
+            'grand_total' => 4200.0,
+            'paid_amount' => 4200.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+        ]);
+
+        $response = $this->getJson('/api/reports/commercial-tax');
+        $response->assertStatus(200)
+            ->assertJson([
+                'status' => 'success',
+                'output_tax' => [
+                    'gross_sales_tax' => 1000.0,
+                    'returns_tax_refund' => 200.0,
+                    'net_output_tax' => 800.0,
+                    'taxable_sales_amount' => 16000.0, // 20,000 - 4,000 (ignores 100k exempt sale & 50k exempt return)
+                    'sales_count' => 1,
+                ],
+                'sales_pagination' => [
+                    'total' => 1,
+                ],
+            ]);
+    }
 }
