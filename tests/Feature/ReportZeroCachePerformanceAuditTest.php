@@ -346,4 +346,125 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
         $this->assertTrue(Schema::hasIndex('stock_movements', 'idx_sm_type_wh_created'));
         $this->assertTrue(Schema::hasIndex('stock_balances', 'idx_sb_wh_prod_qty'));
     }
+
+    public function test_cashier_audit_reconciles_tenders_and_includes_shift_or_return_only_staff(): void
+    {
+        $outlet = Outlet::create(['name' => 'Audit Outlet', 'is_active' => true]);
+        $customer = Customer::create(['name' => 'Walk-in', 'phone' => '09111111']);
+        $user = $this->createAdminUser(['report_cashier_audit.view', 'reports.view']);
+        $today = \Carbon\Carbon::today()->toDateString();
+
+        // Staff A: 1 Cash Sale of 10,000 + 1 KBZPay Sale Return of 15,000 -> Cash=+10,000, NonCash=-15,000, NetCollected=-5,000
+        Sale::create([
+            'reference_no' => 'SA-AUD-C1',
+            'customer_id' => $customer->id,
+            'customer_name' => $customer->name,
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'date' => $today . ' 10:00:00',
+            'status' => 'Completed',
+            'grand_total' => 10000.0,
+            'paid_amount' => 10000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+            'user_name' => 'Cashier Alpha',
+            'created_by' => 'Cashier Alpha',
+            'user_role' => 'Cashier',
+        ]);
+        SaleReturn::create([
+            'reference_no' => 'SR-AUD-C1',
+            'customer_id' => $customer->id,
+            'customer_name' => $customer->name,
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'date' => $today . ' 11:00:00',
+            'status' => 'Completed',
+            'grand_total' => 15000.0,
+            'paid_amount' => 15000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'KBZPay',
+            'refund_tender' => 'KBZPay',
+            'user_name' => 'Cashier Alpha',
+            'created_by' => 'Cashier Alpha',
+        ]);
+
+        // Staff B: Zero sales, only an open register shift with 50,000 float -> MUST still appear in Fraud Audit!
+        DB::table('cash_registers')->insert([
+            'reference_no' => 'REG-AUD-BETA',
+            'user_id' => $user->id,
+            'user_name' => 'Shift Only Staff',
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'register_name' => 'Register 02',
+            'status' => 'open',
+            'opening_cash' => 50000.0,
+            'expected_cash' => 50000.0,
+            'opened_at' => $today . ' 08:00:00',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $res = $this->withToken($user->api_token)
+            ->getJson("/api/reports/cashier-audit?start_date={$today}&end_date={$today}")
+            ->assertStatus(200);
+
+        $rows = collect($res->json('data'));
+        $alpha = $rows->firstWhere('cashier_name', 'Cashier Alpha');
+        $this->assertNotNull($alpha);
+        $this->assertEquals(10000.0, (float)$alpha['cash_collected']);
+        $this->assertEquals(-15000.0, (float)$alpha['non_cash_collected']);
+        $this->assertEquals(-5000.0, (float)$alpha['total_collected']);
+        $this->assertEquals(round((float)$alpha['cash_collected'] + (float)$alpha['non_cash_collected'], 2), (float)$alpha['total_collected']);
+
+        $beta = $rows->firstWhere('cashier_name', 'Shift Only Staff');
+        $this->assertNotNull($beta);
+        $this->assertEquals(50000.0, (float)$beta['expected_cash']);
+    }
+
+    public function test_dead_stock_values_inventory_using_active_fifo_batches_and_excludes_deleted_variants(): void
+    {
+        $outlet = Outlet::create(['name' => 'DeadStock Branch', 'is_active' => true]);
+        $user = $this->createAdminUser(['report_dead_stock.view', 'reports.view', 'products.view_cost']);
+
+        $prod = Product::create([
+            'code' => 'P-DEAD-FIFO',
+            'name' => 'Stale Batch Goods',
+            'cost_price' => 1000.0,
+            'purchase_price' => 1000.0,
+            'selling_price' => 2500.0,
+            'stock_quantity' => 5,
+            'product_unit' => 'Pc',
+            'barcode_symbol' => 'CODE128',
+        ]);
+        DB::table('products')->where('id', $prod->id)->update(['created_at' => now()->subDays(120)]);
+        DB::table('stock_balances')->insert([
+            'warehouse_id' => $outlet->id,
+            'product_id' => $prod->id,
+            'quantity' => 5,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        DB::table('inventory_batches')->insert([
+            'warehouse_id' => $outlet->id,
+            'product_id' => $prod->id,
+            'initial_quantity' => 5,
+            'remaining_quantity' => 5,
+            'unit_cost' => 1400.0, // True landed FIFO cost > master cost_price 1000
+            'status' => 'active',
+            'received_date' => now()->subDays(120),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $res = $this->withToken($user->api_token)
+            ->getJson("/api/reports/dead-stock?warehouse={$outlet->name}&days=60")
+            ->assertStatus(200);
+
+        $item = collect($res->json('data'))->firstWhere('product_id', $prod->id);
+        $this->assertNotNull($item);
+        $this->assertEquals(7000.0, (float)$item['tied_up_capital']); // 5 * 1400 FIFO cost
+        $this->assertEquals(7000.0, (float)$res->json('summary.total_tied_up_capital'));
+    }
 }

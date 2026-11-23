@@ -1060,6 +1060,10 @@ class PurchaseAccountingService
         if ($trimmed === '') {
             return $fallback ?: now()->format('Y-m-d H:i:s');
         }
+        // O(1) fast path for already-normalized 'Y-m-d H:i:s' database timestamps
+        if (strlen($trimmed) === 19 && $trimmed[4] === '-' && $trimmed[7] === '-' && $trimmed[10] === ' ' && $trimmed[13] === ':' && $trimmed[16] === ':') {
+            return $trimmed;
+        }
         if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $trimmed) || (!str_contains($trimmed, ':') && !str_contains($trimmed, 'T'))) {
             return $trimmed . ' ' . now()->format('H:i:s');
         }
@@ -1363,7 +1367,7 @@ class PurchaseAccountingService
         $hasWarehouse = $warehouse !== null && $warehouse !== '' && $warehouse !== 'All';
         $hasOutlets = !empty($allowedOutlets);
 
-        $purchases = DB::table('purchases')
+        $purchaseRows = DB::table('purchases')
             ->whereIn('status', ['Received', 'Completed'])
             ->where(function ($q) {
                 $q->whereNull('payment_type')
@@ -1372,15 +1376,20 @@ class PurchaseAccountingService
             ->when($hasOutlets, fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
             ->when($hasWarehouse, fn($q) => $q->where('warehouse_name', $warehouse))
             ->where('due_amount', '>', 0)
-            ->select(['supplier_id', 'supplier_name', 'due_amount'])
+            ->select([
+                'supplier_id',
+                'supplier_name',
+                DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
+            ])
+            ->groupBy('supplier_id', 'supplier_name')
             ->get();
 
         $supplierDueByKey = [];
-        foreach ($purchases as $p) {
+        foreach ($purchaseRows as $p) {
             $key = ($p->supplier_id ?: 0) > 0
                 ? (string)$p->supplier_id
                 : 'name_' . ($p->supplier_name ?: 'General Supplier');
-            $supplierDueByKey[$key] = ($supplierDueByKey[$key] ?? 0.0) + (float)$p->due_amount;
+            $supplierDueByKey[$key] = ($supplierDueByKey[$key] ?? 0.0) + (float)$p->total_due;
         }
 
         if (!$hasWarehouse && !$hasOutlets) {
@@ -1393,47 +1402,44 @@ class PurchaseAccountingService
             }
         }
 
-        $openCredits = DB::table('purchase_returns')
-            ->whereIn('status', ['Completed', 'Received'])
-            ->when($hasOutlets, fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
-            ->when($hasWarehouse, fn($q) => $q->where('warehouse_name', $warehouse))
-            ->select(['id', 'supplier_id', 'supplier_name', 'grand_total', 'paid_amount', 'due_amount'])
+        if (empty($supplierDueByKey)) {
+            return 0.0;
+        }
+
+        $hasReleasedAt = $this->schemaHasColumn('purchase_return_allocations', 'released_at');
+        $allocSub = DB::table('purchase_return_allocations as pra')
+            ->join('purchases as p', 'pra.purchase_id', '=', 'p.id')
+            ->whereIn('p.status', ['Received', 'Completed'])
+            ->when($hasOutlets, fn($q) => $q->whereIn('p.warehouse_id', $allowedOutlets))
+            ->when($hasWarehouse, fn($q) => $q->where('p.warehouse_name', $warehouse))
+            ->when($hasReleasedAt, fn($q) => $q->whereNull('pra.released_at'))
+            ->select('pra.purchase_return_id', DB::raw('COALESCE(SUM(pra.amount), 0) as allocated'))
+            ->groupBy('pra.purchase_return_id');
+
+        $openCreditRows = DB::table('purchase_returns as pr')
+            ->leftJoinSub($allocSub, 'alloc', 'alloc.purchase_return_id', '=', 'pr.id')
+            ->whereIn('pr.status', ['Completed', 'Received'])
+            ->when($hasOutlets, fn($q) => $q->whereIn('pr.warehouse_id', $allowedOutlets))
+            ->when($hasWarehouse, fn($q) => $q->where('pr.warehouse_name', $warehouse))
+            ->whereRaw('COALESCE(pr.grand_total, 0) - COALESCE(pr.paid_amount, 0) > 0.001')
+            ->select([
+                'pr.supplier_id',
+                'pr.supplier_name',
+                DB::raw('COALESCE(SUM(CASE WHEN (COALESCE(pr.grand_total, 0) - COALESCE(pr.paid_amount, 0) - COALESCE(alloc.allocated, 0)) > 0.001 THEN (COALESCE(pr.grand_total, 0) - COALESCE(pr.paid_amount, 0) - COALESCE(alloc.allocated, 0)) ELSE 0 END), 0) as unalloc_sum'),
+            ])
+            ->groupBy('pr.supplier_id', 'pr.supplier_name')
             ->get();
 
-        if ($openCredits->isNotEmpty()) {
-            $openCreditIds = $openCredits->pluck('id')->all();
-            $allocByPr = [];
-            $hasReleasedAt = $this->schemaHasColumn('purchase_return_allocations', 'released_at');
-            foreach (array_chunk($openCreditIds, 400) as $idChunk) {
-                $allocQuery = DB::table('purchase_return_allocations')
-                    ->join('purchases', 'purchase_return_allocations.purchase_id', '=', 'purchases.id')
-                    ->whereIn('purchase_return_allocations.purchase_return_id', $idChunk)
-                    ->whereIn('purchases.status', ['Received', 'Completed'])
-                    ->when($hasOutlets, fn($q) => $q->whereIn('purchases.warehouse_id', $allowedOutlets))
-                    ->when($hasWarehouse, fn($q) => $q->where('purchases.warehouse_name', $warehouse));
-                if ($hasReleasedAt) {
-                    $allocQuery->whereNull('purchase_return_allocations.released_at');
-                }
-                foreach ($allocQuery
-                    ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as allocated'))
-                    ->groupBy('purchase_return_allocations.purchase_return_id')
-                    ->pluck('allocated', 'purchase_return_id') as $prId => $amt) {
-                    $allocByPr[$prId] = ($allocByPr[$prId] ?? 0.0) + (float)$amt;
-                }
+        foreach ($openCreditRows as $cr) {
+            $unalloc = round((float)($cr->unalloc_sum ?? 0.0), 2);
+            if ($unalloc <= 0.001) {
+                continue;
             }
-
-            foreach ($openCredits as $cr) {
-                $crDue = max(0.0, (float)$cr->grand_total - (float)$cr->paid_amount);
-                $unalloc = round(max(0.0, $crDue - (float)($allocByPr[$cr->id] ?? 0.0)), 2);
-                if ($unalloc <= 0.001) {
-                    continue;
-                }
-                $cKey = ($cr->supplier_id ?: 0) > 0
-                    ? (string)$cr->supplier_id
-                    : 'name_' . ($cr->supplier_name ?: 'General Supplier');
-                if (isset($supplierDueByKey[$cKey])) {
-                    $supplierDueByKey[$cKey] = max(0.0, $supplierDueByKey[$cKey] - $unalloc);
-                }
+            $cKey = ($cr->supplier_id ?: 0) > 0
+                ? (string)$cr->supplier_id
+                : 'name_' . ($cr->supplier_name ?: 'General Supplier');
+            if (isset($supplierDueByKey[$cKey])) {
+                $supplierDueByKey[$cKey] = max(0.0, $supplierDueByKey[$cKey] - $unalloc);
             }
         }
 
@@ -1471,50 +1477,102 @@ class PurchaseAccountingService
             }
         }
 
+        $hasNullPoSup = DB::table('purchases')->whereNull('supplier_id')->exists();
         $poQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
         $this->excludeOpeningStockPurchases($poQuery, 'payment_type');
         $poDueBySup = [];
-        foreach ($poQuery->select(['supplier_id', 'supplier_name', 'due_amount'])->get() as $p) {
-            $sId = (int)($p->supplier_id ?? 0);
-            if ($sId <= 0) {
-                $sId = $supIdByName[strtolower(trim((string)($p->supplier_name ?? '')))] ?? 0;
+        if (!$hasNullPoSup) {
+            if (!empty($supplierIds) && count($supplierIds) <= 200) {
+                $poQuery->whereIn('supplier_id', array_values(array_unique(array_map('intval', $supplierIds))));
             }
-            if ($sId > 0) {
-                $poDueBySup[$sId] = ($poDueBySup[$sId] ?? 0.0) + (float)$p->due_amount;
+            foreach ($poQuery
+                ->select('supplier_id', DB::raw('COALESCE(SUM(due_amount), 0) as due_sum'))
+                ->groupBy('supplier_id')
+                ->get() as $p) {
+                $sId = (int)($p->supplier_id ?? 0);
+                if ($sId > 0) {
+                    $poDueBySup[$sId] = (float)$p->due_sum;
+                }
+            }
+        } else {
+            foreach ($poQuery
+                ->select('supplier_id', 'supplier_name', DB::raw('COALESCE(SUM(due_amount), 0) as due_sum'))
+                ->groupBy('supplier_id', 'supplier_name')
+                ->get() as $p) {
+                $sId = (int)($p->supplier_id ?? 0);
+                if ($sId <= 0) {
+                    $sId = $supIdByName[strtolower(trim((string)($p->supplier_name ?? '')))] ?? 0;
+                }
+                if ($sId > 0) {
+                    $poDueBySup[$sId] = ($poDueBySup[$sId] ?? 0.0) + (float)$p->due_sum;
+                }
             }
         }
 
-        $prs = DB::table('purchase_returns')
-            ->whereIn('status', self::COMPLETED_RETURN_STATUSES)
-            ->select(['id', 'supplier_id', 'supplier_name', 'due_amount'])
-            ->get();
-        $prIds = $prs->pluck('id')->all();
-        $allocMap = [];
-        if (!empty($prIds) && $this->schemaHasTable('purchase_return_allocations')) {
-            $hasReleasedAt = $this->schemaHasColumn('purchase_return_allocations', 'released_at');
-            foreach (array_chunk($prIds, 400) as $idChunk) {
-                $aq = DB::table('purchase_return_allocations')->whereIn('purchase_return_id', $idChunk);
-                if ($hasReleasedAt) {
-                    $aq->whereNull('released_at');
+        $hasNullPrSup = DB::table('purchase_returns')->whereNull('supplier_id')->exists();
+        $unallocBySup = [];
+        $prBase = DB::table('purchase_returns')->whereIn('status', self::COMPLETED_RETURN_STATUSES);
+        if (!$hasNullPrSup) {
+            if (!empty($supplierIds) && count($supplierIds) <= 200) {
+                $prBase->whereIn('supplier_id', array_values(array_unique(array_map('intval', $supplierIds))));
+            }
+            foreach ($prBase
+                ->select('supplier_id', DB::raw('COALESCE(SUM(due_amount), 0) as due_sum'))
+                ->groupBy('supplier_id')
+                ->get() as $pr) {
+                $sId = (int)($pr->supplier_id ?? 0);
+                if ($sId > 0) {
+                    $unallocBySup[$sId] = (float)$pr->due_sum;
                 }
-                foreach ($aq->select('purchase_return_id', DB::raw('SUM(amount) as alloc_sum'))
-                    ->groupBy('purchase_return_id')
-                    ->pluck('alloc_sum', 'purchase_return_id') as $k => $v) {
-                    $allocMap[$k] = ($allocMap[$k] ?? 0.0) + (float)$v;
+            }
+        } else {
+            $prAggRows = $prBase
+                ->select('supplier_id', 'supplier_name', DB::raw('COALESCE(SUM(due_amount), 0) as due_sum'))
+                ->groupBy('supplier_id', 'supplier_name')
+                ->get();
+            foreach ($prAggRows as $pr) {
+                $sId = (int)($pr->supplier_id ?? 0);
+                if ($sId <= 0) {
+                    $sId = $supIdByName[strtolower(trim((string)($pr->supplier_name ?? '')))] ?? 0;
+                }
+                if ($sId > 0) {
+                    $unallocBySup[$sId] = ($unallocBySup[$sId] ?? 0.0) + (float)$pr->due_sum;
                 }
             }
         }
-        $unallocBySup = [];
-        foreach ($prs as $pr) {
-            $sId = (int)($pr->supplier_id ?? 0);
-            if ($sId <= 0) {
-                $sId = $supIdByName[strtolower(trim((string)($pr->supplier_name ?? '')))] ?? 0;
+
+        if ($this->schemaHasTable('purchase_return_allocations') && DB::table('purchase_return_allocations')->exists()) {
+            $hasReleasedAt = $this->schemaHasColumn('purchase_return_allocations', 'released_at');
+            $allocQuery = DB::table('purchase_return_allocations')
+                ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
+                ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES);
+            if ($hasReleasedAt) {
+                $allocQuery->whereNull('purchase_return_allocations.released_at');
             }
-            if ($sId <= 0) {
-                continue;
+            $allocByPr = $allocQuery
+                ->select(
+                    'purchase_returns.id',
+                    'purchase_returns.supplier_id',
+                    'purchase_returns.supplier_name',
+                    'purchase_returns.due_amount',
+                    DB::raw('COALESCE(SUM(purchase_return_allocations.amount), 0) as alloc_sum')
+                )
+                ->groupBy('purchase_returns.id', 'purchase_returns.supplier_id', 'purchase_returns.supplier_name', 'purchase_returns.due_amount')
+                ->get();
+            foreach ($allocByPr as $ar) {
+                $sId = (int)($ar->supplier_id ?? 0);
+                if ($sId <= 0) {
+                    $sId = $supIdByName[strtolower(trim((string)($ar->supplier_name ?? '')))] ?? 0;
+                }
+                if ($sId <= 0) {
+                    continue;
+                }
+                $dueAmt = (float)$ar->due_amount;
+                $allocSum = (float)$ar->alloc_sum;
+                // Subtract only the portion previously added into $unallocBySup (clamped at 0)
+                $deduct = min($dueAmt, $allocSum);
+                $unallocBySup[$sId] = max(0.0, ($unallocBySup[$sId] ?? 0.0) - $deduct);
             }
-            $unalloc = max(0.0, (float)$pr->due_amount - (float)($allocMap[$pr->id] ?? 0.0));
-            $unallocBySup[$sId] = ($unallocBySup[$sId] ?? 0.0) + $unalloc;
         }
 
         $result = [];
@@ -1533,8 +1591,10 @@ class PurchaseAccountingService
             $allDue = round((float)($poDueBySup[$sId] ?? 0.0), 2);
             $allUnalloc = round((float)($unallocBySup[$sId] ?? 0.0), 2);
             $rawAdj = round((float)($sup->balance_due ?? 0.0) - ($allDue - $allUnalloc), 2);
+            $hasSubledgerDocs = ($allDue > 0.005 || $allUnalloc > 0.005);
             $effAdj = 0.0;
-            if ($eligible && abs($rawAdj) > 0.005) {
+            // Ignore negative adjustments on suppliers with subledger docs so un-synced balance_due stays safe
+            if ($eligible && ($hasSubledgerDocs ? ($rawAdj > 0.005) : (abs($rawAdj) > 0.005))) {
                 $effAdj = $rawAdj;
             }
             $result[$sId] = [
@@ -1634,6 +1694,69 @@ class PurchaseAccountingService
     }
 
     /**
+     * Single-pass computation of both [$inRangeSum, $asOfClosingSum, $docInRange] to avoid double JSON decoding.
+     *
+     * @return array{0: float, 1: float, 2: bool}
+     */
+    public function sumPayloadPaymentsRangeAndAsOf(
+        mixed $payload,
+        float $fallbackPaid,
+        string $docDate,
+        ?string $fromStart,
+        ?string $toEnd,
+        string $closingCutoff
+    ): array {
+        $normDoc = $docDate !== '' ? $this->normalizeTransactionDate($docDate, $docDate) : '';
+        $docInRange = ($fromStart === null || $normDoc === '' || $normDoc >= $fromStart)
+            && ($toEnd === null || $normDoc === '' || $normDoc <= $toEnd);
+
+        $rawPayload = is_string($payload) ? trim($payload) : null;
+        $hasPayload = is_array($payload)
+            ? !empty($payload)
+            : ($rawPayload !== null && $rawPayload !== '' && $rawPayload !== '[]');
+        if (!$hasPayload) {
+            if ($fallbackPaid <= 0.0001) {
+                return [0.0, 0.0, $docInRange];
+            }
+            $rounded = round($fallbackPaid, 2);
+            $asOf = ($normDoc === '' || $normDoc <= $closingCutoff);
+            return [$docInRange ? $rounded : 0.0, $asOf ? $rounded : 0.0, $docInRange];
+        }
+
+        $decoded = is_array($payload) ? $payload : json_decode((string)$payload, true);
+        if (!is_array($decoded) || empty($decoded)) {
+            $rounded = round(max(0.0, $fallbackPaid), 2);
+            $asOf = ($normDoc === '' || $normDoc <= $closingCutoff);
+            return [$docInRange ? $rounded : 0.0, $asOf ? $rounded : 0.0, $docInRange];
+        }
+
+        $inRangeSum = 0.0;
+        $asOfSum = 0.0;
+        foreach ($decoded as $leg) {
+            if (!is_array($leg)) {
+                continue;
+            }
+            $amt = (float)($leg['amount'] ?? 0);
+            if ($amt <= 0) {
+                continue;
+            }
+            $rawDate = trim((string)($leg['payment_date'] ?? ''));
+            $pDt = $rawDate !== ''
+                ? $this->normalizeTransactionDate($rawDate, $normDoc)
+                : $normDoc;
+            if (($fromStart === null || $pDt === '' || $pDt >= $fromStart)
+                && ($toEnd === null || $pDt === '' || $pDt <= $toEnd)) {
+                $inRangeSum += $amt;
+            }
+            if ($pDt === '' || $pDt <= $closingCutoff) {
+                $asOfSum += $amt;
+            }
+        }
+
+        return [round($inRangeSum, 2), round($asOfSum, 2), $docInRange];
+    }
+
+    /**
      * Load As-Of Purchase Return allocation totals for given PO IDs and PR IDs up to $asOfEnd.
      *
      * @param array<int, int> $poIds
@@ -1646,7 +1769,7 @@ class PurchaseAccountingService
         $poHasAnyAlloc = [];
         $prAllocAsOf = [];
 
-        if (!$this->schemaHasTable('purchase_return_allocations')) {
+        if (!$this->schemaHasTable('purchase_return_allocations') || !DB::table('purchase_return_allocations')->exists()) {
             return [
                 'po_alloc' => $poAllocAsOf,
                 'po_has_any_alloc' => $poHasAnyAlloc,
@@ -1665,10 +1788,32 @@ class PurchaseAccountingService
         };
 
         if (!empty($poIds)) {
-            foreach (array_chunk($poIds, 400) as $idChunk) {
+            if (count($poIds) <= 400) {
+                foreach (array_chunk($poIds, 400) as $idChunk) {
+                    $poAllocQuery = DB::table('purchase_return_allocations')
+                        ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
+                        ->whereIn('purchase_return_allocations.purchase_id', $idChunk)
+                        ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
+                        ->where('purchase_returns.date', '<=', $asOfEnd);
+                    $activeAsOfFilter($poAllocQuery);
+                    foreach ($poAllocQuery
+                        ->select('purchase_return_allocations.purchase_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))
+                        ->groupBy('purchase_return_allocations.purchase_id')
+                        ->pluck('alloc_sum', 'purchase_id') as $pid => $val) {
+                        $poAllocAsOf[$pid] = ($poAllocAsOf[$pid] ?? 0.0) + (float)$val;
+                    }
+
+                    $poHasQuery = DB::table('purchase_return_allocations')
+                        ->whereIn('purchase_id', $idChunk);
+                    $activeAsOfFilter($poHasQuery);
+                    foreach ($poHasQuery->distinct()->pluck('purchase_id') as $pid) {
+                        $poHasAnyAlloc[$pid] = true;
+                    }
+                }
+            } else {
+                $poIdSet = array_flip(array_map('intval', $poIds));
                 $poAllocQuery = DB::table('purchase_return_allocations')
                     ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
-                    ->whereIn('purchase_return_allocations.purchase_id', $idChunk)
                     ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
                     ->where('purchase_returns.date', '<=', $asOfEnd);
                 $activeAsOfFilter($poAllocQuery);
@@ -1676,23 +1821,41 @@ class PurchaseAccountingService
                     ->select('purchase_return_allocations.purchase_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))
                     ->groupBy('purchase_return_allocations.purchase_id')
                     ->pluck('alloc_sum', 'purchase_id') as $pid => $val) {
-                    $poAllocAsOf[$pid] = ($poAllocAsOf[$pid] ?? 0.0) + (float)$val;
+                    if (isset($poIdSet[(int)$pid])) {
+                        $poAllocAsOf[$pid] = (float)$val;
+                    }
                 }
 
-                $poHasQuery = DB::table('purchase_return_allocations')
-                    ->whereIn('purchase_id', $idChunk);
+                $poHasQuery = DB::table('purchase_return_allocations');
                 $activeAsOfFilter($poHasQuery);
                 foreach ($poHasQuery->distinct()->pluck('purchase_id') as $pid) {
-                    $poHasAnyAlloc[$pid] = true;
+                    if (isset($poIdSet[(int)$pid])) {
+                        $poHasAnyAlloc[$pid] = true;
+                    }
                 }
             }
         }
 
         if (!empty($prIds)) {
-            foreach (array_chunk($prIds, 400) as $idChunk) {
+            if (count($prIds) <= 400) {
+                foreach (array_chunk($prIds, 400) as $idChunk) {
+                    $prAllocQuery = DB::table('purchase_return_allocations')
+                        ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
+                        ->whereIn('purchase_return_allocations.purchase_return_id', $idChunk)
+                        ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
+                        ->where('purchase_returns.date', '<=', $asOfEnd);
+                    $activeAsOfFilter($prAllocQuery);
+                    foreach ($prAllocQuery
+                        ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))
+                        ->groupBy('purchase_return_allocations.purchase_return_id')
+                        ->pluck('alloc_sum', 'purchase_return_id') as $prId => $val) {
+                        $prAllocAsOf[$prId] = ($prAllocAsOf[$prId] ?? 0.0) + (float)$val;
+                    }
+                }
+            } else {
+                $prIdSet = array_flip(array_map('intval', $prIds));
                 $prAllocQuery = DB::table('purchase_return_allocations')
                     ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
-                    ->whereIn('purchase_return_allocations.purchase_return_id', $idChunk)
                     ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
                     ->where('purchase_returns.date', '<=', $asOfEnd);
                 $activeAsOfFilter($prAllocQuery);
@@ -1700,7 +1863,9 @@ class PurchaseAccountingService
                     ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))
                     ->groupBy('purchase_return_allocations.purchase_return_id')
                     ->pluck('alloc_sum', 'purchase_return_id') as $prId => $val) {
-                    $prAllocAsOf[$prId] = ($prAllocAsOf[$prId] ?? 0.0) + (float)$val;
+                    if (isset($prIdSet[(int)$prId])) {
+                        $prAllocAsOf[$prId] = (float)$val;
+                    }
                 }
             }
         }
@@ -1820,6 +1985,33 @@ class PurchaseAccountingService
             && !str_contains($norm, 'non-cash')
             && !str_contains($norm, 'non cash')
             && !str_contains($norm, 'cashless');
+    }
+
+    /**
+     * Identify non-cash ledger offsets / unpaid settlements that must not enter IAS 7 Cash Flow.
+     */
+    public function isNonCashSettlementType(?string $paymentType): bool
+    {
+        $norm = strtolower(trim((string)$paymentType));
+        if ($norm === '') {
+            return false;
+        }
+        if (in_array($norm, [
+            'credit note',
+            'store credit',
+            'credit',
+            'unpaid',
+            'points',
+            'loyalty points',
+            'opening stock',
+            'none',
+            'n/a',
+            'void',
+            'voided',
+        ], true)) {
+            return true;
+        }
+        return str_contains($norm, 'credit note') || str_contains($norm, 'store credit');
     }
 
     /**

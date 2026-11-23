@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use App\Models\Sale;
 use App\Models\SaleReturn;
@@ -27,6 +28,9 @@ class ReportController extends Controller
 {
     /** @var array<string, ?int> */
     private array $warehouseIdCache = [];
+
+    /** @var array<string, ?int> */
+    private array $supplierIdCache = [];
 
     private function accounting(): PurchaseAccountingService
     {
@@ -117,6 +121,22 @@ class ReportController extends Controller
         }
         $id = Outlet::where('name', $key)->value('id');
         return $this->warehouseIdCache[$key] = ($id !== null ? (int)$id : null);
+    }
+
+    private function resolveSupplierIdParam(?string $supplierParam): ?int
+    {
+        if (empty($supplierParam) || $supplierParam === 'All') {
+            return null;
+        }
+        if (is_numeric($supplierParam)) {
+            return (int)$supplierParam;
+        }
+        $key = trim($supplierParam);
+        if (array_key_exists($key, $this->supplierIdCache)) {
+            return $this->supplierIdCache[$key];
+        }
+        $id = Supplier::where('name', $key)->value('id');
+        return $this->supplierIdCache[$key] = ($id !== null ? (int)$id : null);
     }
 
     /**
@@ -306,6 +326,7 @@ class ReportController extends Controller
         };
 
         $filterWh = ($warehouse !== 'All' && $warehouse !== '');
+        $warehouseId = $filterWh ? $this->resolveWarehouseIdParam($warehouse) : null;
         $filterProducts = $productIds !== null && !empty($productIds);
         $effAdjTypeSql = $this->effectiveAdjustmentTypeSql();
         $accounting = $this->accounting();
@@ -333,7 +354,11 @@ class ReportController extends Controller
             ->whereIn('purchases.status', ['Received', 'Completed']);
         $applyWindow($purchQ, 'purchases.date');
         if (!empty($allowedOutlets)) $purchQ->whereIn('purchases.warehouse_id', $allowedOutlets);
-        if ($filterWh) $purchQ->where('purchases.warehouse_name', $warehouse);
+        if ($warehouseId !== null) {
+            $purchQ->where('purchases.warehouse_id', $warehouseId);
+        } elseif ($filterWh) {
+            $purchQ->where('purchases.warehouse_name', $warehouse);
+        }
         if ($filterProducts) $purchQ->whereIn('purchase_items.product_id', $productIds);
         if ($includePostWindow) {
             $purchRows = $purchQ->selectRaw("purchase_items.product_id, SUM(CASE WHEN purchases.date <= ? THEN {$purchQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN purchases.date > ? THEN {$purchQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
@@ -350,7 +375,11 @@ class ReportController extends Controller
         $this->applyActiveDocumentFilter($salesQ, 'sales.status');
         $applyWindow($salesQ, 'sales.date');
         if (!empty($allowedOutlets)) $salesQ->whereIn('sales.warehouse_id', $allowedOutlets);
-        if ($filterWh) $salesQ->where('sales.warehouse_name', $warehouse);
+        if ($warehouseId !== null) {
+            $salesQ->where('sales.warehouse_id', $warehouseId);
+        } elseif ($filterWh) {
+            $salesQ->where('sales.warehouse_name', $warehouse);
+        }
         if ($filterProducts) $salesQ->whereIn('sale_items.product_id', $productIds);
         if ($includePostWindow) {
             $saleRows = $salesQ->selectRaw("sale_items.product_id, SUM(CASE WHEN sales.date <= ? THEN {$saleQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN sales.date > ? THEN {$saleQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
@@ -366,7 +395,11 @@ class ReportController extends Controller
             ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
         $applyWindow($adjBaseQ, 'stock_adjustments.date');
         if (!empty($allowedOutlets)) $adjBaseQ->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
-        if ($filterWh) $adjBaseQ->where('stock_adjustments.warehouse_name', $warehouse);
+        if ($warehouseId !== null) {
+            $adjBaseQ->where('stock_adjustments.warehouse_id', $warehouseId);
+        } elseif ($filterWh) {
+            $adjBaseQ->where('stock_adjustments.warehouse_name', $warehouse);
+        }
         if ($filterProducts) $adjBaseQ->whereIn('stock_adjustment_items.product_id', $productIds);
         if ($includePostWindow) {
             $adjRows = $adjBaseQ->selectRaw("
@@ -403,7 +436,11 @@ class ReportController extends Controller
             ->whereIn('stock_transfers.status', ['Sent', 'Completed']);
         $applyWindow($trfOutQ, 'stock_transfers.date');
         if (!empty($allowedOutlets)) $trfOutQ->whereIn('stock_transfers.from_warehouse_id', $allowedOutlets);
-        if ($filterWh) $trfOutQ->where('stock_transfers.from_warehouse', $warehouse);
+        if ($warehouseId !== null) {
+            $trfOutQ->where('stock_transfers.from_warehouse_id', $warehouseId);
+        } elseif ($filterWh) {
+            $trfOutQ->where('stock_transfers.from_warehouse', $warehouse);
+        }
         if ($filterProducts) $trfOutQ->whereIn('stock_transfer_items.product_id', $productIds);
         if ($includePostWindow) {
             $extractMaps(
@@ -422,7 +459,11 @@ class ReportController extends Controller
             ->where('stock_transfers.status', 'Completed');
         $applyWindow($trfInQ, 'stock_transfers.date');
         if (!empty($allowedOutlets)) $trfInQ->whereIn('stock_transfers.to_warehouse_id', $allowedOutlets);
-        if ($filterWh) $trfInQ->where('stock_transfers.to_warehouse', $warehouse);
+        if ($warehouseId !== null) {
+            $trfInQ->where('stock_transfers.to_warehouse_id', $warehouseId);
+        } elseif ($filterWh) {
+            $trfInQ->where('stock_transfers.to_warehouse', $warehouse);
+        }
         if ($filterProducts) $trfInQ->whereIn('stock_transfer_items.product_id', $productIds);
         if ($includePostWindow) {
             $extractMaps(
@@ -455,7 +496,9 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $srQ->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
         }
-        if ($filterWh) {
+        if ($warehouseId !== null) {
+            $srQ->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) = ?', [$warehouseId]);
+        } elseif ($filterWh) {
             $srQ->whereRaw('COALESCE(sale_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
         }
         if ($filterProducts) {
@@ -493,7 +536,9 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $prQ->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
         }
-        if ($filterWh) {
+        if ($warehouseId !== null) {
+            $prQ->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) = ?', [$warehouseId]);
+        } elseif ($filterWh) {
             $prQ->whereRaw('COALESCE(purchase_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
         }
         if ($filterProducts) {
@@ -516,7 +561,11 @@ class ReportController extends Controller
             $pInQ = DB::table('processings')->where('status', 'completed');
             $applyWindow($pInQ, 'date');
             if (!empty($allowedOutlets)) $pInQ->whereIn('warehouse_id', $allowedOutlets);
-            if ($filterWh) $pInQ->where('warehouse_name', $warehouse);
+            if ($warehouseId !== null) {
+                $pInQ->where('warehouse_id', $warehouseId);
+            } elseif ($filterWh) {
+                $pInQ->where('warehouse_name', $warehouse);
+            }
             if ($filterProducts) $pInQ->whereIn('output_product_id', $productIds);
             if ($includePostWindow) {
                 $pInRows = $pInQ->selectRaw('output_product_id as product_id, SUM(CASE WHEN date <= ? THEN output_base_quantity ELSE 0 END) as period_qty, SUM(CASE WHEN date > ? THEN output_base_quantity ELSE 0 END) as post_qty', [$toDateTime, $toDateTime])
@@ -532,7 +581,11 @@ class ReportController extends Controller
                 ->where('processings.status', 'completed');
             $applyWindow($pOutQ, 'processings.date');
             if (!empty($allowedOutlets)) $pOutQ->whereIn('processings.warehouse_id', $allowedOutlets);
-            if ($filterWh) $pOutQ->where('processings.warehouse_name', $warehouse);
+            if ($warehouseId !== null) {
+                $pOutQ->where('processings.warehouse_id', $warehouseId);
+            } elseif ($filterWh) {
+                $pOutQ->where('processings.warehouse_name', $warehouse);
+            }
             if ($filterProducts) $pOutQ->whereIn('processing_items.product_id', $productIds);
             if ($includePostWindow) {
                 $pOutRows = $pOutQ->selectRaw('processing_items.product_id, SUM(CASE WHEN processings.date <= ? THEN processing_items.base_quantity ELSE 0 END) as period_qty, SUM(CASE WHEN processings.date > ? THEN processing_items.base_quantity ELSE 0 END) as post_qty', [$toDateTime, $toDateTime])
@@ -555,6 +608,7 @@ class ReportController extends Controller
         $warehouse = $request->query('warehouse', 'All');
         $year = (int)$request->query('year', Carbon::now()->year);
         $forceRefresh = $request->boolean('force_refresh') || $request->query('force_refresh') === 'true' || $request->query('force_refresh') === '1';
+        $compact = $request->boolean('compact') || $request->query('compact') === 'true' || $request->query('compact') === '1';
 
         $dateFilter = strtolower(trim((string)$request->query('date_filter', 'this_month')));
         $startDate = $request->query('start_date');
@@ -622,12 +676,13 @@ class ReportController extends Controller
 
         $today = Carbon::today()->toDateString();
         $yesterday = Carbon::yesterday()->toDateString();
-        $todayStart = $today . ' 00:00:00';
+        // Use 10-char YYYY-MM-DD lower bounds so date-only rows ('2026-11-23') and datetime rows ('2026-11-23 09:00:00') BOTH match
+        $todayStart = $today;
         $todayEnd = $today . ' 23:59:59';
-        $yesterdayStart = $yesterday . ' 00:00:00';
+        $yesterdayStart = $yesterday;
         $yesterdayEnd = $yesterday . ' 23:59:59';
 
-        // Date scoping helper (preserves index range seek)
+        // Date scoping helper (preserves B-tree index range seek)
         $applyDateScope = function ($query, $column = 'date') use ($startDate, $endDate) {
             if (!empty($startDate) && !empty($endDate)) {
                 $query->where($column, '>=', $startDate)
@@ -635,11 +690,14 @@ class ReportController extends Controller
             }
         };
 
+        $useShortCache = !$forceRefresh && !app()->environment('testing');
+        $scopeCacheKey = md5($warehouse . '|' . implode(',', $allowedOutlets) . '|' . ($canViewCost ? '1' : '0'));
+
         // 1. Base query scopes
         $salesBaseQuery = DB::table('sales');
-        $this->applyActiveDocumentFilter($salesBaseQuery, 'status');
-        $purchBaseQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
-        $this->excludeOpeningStockPurchases($purchBaseQuery);
+        $this->applyActiveDocumentFilter($salesBaseQuery, 'sales.status');
+        $purchBaseQuery = DB::table('purchases')->whereIn('purchases.status', ['Received', 'Completed']);
+        $this->excludeOpeningStockPurchases($purchBaseQuery, 'purchases.payment_type');
         $expBaseQuery = DB::table('expenses')
             ->where(function ($q) {
                 $q->whereNull('payment_status')
@@ -651,53 +709,92 @@ class ReportController extends Controller
             });
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesBaseQuery->where('warehouse_name', $warehouse);
-            $purchBaseQuery->where('warehouse_name', $warehouse);
-            $expBaseQuery->where('warehouse_name', $warehouse);
+            $salesBaseQuery->where('sales.warehouse_name', $warehouse);
+            $purchBaseQuery->where('purchases.warehouse_name', $warehouse);
+            $expBaseQuery->where('expenses.warehouse_name', $warehouse);
         }
         if (!empty($allowedOutlets)) {
-            $salesBaseQuery->whereIn('warehouse_id', $allowedOutlets);
-            $purchBaseQuery->whereIn('warehouse_id', $allowedOutlets);
-            $expBaseQuery->whereIn('warehouse_id', $allowedOutlets);
+            $salesBaseQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+            $purchBaseQuery->whereIn('purchases.warehouse_id', $allowedOutlets);
+            $expBaseQuery->whereIn('expenses.warehouse_id', $allowedOutlets);
         }
 
-        // 2. Single-Pass Consolidated Period Sales Aggregation
-        $periodSalesQuery = clone $salesBaseQuery;
-        $applyDateScope($periodSalesQuery, 'date');
-        $periodSalesAgg = $periodSalesQuery->selectRaw('
-            COALESCE(SUM(grand_total), 0) as total_sales,
-            COALESCE(SUM(paid_amount), 0) as paid_amount,
-            COALESCE(SUM(due_amount), 0) as due_amount,
-            COALESCE(SUM(total_cogs), 0) as total_cogs,
-            COUNT(*) as orders_count
-        ')->first();
+        // Helper for scoped sale_items tax subquery (strictly matches ReportController::profitLoss IFRS/GAAP revenue)
+        $buildSiTaxSub = function (?string $fromDate, ?string $toDateEnd) use ($warehouse, $allowedOutlets) {
+            $q = DB::table('sale_items as si')
+                ->join('sales as s', 's.id', '=', 'si.sale_id')
+                ->where('si.tax', '>', 0);
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $q->where('s.warehouse_name', $warehouse);
+            }
+            if (!empty($allowedOutlets)) {
+                $q->whereIn('s.warehouse_id', $allowedOutlets);
+            }
+            if (!empty($fromDate) && !empty($toDateEnd)) {
+                $q->where('s.date', '>=', $fromDate)->where('s.date', '<=', $toDateEnd);
+            }
+            return $q->select('si.sale_id', DB::raw('COALESCE(SUM(si.tax), 0) as item_tax_sum'))
+                ->groupBy('si.sale_id');
+        };
 
-        $totalSales = (float)($periodSalesAgg->total_sales ?? 0);
-        $periodPaid = (float)($periodSalesAgg->paid_amount ?? 0);
-        $periodDue = (float)($periodSalesAgg->due_amount ?? 0);
+        $plSalesTaxSql = 'COALESCE(sales.tax_amount, 0) + COALESCE(sit.item_tax_sum, 0) + COALESCE(sales.shipping, 0)';
+        $plNetSaleSql = "CASE WHEN (sales.grand_total - ({$plSalesTaxSql})) < 0 THEN 0 ELSE (sales.grand_total - ({$plSalesTaxSql})) END";
+        $srNetRevSql = 'CASE WHEN (sr.grand_total - COALESCE(sr.tax_amount, 0) - COALESCE(sr.shipping, 0)) < 0 THEN 0 ELSE (sr.grand_total - COALESCE(sr.tax_amount, 0) - COALESCE(sr.shipping, 0)) END';
+        $cogsFallbackExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0)';
+
+        // 2. Single-Pass Consolidated Period Sales Aggregation (Tax-Exclusive & Ex-Shipping matching P&L)
+        $periodSiTaxSub = $buildSiTaxSub($startDate, !empty($endDate) ? $endDate . ' 23:59:59' : null);
+        $periodSalesQuery = (clone $salesBaseQuery)
+            ->leftJoinSub($periodSiTaxSub, 'sit', 'sit.sale_id', '=', 'sales.id');
+        $applyDateScope($periodSalesQuery, 'sales.date');
+        $periodSalesAgg = $periodSalesQuery->selectRaw("
+            COALESCE(SUM({$plNetSaleSql}), 0) as total_sales,
+            COALESCE(SUM(sales.grand_total), 0) as gross_invoiced_sales,
+            COALESCE(SUM(COALESCE(sales.tax_amount, 0) + COALESCE(sit.item_tax_sum, 0)), 0) as tax_collected,
+            COALESCE(SUM(sales.paid_amount), 0) as paid_amount,
+            COALESCE(SUM(sales.due_amount), 0) as due_amount,
+            COALESCE(SUM(CASE WHEN sales.total_cogs > 0 THEN sales.total_cogs ELSE 0 END), 0) as total_cogs,
+            COALESCE(SUM(CASE WHEN sales.total_cogs IS NULL OR sales.total_cogs <= 0 THEN 1 ELSE 0 END), 0) as missing_cogs_count,
+            COUNT(sales.id) as orders_count
+        ")->first();
+
+        $totalSales = round((float)($periodSalesAgg->total_sales ?? 0), 2);
+        $grossInvoicedSales = round((float)($periodSalesAgg->gross_invoiced_sales ?? 0), 2);
+        $taxCollected = round((float)($periodSalesAgg->tax_collected ?? 0), 2);
+        $periodPaid = round((float)($periodSalesAgg->paid_amount ?? 0), 2);
+        $periodDue = round((float)($periodSalesAgg->due_amount ?? 0), 2);
         $ordersCount = (int)($periodSalesAgg->orders_count ?? 0);
         $totalCogs = (float)($periodSalesAgg->total_cogs ?? 0);
+        $missingPeriodCogsCount = (int)($periodSalesAgg->missing_cogs_count ?? 0);
 
-        // Real-time Pulse Metrics (Today vs Yesterday)
+        // Real-time Pulse Metrics (Today vs Yesterday, Tax-Exclusive & Ex-Shipping matching P&L)
+        $pulseStart = min($yesterdayStart, $todayStart);
+        $pulseSiTaxSub = $buildSiTaxSub($pulseStart, $todayEnd);
         $pulseSalesAgg = (clone $salesBaseQuery)
-            ->where('date', '>=', min($yesterdayStart, $todayStart))
-            ->where('date', '<=', $todayEnd)
-            ->selectRaw('
-                COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN grand_total ELSE 0 END), 0) as today_sales,
-                COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN 1 ELSE 0 END), 0) as today_sales_count,
-                COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN total_cogs ELSE 0 END), 0) as today_cogs,
-                COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN grand_total ELSE 0 END), 0) as yesterday_sales
-            ', [$todayStart, $todayEnd, $todayStart, $todayEnd, $todayStart, $todayEnd, $yesterdayStart, $yesterdayEnd])->first();
+            ->leftJoinSub($pulseSiTaxSub, 'sit', 'sit.sale_id', '=', 'sales.id')
+            ->where('sales.date', '>=', $pulseStart)
+            ->where('sales.date', '<=', $todayEnd)
+            ->selectRaw("
+                COALESCE(SUM(CASE WHEN sales.date >= ? AND sales.date <= ? THEN {$plNetSaleSql} ELSE 0 END), 0) as today_sales,
+                COALESCE(SUM(CASE WHEN sales.date >= ? AND sales.date <= ? THEN 1 ELSE 0 END), 0) as today_sales_count,
+                COALESCE(SUM(CASE WHEN sales.date >= ? AND sales.date <= ? AND sales.total_cogs > 0 THEN sales.total_cogs ELSE 0 END), 0) as today_cogs,
+                COALESCE(SUM(CASE WHEN sales.date >= ? AND sales.date <= ? AND (sales.total_cogs IS NULL OR sales.total_cogs <= 0) THEN 1 ELSE 0 END), 0) as today_missing_cogs,
+                COALESCE(SUM(CASE WHEN sales.date >= ? AND sales.date <= ? THEN {$plNetSaleSql} ELSE 0 END), 0) as yesterday_sales
+            ", [
+                $todayStart, $todayEnd,
+                $todayStart, $todayEnd,
+                $todayStart, $todayEnd,
+                $todayStart, $todayEnd,
+                $yesterdayStart, $yesterdayEnd,
+            ])->first();
 
-        $todaySales = (float)($pulseSalesAgg->today_sales ?? 0);
+        $todayGrossSales = round((float)($pulseSalesAgg->today_sales ?? 0), 2);
         $todaySalesCount = (int)($pulseSalesAgg->today_sales_count ?? 0);
         $todayCogs = (float)($pulseSalesAgg->today_cogs ?? 0);
-        $yesterdaySales = (float)($pulseSalesAgg->yesterday_sales ?? 0);
-        $salesGrowthPct = $yesterdaySales > 0
-            ? round((($todaySales - $yesterdaySales) / $yesterdaySales) * 100, 1)
-            : ($todaySales > 0 ? 100.0 : 0.0);
+        $todayMissingCogsCount = (int)($pulseSalesAgg->today_missing_cogs ?? 0);
+        $yesterdaySales = round((float)($pulseSalesAgg->yesterday_sales ?? 0), 2);
 
-        // Sales Returns & Returned-Goods COGS in matching period (and today) without correlated subquery per row
+        // Sales Returns & Returned-Goods COGS (Tax-Exclusive & Ex-Shipping matching P&L, date-scoped cost layer join)
         $totalSaleReturns = 0.0;
         $totalReturnedCogs = 0.0;
         $todaySaleReturns = 0.0;
@@ -711,52 +808,79 @@ class ReportController extends Controller
             if (!empty($allowedOutlets)) {
                 $srBaseQ->whereIn('sr.warehouse_id', $allowedOutlets);
             }
-            $srLayerSub = DB::table('sale_return_cost_layers')
-                ->select('sale_return_id', DB::raw('SUM(total_cost) as layer_cost'))
-                ->groupBy('sale_return_id');
+            $buildSrLayerSub = function (?string $fromDate, ?string $toDateEnd) use ($warehouse, $allowedOutlets) {
+                $q = DB::table('sale_return_cost_layers as srcl')
+                    ->join('sale_returns as sr_i', 'sr_i.id', '=', 'srcl.sale_return_id');
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $q->where('sr_i.warehouse_name', $warehouse);
+                }
+                if (!empty($allowedOutlets)) {
+                    $q->whereIn('sr_i.warehouse_id', $allowedOutlets);
+                }
+                if (!empty($fromDate) && !empty($toDateEnd)) {
+                    $q->where('sr_i.date', '>=', $fromDate)->where('sr_i.date', '<=', $toDateEnd);
+                }
+                return $q->select('srcl.sale_return_id', DB::raw('COALESCE(SUM(srcl.total_cost), 0) as layer_cost'))
+                    ->groupBy('srcl.sale_return_id');
+            };
             $srCogsExpr = 'COALESCE(NULLIF(sr.return_cost_total, 0), COALESCE(srcl.layer_cost, 0))';
 
-            $srPeriodQ = (clone $srBaseQ)->leftJoinSub($srLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id');
+            $srPeriodLayerSub = $buildSrLayerSub($startDate, !empty($endDate) ? $endDate . ' 23:59:59' : null);
+            $srPeriodQ = (clone $srBaseQ)->leftJoinSub($srPeriodLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id');
             $applyDateScope($srPeriodQ, 'sr.date');
             $srPeriodAgg = $srPeriodQ->selectRaw("
-                COALESCE(SUM(sr.grand_total), 0) as ret_total,
+                COALESCE(SUM({$srNetRevSql}), 0) as ret_total,
+                COALESCE(SUM(COALESCE(sr.tax_amount, 0)), 0) as ret_tax,
                 COALESCE(SUM({$srCogsExpr}), 0) as ret_cogs
             ")->first();
-            $totalSaleReturns = (float)($srPeriodAgg->ret_total ?? 0);
+            $totalSaleReturns = round((float)($srPeriodAgg->ret_total ?? 0), 2);
+            $taxCollected = round(max(0.0, $taxCollected - (float)($srPeriodAgg->ret_tax ?? 0)), 2);
             $totalReturnedCogs = (float)($srPeriodAgg->ret_cogs ?? 0);
 
+            $srTodayLayerSub = $buildSrLayerSub($todayStart, $todayEnd);
             $srTodayAgg = (clone $srBaseQ)
-                ->leftJoinSub($srLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id')
+                ->leftJoinSub($srTodayLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id')
                 ->where('sr.date', '>=', $todayStart)
                 ->where('sr.date', '<=', $todayEnd)
                 ->selectRaw("
-                    COALESCE(SUM(sr.grand_total), 0) as ret_total,
+                    COALESCE(SUM({$srNetRevSql}), 0) as ret_total,
                     COALESCE(SUM({$srCogsExpr}), 0) as ret_cogs
                 ")->first();
-            $todaySaleReturns = (float)($srTodayAgg->ret_total ?? 0);
+            $todaySaleReturns = round((float)($srTodayAgg->ret_total ?? 0), 2);
             $todayReturnedCogs = (float)($srTodayAgg->ret_cogs ?? 0);
         } catch (\Throwable $e) {}
 
         $netSales = round($totalSales - $totalSaleReturns, 2);
+        $todaySales = round($todayGrossSales - $todaySaleReturns, 2);
+        $salesGrowthPct = $yesterdaySales > 0
+            ? round((($todaySales - $yesterdaySales) / $yesterdaySales) * 100, 1)
+            : ($todaySales > 0 ? 100.0 : 0.0);
         $averageOrderValue = $ordersCount > 0 ? round($netSales / $ordersCount, 2) : 0.0;
-        $cashRatioPct = $totalSales > 0 ? round(($periodPaid / $totalSales) * 100, 1) : 0.0;
+        $cashRatioPct = $grossInvoicedSales > 0 ? round(($periodPaid / $grossInvoicedSales) * 100, 1) : 0.0;
 
-        // 3. Consolidated Purchases Aggregation via Pre-Joined Tax Subquery (zero per-row correlated subquery)
-        $purchTaxSub = DB::table('purchase_items as pi')
-            ->join('purchases as p', 'p.id', '=', 'pi.purchase_id')
-            ->where('p.is_tax_recoverable', 1)
-            ->select('pi.purchase_id', DB::raw('COALESCE(SUM(pi.tax), 0) as item_tax'))
-            ->groupBy('pi.purchase_id');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $purchTaxSub->where('p.warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $purchTaxSub->whereIn('p.warehouse_id', $allowedOutlets);
-        }
+        // 3. Consolidated Purchases Aggregation via Date-Scoped Tax Subquery (zero full-table purchase_items scan)
+        $buildPurchTaxSub = function (?string $fromDate, ?string $toDateEnd) use ($warehouse, $allowedOutlets) {
+            $q = DB::table('purchase_items as pi')
+                ->join('purchases as p', 'p.id', '=', 'pi.purchase_id')
+                ->where('p.is_tax_recoverable', 1)
+                ->where('pi.tax', '>', 0);
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $q->where('p.warehouse_name', $warehouse);
+            }
+            if (!empty($allowedOutlets)) {
+                $q->whereIn('p.warehouse_id', $allowedOutlets);
+            }
+            if (!empty($fromDate) && !empty($toDateEnd)) {
+                $q->where('p.date', '>=', $fromDate)->where('p.date', '<=', $toDateEnd);
+            }
+            return $q->select('pi.purchase_id', DB::raw('COALESCE(SUM(pi.tax), 0) as item_tax'))
+                ->groupBy('pi.purchase_id');
+        };
 
         $netPurchJoinedSql = 'CASE WHEN COALESCE(purchases.is_tax_recoverable, 0) = 1 THEN CASE WHEN (purchases.grand_total - COALESCE(purchases.tax_amount, 0) - COALESCE(pt.item_tax, 0)) < 0 THEN 0 ELSE (purchases.grand_total - COALESCE(purchases.tax_amount, 0) - COALESCE(pt.item_tax, 0)) END ELSE purchases.grand_total END';
 
-        $periodPurchQuery = (clone $purchBaseQuery)->leftJoinSub($purchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id');
+        $periodPurchTaxSub = $buildPurchTaxSub($startDate, !empty($endDate) ? $endDate . ' 23:59:59' : null);
+        $periodPurchQuery = (clone $purchBaseQuery)->leftJoinSub($periodPurchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id');
         $applyDateScope($periodPurchQuery, 'purchases.date');
         $periodPurchAgg = $periodPurchQuery->selectRaw("
             COALESCE(SUM({$netPurchJoinedSql}), 0) as total_purchases,
@@ -765,15 +889,16 @@ class ReportController extends Controller
             COUNT(*) as purchases_count
         ")->first();
 
-        $totalPurchases = (float)($periodPurchAgg->total_purchases ?? 0);
-        $periodPurchDue = (float)($periodPurchAgg->due_amount ?? 0);
+        $totalPurchases = round((float)($periodPurchAgg->total_purchases ?? 0), 2);
+        $periodPurchDue = round((float)($periodPurchAgg->due_amount ?? 0), 2);
 
-        $todayPurchases = (float)(clone $purchBaseQuery)
-            ->leftJoinSub($purchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id')
+        $todayPurchTaxSub = $buildPurchTaxSub($todayStart, $todayEnd);
+        $todayPurchases = round((float)(clone $purchBaseQuery)
+            ->leftJoinSub($todayPurchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id')
             ->where('purchases.date', '>=', $todayStart)
             ->where('purchases.date', '<=', $todayEnd)
             ->selectRaw("COALESCE(SUM({$netPurchJoinedSql}), 0) as total")
-            ->value('total');
+            ->value('total'), 2);
 
         $purchaseAccounting = $this->accounting();
         $totalPurchaseReturns = 0.0;
@@ -791,17 +916,20 @@ class ReportController extends Controller
             $applyDateScope($prPeriodQuery, 'date');
             $prAgg = (clone $prPeriodQuery)->selectRaw('
                 COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) != 1 THEN grand_total ELSE 0 END), 0) as non_recov_total,
+                COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) = 1 THEN 1 ELSE 0 END), 0) as recov_count,
                 COALESCE(SUM(COALESCE(cost_variance, 0)), 0) as total_variance
             ')->first();
             $totalPurchaseReturns = (float)($prAgg->non_recov_total ?? 0);
             $totalPurchaseReturnVariance = round((float)($prAgg->total_variance ?? 0), 2);
 
-            $recovPrRows = (clone $prPeriodQuery)
-                ->where('is_tax_recoverable', 1)
-                ->select(['grand_total', 'tax_amount', 'is_tax_recoverable', 'items_payload'])
-                ->get();
-            foreach ($recovPrRows as $prRow) {
-                $totalPurchaseReturns += $purchaseAccounting->netPurchaseReturnAmount($prRow);
+            if ((int)($prAgg->recov_count ?? 0) > 0) {
+                $recovPrRows = (clone $prPeriodQuery)
+                    ->where('is_tax_recoverable', 1)
+                    ->select(['grand_total', 'tax_amount', 'is_tax_recoverable', 'items_payload'])
+                    ->get();
+                foreach ($recovPrRows as $prRow) {
+                    $totalPurchaseReturns += $purchaseAccounting->netPurchaseReturnAmount($prRow);
+                }
             }
             $totalPurchaseReturns = round($totalPurchaseReturns, 2);
 
@@ -813,36 +941,57 @@ class ReportController extends Controller
 
         $netPurchases = round($totalPurchases - $totalPurchaseReturns, 2);
 
-        // 4. Single-Pass Consolidated Expenses Aggregation in Period
+        // 4. Consolidated Expenses Aggregation (Period + Today)
         $periodExpQuery = clone $expBaseQuery;
         $applyDateScope($periodExpQuery, 'date');
-        $totalExpenses = (float)$periodExpQuery->sum('amount');
+        $totalExpenses = round((float)$periodExpQuery->sum('amount'), 2);
 
-        $todayExpenses = (float)(clone $expBaseQuery)
+        $todayExpenses = round((float)(clone $expBaseQuery)
             ->where('date', '>=', $todayStart)
             ->where('date', '<=', $todayEnd)
-            ->sum('amount');
+            ->sum('amount'), 2);
 
-        // 5. Cost of Goods Sold (COGS) & GAAP/IFRS Operational Profitability
-        if ($totalCogs == 0.0 && $totalSales > 0.0) {
+        // 5. Accurate Partial-Missing COGS Fallback (Period + Today, matching ReportController::profitLoss)
+        if ($missingPeriodCogsCount > 0) {
             try {
-                $cogsBaseQuery = DB::table('sale_items')
+                $missingCogsQ = DB::table('sale_items')
                     ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
                     ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-                    ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
-                $this->applyActiveDocumentFilter($cogsBaseQuery, 'sales.status');
-
+                    ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                    ->where(function ($q) {
+                        $q->whereNull('sales.total_cogs')->orWhere('sales.total_cogs', '<=', 0);
+                    });
+                $this->applyActiveDocumentFilter($missingCogsQ, 'sales.status');
                 if ($warehouse !== 'All' && !empty($warehouse)) {
-                    $cogsBaseQuery->where('sales.warehouse_name', $warehouse);
+                    $missingCogsQ->where('sales.warehouse_name', $warehouse);
                 }
                 if (!empty($allowedOutlets)) {
-                    $cogsBaseQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+                    $missingCogsQ->whereIn('sales.warehouse_id', $allowedOutlets);
                 }
+                $applyDateScope($missingCogsQ, 'sales.date');
+                $totalCogs += (float)$missingCogsQ->selectRaw("{$cogsFallbackExpr} as cogs_sum")->value('cogs_sum');
+            } catch (\Throwable $e) {}
+        }
 
-                $cogsExpr = 'COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0))), 0) as total_cogs';
-                $periodCogsQuery = clone $cogsBaseQuery;
-                $applyDateScope($periodCogsQuery, 'sales.date');
-                $totalCogs = (float)$periodCogsQuery->selectRaw($cogsExpr)->value('total_cogs');
+        if ($todayMissingCogsCount > 0) {
+            try {
+                $todayMissingCogsQ = DB::table('sale_items')
+                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                    ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+                    ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                    ->where(function ($q) {
+                        $q->whereNull('sales.total_cogs')->orWhere('sales.total_cogs', '<=', 0);
+                    })
+                    ->where('sales.date', '>=', $todayStart)
+                    ->where('sales.date', '<=', $todayEnd);
+                $this->applyActiveDocumentFilter($todayMissingCogsQ, 'sales.status');
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $todayMissingCogsQ->where('sales.warehouse_name', $warehouse);
+                }
+                if (!empty($allowedOutlets)) {
+                    $todayMissingCogsQ->whereIn('sales.warehouse_id', $allowedOutlets);
+                }
+                $todayCogs += (float)$todayMissingCogsQ->selectRaw("{$cogsFallbackExpr} as cogs_sum")->value('cogs_sum');
             } catch (\Throwable $e) {}
         }
 
@@ -881,19 +1030,21 @@ class ReportController extends Controller
                 ")->value('net_adj');
             $todayAdjustmentNet = (float)($todayOpAdj ?? 0);
 
-            $nonPnlQuery = DB::table('stock_adjustment_items')
-                ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $nonPnlQuery->where('stock_adjustments.warehouse_name', $warehouse);
+            if (!$compact) {
+                $nonPnlQuery = DB::table('stock_adjustment_items')
+                    ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $nonPnlQuery->where('stock_adjustments.warehouse_name', $warehouse);
+                }
+                if (!empty($allowedOutlets)) {
+                    $nonPnlQuery->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
+                }
+                $this->applyOperatingAdjustmentScope($nonPnlQuery, false);
+                $applyDateScope($nonPnlQuery, 'stock_adjustments.date');
+                $nonPnlAdjustments = (float)$nonPnlQuery->selectRaw("
+                    COALESCE(SUM(CASE WHEN {$effAdjTypeSql} = 'addition' THEN stock_adjustment_items.subtotal ELSE -stock_adjustment_items.subtotal END), 0) as net_cap
+                ")->value('net_cap');
             }
-            if (!empty($allowedOutlets)) {
-                $nonPnlQuery->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
-            }
-            $this->applyOperatingAdjustmentScope($nonPnlQuery, false);
-            $applyDateScope($nonPnlQuery, 'stock_adjustments.date');
-            $nonPnlAdjustments = (float)$nonPnlQuery->selectRaw("
-                COALESCE(SUM(CASE WHEN {$effAdjTypeSql} = 'addition' THEN stock_adjustment_items.subtotal ELSE -stock_adjustment_items.subtotal END), 0) as net_cap
-            ")->value('net_cap');
         } catch (\Throwable $e) {}
 
         $totalCogs = round($totalCogs - $totalReturnedCogs, 2);
@@ -901,414 +1052,540 @@ class ReportController extends Controller
         $grossProfit = round($netSales - $totalCogs, 2);
         $netProfit = round($grossProfit - $totalExpenses - $totalAdjustmentLoss + $totalAdjustmentGain + $totalPurchaseReturnVariance, 2);
         $profitMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 2) : 0.0;
-        $todayGrossProfit = round(($todaySales - $todaySaleReturns) - $todayCogs, 2);
+        $todayGrossProfit = round($todaySales - $todayCogs, 2);
         $todayProfit = round($todayGrossProfit - $todayExpenses + $todayAdjustmentNet + $todayPurchaseReturnVariance, 2);
 
-        // 6. Live Balance Sheet & SQL-Level Inventory Valuation Summary (zero cache)
-        $grossReceivablesQ = DB::table('sales');
-        $this->applyActiveDocumentFilter($grossReceivablesQ, 'status');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $grossReceivablesQ->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $grossReceivablesQ->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $grossCustomerDue = (float)$grossReceivablesQ->sum('due_amount');
+        // 6. Balance Sheet Snapshot (AR, AP, Shelf Inventory Cost Valuation — independent of date_filter)
+        $computeBalanceSheet = function () use ($warehouse, $warehouseId, $allowedOutlets, $canViewCost, $purchaseAccounting): array {
+            $grossReceivablesQ = DB::table('sales');
+            $this->applyActiveDocumentFilter($grossReceivablesQ, 'status');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $grossReceivablesQ->where('warehouse_name', $warehouse);
+            }
+            if (!empty($allowedOutlets)) {
+                $grossReceivablesQ->whereIn('warehouse_id', $allowedOutlets);
+            }
+            $grossCustomerDue = (float)$grossReceivablesQ->where('due_amount', '>', 0)->sum('due_amount');
 
-        $openCreditNotesQ = DB::table('sale_returns');
-        $this->applyActiveDocumentFilter($openCreditNotesQ, 'status');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $openCreditNotesQ->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $openCreditNotesQ->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $openCreditNotes = (float)$openCreditNotesQ->sum('due_amount');
-        $customerDue = max(0.0, round($grossCustomerDue - $openCreditNotes, 2));
+            $openCreditNotesQ = DB::table('sale_returns');
+            $this->applyActiveDocumentFilter($openCreditNotesQ, 'status');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                $openCreditNotesQ->where('warehouse_name', $warehouse);
+            }
+            if (!empty($allowedOutlets)) {
+                $openCreditNotesQ->whereIn('warehouse_id', $allowedOutlets);
+            }
+            $openCreditNotes = (float)$openCreditNotesQ->where('due_amount', '>', 0)->sum('due_amount');
+            $customerDue = max(0.0, round($grossCustomerDue - $openCreditNotes, 2));
 
-        $supplierDue = $purchaseAccounting
-            ->computeNetSupplierPayable($warehouse, !empty($allowedOutlets) ? $allowedOutlets : null);
+            $supplierDue = $canViewCost
+                ? $purchaseAccounting->computeNetSupplierPayable($warehouse, !empty($allowedOutlets) ? $allowedOutlets : null)
+                : 0.0;
 
-        $valuation = app(InventoryReconciliationService::class)->computeValuationSummary(
-            $warehouseId,
-            !empty($allowedOutlets) ? $allowedOutlets : null
-        );
-        $inventoryValuationCost = round((float)$valuation['effective_valuation'], 2);
-        $fifoBatchValuation = round((float)$valuation['fifo_batch_valuation'], 2);
-        $masterInventoryValuation = round((float)$valuation['master_valuation'], 2);
-        $totalInStockUnits = round((float)($valuation['total_book_qty'] ?? 0), 4);
+            $inventoryValuationCost = 0.0;
+            $fifoBatchValuation = 0.0;
+            $masterInventoryValuation = 0.0;
+            $totalInStockUnits = 0.0;
 
-        $totalProducts = (int) DB::table('products')->whereNull('deleted_at')->count();
+            if ($canViewCost) {
+                // includeInTransit=false: Dashboard displays shelf inventory valuation only (skips 266ms stock_transfer_items scan)
+                $valuation = app(InventoryReconciliationService::class)->computeValuationSummary(
+                    $warehouseId,
+                    !empty($allowedOutlets) ? $allowedOutlets : null,
+                    null,
+                    null,
+                    false
+                );
+                $inventoryValuationCost = round((float)$valuation['effective_valuation'], 2);
+                $fifoBatchValuation = round((float)$valuation['fifo_batch_valuation'], 2);
+                $masterInventoryValuation = round((float)$valuation['master_valuation'], 2);
+                $totalInStockUnits = round((float)($valuation['total_book_qty'] ?? 0), 4);
+            }
 
-        $singleLowStockQuery = DB::table('products as p')
-            ->whereNull('p.deleted_at')
-            ->where(function ($q) {
-                $q->where('p.has_variants', false)->orWhereNull('p.has_variants');
+            return [
+                'customer_due' => $customerDue,
+                'supplier_due' => $supplierDue,
+                'inventory_valuation_cost' => $inventoryValuationCost,
+                'fifo_batch_valuation' => $fifoBatchValuation,
+                'master_inventory_valuation' => $masterInventoryValuation,
+                'total_in_stock_units' => $totalInStockUnits,
+            ];
+        };
+
+        $bsCacheKey = "dash_bs_v2_{$scopeCacheKey}";
+        $balanceSheet = $useShortCache
+            ? Cache::remember($bsCacheKey, 20, $computeBalanceSheet)
+            : $computeBalanceSheet();
+
+        $customerDue = $balanceSheet['customer_due'];
+        $supplierDue = $balanceSheet['supplier_due'];
+        $inventoryValuationCost = $balanceSheet['inventory_valuation_cost'];
+        $fifoBatchValuation = $balanceSheet['fifo_batch_valuation'];
+        $masterInventoryValuation = $balanceSheet['master_inventory_valuation'];
+        $totalInStockUnits = $balanceSheet['total_in_stock_units'];
+
+        // Optional extra dashboard lists (skipped in compact=1 mode used by DashboardScreen -> saves ~700ms!)
+        $totalProducts = 0;
+        $totalVariants = 0;
+        $lowStockCount = 0;
+        $outOfStockCount = 0;
+        $totalCustomers = 0;
+        $totalSuppliers = 0;
+        $totalOutlets = 1;
+        $lowStockProducts = collect();
+        $isBranchScoped = $warehouseId !== null || !empty($allowedOutlets);
+
+        if (!$compact) {
+            $totalProducts = (int) DB::table('products')->whereNull('deleted_at')->count();
+
+            $singleLowStockQuery = DB::table('products as p')
+                ->whereNull('p.deleted_at')
+                ->where(function ($q) {
+                    $q->where('p.has_variants', false)->orWhereNull('p.has_variants');
+                });
+
+            if ($isBranchScoped) {
+                $sbProdSub = DB::table('stock_balances')
+                    ->select('product_id', DB::raw('SUM(quantity) as wh_qty'))
+                    ->where(function ($q) {
+                        $q->whereNull('product_variant_id')->orWhere('product_variant_id', 0);
+                    })
+                    ->groupBy('product_id');
+                if ($warehouseId !== null) {
+                    $sbProdSub->where('warehouse_id', $warehouseId);
+                } else {
+                    $sbProdSub->whereIn('warehouse_id', $allowedOutlets);
+                }
+                $singleLowStockRows = $singleLowStockQuery
+                    ->joinSub($sbProdSub, 'sb', 'sb.product_id', '=', 'p.id')
+                    ->whereRaw('sb.wh_qty <= COALESCE(NULLIF(p.alert_quantity, 0), NULLIF(p.stock_alert, 0), NULLIF(p.low_qty, 0), 10)')
+                    ->select([
+                        'p.id', 'p.name', 'p.code', 'p.sku', 'p.alternative_name',
+                        'p.category_name', 'p.brand_name', 'p.unit_name',
+                        'sb.wh_qty as effective_stock',
+                        'p.alert_quantity', 'p.stock_alert', 'p.low_qty',
+                        'p.retail_price', 'p.selling_price',
+                    ])
+                    ->orderBy('sb.wh_qty', 'asc')
+                    ->limit(15)
+                    ->get();
+            } else {
+                $singleLowStockRows = $singleLowStockQuery
+                    ->where(function ($q) {
+                        $q->whereColumn('p.stock_quantity', '<=', 'p.alert_quantity')
+                          ->orWhereColumn('p.stock_quantity', '<=', 'p.stock_alert')
+                          ->orWhereColumn('p.stock_quantity', '<=', 'p.low_qty')
+                          ->orWhere('p.stock_quantity', '<=', 0);
+                    })
+                    ->select([
+                        'p.id', 'p.name', 'p.code', 'p.sku', 'p.alternative_name',
+                        'p.category_name', 'p.brand_name', 'p.unit_name',
+                        'p.stock_quantity as effective_stock',
+                        'p.alert_quantity', 'p.stock_alert', 'p.low_qty',
+                        'p.retail_price', 'p.selling_price',
+                    ])
+                    ->orderBy('p.stock_quantity', 'asc')
+                    ->limit(15)
+                    ->get();
+            }
+
+            $singleLowStock = $singleLowStockRows->map(function ($p) {
+                $alertQty = (float)($p->alert_quantity ?: ($p->stock_alert ?: ($p->low_qty ?: 10)));
+                $stockQty = (float)($p->effective_stock ?? 0);
+                return [
+                    'id' => (int)$p->id,
+                    'product_id' => (int)$p->id,
+                    'is_variant' => false,
+                    'variant_name' => '',
+                    'product_name' => $p->name,
+                    'code' => $p->code ?: ($p->sku ?? ''),
+                    'name' => $p->name,
+                    'display_name' => $p->name,
+                    'alternative_name' => $p->alternative_name ?? '',
+                    'category_name' => $p->category_name ?? 'General',
+                    'brand_name' => $p->brand_name ?? 'Generic',
+                    'unit_name' => $p->unit_name ?? 'Piece',
+                    'stock_quantity' => $stockQty,
+                    'alert_quantity' => $alertQty,
+                    'retail_price' => (float)($p->retail_price ?? ($p->selling_price ?? 0)),
+                ];
             });
 
-        $isBranchScoped = $warehouseId !== null || !empty($allowedOutlets);
-        if ($isBranchScoped) {
-            $sbProdSub = DB::table('stock_balances')
-                ->select('product_id', DB::raw('SUM(quantity) as wh_qty'))
-                ->where(function ($q) {
-                    $q->whereNull('product_variant_id')->orWhere('product_variant_id', 0);
-                })
-                ->groupBy('product_id');
-            if ($warehouseId !== null) {
-                $sbProdSub->where('warehouse_id', $warehouseId);
-            } else {
-                $sbProdSub->whereIn('warehouse_id', $allowedOutlets);
-            }
-            $singleLowStockRows = $singleLowStockQuery
-                ->joinSub($sbProdSub, 'sb', 'sb.product_id', '=', 'p.id')
-                ->whereRaw('sb.wh_qty <= COALESCE(NULLIF(p.alert_quantity, 0), NULLIF(p.stock_alert, 0), NULLIF(p.low_qty, 0), 10)')
-                ->select([
-                    'p.id', 'p.name', 'p.code', 'p.sku', 'p.alternative_name',
-                    'p.category_name', 'p.brand_name', 'p.unit_name',
-                    'sb.wh_qty as effective_stock',
-                    'p.alert_quantity', 'p.stock_alert', 'p.low_qty',
-                    'p.retail_price', 'p.selling_price',
-                ])
-                ->orderBy('sb.wh_qty', 'asc')
-                ->limit(15)
-                ->get();
-        } else {
-            $singleLowStockRows = $singleLowStockQuery
-                ->where(function ($q) {
-                    $q->whereColumn('p.stock_quantity', '<=', 'p.alert_quantity')
-                      ->orWhereColumn('p.stock_quantity', '<=', 'p.stock_alert')
-                      ->orWhereColumn('p.stock_quantity', '<=', 'p.low_qty')
-                      ->orWhere('p.stock_quantity', '<=', 0);
-                })
-                ->select([
-                    'p.id', 'p.name', 'p.code', 'p.sku', 'p.alternative_name',
-                    'p.category_name', 'p.brand_name', 'p.unit_name',
-                    'p.stock_quantity as effective_stock',
-                    'p.alert_quantity', 'p.stock_alert', 'p.low_qty',
-                    'p.retail_price', 'p.selling_price',
-                ])
-                ->orderBy('p.stock_quantity', 'asc')
-                ->limit(15)
-                ->get();
-        }
+            $variantLowStock = collect();
+            try {
+                $sbVarQuery = DB::table('stock_balances')
+                    ->select('product_variant_id', DB::raw('SUM(quantity) as current_stock'))
+                    ->whereNotNull('product_variant_id');
+                if ($warehouseId !== null) {
+                    $sbVarQuery->where('warehouse_id', $warehouseId);
+                } elseif (!empty($allowedOutlets)) {
+                    $sbVarQuery->whereIn('warehouse_id', $allowedOutlets);
+                }
+                $lowStockVariantIds = $sbVarQuery
+                    ->groupBy('product_variant_id')
+                    ->havingRaw('current_stock <= 10')
+                    ->orderBy('current_stock', 'asc')
+                    ->limit(15)
+                    ->get();
 
-        $singleLowStock = $singleLowStockRows->map(function ($p) {
-            $alertQty = (float)($p->alert_quantity ?: ($p->stock_alert ?: ($p->low_qty ?: 10)));
-            $stockQty = (float)($p->effective_stock ?? 0);
-            return [
-                'id' => (int)$p->id,
-                'product_id' => (int)$p->id,
-                'is_variant' => false,
-                'variant_name' => '',
-                'product_name' => $p->name,
-                'code' => $p->code ?: ($p->sku ?? ''),
-                'name' => $p->name,
-                'display_name' => $p->name,
-                'alternative_name' => $p->alternative_name ?? '',
-                'category_name' => $p->category_name ?? 'General',
-                'brand_name' => $p->brand_name ?? 'Generic',
-                'unit_name' => $p->unit_name ?? 'Piece',
-                'stock_quantity' => $stockQty,
-                'alert_quantity' => $alertQty,
-                'retail_price' => (float)($p->retail_price ?? ($p->selling_price ?? 0)),
-            ];
-        });
+                if ($lowStockVariantIds->isNotEmpty()) {
+                    $vIds = $lowStockVariantIds->pluck('product_variant_id')->all();
+                    $variantDetails = DB::table('product_variants')
+                        ->join('products', 'product_variants.product_id', '=', 'products.id')
+                        ->whereIn('product_variants.id', $vIds)
+                        ->whereNull('products.deleted_at')
+                        ->whereNull('product_variants.deleted_at')
+                        ->select(
+                            'product_variants.id as variant_id',
+                            'products.id as product_id',
+                            'products.name as product_name',
+                            'product_variants.name as variant_name',
+                            'product_variants.sku as variant_sku',
+                            'product_variants.barcode as variant_barcode',
+                            'products.code as product_code',
+                            'products.alternative_name',
+                            'products.category_name',
+                            'products.brand_name',
+                            'products.unit_name',
+                            'products.alert_quantity',
+                            'products.stock_alert',
+                            'products.low_qty',
+                            'product_variants.selling_price as variant_price',
+                            'products.retail_price as product_price'
+                        )
+                        ->get()
+                        ->keyBy('variant_id');
 
-        $variantLowStock = collect();
-        try {
-            $sbVarQuery = DB::table('stock_balances')
-                ->select('product_variant_id', DB::raw('SUM(quantity) as current_stock'))
-                ->whereNotNull('product_variant_id');
-            if ($warehouseId !== null) {
-                $sbVarQuery->where('warehouse_id', $warehouseId);
-            } elseif (!empty($allowedOutlets)) {
-                $sbVarQuery->whereIn('warehouse_id', $allowedOutlets);
-            }
-            $lowStockVariantIds = $sbVarQuery
-                ->groupBy('product_variant_id')
-                ->havingRaw('current_stock <= 10')
-                ->orderBy('current_stock', 'asc')
-                ->limit(15)
-                ->get();
+                    foreach ($lowStockVariantIds as $vItem) {
+                        $v = $variantDetails->get($vItem->product_variant_id);
+                        if (!$v) continue;
+                        $alertQty = (float)($v->alert_quantity ?: ($v->stock_alert ?: ($v->low_qty ?: 10)));
+                        $stockQty = (float)$vItem->current_stock;
+                        $displayName = $v->product_name . ' (' . $v->variant_name . ')';
+                        $variantLowStock->push([
+                            'id' => (int)$v->variant_id,
+                            'product_id' => (int)$v->product_id,
+                            'is_variant' => true,
+                            'variant_name' => $v->variant_name,
+                            'product_name' => $v->product_name,
+                            'code' => $v->variant_sku ?: ($v->variant_barcode ?: ($v->product_code ?? '')),
+                            'name' => $displayName,
+                            'display_name' => $displayName,
+                            'alternative_name' => $v->alternative_name ?? '',
+                            'category_name' => $v->category_name ?? 'General',
+                            'brand_name' => $v->brand_name ?? 'Generic',
+                            'unit_name' => $v->unit_name ?? 'Piece',
+                            'stock_quantity' => $stockQty,
+                            'alert_quantity' => $alertQty,
+                            'retail_price' => (float)($v->variant_price ?? ($v->product_price ?? 0)),
+                        ]);
+                    }
+                }
+            } catch (\Throwable $e) {}
 
-            if ($lowStockVariantIds->isNotEmpty()) {
-                $vIds = $lowStockVariantIds->pluck('product_variant_id')->all();
-                $variantDetails = DB::table('product_variants')
+            $allLowStock = $singleLowStock->concat($variantLowStock)
+                ->sortBy('stock_quantity')
+                ->values();
+            $lowStockProducts = $allLowStock->take(10)->values();
+
+            try {
+                $totalVariants = DB::table('product_variants')
                     ->join('products', 'product_variants.product_id', '=', 'products.id')
-                    ->whereIn('product_variants.id', $vIds)
                     ->whereNull('products.deleted_at')
                     ->whereNull('product_variants.deleted_at')
-                    ->select(
-                        'product_variants.id as variant_id',
-                        'products.id as product_id',
-                        'products.name as product_name',
-                        'product_variants.name as variant_name',
-                        'product_variants.sku as variant_sku',
-                        'product_variants.barcode as variant_barcode',
-                        'products.code as product_code',
-                        'products.alternative_name',
-                        'products.category_name',
-                        'products.brand_name',
-                        'products.unit_name',
-                        'products.alert_quantity',
-                        'products.stock_alert',
-                        'products.low_qty',
-                        'product_variants.selling_price as variant_price',
-                        'products.retail_price as product_price'
-                    )
-                    ->get()
-                    ->keyBy('variant_id');
+                    ->count();
+            } catch (\Throwable $e) {}
 
-                foreach ($lowStockVariantIds as $vItem) {
-                    $v = $variantDetails->get($vItem->product_variant_id);
-                    if (!$v) continue;
-                    $alertQty = (float)($v->alert_quantity ?: ($v->stock_alert ?: ($v->low_qty ?: 10)));
-                    $stockQty = (float)$vItem->current_stock;
-                    $displayName = $v->product_name . ' (' . $v->variant_name . ')';
-                    $variantLowStock->push([
-                        'id' => (int)$v->variant_id,
-                        'product_id' => (int)$v->product_id,
-                        'is_variant' => true,
-                        'variant_name' => $v->variant_name,
-                        'product_name' => $v->product_name,
-                        'code' => $v->variant_sku ?: ($v->variant_barcode ?: ($v->product_code ?? '')),
-                        'name' => $displayName,
-                        'display_name' => $displayName,
-                        'alternative_name' => $v->alternative_name ?? '',
-                        'category_name' => $v->category_name ?? 'General',
-                        'brand_name' => $v->brand_name ?? 'Generic',
-                        'unit_name' => $v->unit_name ?? 'Piece',
-                        'stock_quantity' => $stockQty,
-                        'alert_quantity' => $alertQty,
-                        'retail_price' => (float)($v->variant_price ?? ($v->product_price ?? 0)),
-                    ]);
-                }
-            }
-        } catch (\Throwable $e) {}
-
-        $allLowStock = $singleLowStock->concat($variantLowStock)
-            ->sortBy('stock_quantity')
-            ->values();
-        $lowStockProducts = $allLowStock->take(10)->values();
-
-        $totalVariants = 0;
-        try {
-            $totalVariants = DB::table('product_variants')
-                ->join('products', 'product_variants.product_id', '=', 'products.id')
-                ->whereNull('products.deleted_at')
-                ->whereNull('product_variants.deleted_at')
-                ->count();
-        } catch (\Throwable $e) {}
-
-        $lowStockCount = $allLowStock->count();
-        $outOfStockCount = $allLowStock->where('stock_quantity', '<=', 0)->count();
-        $totalCustomers = (int) DB::table('customers')->count();
-        $totalSuppliers = (int) DB::table('suppliers')->count();
-        $totalOutlets = 1;
-        try {
-            $totalOutlets = (int)(DB::table('outlets')->count() ?: 1);
-        } catch (\Throwable $e) {}
-
-        // 7. Monthly 12-Month Trends for Selected Year
-        $monthlySales = array_fill(0, 12, 0.0);
-        $monthlyPurchases = array_fill(0, 12, 0.0);
-        $monthlyExpenses = array_fill(0, 12, 0.0);
-        $monthlyProfit = array_fill(0, 12, 0.0);
-        $monthlyCogs = array_fill(0, 12, 0.0);
-
-        $yearStart = "{$year}-01-01 00:00:00";
-        $yearEnd = "{$year}-12-31 23:59:59";
-
-        $isSqlite = DB::connection()->getDriverName() === 'sqlite';
-        $monthExpr = $isSqlite ? DB::raw("CAST(strftime('%m', date) AS integer)") : DB::raw('MONTH(date)');
-
-        $salesMonthlyData = (clone $salesBaseQuery)
-            ->where('date', '>=', $yearStart)
-            ->where('date', '<=', $yearEnd)
-            ->selectRaw($isSqlite
-                ? "CAST(strftime('%m', date) AS integer) as m, SUM(grand_total) as total, SUM(total_cogs) as total_cogs"
-                : "MONTH(date) as m, SUM(grand_total) as total, SUM(total_cogs) as total_cogs"
-            )
-            ->groupBy($monthExpr)
-            ->get();
-
-        foreach ($salesMonthlyData as $row) {
-            $mIdx = (int)$row->m;
-            if ($mIdx >= 1 && $mIdx <= 12) {
-                $monthlySales[$mIdx - 1] = (float)$row->total;
-                $monthlyCogs[$mIdx - 1] = (float)($row->total_cogs ?? 0);
-            }
+            $lowStockCount = $allLowStock->count();
+            $outOfStockCount = $allLowStock->where('stock_quantity', '<=', 0)->count();
+            $totalCustomers = (int) DB::table('customers')->count();
+            $totalSuppliers = (int) DB::table('suppliers')->count();
+            try {
+                $totalOutlets = (int)(DB::table('outlets')->count() ?: 1);
+            } catch (\Throwable $e) {}
         }
 
-        // Deduct monthly sale returns & returned COGS using pre-aggregated layer join
-        try {
-            $srLayerYearSub = DB::table('sale_return_cost_layers')
-                ->select('sale_return_id', DB::raw('SUM(total_cost) as layer_cost'))
-                ->groupBy('sale_return_id');
-            $srMonthQuery = DB::table('sale_returns as sr')
-                ->leftJoinSub($srLayerYearSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id');
-            $this->applyActiveDocumentFilter($srMonthQuery, 'sr.status');
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $srMonthQuery->where('sr.warehouse_name', $warehouse);
-            }
-            if (!empty($allowedOutlets)) {
-                $srMonthQuery->whereIn('sr.warehouse_id', $allowedOutlets);
-            }
-            $srMonthExpr = $isSqlite ? DB::raw("CAST(strftime('%m', sr.date) AS integer)") : DB::raw('MONTH(sr.date)');
-            $srYearCogsExpr = 'COALESCE(NULLIF(sr.return_cost_total, 0), COALESCE(srcl.layer_cost, 0))';
-            $saleReturnsByMonth = $srMonthQuery
-                ->where('sr.date', '>=', $yearStart)
-                ->where('sr.date', '<=', $yearEnd)
-                ->selectRaw($isSqlite
-                    ? "CAST(strftime('%m', sr.date) AS integer) as m, SUM(sr.grand_total) as total, SUM({$srYearCogsExpr}) as ret_cogs"
-                    : "MONTH(sr.date) as m, SUM(sr.grand_total) as total, SUM({$srYearCogsExpr}) as ret_cogs")
-                ->groupBy($srMonthExpr)
-                ->get();
+        // 7. Monthly 12-Month Trends for Selected Year (IFRS/GAAP Tax-Exclusive, Partial-COGS Fallback, Cached per Year+Scope)
+        $computeMonthlyTrends = function () use (
+            $year, $warehouse, $allowedOutlets, $canViewCost,
+            $salesBaseQuery, $purchBaseQuery, $expBaseQuery,
+            $buildSiTaxSub, $buildPurchTaxSub,
+            $plNetSaleSql, $srNetRevSql, $netPurchJoinedSql, $cogsFallbackExpr,
+            $purchaseAccounting
+        ): array {
+            $monthlySales = array_fill(0, 12, 0.0);
+            $monthlyPurchases = array_fill(0, 12, 0.0);
+            $monthlyExpenses = array_fill(0, 12, 0.0);
+            $monthlyProfit = array_fill(0, 12, 0.0);
+            $monthlyCogs = array_fill(0, 12, 0.0);
 
-            foreach ($saleReturnsByMonth as $srRow) {
-                $mIdx = (int)$srRow->m;
-                if ($mIdx >= 1 && $mIdx <= 12) {
-                    $monthlySales[$mIdx - 1] = max(0.0, round($monthlySales[$mIdx - 1] - (float)$srRow->total, 2));
-                    $monthlyCogs[$mIdx - 1] = round($monthlyCogs[$mIdx - 1] - (float)$srRow->ret_cogs, 2);
-                }
-            }
-        } catch (\Throwable $e) {}
+            // Use YYYY-01-01 (10-char) lower bound so date-only rows on Jan 1 are never missed
+            $yearStart = "{$year}-01-01";
+            $yearEnd = "{$year}-12-31 23:59:59";
 
-        // Group purchases by month using pre-joined tax subquery
-        $purchasesByMonth = (clone $purchBaseQuery)
-            ->leftJoinSub($purchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id')
-            ->where('purchases.date', '>=', $yearStart)
-            ->where('purchases.date', '<=', $yearEnd)
-            ->selectRaw($isSqlite
-                ? "CAST(strftime('%m', purchases.date) AS integer) as m, SUM({$netPurchJoinedSql}) as total"
-                : "MONTH(purchases.date) as m, SUM({$netPurchJoinedSql}) as total")
-            ->groupBy($isSqlite ? DB::raw("CAST(strftime('%m', purchases.date) AS integer)") : DB::raw('MONTH(purchases.date)'))
-            ->pluck('total', 'm');
+            $isSqlite = DB::connection()->getDriverName() === 'sqlite';
+            $monthExprSales = $isSqlite ? "CAST(strftime('%m', sales.date) AS integer)" : 'MONTH(sales.date)';
+            $monthExprGeneric = $isSqlite ? "CAST(strftime('%m', date) AS integer)" : 'MONTH(date)';
 
-        foreach ($purchasesByMonth as $m => $tot) {
-            $mIdx = (int)$m;
-            if ($mIdx >= 1 && $mIdx <= 12) {
-                $monthlyPurchases[$mIdx - 1] = (float)$tot;
-            }
-        }
-
-        // Deduct monthly completed purchase returns (SQL for non-recoverable + PHP only for recoverable tax rows)
-        $monthlyPrVariance = array_fill(0, 12, 0.0);
-        try {
-            $prMonthQuery = DB::table('purchase_returns')->whereIn('status', ['Completed', 'Received']);
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $prMonthQuery->where('warehouse_name', $warehouse);
-            }
-            if (!empty($allowedOutlets)) {
-                $prMonthQuery->whereIn('warehouse_id', $allowedOutlets);
-            }
-            $prYearBase = (clone $prMonthQuery)
-                ->where('date', '>=', $yearStart)
-                ->where('date', '<=', $yearEnd);
-
-            $prMonthAggs = (clone $prYearBase)
-                ->selectRaw($isSqlite
-                    ? "CAST(strftime('%m', date) AS integer) as m, COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) != 1 THEN grand_total ELSE 0 END), 0) as non_recov, COALESCE(SUM(COALESCE(cost_variance, 0)), 0) as var_sum"
-                    : "MONTH(date) as m, COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) != 1 THEN grand_total ELSE 0 END), 0) as non_recov, COALESCE(SUM(COALESCE(cost_variance, 0)), 0) as var_sum")
-                ->groupBy($monthExpr)
-                ->get();
-
-            foreach ($prMonthAggs as $pmRow) {
-                $mIdx = (int)$pmRow->m;
-                if ($mIdx >= 1 && $mIdx <= 12) {
-                    $monthlyPurchases[$mIdx - 1] = max(0.0, round($monthlyPurchases[$mIdx - 1] - (float)$pmRow->non_recov, 2));
-                    $monthlyPrVariance[$mIdx - 1] = round($monthlyPrVariance[$mIdx - 1] + (float)$pmRow->var_sum, 2);
-                }
-            }
-
-            $recovPrYearRows = (clone $prYearBase)
-                ->where('is_tax_recoverable', 1)
-                ->select(['date', 'grand_total', 'tax_amount', 'is_tax_recoverable', 'items_payload'])
-                ->get();
-            foreach ($recovPrYearRows as $prMRow) {
-                $mIdx = (int)substr((string)$prMRow->date, 5, 2);
-                if ($mIdx >= 1 && $mIdx <= 12) {
-                    $netPrAmt = $purchaseAccounting->netPurchaseReturnAmount($prMRow);
-                    $monthlyPurchases[$mIdx - 1] = max(0.0, round($monthlyPurchases[$mIdx - 1] - $netPrAmt, 2));
-                }
-            }
-        } catch (\Throwable $e) {}
-
-        // Group expenses by month
-        $expensesByMonth = (clone $expBaseQuery)
-            ->where('date', '>=', $yearStart)
-            ->where('date', '<=', $yearEnd)
-            ->selectRaw($isSqlite ? "CAST(strftime('%m', date) AS integer) as m, SUM(amount) as total" : "MONTH(date) as m, SUM(amount) as total")
-            ->groupBy($monthExpr)
-            ->pluck('total', 'm');
-
-        foreach ($expensesByMonth as $m => $tot) {
-            $mIdx = (int)$m;
-            if ($mIdx >= 1 && $mIdx <= 12) {
-                $monthlyExpenses[$mIdx - 1] = (float)$tot;
-            }
-        }
-
-        // Group monthly operating stock adjustments (enforcing $allowedOutlets & sargable date index)
-        $monthlyAdjNet = array_fill(0, 12, 0.0);
-        try {
-            $effAdjTypeSqlM = $this->effectiveAdjustmentTypeSql();
-            $adjMonthBase = DB::table('stock_adjustment_items')
-                ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-                ->where('stock_adjustments.date', '>=', $yearStart)
-                ->where('stock_adjustments.date', '<=', $yearEnd);
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $adjMonthBase->where('stock_adjustments.warehouse_name', $warehouse);
-            }
-            if (!empty($allowedOutlets)) {
-                $adjMonthBase->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
-            }
-            $this->applyOperatingAdjustmentScope($adjMonthBase, true);
-
-            $adjMonthExpr = $isSqlite
-                ? "CAST(strftime('%m', stock_adjustments.date) AS integer)"
-                : 'MONTH(stock_adjustments.date)';
-            $adjMonthRows = $adjMonthBase
+            $yearSiTaxSub = $buildSiTaxSub($yearStart, $yearEnd);
+            $salesMonthlyData = (clone $salesBaseQuery)
+                ->leftJoinSub($yearSiTaxSub, 'sit', 'sit.sale_id', '=', 'sales.id')
+                ->where('sales.date', '>=', $yearStart)
+                ->where('sales.date', '<=', $yearEnd)
                 ->selectRaw("
-                    {$adjMonthExpr} as m,
-                    COALESCE(SUM(CASE WHEN {$effAdjTypeSqlM} = 'addition' THEN stock_adjustment_items.subtotal ELSE 0 END), 0) as adj_gain,
-                    COALESCE(SUM(CASE WHEN {$effAdjTypeSqlM} = 'subtraction' THEN stock_adjustment_items.subtotal ELSE 0 END), 0) as adj_loss
+                    {$monthExprSales} as m,
+                    COALESCE(SUM({$plNetSaleSql}), 0) as total,
+                    COALESCE(SUM(CASE WHEN sales.total_cogs > 0 THEN sales.total_cogs ELSE 0 END), 0) as total_cogs,
+                    COALESCE(SUM(CASE WHEN sales.total_cogs IS NULL OR sales.total_cogs <= 0 THEN 1 ELSE 0 END), 0) as missing_cogs
                 ")
-                ->groupBy(DB::raw($adjMonthExpr))
+                ->groupBy(DB::raw($monthExprSales))
                 ->get();
 
-            foreach ($adjMonthRows as $am) {
-                $mIdx = (int)$am->m;
+            $hasMonthlyMissingCogs = false;
+            foreach ($salesMonthlyData as $row) {
+                $mIdx = (int)$row->m;
                 if ($mIdx >= 1 && $mIdx <= 12) {
-                    $monthlyAdjNet[$mIdx - 1] = round((float)$am->adj_gain - (float)$am->adj_loss, 2);
+                    $monthlySales[$mIdx - 1] = round((float)$row->total, 2);
+                    $monthlyCogs[$mIdx - 1] = round((float)($row->total_cogs ?? 0), 2);
+                    if ((int)($row->missing_cogs ?? 0) > 0) {
+                        $hasMonthlyMissingCogs = true;
+                    }
                 }
             }
-        } catch (\Throwable $e) {}
 
-        for ($i = 0; $i < 12; $i++) {
-            $monthlyProfit[$i] = round($monthlySales[$i] - $monthlyCogs[$i] - $monthlyExpenses[$i] + $monthlyPrVariance[$i] + $monthlyAdjNet[$i], 2);
-        }
+            if ($canViewCost && $hasMonthlyMissingCogs) {
+                try {
+                    $missingMonthlyCogs = DB::table('sale_items')
+                        ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                        ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+                        ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                        ->where(function ($q) {
+                            $q->whereNull('sales.total_cogs')->orWhere('sales.total_cogs', '<=', 0);
+                        })
+                        ->where('sales.date', '>=', $yearStart)
+                        ->where('sales.date', '<=', $yearEnd);
+                    $this->applyActiveDocumentFilter($missingMonthlyCogs, 'sales.status');
+                    if ($warehouse !== 'All' && !empty($warehouse)) {
+                        $missingMonthlyCogs->where('sales.warehouse_name', $warehouse);
+                    }
+                    if (!empty($allowedOutlets)) {
+                        $missingMonthlyCogs->whereIn('sales.warehouse_id', $allowedOutlets);
+                    }
+                    $missingRows = $missingMonthlyCogs
+                        ->selectRaw("{$monthExprSales} as m, {$cogsFallbackExpr} as cogs_sum")
+                        ->groupBy(DB::raw($monthExprSales))
+                        ->get();
+                    foreach ($missingRows as $mr) {
+                        $mIdx = (int)$mr->m;
+                        if ($mIdx >= 1 && $mIdx <= 12) {
+                            $monthlyCogs[$mIdx - 1] = round($monthlyCogs[$mIdx - 1] + (float)$mr->cogs_sum, 2);
+                        }
+                    }
+                } catch (\Throwable $e) {}
+            }
 
-        // 8. Payment Methods Tender Mix in Period
-        $rawPaymentMethodsQuery = (clone $salesBaseQuery);
-        $applyDateScope($rawPaymentMethodsQuery, 'date');
-        $rawPaymentMethods = $rawPaymentMethodsQuery
-            ->select('payment_type', DB::raw('COUNT(*) as count'), DB::raw('SUM(grand_total) as amount'))
-            ->groupBy('payment_type')
-            ->orderByDesc('amount')
-            ->get();
+            // Deduct monthly sale returns & returned COGS (Tax-Exclusive & Ex-Shipping, date-scoped layer join)
+            try {
+                $srLayerYearSub = DB::table('sale_return_cost_layers as srcl')
+                    ->join('sale_returns as sr_i', 'sr_i.id', '=', 'srcl.sale_return_id')
+                    ->where('sr_i.date', '>=', $yearStart)
+                    ->where('sr_i.date', '<=', $yearEnd)
+                    ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('sr_i.warehouse_name', $warehouse))
+                    ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('sr_i.warehouse_id', $allowedOutlets))
+                    ->select('srcl.sale_return_id', DB::raw('COALESCE(SUM(srcl.total_cost), 0) as layer_cost'))
+                    ->groupBy('srcl.sale_return_id');
 
-        $paymentMethods = [];
-        $pTotal = $totalSales > 0 ? $totalSales : 1.0;
-        foreach ($rawPaymentMethods as $pm) {
-            $type = !empty($pm->payment_type) ? $pm->payment_type : 'Cash';
-            $amt = (float)$pm->amount;
-            $paymentMethods[] = [
-                'type' => $type,
-                'amount' => $amt,
-                'count' => (int)$pm->count,
-                'percentage' => round(($amt / $pTotal) * 100, 1),
+                $srMonthQuery = DB::table('sale_returns as sr')
+                    ->leftJoinSub($srLayerYearSub, 'srcl', 'srcl.sale_return_id', '=', 'sr.id');
+                $this->applyActiveDocumentFilter($srMonthQuery, 'sr.status');
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $srMonthQuery->where('sr.warehouse_name', $warehouse);
+                }
+                if (!empty($allowedOutlets)) {
+                    $srMonthQuery->whereIn('sr.warehouse_id', $allowedOutlets);
+                }
+                $srMonthExpr = $isSqlite ? "CAST(strftime('%m', sr.date) AS integer)" : 'MONTH(sr.date)';
+                $srYearCogsExpr = 'COALESCE(NULLIF(sr.return_cost_total, 0), COALESCE(srcl.layer_cost, 0))';
+                $saleReturnsByMonth = $srMonthQuery
+                    ->where('sr.date', '>=', $yearStart)
+                    ->where('sr.date', '<=', $yearEnd)
+                    ->selectRaw("{$srMonthExpr} as m, COALESCE(SUM({$srNetRevSql}), 0) as total, COALESCE(SUM({$srYearCogsExpr}), 0) as ret_cogs")
+                    ->groupBy(DB::raw($srMonthExpr))
+                    ->get();
+
+                foreach ($saleReturnsByMonth as $srRow) {
+                    $mIdx = (int)$srRow->m;
+                    if ($mIdx >= 1 && $mIdx <= 12) {
+                        $monthlySales[$mIdx - 1] = round($monthlySales[$mIdx - 1] - (float)$srRow->total, 2);
+                        $monthlyCogs[$mIdx - 1] = round($monthlyCogs[$mIdx - 1] - (float)$srRow->ret_cogs, 2);
+                    }
+                }
+            } catch (\Throwable $e) {}
+
+            // Group purchases & purchase returns by month (only needed when canViewCost)
+            $monthlyPrVariance = array_fill(0, 12, 0.0);
+            if ($canViewCost) {
+                $yearPurchTaxSub = $buildPurchTaxSub($yearStart, $yearEnd);
+                $purchMonthExpr = $isSqlite ? "CAST(strftime('%m', purchases.date) AS integer)" : 'MONTH(purchases.date)';
+                $purchasesByMonth = (clone $purchBaseQuery)
+                    ->leftJoinSub($yearPurchTaxSub, 'pt', 'pt.purchase_id', '=', 'purchases.id')
+                    ->where('purchases.date', '>=', $yearStart)
+                    ->where('purchases.date', '<=', $yearEnd)
+                    ->selectRaw("{$purchMonthExpr} as m, COALESCE(SUM({$netPurchJoinedSql}), 0) as total")
+                    ->groupBy(DB::raw($purchMonthExpr))
+                    ->pluck('total', 'm');
+
+                foreach ($purchasesByMonth as $m => $tot) {
+                    $mIdx = (int)$m;
+                    if ($mIdx >= 1 && $mIdx <= 12) {
+                        $monthlyPurchases[$mIdx - 1] = round((float)$tot, 2);
+                    }
+                }
+
+                try {
+                    $prYearBase = DB::table('purchase_returns')
+                        ->whereIn('status', ['Completed', 'Received'])
+                        ->where('date', '>=', $yearStart)
+                        ->where('date', '<=', $yearEnd);
+                    if ($warehouse !== 'All' && !empty($warehouse)) {
+                        $prYearBase->where('warehouse_name', $warehouse);
+                    }
+                    if (!empty($allowedOutlets)) {
+                        $prYearBase->whereIn('warehouse_id', $allowedOutlets);
+                    }
+
+                    $prMonthAggs = (clone $prYearBase)
+                        ->selectRaw("
+                            {$monthExprGeneric} as m,
+                            COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) != 1 THEN grand_total ELSE 0 END), 0) as non_recov,
+                            COALESCE(SUM(CASE WHEN COALESCE(is_tax_recoverable, 0) = 1 THEN 1 ELSE 0 END), 0) as recov_cnt,
+                            COALESCE(SUM(COALESCE(cost_variance, 0)), 0) as var_sum
+                        ")
+                        ->groupBy(DB::raw($monthExprGeneric))
+                        ->get();
+
+                    $hasRecovPrYear = false;
+                    foreach ($prMonthAggs as $pmRow) {
+                        $mIdx = (int)$pmRow->m;
+                        if ($mIdx >= 1 && $mIdx <= 12) {
+                            $monthlyPurchases[$mIdx - 1] = max(0.0, round($monthlyPurchases[$mIdx - 1] - (float)$pmRow->non_recov, 2));
+                            $monthlyPrVariance[$mIdx - 1] = round($monthlyPrVariance[$mIdx - 1] + (float)$pmRow->var_sum, 2);
+                            if ((int)($pmRow->recov_cnt ?? 0) > 0) {
+                                $hasRecovPrYear = true;
+                            }
+                        }
+                    }
+
+                    if ($hasRecovPrYear) {
+                        $recovPrYearRows = (clone $prYearBase)
+                            ->where('is_tax_recoverable', 1)
+                            ->select(['date', 'grand_total', 'tax_amount', 'is_tax_recoverable', 'items_payload'])
+                            ->get();
+                        foreach ($recovPrYearRows as $prMRow) {
+                            $mIdx = (int)substr((string)$prMRow->date, 5, 2);
+                            if ($mIdx >= 1 && $mIdx <= 12) {
+                                $netPrAmt = $purchaseAccounting->netPurchaseReturnAmount($prMRow);
+                                $monthlyPurchases[$mIdx - 1] = max(0.0, round($monthlyPurchases[$mIdx - 1] - $netPrAmt, 2));
+                            }
+                        }
+                    }
+                } catch (\Throwable $e) {}
+            }
+
+            // Group expenses by month
+            $expensesByMonth = (clone $expBaseQuery)
+                ->where('date', '>=', $yearStart)
+                ->where('date', '<=', $yearEnd)
+                ->selectRaw("{$monthExprGeneric} as m, COALESCE(SUM(amount), 0) as total")
+                ->groupBy(DB::raw($monthExprGeneric))
+                ->pluck('total', 'm');
+
+            foreach ($expensesByMonth as $m => $tot) {
+                $mIdx = (int)$m;
+                if ($mIdx >= 1 && $mIdx <= 12) {
+                    $monthlyExpenses[$mIdx - 1] = round((float)$tot, 2);
+                }
+            }
+
+            // Group monthly operating stock adjustments (only needed for profit when canViewCost)
+            $monthlyAdjNet = array_fill(0, 12, 0.0);
+            if ($canViewCost) {
+                try {
+                    $effAdjTypeSqlM = $this->effectiveAdjustmentTypeSql();
+                    $adjMonthBase = DB::table('stock_adjustment_items')
+                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+                        ->where('stock_adjustments.date', '>=', $yearStart)
+                        ->where('stock_adjustments.date', '<=', $yearEnd);
+                    if ($warehouse !== 'All' && !empty($warehouse)) {
+                        $adjMonthBase->where('stock_adjustments.warehouse_name', $warehouse);
+                    }
+                    if (!empty($allowedOutlets)) {
+                        $adjMonthBase->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
+                    }
+                    $this->applyOperatingAdjustmentScope($adjMonthBase, true);
+
+                    $adjMonthExpr = $isSqlite
+                        ? "CAST(strftime('%m', stock_adjustments.date) AS integer)"
+                        : 'MONTH(stock_adjustments.date)';
+                    $adjMonthRows = $adjMonthBase
+                        ->selectRaw("
+                            {$adjMonthExpr} as m,
+                            COALESCE(SUM(CASE WHEN {$effAdjTypeSqlM} = 'addition' THEN stock_adjustment_items.subtotal ELSE 0 END), 0) as adj_gain,
+                            COALESCE(SUM(CASE WHEN {$effAdjTypeSqlM} = 'subtraction' THEN stock_adjustment_items.subtotal ELSE 0 END), 0) as adj_loss
+                        ")
+                        ->groupBy(DB::raw($adjMonthExpr))
+                        ->get();
+
+                    foreach ($adjMonthRows as $am) {
+                        $mIdx = (int)$am->m;
+                        if ($mIdx >= 1 && $mIdx <= 12) {
+                            $monthlyAdjNet[$mIdx - 1] = round((float)$am->adj_gain - (float)$am->adj_loss, 2);
+                        }
+                    }
+                } catch (\Throwable $e) {}
+
+                for ($i = 0; $i < 12; $i++) {
+                    $monthlyProfit[$i] = round($monthlySales[$i] - $monthlyCogs[$i] - $monthlyExpenses[$i] + $monthlyPrVariance[$i] + $monthlyAdjNet[$i], 2);
+                }
+            }
+
+            return [
+                'year' => $year,
+                'months' => ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+                'sales' => $monthlySales,
+                'purchases' => $canViewCost ? $monthlyPurchases : array_fill(0, 12, 0.0),
+                'expenses' => $monthlyExpenses,
+                'net_profit' => $canViewCost ? $monthlyProfit : array_fill(0, 12, 0.0),
             ];
+        };
+
+        $trendCacheKey = "dash_trends_v2_{$year}_{$scopeCacheKey}";
+        $monthlyTrends = $useShortCache
+            ? Cache::remember($trendCacheKey, 20, $computeMonthlyTrends)
+            : $computeMonthlyTrends();
+
+        // 8. Payment Methods Tender Mix (skipped in compact=1 mode)
+        $paymentMethods = [];
+        if (!$compact) {
+            $rawPaymentMethodsQuery = (clone $salesBaseQuery);
+            $applyDateScope($rawPaymentMethodsQuery, 'sales.date');
+            $rawPaymentMethods = $rawPaymentMethodsQuery
+                ->select('sales.payment_type', DB::raw('COUNT(*) as count'), DB::raw('SUM(sales.grand_total) as amount'))
+                ->groupBy('sales.payment_type')
+                ->orderByDesc('amount')
+                ->get();
+
+            $pTotal = $grossInvoicedSales > 0 ? $grossInvoicedSales : 1.0;
+            foreach ($rawPaymentMethods as $pm) {
+                $type = !empty($pm->payment_type) ? $pm->payment_type : 'Cash';
+                $amt = (float)$pm->amount;
+                $paymentMethods[] = [
+                    'type' => $type,
+                    'amount' => $amt,
+                    'count' => (int)$pm->count,
+                    'percentage' => round(($amt / $pTotal) * 100, 1),
+                ];
+            }
         }
 
         // 9. Top Selling Products in Period (uniformly applying active filter + allowedOutlets)
@@ -1401,78 +1678,80 @@ class ReportController extends Controller
                 })->all();
         }
 
-        // 10. Top Category Sales Share in Period (uniformly applying active filter + allowedOutlets)
+        // 10 & 11. Top Category Sales Share & Recent Sales (skipped in compact=1 mode)
         $categorySales = [];
-        try {
-            $catQuery = DB::table('sale_items')
-                ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-                ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
-            $this->applyActiveDocumentFilter($catQuery, 'sales.status');
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $catQuery->where('sales.warehouse_name', $warehouse);
-            }
-            if (!empty($allowedOutlets)) {
-                $catQuery->whereIn('sales.warehouse_id', $allowedOutlets);
-            }
-            $applyDateScope($catQuery, 'sales.date');
+        $recentSales = [];
+        if (!$compact) {
+            try {
+                $catQuery = DB::table('sale_items')
+                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                    ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
+                $this->applyActiveDocumentFilter($catQuery, 'sales.status');
+                if ($warehouse !== 'All' && !empty($warehouse)) {
+                    $catQuery->where('sales.warehouse_name', $warehouse);
+                }
+                if (!empty($allowedOutlets)) {
+                    $catQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+                }
+                $applyDateScope($catQuery, 'sales.date');
 
-            $catResults = $catQuery
-                ->select(
-                    DB::raw("COALESCE(NULLIF(products.category_name, ''), 'General') as category_name"),
-                    DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales'),
-                    DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_qty'),
-                    DB::raw('COUNT(sale_items.id) as orders_count')
-                )
-                ->groupBy('category_name')
-                ->orderByDesc('total_sales')
-                ->limit(8)
-                ->get();
+                $catResults = $catQuery
+                    ->select(
+                        DB::raw("COALESCE(NULLIF(products.category_name, ''), 'General') as category_name"),
+                        DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales'),
+                        DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_qty'),
+                        DB::raw('COUNT(sale_items.id) as orders_count')
+                    )
+                    ->groupBy('category_name')
+                    ->orderByDesc('total_sales')
+                    ->limit(8)
+                    ->get();
 
-            foreach ($catResults as $cr) {
-                $amt = (float)$cr->total_sales;
-                $categorySales[] = [
-                    'category_name' => $cr->category_name,
-                    'amount' => $amt,
-                    'quantity' => (float)$cr->total_qty,
-                    'orders_count' => (int)$cr->orders_count,
-                    'percentage' => $totalSales > 0 ? round(($amt / $totalSales) * 100, 1) : 0.0,
-                ];
-            }
-        } catch (\Throwable $e) {}
+                foreach ($catResults as $cr) {
+                    $amt = (float)$cr->total_sales;
+                    $categorySales[] = [
+                        'category_name' => $cr->category_name,
+                        'amount' => $amt,
+                        'quantity' => (float)$cr->total_qty,
+                        'orders_count' => (int)$cr->orders_count,
+                        'percentage' => $totalSales > 0 ? round(($amt / $totalSales) * 100, 1) : 0.0,
+                    ];
+                }
+            } catch (\Throwable $e) {}
 
-        // 11. Recent Sales Transactions (Latest 10 with explicit column projection)
-        $recentSales = (clone $salesBaseQuery)
-            ->select([
-                'id',
-                'reference_no',
-                'customer_name',
-                'warehouse_name',
-                'date',
-                'grand_total',
-                'paid_amount',
-                'due_amount',
-                'payment_type',
-                'payment_status',
-                'status',
-            ])
-            ->orderBy('id', 'desc')
-            ->limit(10)
-            ->get()
-            ->map(function ($s) {
-                return [
-                    'id' => $s->id,
-                    'reference_no' => $s->reference_no,
-                    'customer_name' => $s->customer_name ?? 'Walk-in Customer',
-                    'warehouse_name' => $s->warehouse_name ?? 'Main Branch Outlet',
-                    'date' => $s->date,
-                    'grand_total' => (float)$s->grand_total,
-                    'paid_amount' => (float)$s->paid_amount,
-                    'due_amount' => (float)$s->due_amount,
-                    'payment_type' => $s->payment_type ?? 'Cash',
-                    'payment_status' => $s->payment_status ?? 'Paid',
-                    'status' => $s->status ?? 'Completed',
-                ];
-            })->all();
+            $recentSales = (clone $salesBaseQuery)
+                ->select([
+                    'sales.id',
+                    'sales.reference_no',
+                    'sales.customer_name',
+                    'sales.warehouse_name',
+                    'sales.date',
+                    'sales.grand_total',
+                    'sales.paid_amount',
+                    'sales.due_amount',
+                    'sales.payment_type',
+                    'sales.payment_status',
+                    'sales.status',
+                ])
+                ->orderBy('sales.id', 'desc')
+                ->limit(10)
+                ->get()
+                ->map(function ($s) {
+                    return [
+                        'id' => $s->id,
+                        'reference_no' => $s->reference_no,
+                        'customer_name' => $s->customer_name ?? 'Walk-in Customer',
+                        'warehouse_name' => $s->warehouse_name ?? 'Main Branch Outlet',
+                        'date' => $s->date,
+                        'grand_total' => (float)$s->grand_total,
+                        'paid_amount' => (float)$s->paid_amount,
+                        'due_amount' => (float)$s->due_amount,
+                        'payment_type' => $s->payment_type ?? 'Cash',
+                        'payment_status' => $s->payment_status ?? 'Paid',
+                        'status' => $s->status ?? 'Completed',
+                    ];
+                })->all();
+        }
 
         $responsePayload = [
             'status' => 'success',
@@ -1484,6 +1763,8 @@ class ReportController extends Controller
                 'end_date' => $endDate,
 
                 'total_sales' => $totalSales,
+                'gross_invoiced_sales' => $grossInvoicedSales,
+                'tax_collected' => $taxCollected,
                 'total_sale_returns' => $totalSaleReturns,
                 'net_sales' => $netSales,
                 'orders_count' => $ordersCount,
@@ -1533,14 +1814,7 @@ class ReportController extends Controller
                 'total_suppliers' => $totalSuppliers,
                 'total_outlets' => $totalOutlets,
 
-                'monthly_trends' => [
-                    'year' => $year,
-                    'months' => ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
-                    'sales' => $monthlySales,
-                    'purchases' => $canViewCost ? $monthlyPurchases : array_fill(0, 12, 0.0),
-                    'expenses' => $monthlyExpenses,
-                    'net_profit' => $canViewCost ? $monthlyProfit : array_fill(0, 12, 0.0),
-                ],
+                'monthly_trends' => $monthlyTrends,
 
                 'payment_methods' => $paymentMethods,
                 'top_products' => $topProducts,
@@ -1639,7 +1913,24 @@ class ReportController extends Controller
 
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
         if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $baseQuery->where('warehouse_name', $warehouse);
+            $whId = $this->resolveWarehouseIdParam((string)$warehouse);
+            if ($whId !== null) {
+                $hasNullSaleWh = DB::table('sales')->whereNull('warehouse_id')->limit(1)->exists();
+                if ($hasNullSaleWh) {
+                    $baseQuery->where(function ($q) use ($warehouse, $whId) {
+                        $q->where('warehouse_id', $whId)
+                          ->orWhere(function ($legacy) use ($warehouse) {
+                              $legacy->whereNull('warehouse_id')->where('warehouse_name', $warehouse);
+                          });
+                    });
+                } else {
+                    $baseQuery->where('warehouse_id', $whId);
+                }
+            } elseif (is_numeric($warehouse)) {
+                $baseQuery->where('warehouse_id', -1);
+            } else {
+                $baseQuery->where('warehouse_name', $warehouse);
+            }
         }
 
         if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
@@ -1657,7 +1948,27 @@ class ReportController extends Controller
         }
 
         if ($request->filled('payment_type') && $request->input('payment_type') !== 'All') {
-            $baseQuery->where('payment_type', $request->input('payment_type'));
+            $paymentType = (string)$request->input('payment_type');
+            $hasSalePaymentsPayload = $this->accounting()->schemaHasColumn('sales', 'payments_payload');
+            $baseQuery->where(function ($q) use ($paymentType, $hasSalePaymentsPayload) {
+                $q->where('payment_type', $paymentType);
+                if ($paymentType !== 'Split Payment') {
+                    $q->orWhere(function ($sq) use ($paymentType, $hasSalePaymentsPayload) {
+                        $sq->where('payment_type', 'Split Payment')
+                           ->where(function ($sub) use ($paymentType, $hasSalePaymentsPayload) {
+                               $sub->whereExists(function ($ep) use ($paymentType) {
+                                   $ep->select(DB::raw(1))
+                                      ->from('sale_payments as sp_f')
+                                      ->whereColumn('sp_f.sale_id', 'sales.id')
+                                      ->where('sp_f.payment_type', $paymentType);
+                               });
+                               if ($hasSalePaymentsPayload) {
+                                   $sub->orWhere('payments_payload', 'like', '%' . addcslashes($paymentType, '%_\\') . '%');
+                               }
+                           });
+                    });
+                }
+            });
         }
 
         if ($request->filled('customer_id') && $request->input('customer_id') !== 'All') {
@@ -1685,22 +1996,27 @@ class ReportController extends Controller
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $knownTotal = $request->filled('known_total') ? max(0, (int)$request->input('known_total')) : null;
 
+        $hasReturnedCredit = $this->accounting()->schemaHasColumn('sales', 'returned_credit_amount');
         $totalCount = 0;
         $totalRevenue = 0.0;
         $totalPaid = 0.0;
         $totalDue = 0.0;
+        $totalReturnedCredit = 0.0;
         if (!$skipSummary && $page === 1) {
-            $totals = (clone $baseQuery)->select(DB::raw('
+            $retCreditExpr = $hasReturnedCredit ? 'COALESCE(SUM(returned_credit_amount), 0)' : '0';
+            $totals = (clone $baseQuery)->select(DB::raw("
                 COUNT(*) as total_count,
                 COALESCE(SUM(grand_total), 0) as total_revenue,
                 COALESCE(SUM(paid_amount), 0) as total_paid,
-                COALESCE(SUM(due_amount), 0) as total_due
-            '))->first();
+                COALESCE(SUM(due_amount), 0) as total_due,
+                {$retCreditExpr} as total_returned_credit
+            "))->first();
 
             $totalCount = (int)($totals->total_count ?? 0);
             $totalRevenue = (float)($totals->total_revenue ?? 0);
             $totalPaid = (float)($totals->total_paid ?? 0);
             $totalDue = (float)($totals->total_due ?? 0);
+            $totalReturnedCredit = round((float)($totals->total_returned_credit ?? 0), 2);
         } elseif ($knownTotal !== null) {
             $totalCount = $knownTotal;
         } else {
@@ -1716,6 +2032,9 @@ class ReportController extends Controller
             'created_by', 'user_id', 'user_name', 'user_role',
             'created_at', 'updated_at',
         ];
+        if ($hasReturnedCredit) {
+            $selectCols[] = 'returned_credit_amount';
+        }
         if ($this->accounting()->schemaHasColumn('sales', 'points_discount')) {
             $selectCols[] = 'points_discount';
             $selectCols[] = 'redeemed_points';
@@ -1751,11 +2070,56 @@ class ReportController extends Controller
             : null;
         $lastPage = max(1, (int)ceil($totalCount / max(1, $perPage)));
 
+        $availableFilters = [];
+        if (!$skipSummary && $page === 1) {
+            $userNames = [];
+            foreach ($salesItems as $sRow) {
+                $raw = trim((string)($sRow->user_name ?: $sRow->created_by));
+                if ($raw !== '') {
+                    $clean = trim((string)(preg_replace('/\s*\([^)]*\)\s*$/', '', $raw) ?: $raw));
+                    if ($clean !== '') {
+                        $userNames[strtolower($clean)] = $clean;
+                    }
+                }
+            }
+            $distinctCreators = DB::table('sales')
+                ->select('user_name', 'created_by')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->distinct()
+                ->limit(100)
+                ->get();
+            foreach ($distinctCreators as $uRow) {
+                $raw = trim((string)($uRow->user_name ?: $uRow->created_by));
+                if ($raw !== '') {
+                    $clean = trim((string)(preg_replace('/\s*\([^)]*\)\s*$/', '', $raw) ?: $raw));
+                    if ($clean !== '') {
+                        $userNames[strtolower($clean)] = $clean;
+                    }
+                }
+            }
+            $userList = array_values($userNames);
+            natcasesort($userList);
+
+            $availableFilters = [
+                'warehouses' => DB::table('outlets')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                    ->orderBy('name')
+                    ->pluck('name')
+                    ->values()
+                    ->all(),
+                'users' => array_values($userList),
+            ];
+        }
+
         return $this->noStoreJson([
             'status' => 'success',
+            'available_filters' => $availableFilters,
             'data' => [
+                'available_filters' => $availableFilters,
                 'total_sales_count' => $totalCount,
                 'total_revenue' => $totalRevenue,
+                'total_returned_credit' => $totalReturnedCredit,
+                'net_revenue' => round($totalRevenue - $totalReturnedCredit, 2),
                 'total_paid' => $totalPaid,
                 'total_due' => $totalDue,
                 'sales' => $salesItems,
@@ -1805,7 +2169,24 @@ class ReportController extends Controller
 
         $supplierName = $request->input('supplier_name') ?? $request->input('supplier');
         if (!empty($supplierName) && $supplierName !== 'All' && $supplierName !== 'all') {
-            $baseQuery->where('supplier_name', $supplierName);
+            $supId = $this->resolveSupplierIdParam((string)$supplierName);
+            if ($supId !== null) {
+                $hasNullSup = DB::table('purchases')->whereNull('supplier_id')->limit(1)->exists();
+                if ($hasNullSup) {
+                    $baseQuery->where(function ($q) use ($supplierName, $supId) {
+                        $q->where('supplier_id', $supId)
+                          ->orWhere(function ($legacy) use ($supplierName) {
+                              $legacy->whereNull('supplier_id')->where('supplier_name', $supplierName);
+                          });
+                    });
+                } else {
+                    $baseQuery->where('supplier_id', $supId);
+                }
+            } elseif (is_numeric($supplierName)) {
+                $baseQuery->where('supplier_id', -1);
+            } else {
+                $baseQuery->where('supplier_name', $supplierName);
+            }
         }
 
         if ($request->filled('supplier_id') && $request->input('supplier_id') !== 'All') {
@@ -1814,7 +2195,24 @@ class ReportController extends Controller
 
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
         if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $baseQuery->where('warehouse_name', $warehouse);
+            $whId = $this->resolveWarehouseIdParam((string)$warehouse);
+            if ($whId !== null) {
+                $hasNullWh = DB::table('purchases')->whereNull('warehouse_id')->limit(1)->exists();
+                if ($hasNullWh) {
+                    $baseQuery->where(function ($q) use ($warehouse, $whId) {
+                        $q->where('warehouse_id', $whId)
+                          ->orWhere(function ($legacy) use ($warehouse) {
+                              $legacy->whereNull('warehouse_id')->where('warehouse_name', $warehouse);
+                          });
+                    });
+                } else {
+                    $baseQuery->where('warehouse_id', $whId);
+                }
+            } elseif (is_numeric($warehouse)) {
+                $baseQuery->where('warehouse_id', -1);
+            } else {
+                $baseQuery->where('warehouse_name', $warehouse);
+            }
         }
 
         if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
@@ -1828,11 +2226,34 @@ class ReportController extends Controller
         }
 
         if ($request->filled('payment_status') && $request->input('payment_status') !== 'All') {
-            $baseQuery->where('payment_status', $request->input('payment_status'));
+            $payStatus = trim((string)$request->input('payment_status'));
+            $payLower = strtolower($payStatus);
+            if ($payLower === 'due' || $payLower === 'unpaid') {
+                $baseQuery->whereIn('payment_status', ['Unpaid', 'Due']);
+            } else {
+                $baseQuery->where('payment_status', $payStatus);
+            }
         }
 
         if ($request->filled('payment_type') && $request->input('payment_type') !== 'All') {
-            $baseQuery->where('payment_type', $request->input('payment_type'));
+            $paymentType = (string)$request->input('payment_type');
+            if ($paymentType !== 'Opening Stock') {
+                $this->excludeOpeningStockPurchases($baseQuery);
+            }
+            $hasSplitPurchase = ($paymentType !== 'Split Payment' && $paymentType !== 'Opening Stock')
+                ? DB::table('purchases')->where('payment_type', 'Split Payment')->limit(1)->exists()
+                : false;
+            if ($hasSplitPurchase) {
+                $baseQuery->where(function ($q) use ($paymentType) {
+                    $q->where('payment_type', $paymentType)
+                      ->orWhere(function ($sq) use ($paymentType) {
+                          $sq->where('payment_type', 'Split Payment')
+                             ->where('payments_payload', 'like', '%' . addcslashes($paymentType, '%_\\') . '%');
+                      });
+                });
+            } else {
+                $baseQuery->where('payment_type', $paymentType);
+            }
         } else {
             $this->excludeOpeningStockPurchases($baseQuery);
         }
@@ -1858,22 +2279,27 @@ class ReportController extends Controller
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $knownTotal = $request->filled('known_total') ? max(0, (int)$request->input('known_total')) : null;
 
+        $hasReturnedCredit = $accounting->schemaHasColumn('purchases', 'returned_credit_amount');
         $totalCount = 0;
         $totalCost = 0.0;
         $totalPaid = 0.0;
         $totalDue = 0.0;
+        $totalReturnedCredit = 0.0;
         if (!$skipSummary && $page === 1) {
-            $totals = (clone $baseQuery)->select(DB::raw('
+            $retCreditExpr = $hasReturnedCredit ? 'COALESCE(SUM(returned_credit_amount), 0)' : '0';
+            $totals = (clone $baseQuery)->select(DB::raw("
                 COUNT(*) as total_count,
                 COALESCE(SUM(grand_total), 0) as total_cost,
                 COALESCE(SUM(paid_amount), 0) as total_paid,
-                COALESCE(SUM(due_amount), 0) as total_due
-            '))->first();
+                COALESCE(SUM(due_amount), 0) as total_due,
+                {$retCreditExpr} as total_returned_credit
+            "))->first();
 
             $totalCount = (int)($totals->total_count ?? 0);
             $totalCost = (float)($totals->total_cost ?? 0);
             $totalPaid = (float)($totals->total_paid ?? 0);
             $totalDue = (float)($totals->total_due ?? 0);
+            $totalReturnedCredit = round((float)($totals->total_returned_credit ?? 0), 2);
         } elseif ($knownTotal !== null) {
             $totalCount = $knownTotal;
         } else {
@@ -1884,11 +2310,14 @@ class ReportController extends Controller
             'id', 'reference_no', 'supplier_id', 'supplier_name',
             'warehouse_id', 'warehouse_name', 'date', 'status',
             'tax_rate', 'tax_amount', 'discount', 'shipping', 'is_tax_recoverable',
-            'grand_total', 'paid_amount', 'due_amount', 'returned_credit_amount',
+            'grand_total', 'paid_amount', 'due_amount',
             'payment_status', 'payment_type', 'cash_register_id', 'notes',
             'created_by', 'user_id', 'user_name', 'user_role',
             'created_at', 'updated_at',
         ];
+        if ($hasReturnedCredit) {
+            $selectCols[] = 'returned_credit_amount';
+        }
         if ($includePayments) {
             $selectCols[] = 'payments_payload';
         }
@@ -1934,15 +2363,96 @@ class ReportController extends Controller
             'total_cost' => $totalCost,
             'total_paid' => $totalPaid,
             'total_due' => $totalDue,
+            'total_returned_credit' => $totalReturnedCredit,
+            'net_cost' => round(max(0.0, $totalCost - $totalReturnedCredit), 2),
         ], $canViewCost, ['total_purchases_count']);
+
+        $availableFilters = [];
+        if (!$skipSummary && $page === 1) {
+            $userNames = [];
+            $payTypes = [];
+            $supplierNames = [];
+            foreach ($slicedRows as $pRow) {
+                $rawU = trim((string)($pRow->user_name ?: $pRow->created_by));
+                if ($rawU !== '') {
+                    $cleanU = trim((string)(preg_replace('/\s*\([^)]*\)\s*$/', '', $rawU) ?: $rawU));
+                    if ($cleanU !== '') {
+                        $userNames[strtolower($cleanU)] = $cleanU;
+                    }
+                }
+                $pt = trim((string)($pRow->payment_type ?? ''));
+                if ($pt !== '' && strcasecmp($pt, 'Opening Stock') !== 0 && strcasecmp($pt, 'Split Payment') !== 0) {
+                    $payTypes[strtolower($pt)] = $pt;
+                }
+                $sn = trim((string)($pRow->supplier_name ?? ''));
+                if ($sn !== '') {
+                    $supplierNames[strtolower($sn)] = $sn;
+                }
+            }
+            $distinctCreators = DB::table('purchases')
+                ->whereNotNull('created_by')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->distinct()
+                ->limit(100)
+                ->pluck('created_by');
+            foreach ($distinctCreators as $rawCreator) {
+                $rawU = trim((string)$rawCreator);
+                if ($rawU !== '') {
+                    $cleanU = trim((string)(preg_replace('/\s*\([^)]*\)\s*$/', '', $rawU) ?: $rawU));
+                    if ($cleanU !== '') {
+                        $userNames[strtolower($cleanU)] = $userNames[strtolower($cleanU)] ?? $cleanU;
+                    }
+                }
+            }
+            $distinctPayTypes = DB::table('purchases')
+                ->whereNotNull('payment_type')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->distinct()
+                ->limit(50)
+                ->pluck('payment_type');
+            foreach ($distinctPayTypes as $ptRow) {
+                $pt = trim((string)$ptRow);
+                if ($pt !== '' && strcasecmp($pt, 'Opening Stock') !== 0 && strcasecmp($pt, 'Split Payment') !== 0) {
+                    $payTypes[strtolower($pt)] = $payTypes[strtolower($pt)] ?? $pt;
+                }
+            }
+            foreach (DB::table('suppliers')->orderBy('name')->limit(200)->pluck('name') as $sRow) {
+                $sn = trim((string)$sRow);
+                if ($sn !== '') {
+                    $supplierNames[strtolower($sn)] = $supplierNames[strtolower($sn)] ?? $sn;
+                }
+            }
+            $userList = array_values($userNames);
+            natcasesort($userList);
+            $supplierList = array_values($supplierNames);
+            natcasesort($supplierList);
+            $payTypeList = array_values($payTypes);
+            natcasesort($payTypeList);
+
+            $availableFilters = [
+                'warehouses' => DB::table('outlets')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                    ->orderBy('name')
+                    ->pluck('name')
+                    ->values()
+                    ->all(),
+                'suppliers' => array_values($supplierList),
+                'users' => array_values($userList),
+                'payment_types' => array_values($payTypeList),
+            ];
+        }
 
         return $this->noStoreJson([
             'status' => 'success',
+            'available_filters' => $availableFilters,
             'data' => [
+                'available_filters' => $availableFilters,
                 'total_purchases_count' => $maskedTotals['total_purchases_count'],
                 'total_cost' => $maskedTotals['total_cost'],
                 'total_paid' => $maskedTotals['total_paid'],
                 'total_due' => $maskedTotals['total_due'],
+                'total_returned_credit' => $maskedTotals['total_returned_credit'],
+                'net_cost' => $maskedTotals['net_cost'],
                 'cost_masked' => !$canViewCost,
                 'purchases' => $purchaseRows,
                 'pagination' => [
@@ -1966,7 +2476,37 @@ class ReportController extends Controller
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
 
-        $baseQuery = Expense::query()
+        $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $requestedWhId = null;
+        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
+            $requestedWhId = $this->resolveWarehouseIdParam((string)$warehouse);
+            if (!empty($allowedOutlets)) {
+                if ($requestedWhId !== null && !in_array($requestedWhId, $allowedOutlets, true)) {
+                    return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                }
+                if ($requestedWhId === null && is_numeric($warehouse) && !in_array((int)$warehouse, $allowedOutlets, true)) {
+                    return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                }
+                if ($requestedWhId === null && !is_numeric($warehouse)) {
+                    $allowedNames = DB::table('outlets')
+                        ->whereIn('id', $allowedOutlets)
+                        ->pluck('name')
+                        ->map(fn ($n) => strtolower(trim((string)$n)))
+                        ->all();
+                    if (!in_array(strtolower(trim((string)$warehouse)), $allowedNames, true)) {
+                        return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                    }
+                }
+            }
+        }
+        if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
+            $explicitWhId = (int)$request->input('warehouse_id');
+            if (!empty($allowedOutlets) && !in_array($explicitWhId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+            }
+        }
+
+        $baseQuery = DB::table('expenses')
             ->where(function ($q) {
                 $q->whereNull('payment_status')
                   ->orWhereNotIn('payment_status', [
@@ -1983,9 +2523,25 @@ class ReportController extends Controller
         $endDate   = $request->input('end_date') ?? $request->input('to_date');
         $this->applyReportDateRange($baseQuery, $startDate, $endDate, 'date');
 
-        $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
         if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $baseQuery->where('warehouse_name', $warehouse);
+            $whId = $requestedWhId;
+            if ($whId !== null) {
+                $hasNullWh = DB::table('expenses')->whereNull('warehouse_id')->limit(1)->exists();
+                if ($hasNullWh) {
+                    $baseQuery->where(function ($q) use ($warehouse, $whId) {
+                        $q->where('warehouse_id', $whId)
+                          ->orWhere(function ($legacy) use ($warehouse) {
+                              $legacy->whereNull('warehouse_id')->where('warehouse_name', $warehouse);
+                          });
+                    });
+                } else {
+                    $baseQuery->where('warehouse_id', $whId);
+                }
+            } elseif (is_numeric($warehouse)) {
+                $baseQuery->where('warehouse_id', -1);
+            } else {
+                $baseQuery->where('warehouse_name', $warehouse);
+            }
         }
 
         if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
@@ -2014,8 +2570,34 @@ class ReportController extends Controller
         }
 
         $paymentMethod = $request->input('payment_method') ?? $request->input('payment_type');
-        if (!empty($paymentMethod) && $paymentMethod !== 'All' && $paymentMethod !== 'all') {
-            $baseQuery->where('payment_method', $paymentMethod);
+        $hasPaymentMethodFilter = !empty($paymentMethod) && $paymentMethod !== 'All' && $paymentMethod !== 'all';
+        $isSingleTenderFilter = $hasPaymentMethodFilter && strcasecmp((string)$paymentMethod, 'Split Payment') !== 0;
+        if ($hasPaymentMethodFilter) {
+            $baseQuery->where(function ($q) use ($paymentMethod) {
+                $q->where('payment_method', $paymentMethod);
+                if (strcasecmp((string)$paymentMethod, 'Split Payment') !== 0) {
+                    $q->orWhere(function ($sq) use ($paymentMethod) {
+                        $sq->where('payment_method', 'Split Payment')
+                           ->whereExists(function ($ep) use ($paymentMethod) {
+                               $ep->select(DB::raw(1))
+                                  ->from('expense_payments as ep_f')
+                                  ->whereColumn('ep_f.expense_id', 'expenses.id')
+                                  ->where('ep_f.payment_type', $paymentMethod);
+                           });
+                    });
+                }
+            });
+        }
+
+        if ($request->filled('payment_status') && $request->input('payment_status') !== 'All') {
+            $baseQuery->where('payment_status', $request->input('payment_status'));
+        }
+
+        $dueFilter = $request->input('due_filter');
+        if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
+            $baseQuery->where('due_amount', '>', 0.005);
+        } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
+            $baseQuery->whereRaw('COALESCE(due_amount, 0) <= 0.005');
         }
 
         if ($request->filled('search')) {
@@ -2052,33 +2634,31 @@ class ReportController extends Controller
         $byPaymentMethodList = [];
 
         if (!$skipSummary && $page === 1) {
-            $totals = (clone $baseQuery)->select(DB::raw("
-                COUNT(*) as total_count,
-                COALESCE(SUM(amount), 0) as total_amount,
-                COALESCE(SUM(CASE
+            // Single-pass SQL aggregation by category (yields totals + category breakdown together)
+            $categoryBreakdown = (clone $baseQuery)->select(
+                'expense_category_name',
+                DB::raw('COUNT(*) as count'),
+                DB::raw('COALESCE(SUM(amount), 0) as total'),
+                DB::raw("COALESCE(SUM(CASE
                     WHEN LOWER(TRIM(COALESCE(payment_status, ''))) = 'unpaid' THEN 0
                     WHEN COALESCE(paid_amount, 0) > 0 THEN paid_amount
                     WHEN COALESCE(due_amount, 0) <= 0 AND LOWER(TRIM(COALESCE(payment_status, ''))) IN ('', 'paid') THEN amount
                     ELSE 0
-                END), 0) as total_paid,
-                COALESCE(SUM(COALESCE(due_amount, 0)), 0) as total_due,
-                COALESCE(AVG(amount), 0) as average_amount
-            "))->first();
-
-            $totalRecords = (int)($totals->total_count ?? 0);
-            $totalAmount = (float)($totals->total_amount ?? 0.0);
-            $totalPaid = (float)($totals->total_paid ?? 0.0);
-            $totalDue = (float)($totals->total_due ?? 0.0);
-            $averageAmount = (float)($totals->average_amount ?? 0.0);
-
-            $categoryBreakdown = (clone $baseQuery)->select(
-                'expense_category_name',
-                DB::raw('COUNT(*) as count'),
-                DB::raw('COALESCE(SUM(amount), 0) as total')
+                END), 0) as paid_total"),
+                DB::raw('COALESCE(SUM(COALESCE(due_amount, 0)), 0) as due_total')
             )
             ->groupBy('expense_category_name')
-            ->orderByDesc('total')
-            ->get();
+            ->get()
+            ->sortByDesc('total')
+            ->values();
+
+            foreach ($categoryBreakdown as $cb) {
+                $totalRecords += (int)$cb->count;
+                $totalAmount += (float)$cb->total;
+                $totalPaid += (float)$cb->paid_total;
+                $totalDue += (float)$cb->due_total;
+            }
+            $averageAmount = $totalRecords > 0 ? round($totalAmount / $totalRecords, 2) : 0.0;
 
             if ($categoryBreakdown->isNotEmpty()) {
                 $topCategoryName = $categoryBreakdown->first()->expense_category_name ?: 'General';
@@ -2096,16 +2676,19 @@ class ReportController extends Controller
                 ];
             }
 
-            $expIdsSub = (clone $baseQuery)->toBase();
-            $expIdsSub->columns = ['id'];
-            $expIdsSub->orders = null;
-
-            $payLegAgg = DB::table('expense_payments')
-                ->whereIn('expense_id', $expIdsSub)
+            // INNER JOIN derived table of matched expense IDs avoids slow MariaDB IN-subquery materialization
+            $payLegQuery = DB::table('expense_payments as ep')
+                ->joinSub((clone $baseQuery)->select('id as exp_id'), 'matched_exp', function ($join) {
+                    $join->on('matched_exp.exp_id', '=', 'ep.expense_id');
+                });
+            if ($isSingleTenderFilter) {
+                $payLegQuery->where('ep.payment_type', $paymentMethod);
+            }
+            $payLegAgg = $payLegQuery
                 ->select(
-                    DB::raw("COALESCE(NULLIF(TRIM(payment_type), ''), 'Cash') as method_name"),
+                    DB::raw("COALESCE(NULLIF(TRIM(ep.payment_type), ''), 'Cash') as method_name"),
                     DB::raw('COUNT(*) as count'),
-                    DB::raw('COALESCE(SUM(amount), 0) as total')
+                    DB::raw('COALESCE(SUM(ep.amount), 0) as total')
                 )
                 ->groupBy('method_name')
                 ->get();
@@ -2129,6 +2712,7 @@ class ReportController extends Controller
                 ->get();
 
             $methodMap = [];
+            $reconciledPaidFromLegs = 0.0;
             foreach ($payLegAgg->concat($legacyPaidAgg) as $row) {
                 $pmAmt = (float)$row->total;
                 if ($pmAmt <= 0.0001) {
@@ -2140,11 +2724,17 @@ class ReportController extends Controller
                 }
                 $methodMap[$mName]['count'] += (int)$row->count;
                 $methodMap[$mName]['total'] += $pmAmt;
+                $reconciledPaidFromLegs += $pmAmt;
                 if ($accounting->isCashPaymentType($mName)) {
                     $cashPaid += $pmAmt;
                 } elseif (!in_array(strtolower($mName), ['', 'unpaid', 'n/a', 'split payment'], true)) {
                     $digitalPaid += $pmAmt;
                 }
+            }
+
+            // Under single-tender filtering (e.g. Cash), constrain totalPaid on split vouchers to the filtered tender's disbursement
+            if ($isSingleTenderFilter) {
+                $totalPaid = $reconciledPaidFromLegs;
             }
             uasort($methodMap, static fn($a, $b) => $b['total'] <=> $a['total']);
 
@@ -2180,7 +2770,7 @@ class ReportController extends Controller
             ['amount']
         );
         if ($cursor !== null) {
-            ListCursorHelper::apply($baseQuery->toBase(), $sortCol, $sortOrder, $cursor);
+            ListCursorHelper::apply($baseQuery, $sortCol, $sortOrder, $cursor);
         } elseif ($page > 1) {
             $baseQuery->offset(($page - 1) * $perPage);
         }
@@ -2216,31 +2806,88 @@ class ReportController extends Controller
             'has_more'     => $hasMore,
         ];
 
+        $availableCategories = [];
+        $availablePaymentMethods = [];
+        $availableUsers = [];
+        if (!$skipSummary && $page === 1) {
+            $availableCategories = DB::table('expenses')
+                ->whereNotNull('expense_category_name')
+                ->where('expense_category_name', '!=', '')
+                ->distinct()
+                ->orderBy('expense_category_name')
+                ->pluck('expense_category_name')
+                ->values()
+                ->all();
+
+            $availablePaymentMethods = DB::table('expenses')
+                ->whereNotNull('payment_method')
+                ->where('payment_method', '!=', '')
+                ->distinct()
+                ->pluck('payment_method')
+                ->merge(
+                    DB::table('expense_payments')
+                        ->whereNotNull('payment_type')
+                        ->where('payment_type', '!=', '')
+                        ->distinct()
+                        ->pluck('payment_type')
+                )
+                ->unique()
+                ->sort()
+                ->values()
+                ->all();
+
+            // Index-only scans on idx_exp_user_name + idx_exp_created_by (avoids slow COALESCE full scan)
+            $userNamesCol = DB::table('expenses')
+                ->whereNotNull('user_name')
+                ->where('user_name', '!=', '')
+                ->distinct()
+                ->limit(200)
+                ->pluck('user_name')
+                ->merge(
+                    DB::table('expenses')
+                        ->whereNotNull('created_by')
+                        ->where('created_by', '!=', '')
+                        ->distinct()
+                        ->limit(200)
+                        ->pluck('created_by')
+                )
+                ->map(fn ($v) => trim((string)$v))
+                ->filter(fn ($v) => $v !== '')
+                ->unique()
+                ->values()
+                ->all();
+            natcasesort($userNamesCol);
+            $availableUsers = array_values($userNamesCol);
+        }
+
         $summary = [
             'total_count' => $totalRecords,
-            'total_amount' => $totalAmount,
+            'total_amount' => round($totalAmount, 2),
             'total_paid' => round($totalPaid, 2),
             'total_due' => round($totalDue, 2),
             'cash_paid' => round($cashPaid, 2),
             'digital_paid' => round($digitalPaid, 2),
             'average_amount' => $averageAmount,
             'top_category_name' => $topCategoryName,
-            'top_category_amount' => $topCategoryAmount,
+            'top_category_amount' => round($topCategoryAmount, 2),
         ];
 
         return $this->noStoreJson([
             'status' => 'success',
             'data' => [
-                'total_expense' => $totalAmount,
+                'total_expense' => round($totalAmount, 2),
                 'total_count' => $totalRecords,
-                'total_amount' => $totalAmount,
+                'total_amount' => round($totalAmount, 2),
                 'total_paid' => round($totalPaid, 2),
                 'total_due' => round($totalDue, 2),
                 'cash_paid' => round($cashPaid, 2),
                 'digital_paid' => round($digitalPaid, 2),
                 'average_amount' => $averageAmount,
                 'top_category_name' => $topCategoryName,
-                'top_category_amount' => $topCategoryAmount,
+                'top_category_amount' => round($topCategoryAmount, 2),
+                'available_categories' => $availableCategories,
+                'available_payment_methods' => $availablePaymentMethods,
+                'available_users' => $availableUsers,
                 'summary' => $summary,
                 'pagination' => $pagination,
                 'by_category' => $byCategoryList,
@@ -2259,45 +2906,98 @@ class ReportController extends Controller
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
 
-        $salesQuery = Sale::query();
-        $this->applyActiveDocumentFilter($salesQuery, 'status');
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate   = $request->input('end_date') ?? $request->input('to_date');
-        $this->applyReportDateRange($salesQuery, $startDate, $endDate, 'date');
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $salesQuery->where('warehouse_name', $warehouse);
+        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
+        $warehouseIdResolved = $hasWarehouseFilter ? $this->resolveWarehouseIdParam((string)$warehouse) : null;
+        if (!empty($allowedOutlets) && $warehouseIdResolved !== null && !in_array($warehouseIdResolved, $allowedOutlets, true)) {
+            return $this->noStoreJson([
+                'status' => 'error',
+                'message' => 'Unauthorized outlet access.',
+            ], 403);
+        }
+
+        $hasNullSWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('sales')->whereNull('warehouse_id')->exists()
+            : false;
+        $hasNullSrWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('sale_returns')->whereNull('warehouse_id')->exists()
+            : false;
+        $hasNullSCust = DB::table('sales')->whereNull('customer_id')->exists();
+        $hasNullSrCust = DB::table('sale_returns')->whereNull('customer_id')->exists();
+
+        $salesQuery = DB::table('sales');
+        $this->applyActiveDocumentFilter($salesQuery, 'status');
+        $this->applyReportDateRange($salesQuery, $startDate, $endDate, 'date');
+        if ($hasWarehouseFilter) {
+            if ($warehouseIdResolved !== null && !$hasNullSWh) {
+                $salesQuery->where('warehouse_id', $warehouseIdResolved);
+            } else {
+                $salesQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                    $q->where('warehouse_name', $warehouse);
+                    if ($warehouseIdResolved !== null) {
+                        $q->orWhere('warehouse_id', $warehouseIdResolved);
+                    }
+                });
+            }
         }
         if (!empty($allowedOutlets)) {
             $salesQuery->whereIn('warehouse_id', $allowedOutlets);
         }
 
+        $walkInCustomerId = ($hasNullSCust || $hasNullSrCust)
+            ? DB::table('customers')
+                ->where(function ($q) {
+                    $q->whereRaw('LOWER(name) LIKE ?', ['%walk-in%'])
+                      ->orWhereRaw('LOWER(name) LIKE ?', ['%walkin%'])
+                      ->orWhere('customer_id', 'CUST-001');
+                })
+                ->orderBy('id')
+                ->value('id')
+            : null;
+        $saleCustExpr = ($hasNullSCust && $walkInCustomerId)
+            ? ('COALESCE(customer_id, ' . (int)$walkInCustomerId . ')')
+            : 'customer_id';
+        $retCustExpr = ($hasNullSrCust && $walkInCustomerId)
+            ? ('COALESCE(customer_id, ' . (int)$walkInCustomerId . ')')
+            : 'customer_id';
+
         $salesAgg = $salesQuery->select(
-            DB::raw('COALESCE(customer_id, 1) as customer_id'),
+            DB::raw("{$saleCustExpr} as customer_id"),
             DB::raw('COUNT(*) as total_orders'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_spent'),
             DB::raw('COALESCE(SUM(paid_amount), 0) as total_paid'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
             DB::raw('MAX(date) as last_purchase_date')
-        )->groupBy(DB::raw('COALESCE(customer_id, 1)'));
+        )->groupBy(DB::raw($saleCustExpr));
 
-        $returnsQuery = SaleReturn::query();
+        $returnsQuery = DB::table('sale_returns');
         $this->applyActiveDocumentFilter($returnsQuery, 'status');
         $this->applyReportDateRange($returnsQuery, $startDate, $endDate, 'date');
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $returnsQuery->where('warehouse_name', $warehouse);
+        if ($hasWarehouseFilter) {
+            if ($warehouseIdResolved !== null && !$hasNullSrWh) {
+                $returnsQuery->where('warehouse_id', $warehouseIdResolved);
+            } else {
+                $returnsQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                    $q->where('warehouse_name', $warehouse);
+                    if ($warehouseIdResolved !== null) {
+                        $q->orWhere('warehouse_id', $warehouseIdResolved);
+                    }
+                });
+            }
         }
         if (!empty($allowedOutlets)) {
             $returnsQuery->whereIn('warehouse_id', $allowedOutlets);
         }
 
         $returnsAgg = $returnsQuery->select(
-            DB::raw('COALESCE(customer_id, 1) as customer_id'),
+            DB::raw("{$retCustExpr} as customer_id"),
             DB::raw('COUNT(*) as total_returns'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_returned_amount'),
             DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded_amount'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
-        )->groupBy(DB::raw('COALESCE(customer_id, 1)'));
+        )->groupBy(DB::raw($retCustExpr));
 
         $driver = DB::connection()->getDriverName();
         $codeExpr = $driver === 'sqlite'
@@ -2312,7 +3012,12 @@ class ReportController extends Controller
 
         $applyCustomerFilters = function ($q) use ($tier, $status, $dueFilter, $search, $digits) {
             if (!empty($tier) && $tier !== 'All' && $tier !== 'all') {
-                $q->where('customers.tier', $tier);
+                $tierNorm = strtolower(trim((string)$tier));
+                if (in_array($tierNorm, ['platinum', 'gold', 'silver', 'bronze', 'general', 'walk-in', 'standard'], true)) {
+                    $q->whereRaw('LOWER(customers.tier) LIKE ?', [$tierNorm . '%']);
+                } else {
+                    $q->where('customers.tier', $tier);
+                }
             }
             if (!empty($status) && $status !== 'All' && $status !== 'all') {
                 $q->where('customers.status', $status);
@@ -2320,6 +3025,7 @@ class ReportController extends Controller
             if ($search !== '') {
                 $q->where(function ($sub) use ($search, $digits) {
                     $sub->where('customers.name', 'like', "%{$search}%")
+                        ->orWhere('customers.customer_id', 'like', "%{$search}%")
                         ->orWhere('customers.phone', 'like', "%{$search}%")
                         ->orWhere('customers.email', 'like', "%{$search}%")
                         ->orWhere('customers.tier', 'like', "%{$search}%");
@@ -2329,9 +3035,9 @@ class ReportController extends Controller
                 });
             }
             if ($dueFilter === 'due_only' || $dueFilter === 'has_due') {
-                $q->whereRaw('COALESCE(sa.total_due, 0) > 0');
+                $q->whereRaw('(COALESCE(sa.total_due, 0) - COALESCE(ra.total_return_due, 0)) > 0.005');
             } elseif ($dueFilter === 'paid_only' || $dueFilter === 'fully_paid') {
-                $q->whereRaw('COALESCE(sa.total_due, 0) <= 0');
+                $q->whereRaw('(COALESCE(sa.total_due, 0) - COALESCE(ra.total_return_due, 0)) <= 0.005');
             }
         };
 
@@ -2347,31 +3053,16 @@ class ReportController extends Controller
         $totalCustomers = 0;
         $totalRevenue = 0.0;
         $totalReturnedAmount = 0.0;
+        $totalRefundedAmount = 0.0;
         $totalReturnDue = 0.0;
         $totalPaid = 0.0;
         $totalDue = 0.0;
-        if (!$skipSummary && $page === 1) {
-            $summaryRow = (clone $joinedBase)->selectRaw('
-                COUNT(DISTINCT customers.id) as total_customers,
-                COALESCE(SUM(COALESCE(sa.total_spent, 0)), 0) as total_revenue,
-                COALESCE(SUM(COALESCE(ra.total_returned_amount, 0)), 0) as total_returned_amount,
-                COALESCE(SUM(COALESCE(ra.total_return_due, 0)), 0) as total_return_due,
-                COALESCE(SUM(COALESCE(sa.total_paid, 0)), 0) as total_paid,
-                COALESCE(SUM(COALESCE(sa.total_due, 0)), 0) as total_due
-            ')->first();
-
-            $totalCustomers = (int)($summaryRow->total_customers ?? 0);
-            $totalRevenue = (float)($summaryRow->total_revenue ?? 0);
-            $totalReturnedAmount = (float)($summaryRow->total_returned_amount ?? 0);
-            $totalReturnDue = (float)($summaryRow->total_return_due ?? 0);
-            $totalPaid = (float)($summaryRow->total_paid ?? 0);
-            $totalDue = (float)($summaryRow->total_due ?? 0);
-        } elseif ($knownTotal !== null) {
-            $totalCustomers = $knownTotal;
-        } else {
-            $totalCustomers = (int)(clone $joinedBase)->count('customers.id');
+        $needWinSummary = !$skipSummary && $page === 1;
+        if (!$needWinSummary) {
+            $totalCustomers = $knownTotal !== null
+                ? $knownTotal
+                : (int)(clone $joinedBase)->count('customers.id');
         }
-        $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
 
         $listQuery = (clone $joinedBase)->select(
             'customers.id',
@@ -2392,6 +3083,17 @@ class ReportController extends Controller
             DB::raw('COALESCE(sa.total_due, 0) as total_due'),
             DB::raw('sa.last_purchase_date as last_purchase_date')
         );
+        if ($needWinSummary) {
+            $listQuery->selectRaw('
+                COUNT(*) OVER() as _win_total_customers,
+                SUM(COALESCE(sa.total_spent, 0)) OVER() as _win_total_revenue,
+                SUM(COALESCE(ra.total_returned_amount, 0)) OVER() as _win_total_returned,
+                SUM(COALESCE(ra.total_refunded_amount, 0)) OVER() as _win_total_refunded,
+                SUM(COALESCE(ra.total_return_due, 0)) OVER() as _win_total_return_due,
+                SUM(COALESCE(sa.total_paid, 0)) OVER() as _win_total_paid,
+                SUM(COALESCE(sa.total_due, 0)) OVER() as _win_total_due
+            ');
+        }
 
         $sortBy = $request->input('sort_by', 'total_spent');
         $sortOrder = strtolower($request->input('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
@@ -2406,6 +3108,23 @@ class ReportController extends Controller
         $rawRows = $listQuery->offset($offset)->limit($perPage + 1)->get();
         $hasMore = $rawRows->count() > $perPage;
         $pagedRows = $hasMore ? $rawRows->slice(0, $perPage)->values() : $rawRows->values();
+
+        if ($needWinSummary) {
+            $firstWin = $pagedRows->first();
+            if ($firstWin !== null) {
+                $totalCustomers = (int)($firstWin->_win_total_customers ?? $pagedRows->count());
+                $totalRevenue = (float)($firstWin->_win_total_revenue ?? 0);
+                $totalReturnedAmount = (float)($firstWin->_win_total_returned ?? 0);
+                $totalRefundedAmount = (float)($firstWin->_win_total_refunded ?? 0);
+                $totalReturnDue = (float)($firstWin->_win_total_return_due ?? 0);
+                $totalPaid = (float)($firstWin->_win_total_paid ?? 0);
+                $totalDue = (float)($firstWin->_win_total_due ?? 0);
+            }
+        }
+        $avgSpent = $totalCustomers > 0 ? ($totalRevenue / $totalCustomers) : 0.0;
+        $netRevenueTotal = round($totalRevenue - $totalReturnedAmount, 2);
+        $netDueTotal = max(0.0, $totalDue - $totalReturnDue);
+        $netAvgSpent = $totalCustomers > 0 ? ($netRevenueTotal / $totalCustomers) : 0.0;
 
         $customers = $pagedRows->map(function ($c) {
             $cDue    = (float)($c->total_due ?? 0);
@@ -2441,16 +3160,30 @@ class ReportController extends Controller
             'has_more' => $hasMore,
         ];
 
+        $availableTiers = !$skipSummary && $page === 1
+            ? DB::table('customers')
+                ->whereNotNull('tier')
+                ->where('tier', '!=', '')
+                ->distinct()
+                ->orderBy('tier')
+                ->pluck('tier')
+                ->values()
+                ->all()
+            : [];
+
         $summary = [
             'total_customers' => $totalCustomers,
             'total_revenue' => $totalRevenue,
             'total_returned' => $totalReturnedAmount,
+            'total_refunded' => $totalRefundedAmount,
             'total_return_due' => $totalReturnDue,
-            'net_revenue' => max(0.0, $totalRevenue - $totalReturnedAmount),
+            'net_revenue' => $netRevenueTotal,
             'total_paid' => $totalPaid,
+            'net_paid' => $totalPaid - $totalRefundedAmount,
             'total_due' => $totalDue,
-            'net_due' => max(0.0, $totalDue - $totalReturnDue),
+            'net_due' => $netDueTotal,
             'average_spent' => $avgSpent,
+            'net_average_spent' => $netAvgSpent,
         ];
 
         return $this->noStoreJson([
@@ -2459,10 +3192,15 @@ class ReportController extends Controller
                 'total_customers' => $totalCustomers,
                 'total_revenue' => $totalRevenue,
                 'total_returned' => $totalReturnedAmount,
-                'net_revenue' => max(0.0, $totalRevenue - $totalReturnedAmount),
+                'total_refunded' => $totalRefundedAmount,
+                'net_revenue' => $netRevenueTotal,
                 'total_paid' => $totalPaid,
+                'net_paid' => $totalPaid - $totalRefundedAmount,
                 'total_due' => $totalDue,
+                'net_due' => $netDueTotal,
                 'average_spent' => $avgSpent,
+                'net_average_spent' => $netAvgSpent,
+                'available_tiers' => $availableTiers,
                 'summary' => $summary,
                 'pagination' => $pagination,
                 'customers' => $customers,
@@ -2486,6 +3224,27 @@ class ReportController extends Controller
 
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
+        $warehouseIdResolved = $hasWarehouseFilter ? $this->resolveWarehouseIdParam((string)$warehouse) : null;
+        if (!empty($allowedOutlets) && $warehouseIdResolved !== null && !in_array($warehouseIdResolved, $allowedOutlets, true)) {
+            return $this->noStoreJson([
+                'status' => 'error',
+                'message' => 'Unauthorized outlet access.',
+            ], 403);
+        }
+
+        $applyWhScope = function ($q) use ($hasWarehouseFilter, $warehouse, $warehouseIdResolved) {
+            if (!$hasWarehouseFilter) {
+                return;
+            }
+            $q->where(function ($wq) use ($warehouse, $warehouseIdResolved) {
+                $wq->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null) {
+                    $wq->orWhere('warehouse_id', $warehouseIdResolved);
+                }
+            });
+        };
+
         $search = trim((string)$request->input('search', ''));
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
@@ -2495,18 +3254,20 @@ class ReportController extends Controller
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $offset = ($page - 1) * $perPage;
 
+        $isWalkInCustomer = $customer->customer_id === 'CUST-001'
+            || stripos((string)$customer->name, 'walk-in') !== false
+            || stripos((string)$customer->name, 'walkin') !== false;
+
         $salesQuery = DB::table('sales')
-            ->where(function ($q) use ($id) {
+            ->where(function ($q) use ($id, $isWalkInCustomer) {
                 $q->where('customer_id', $id);
-                if ((int)$id === 1) {
+                if ($isWalkInCustomer) {
                     $q->orWhereNull('customer_id');
                 }
             });
         $this->applyActiveDocumentFilter($salesQuery, 'status');
 
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $salesQuery->where('warehouse_name', $warehouse);
-        }
+        $applyWhScope($salesQuery);
         if (!empty($allowedOutlets)) {
             $salesQuery->whereIn('warehouse_id', $allowedOutlets);
         }
@@ -2572,17 +3333,15 @@ class ReportController extends Controller
         })->all();
 
         $returnsQuery = DB::table('sale_returns')
-            ->where(function ($q) use ($id) {
+            ->where(function ($q) use ($id, $isWalkInCustomer) {
                 $q->where('customer_id', $id);
-                if ((int)$id === 1) {
+                if ($isWalkInCustomer) {
                     $q->orWhereNull('customer_id');
                 }
             });
         $this->applyActiveDocumentFilter($returnsQuery, 'status');
 
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $returnsQuery->where('warehouse_name', $warehouse);
-        }
+        $applyWhScope($returnsQuery);
         if (!empty($allowedOutlets)) {
             $returnsQuery->whereIn('warehouse_id', $allowedOutlets);
         }
@@ -2654,9 +3413,9 @@ class ReportController extends Controller
         $totalRefunded = (float)($returnsAgg->total_refunded ?? 0);
         $totalReturnDue = (float)($returnsAgg->total_return_due ?? 0);
 
-        $netInvoiced = max(0.0, $totalInvoiced - $totalReturned);
-        $netPaid = max(0.0, $totalPaid - $totalRefunded);
-        $netDue = max(0.0, $totalDue - $totalReturnDue);
+        $netInvoiced = round($totalInvoiced - $totalReturned, 2);
+        $netPaid = round($totalPaid - $totalRefunded, 2);
+        $netDue = max(0.0, round($totalDue - $totalReturnDue, 2));
         $returnRatePct = $totalInvoiced > 0 ? round(($totalReturned / $totalInvoiced) * 100, 2) : 0.0;
         $paymentRatePct = $totalInvoiced > 0 ? round(($totalPaid / $totalInvoiced) * 100, 2) : 100.0;
         $averageOrderValue = $invoicesCount > 0 ? round($totalInvoiced / $invoicesCount, 2) : 0.0;
@@ -2732,9 +3491,23 @@ class ReportController extends Controller
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
+        $warehouseIdResolved = $hasWarehouseFilter ? $this->resolveWarehouseIdParam((string)$warehouse) : null;
+        if (!empty($allowedOutlets) && $warehouseIdResolved !== null && !in_array($warehouseIdResolved, $allowedOutlets, true)) {
+            return $this->noStoreJson([
+                'status' => 'error',
+                'message' => 'Unauthorized outlet access.',
+            ], 403);
+        }
 
         $hasNullPoSup = DB::table('purchases')->whereNull('supplier_id')->exists();
         $hasNullPrSup = DB::table('purchase_returns')->whereNull('supplier_id')->exists();
+        $hasNullPoWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('purchases')->whereNull('warehouse_id')->exists()
+            : false;
+        $hasNullPrWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('purchase_returns')->whereNull('warehouse_id')->exists()
+            : false;
 
         $resolvedSupPurchExpr = $hasNullPoSup
             ? "COALESCE(supplier_id, (SELECT s2.id FROM suppliers s2 WHERE LOWER(TRIM(s2.name)) = LOWER(TRIM(purchases.supplier_name)) ORDER BY s2.id ASC LIMIT 1))"
@@ -2743,124 +3516,188 @@ class ReportController extends Controller
             ? "COALESCE(supplier_id, (SELECT s2.id FROM suppliers s2 WHERE LOWER(TRIM(s2.name)) = LOWER(TRIM(purchase_returns.supplier_name)) ORDER BY s2.id ASC LIMIT 1))"
             : 'purchase_returns.supplier_id';
 
-        $purchQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
-        $this->excludeOpeningStockPurchases($purchQuery);
-        if (!empty($allowedOutlets)) {
-            $purchQuery->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $this->applyReportDateRange($purchQuery, $startDate ? (string)$startDate : null, $endDate ? (string)$endDate : null, 'date');
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $purchQuery->where('warehouse_name', $warehouse);
-        }
+        $category = $request->input('category') ?? $request->input('supplier_category');
+        $terms = $request->input('payment_terms') ?? $request->input('terms');
+        $status = $request->input('status');
+        $searchSup = $request->filled('search') ? trim($request->input('search')) : '';
+        $digitsSup = $searchSup !== '' ? preg_replace('/[^0-9]/', '', $searchSup) : '';
 
-        $purchAgg = (clone $purchQuery)->select(
-            DB::raw("{$resolvedSupPurchExpr} as resolved_supplier_id"),
-            DB::raw('COUNT(*) as total_purchases_count'),
-            DB::raw('COALESCE(SUM(grand_total), 0) as total_purchased_amount'),
-            DB::raw('COALESCE(SUM(paid_amount), 0) as total_paid_amount'),
-            DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
-            DB::raw('MAX(date) as last_purchase_date')
-        )->groupBy(DB::raw($resolvedSupPurchExpr));
+        $applySupFilters = function ($q) use ($category, $terms, $status, $searchSup, $digitsSup) {
+            if (!empty($category) && $category !== 'All' && $category !== 'all') {
+                $q->where('suppliers.category', $category);
+            }
+            if (!empty($terms) && $terms !== 'All' && $terms !== 'all') {
+                $q->where('suppliers.payment_terms', $terms);
+            }
+            if (!empty($status) && $status !== 'All' && $status !== 'all') {
+                $q->where('suppliers.status', $status);
+            }
+            if ($searchSup !== '') {
+                $supIdMatch = null;
+                if (preg_match('/^SUP-?(\d+)$/i', $searchSup, $m)) {
+                    $supIdMatch = (int)$m[1];
+                }
+                $q->where(function ($sub) use ($searchSup, $digitsSup, $supIdMatch) {
+                    $sub->where('suppliers.name', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.contact_person', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.phone', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.email', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.category', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.city', 'like', "%{$searchSup}%")
+                        ->orWhere('suppliers.address', 'like', "%{$searchSup}%");
+                    if ($supIdMatch !== null && $supIdMatch > 0) {
+                        $sub->orWhere('suppliers.id', $supIdMatch);
+                    }
+                    if (!empty($digitsSup)) {
+                        $sub->orWhere('suppliers.phone', 'like', "%{$digitsSup}%");
+                    }
+                });
+            }
+        };
 
-        $hasReleasedAtCol = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
-        $praSub = DB::table('purchase_return_allocations')
-            ->select('purchase_return_id', DB::raw('COALESCE(SUM(amount), 0) as alloc_amt'))
-            ->when($hasReleasedAtCol, fn($q) => $q->whereNull('released_at'))
-            ->groupBy('purchase_return_id');
-
-        $unallocExpr = 'CASE WHEN (purchase_returns.due_amount - COALESCE(pra.alloc_amt, 0)) > 0 THEN (purchase_returns.due_amount - COALESCE(pra.alloc_amt, 0)) ELSE 0 END';
-        $returnsQuery = DB::table('purchase_returns')
-            ->leftJoinSub($praSub, 'pra', 'pra.purchase_return_id', '=', 'purchase_returns.id')
-            ->whereIn('purchase_returns.status', ['Completed', 'Received']);
-        if (!empty($allowedOutlets)) {
-            $returnsQuery->whereIn('purchase_returns.warehouse_id', $allowedOutlets);
-        }
-        $this->applyReportDateRange($returnsQuery, $startDate ? (string)$startDate : null, $endDate ? (string)$endDate : null, 'purchase_returns.date');
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $returnsQuery->where('purchase_returns.warehouse_name', $warehouse);
-        }
-
-        $returnsAgg = (clone $returnsQuery)->select(
-            DB::raw("{$resolvedSupPrExpr} as resolved_supplier_id"),
-            DB::raw('COUNT(*) as total_returns_count'),
-            DB::raw('COALESCE(SUM(purchase_returns.grand_total), 0) as total_returned_amount'),
-            DB::raw('COALESCE(SUM(purchase_returns.paid_amount), 0) as total_refunded_amount'),
-            DB::raw('COALESCE(SUM(purchase_returns.due_amount), 0) as total_return_due'),
-            DB::raw("COALESCE(SUM({$unallocExpr}), 0) as unallocated_return_credit")
-        )->groupBy(DB::raw($resolvedSupPrExpr));
-
-        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
         $hasStartDate = !empty($startDate);
         $hasEndDate = !empty($endDate);
         $isDateFiltered = $hasStartDate || $hasEndDate;
         $isFiltered = $isDateFiltered || $hasWarehouseFilter || !empty($allowedOutlets);
+        $hasPraRows = $accounting->schemaHasColumn('purchase_return_allocations', 'purchase_return_id')
+            && DB::table('purchase_return_allocations')->exists();
 
-        $allPurchAgg = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
-        $this->excludeOpeningStockPurchases($allPurchAgg);
-        if (!empty($allowedOutlets)) {
-            $allPurchAgg->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $allPurchAgg = $allPurchAgg
-            ->select(
-                DB::raw("{$resolvedSupPurchExpr} as resolved_supplier_id"),
-                DB::raw('COALESCE(SUM(due_amount), 0) as all_due')
-            )
-            ->groupBy(DB::raw($resolvedSupPurchExpr));
+        $baseQuery = DB::table('suppliers');
+        $selectCols = [];
 
-        $allReturnsAgg = DB::table('purchase_returns')
-            ->leftJoinSub($praSub, 'pra', 'pra.purchase_return_id', '=', 'purchase_returns.id')
-            ->whereIn('purchase_returns.status', ['Completed', 'Received'])
-            ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('purchase_returns.warehouse_id', $allowedOutlets))
-            ->select(
-                DB::raw("{$resolvedSupPrExpr} as resolved_supplier_id"),
-                DB::raw("COALESCE(SUM({$unallocExpr}), 0) as all_unalloc_credit")
-            )
-            ->groupBy(DB::raw($resolvedSupPrExpr));
-
-        $signedNetDueSql = $isFiltered
-            ? '(COALESCE(pa.total_due, 0) - COALESCE(ra.unallocated_return_credit, 0))'
-            : 'COALESCE(suppliers.balance_due, 0)';
-        $openingAdjSql = $isFiltered
-            ? '0'
-            : '(COALESCE(suppliers.balance_due, 0) - (COALESCE(all_pa.all_due, 0) - COALESCE(all_ra.all_unalloc_credit, 0)))';
-        $dueFormula = "CASE WHEN ({$signedNetDueSql}) < 0 THEN 0 ELSE ({$signedNetDueSql}) END";
-        $creditBalFormula = "CASE WHEN ({$signedNetDueSql}) < 0 THEN ABS({$signedNetDueSql}) ELSE 0 END";
-
-        $baseQuery = DB::table('suppliers')
-            ->leftJoinSub($purchAgg, 'pa', 'suppliers.id', '=', 'pa.resolved_supplier_id')
-            ->leftJoinSub($returnsAgg, 'ra', 'suppliers.id', '=', 'ra.resolved_supplier_id')
-            ->leftJoinSub($allPurchAgg, 'all_pa', 'suppliers.id', '=', 'all_pa.resolved_supplier_id')
-            ->leftJoinSub($allReturnsAgg, 'all_ra', 'suppliers.id', '=', 'all_ra.resolved_supplier_id');
-
-        $category = $request->input('category') ?? $request->input('supplier_category');
-        if (!empty($category) && $category !== 'All' && $category !== 'all') {
-            $baseQuery->where('suppliers.category', $category);
-        }
-
-        $terms = $request->input('payment_terms') ?? $request->input('terms');
-        if (!empty($terms) && $terms !== 'All' && $terms !== 'all') {
-            $baseQuery->where('suppliers.payment_terms', $terms);
-        }
-
-        $status = $request->input('status');
-        if (!empty($status) && $status !== 'All' && $status !== 'all') {
-            $baseQuery->where('suppliers.status', $status);
-        }
-
-        if ($request->filled('search')) {
-            $search = trim($request->input('search'));
-            $digits = preg_replace('/[^0-9]/', '', $search);
-            $baseQuery->where(function ($q) use ($search, $digits) {
-                $q->where('suppliers.name', 'like', "%{$search}%")
-                  ->orWhere('suppliers.contact_person', 'like', "%{$search}%")
-                  ->orWhere('suppliers.phone', 'like', "%{$search}%")
-                  ->orWhere('suppliers.email', 'like', "%{$search}%")
-                  ->orWhere('suppliers.category', 'like', "%{$search}%");
-                if (!empty($digits)) {
-                    $q->orWhere('suppliers.phone', 'like', "%{$digits}%");
+        if (!$isDateFiltered) {
+            $purchQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
+            $this->excludeOpeningStockPurchases($purchQuery);
+            if (!empty($allowedOutlets)) {
+                $purchQuery->whereIn('warehouse_id', $allowedOutlets);
+            }
+            if ($hasWarehouseFilter) {
+                if ($warehouseIdResolved !== null && !$hasNullPoWh) {
+                    $purchQuery->where('warehouse_id', $warehouseIdResolved);
+                } else {
+                    $purchQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                        $q->where('warehouse_name', $warehouse);
+                        if ($warehouseIdResolved !== null) {
+                            $q->orWhere('warehouse_id', $warehouseIdResolved);
+                        }
+                    });
                 }
-            });
+            }
+
+            $purchAgg = (clone $purchQuery)->select(
+                DB::raw("{$resolvedSupPurchExpr} as resolved_supplier_id"),
+                DB::raw('COUNT(*) as total_purchases_count'),
+                DB::raw('COALESCE(SUM(grand_total), 0) as total_purchased_amount'),
+                DB::raw('COALESCE(SUM(paid_amount), 0) as total_paid_amount'),
+                DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
+                DB::raw('MAX(date) as last_purchase_date')
+            )->groupBy(DB::raw($resolvedSupPurchExpr));
+
+            $returnsQuery = DB::table('purchase_returns')
+                ->whereIn('purchase_returns.status', ['Completed', 'Received']);
+            if ($hasPraRows) {
+                $hasReleasedAtCol = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
+                $praSub = DB::table('purchase_return_allocations')
+                    ->select('purchase_return_id', DB::raw('COALESCE(SUM(amount), 0) as alloc_amt'))
+                    ->when($hasReleasedAtCol, fn($q) => $q->whereNull('released_at'))
+                    ->groupBy('purchase_return_id');
+                $unallocExpr = 'CASE WHEN (purchase_returns.due_amount - COALESCE(pra.alloc_amt, 0)) > 0 THEN (purchase_returns.due_amount - COALESCE(pra.alloc_amt, 0)) ELSE 0 END';
+                $returnsQuery->leftJoinSub($praSub, 'pra', 'pra.purchase_return_id', '=', 'purchase_returns.id');
+            } else {
+                $unallocExpr = 'CASE WHEN purchase_returns.due_amount > 0 THEN purchase_returns.due_amount ELSE 0 END';
+            }
+            if (!empty($allowedOutlets)) {
+                $returnsQuery->whereIn('purchase_returns.warehouse_id', $allowedOutlets);
+            }
+            if ($hasWarehouseFilter) {
+                if ($warehouseIdResolved !== null && !$hasNullPrWh) {
+                    $returnsQuery->where('purchase_returns.warehouse_id', $warehouseIdResolved);
+                } else {
+                    $returnsQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                        $q->where('purchase_returns.warehouse_name', $warehouse);
+                        if ($warehouseIdResolved !== null) {
+                            $q->orWhere('purchase_returns.warehouse_id', $warehouseIdResolved);
+                        }
+                    });
+                }
+            }
+
+            $returnsAgg = (clone $returnsQuery)->select(
+                DB::raw("{$resolvedSupPrExpr} as resolved_supplier_id"),
+                DB::raw('COUNT(*) as total_returns_count'),
+                DB::raw('COALESCE(SUM(purchase_returns.grand_total), 0) as total_returned_amount'),
+                DB::raw('COALESCE(SUM(purchase_returns.paid_amount), 0) as total_refunded_amount'),
+                DB::raw('COALESCE(SUM(purchase_returns.due_amount), 0) as total_return_due'),
+                DB::raw("COALESCE(SUM({$unallocExpr}), 0) as unallocated_return_credit")
+            )->groupBy(DB::raw($resolvedSupPrExpr));
+
+            // Authoritative Net AP: subledger (open PO due - unallocated PR credits) + safe positive opening balance
+            // (Negative balance_due only applies when no subledger docs exist, protecting direct-DB fixtures)
+            $subledgerNetExpr = '(COALESCE(pa.total_due, 0) - COALESCE(ra.unallocated_return_credit, 0))';
+            $hasSubledgerExpr = '(COALESCE(pa.total_due, 0) > 0.005 OR COALESCE(ra.unallocated_return_credit, 0) > 0.005)';
+            $rawOpenAdjExpr = "(COALESCE(suppliers.balance_due, 0) - {$subledgerNetExpr})";
+            $effOpenAdjExpr = "(CASE WHEN {$hasSubledgerExpr} THEN (CASE WHEN {$rawOpenAdjExpr} > 0.005 THEN {$rawOpenAdjExpr} ELSE 0 END) ELSE COALESCE(suppliers.balance_due, 0) END)";
+
+            $signedNetDueSql = $isFiltered
+                ? $subledgerNetExpr
+                : "({$subledgerNetExpr} + {$effOpenAdjExpr})";
+            $openingAdjSql = $isFiltered
+                ? '0'
+                : $effOpenAdjExpr;
+            $dueFormula = "CASE WHEN ({$signedNetDueSql}) < 0 THEN 0 ELSE ({$signedNetDueSql}) END";
+            $creditBalFormula = "CASE WHEN ({$signedNetDueSql}) < 0 THEN ABS({$signedNetDueSql}) ELSE 0 END";
+
+            $baseQuery->leftJoinSub($purchAgg, 'pa', 'suppliers.id', '=', 'pa.resolved_supplier_id')
+                ->leftJoinSub($returnsAgg, 'ra', 'suppliers.id', '=', 'ra.resolved_supplier_id');
+
+            $selectCols = [
+                'suppliers.id',
+                'suppliers.name',
+                'suppliers.contact_person',
+                'suppliers.phone',
+                'suppliers.email',
+                'suppliers.category',
+                'suppliers.payment_terms',
+                'suppliers.status',
+                'suppliers.city',
+                'suppliers.address',
+                'suppliers.balance_due as ledger_balance_due',
+                DB::raw("ROUND({$openingAdjSql}, 2) as opening_balance_due"),
+                DB::raw("ROUND({$openingAdjSql}, 2) as opening_balance_adjustment"),
+                DB::raw('COALESCE(pa.total_purchases_count, 0) as total_purchases_count'),
+                DB::raw('COALESCE(pa.total_purchased_amount, 0) as total_purchased_amount'),
+                DB::raw('COALESCE(pa.total_due, 0) as open_po_due'),
+                DB::raw('COALESCE(ra.total_returns_count, 0) as total_returns_count'),
+                DB::raw('COALESCE(ra.total_returned_amount, 0) as total_returned_amount'),
+                DB::raw('COALESCE(ra.total_refunded_amount, 0) as total_refunded_amount'),
+                DB::raw('COALESCE(ra.total_return_due, 0) as returned_credit'),
+                DB::raw('COALESCE(ra.total_return_due, 0) as total_return_due'),
+                DB::raw('COALESCE(ra.unallocated_return_credit, 0) as unallocated_credit'),
+                DB::raw('(COALESCE(pa.total_purchased_amount, 0) - COALESCE(ra.total_returned_amount, 0)) as net_purchased_amount'),
+                DB::raw('COALESCE(pa.total_paid_amount, 0) as total_paid_amount'),
+                DB::raw('(COALESCE(pa.total_paid_amount, 0) - COALESCE(ra.total_refunded_amount, 0)) as net_paid_amount'),
+                DB::raw("{$signedNetDueSql} as net_due"),
+                DB::raw("{$creditBalFormula} as credit_balance"),
+                DB::raw("{$dueFormula} as total_due"),
+                DB::raw('COALESCE(pa.last_purchase_date, suppliers.updated_at) as last_purchase_date'),
+            ];
+        } else {
+            $selectCols = [
+                'suppliers.id',
+                'suppliers.name',
+                'suppliers.contact_person',
+                'suppliers.phone',
+                'suppliers.email',
+                'suppliers.category',
+                'suppliers.payment_terms',
+                'suppliers.status',
+                'suppliers.city',
+                'suppliers.address',
+                'suppliers.balance_due as ledger_balance_due',
+                'suppliers.updated_at',
+            ];
         }
+        $applySupFilters($baseQuery);
 
         $dueFilter = $request->input('due_filter');
         $sortBy = $request->input('sort_by', 'total_purchased_amount');
@@ -2874,38 +3711,6 @@ class ReportController extends Controller
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $offset = ($page - 1) * $perPage;
         $knownTotal = $request->filled('known_total') ? max(0, (int)$request->input('known_total')) : null;
-
-        $selectCols = [
-            'suppliers.id',
-            'suppliers.name',
-            'suppliers.contact_person',
-            'suppliers.phone',
-            'suppliers.email',
-            'suppliers.category',
-            'suppliers.payment_terms',
-            'suppliers.status',
-            'suppliers.city',
-            'suppliers.address',
-            'suppliers.balance_due as ledger_balance_due',
-            DB::raw("ROUND({$openingAdjSql}, 2) as opening_balance_due"),
-            DB::raw("ROUND({$openingAdjSql}, 2) as opening_balance_adjustment"),
-            DB::raw('COALESCE(pa.total_purchases_count, 0) as total_purchases_count'),
-            DB::raw('COALESCE(pa.total_purchased_amount, 0) as total_purchased_amount'),
-            DB::raw('COALESCE(pa.total_due, 0) as open_po_due'),
-            DB::raw('COALESCE(ra.total_returns_count, 0) as total_returns_count'),
-            DB::raw('COALESCE(ra.total_returned_amount, 0) as total_returned_amount'),
-            DB::raw('COALESCE(ra.total_refunded_amount, 0) as total_refunded_amount'),
-            DB::raw('COALESCE(ra.total_return_due, 0) as returned_credit'),
-            DB::raw('COALESCE(ra.total_return_due, 0) as total_return_due'),
-            DB::raw('COALESCE(ra.unallocated_return_credit, 0) as unallocated_credit'),
-            DB::raw('(COALESCE(pa.total_purchased_amount, 0) - COALESCE(ra.total_returned_amount, 0)) as net_purchased_amount'),
-            DB::raw('COALESCE(pa.total_paid_amount, 0) as total_paid_amount'),
-            DB::raw('(COALESCE(pa.total_paid_amount, 0) - COALESCE(ra.total_refunded_amount, 0)) as net_paid_amount'),
-            DB::raw("{$signedNetDueSql} as net_due"),
-            DB::raw("{$creditBalFormula} as credit_balance"),
-            DB::raw("{$dueFormula} as total_due"),
-            DB::raw('COALESCE(pa.last_purchase_date, suppliers.updated_at) as last_purchase_date'),
-        ];
 
         $totalSuppliers = 0;
         $totalPurchased = 0.0;
@@ -2938,7 +3743,16 @@ class ReportController extends Controller
                 $cumPoQuery->whereIn('warehouse_id', $allowedOutlets);
             }
             if ($hasWarehouseFilter) {
-                $cumPoQuery->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null && !$hasNullPoWh) {
+                    $cumPoQuery->where('warehouse_id', $warehouseIdResolved);
+                } else {
+                    $cumPoQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                        $q->where('warehouse_name', $warehouse);
+                        if ($warehouseIdResolved !== null) {
+                            $q->orWhere('warehouse_id', $warehouseIdResolved);
+                        }
+                    });
+                }
             }
             if ($hasEndDate) {
                 $this->applyReportDateRange($cumPoQuery, null, (string)$endDate, 'date');
@@ -2952,7 +3766,16 @@ class ReportController extends Controller
                 $cumPrQuery->whereIn('warehouse_id', $allowedOutlets);
             }
             if ($hasWarehouseFilter) {
-                $cumPrQuery->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null && !$hasNullPrWh) {
+                    $cumPrQuery->where('warehouse_id', $warehouseIdResolved);
+                } else {
+                    $cumPrQuery->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                        $q->where('warehouse_name', $warehouse);
+                        if ($warehouseIdResolved !== null) {
+                            $q->orWhere('warehouse_id', $warehouseIdResolved);
+                        }
+                    });
+                }
             }
             if ($hasEndDate) {
                 $this->applyReportDateRange($cumPrQuery, null, (string)$endDate, 'date');
@@ -2961,14 +3784,27 @@ class ReportController extends Controller
                 ->select(['id', 'supplier_id', 'supplier_name', 'date', 'grand_total', 'paid_amount', 'payments_payload'])
                 ->get();
 
-            $allocMaps = $accounting->computeAsOfPurchaseReturnMaps(
-                $histPoRows->pluck('id')->all(),
-                $histPrRows->pluck('id')->all(),
-                $closingCutoff
-            );
+            $allocMaps = $hasPraRows
+                ? $accounting->computeAsOfPurchaseReturnMaps(
+                    $histPoRows->pluck('id')->all(),
+                    $histPrRows->pluck('id')->all(),
+                    $closingCutoff
+                )
+                : ['po_alloc' => [], 'po_has_any_alloc' => [], 'pr_alloc' => []];
             $poAllocAsOf = $allocMaps['po_alloc'];
             $poHasAnyAlloc = $allocMaps['po_has_any_alloc'];
             $prAllocAsOf = $allocMaps['pr_alloc'];
+
+            $fastPaySums = static function ($payload, float $fallbackPaid, string $docDate) use ($accounting, $rangeStartDt, $rangeEndDt, $closingCutoff): array {
+                return $accounting->sumPayloadPaymentsRangeAndAsOf(
+                    $payload,
+                    $fallbackPaid,
+                    $docDate,
+                    $rangeStartDt,
+                    $rangeEndDt,
+                    $closingCutoff
+                );
+            };
 
             $histPoBySup = [];
             foreach ($histPoRows as $po) {
@@ -2977,25 +3813,21 @@ class ReportController extends Controller
                     $sId = $supIdByName[strtolower(trim((string)($po->supplier_name ?? '')))] ?? 0;
                 }
                 if ($sId <= 0) continue;
-                $paidInPeriod = $accounting->sumPayloadPaymentsInRange(
-                    $po->payments_payload ?? null,
-                    (float)$po->paid_amount,
-                    (string)$po->date,
-                    $rangeStartDt,
-                    $rangeEndDt
-                );
-                $paidClosing = $accounting->sumPayloadPaymentsAsOf(
-                    $po->payments_payload ?? null,
-                    (float)$po->paid_amount,
-                    (string)$po->date,
-                    $closingCutoff
-                );
+                $poDateStr = (string)$po->date;
+                [$paidInPeriod, $paidClosing, $inPeriod] = $fastPaySums($po->payments_payload ?? null, (float)$po->paid_amount, $poDateStr);
                 $credit = isset($poHasAnyAlloc[$po->id])
                     ? (float)($poAllocAsOf[$po->id] ?? 0.0)
                     : (float)($po->returned_credit_amount ?? 0.0);
                 $due = round(max(0.0, (float)$po->grand_total - $paidClosing - $credit), 2);
                 if (!isset($histPoBySup[$sId])) {
-                    $histPoBySup[$sId] = ['paid' => 0.0, 'due' => 0.0];
+                    $histPoBySup[$sId] = ['cnt' => 0, 'purchased' => 0.0, 'paid' => 0.0, 'due' => 0.0, 'last_date' => ''];
+                }
+                if ($inPeriod) {
+                    $histPoBySup[$sId]['cnt']++;
+                    $histPoBySup[$sId]['purchased'] += (float)$po->grand_total;
+                    if ($poDateStr > $histPoBySup[$sId]['last_date']) {
+                        $histPoBySup[$sId]['last_date'] = $poDateStr;
+                    }
                 }
                 $histPoBySup[$sId]['paid'] += $paidInPeriod;
                 $histPoBySup[$sId]['due'] += $due;
@@ -3008,23 +3840,15 @@ class ReportController extends Controller
                     $sId = $supIdByName[strtolower(trim((string)($pr->supplier_name ?? '')))] ?? 0;
                 }
                 if ($sId <= 0) continue;
-                $refundedInPeriod = $accounting->sumPayloadPaymentsInRange(
-                    $pr->payments_payload ?? null,
-                    (float)$pr->paid_amount,
-                    (string)$pr->date,
-                    $rangeStartDt,
-                    $rangeEndDt
-                );
-                $refundedClosing = $accounting->sumPayloadPaymentsAsOf(
-                    $pr->payments_payload ?? null,
-                    (float)$pr->paid_amount,
-                    (string)$pr->date,
-                    $closingCutoff
-                );
+                [$refundedInPeriod, $refundedClosing, $inPeriod] = $fastPaySums($pr->payments_payload ?? null, (float)$pr->paid_amount, (string)$pr->date);
                 $prDue = round(max(0.0, (float)$pr->grand_total - $refundedClosing), 2);
                 $unalloc = round(max(0.0, $prDue - (float)($prAllocAsOf[$pr->id] ?? 0.0)), 2);
                 if (!isset($histPrBySup[$sId])) {
-                    $histPrBySup[$sId] = ['refunded' => 0.0, 'ret_due' => 0.0, 'unalloc' => 0.0];
+                    $histPrBySup[$sId] = ['cnt' => 0, 'returned' => 0.0, 'refunded' => 0.0, 'ret_due' => 0.0, 'unalloc' => 0.0];
+                }
+                if ($inPeriod) {
+                    $histPrBySup[$sId]['cnt']++;
+                    $histPrBySup[$sId]['returned'] += (float)$pr->grand_total;
                 }
                 $histPrBySup[$sId]['refunded'] += $refundedInPeriod;
                 $histPrBySup[$sId]['ret_due'] += $prDue;
@@ -3037,13 +3861,21 @@ class ReportController extends Controller
 
             foreach ($suppliersAll as $supRow) {
                 $sId = (int)$supRow->id;
-                $poAgg = $histPoBySup[$sId] ?? ['paid' => 0.0, 'due' => 0.0];
-                $prAgg = $histPrBySup[$sId] ?? ['refunded' => 0.0, 'ret_due' => 0.0, 'unalloc' => 0.0];
+                $poAgg = $histPoBySup[$sId] ?? ['cnt' => 0, 'purchased' => 0.0, 'paid' => 0.0, 'due' => 0.0, 'last_date' => ''];
+                $prAgg = $histPrBySup[$sId] ?? ['cnt' => 0, 'returned' => 0.0, 'refunded' => 0.0, 'ret_due' => 0.0, 'unalloc' => 0.0];
                 $openAdj = (!$hasWarehouseFilter && empty($allowedOutlets))
                     ? round((float)($openAdjustments[$sId]['opening_adjustment'] ?? 0.0), 2)
                     : 0.0;
                 $signedNet = round($poAgg['due'] - $prAgg['unalloc'] + $openAdj, 2);
+                $poAmt = round($poAgg['purchased'], 2);
+                $prAmt = round($prAgg['returned'], 2);
 
+                $supRow->total_purchases_count = (int)$poAgg['cnt'];
+                $supRow->total_purchased_amount = $poAmt;
+                $supRow->total_returns_count = (int)$prAgg['cnt'];
+                $supRow->total_returned_amount = $prAmt;
+                $supRow->net_purchased_amount = round($poAmt - $prAmt, 2);
+                $supRow->last_purchase_date = $poAgg['last_date'] !== '' ? $poAgg['last_date'] : ($supRow->updated_at ?? null);
                 $supRow->opening_balance_due = $openAdj;
                 $supRow->opening_balance_adjustment = $openAdj;
                 $supRow->total_paid_amount = round($poAgg['paid'], 2);
@@ -3092,34 +3924,27 @@ class ReportController extends Controller
                 $baseQuery->whereRaw("{$signedNetDueSql} <= 0.005");
             }
 
-            if (!$skipSummary && $page === 1) {
-                $sumRow = (clone $baseQuery)->selectRaw("
-                    COUNT(*) as total_suppliers,
-                    COALESCE(SUM(COALESCE(pa.total_purchased_amount, 0)), 0) as total_purchased,
-                    COALESCE(SUM(COALESCE(ra.total_returned_amount, 0)), 0) as total_returned,
-                    COALESCE(SUM(COALESCE(pa.total_purchased_amount, 0) - COALESCE(ra.total_returned_amount, 0)), 0) as net_purchased,
-                    COALESCE(SUM(COALESCE(pa.total_paid_amount, 0)), 0) as total_paid,
-                    COALESCE(SUM(COALESCE(pa.total_paid_amount, 0) - COALESCE(ra.total_refunded_amount, 0)), 0) as net_paid,
-                    COALESCE(SUM({$dueFormula}), 0) as total_due,
-                    COALESCE(SUM({$signedNetDueSql}), 0) as net_due,
-                    COALESCE(SUM({$creditBalFormula}), 0) as credit_balance
-                ")->first();
-                $totalSuppliers = (int)($sumRow->total_suppliers ?? 0);
-                $totalPurchased = (float)($sumRow->total_purchased ?? 0);
-                $totalReturned = (float)($sumRow->total_returned ?? 0);
-                $netPurchased = (float)($sumRow->net_purchased ?? 0);
-                $totalPaid = (float)($sumRow->total_paid ?? 0);
-                $netPaid = (float)($sumRow->net_paid ?? 0);
-                $totalDue = (float)($sumRow->total_due ?? 0);
-                $totalNetDue = (float)($sumRow->net_due ?? 0);
-                $totalCreditBalance = (float)($sumRow->credit_balance ?? 0);
-            } elseif ($knownTotal !== null) {
-                $totalSuppliers = $knownTotal;
-            } else {
-                $totalSuppliers = (int)(clone $baseQuery)->count('suppliers.id');
+            $needWinSummary = !$skipSummary && $page === 1;
+            if (!$needWinSummary) {
+                $totalSuppliers = $knownTotal !== null
+                    ? $knownTotal
+                    : (int)(clone $baseQuery)->count('suppliers.id');
             }
 
             $listQ = (clone $baseQuery)->select($selectCols);
+            if ($needWinSummary) {
+                $listQ->selectRaw("
+                    COUNT(*) OVER() as _win_total_suppliers,
+                    SUM(COALESCE(pa.total_purchased_amount, 0)) OVER() as _win_total_purchased,
+                    SUM(COALESCE(ra.total_returned_amount, 0)) OVER() as _win_total_returned,
+                    SUM(COALESCE(pa.total_purchased_amount, 0) - COALESCE(ra.total_returned_amount, 0)) OVER() as _win_net_purchased,
+                    SUM(COALESCE(pa.total_paid_amount, 0)) OVER() as _win_total_paid,
+                    SUM(COALESCE(pa.total_paid_amount, 0) - COALESCE(ra.total_refunded_amount, 0)) OVER() as _win_net_paid,
+                    SUM({$dueFormula}) OVER() as _win_total_due,
+                    SUM({$signedNetDueSql}) OVER() as _win_net_due,
+                    SUM({$creditBalFormula}) OVER() as _win_credit_balance
+                ");
+            }
             if (in_array($sortBy, $allowedSorts, true)) {
                 $listQ->orderBy($sortBy, $sortOrder)->orderBy('suppliers.id', $sortOrder);
             } else {
@@ -3129,6 +3954,34 @@ class ReportController extends Controller
             $rawRows = $listQ->offset($offset)->limit($perPage + 1)->get();
             $hasMore = $rawRows->count() > $perPage;
             $suppliers = ($hasMore ? $rawRows->slice(0, $perPage) : $rawRows)->values();
+
+            if ($needWinSummary) {
+                $firstWin = $suppliers->first();
+                if ($firstWin !== null) {
+                    $totalSuppliers = (int)($firstWin->_win_total_suppliers ?? $suppliers->count());
+                    $totalPurchased = (float)($firstWin->_win_total_purchased ?? 0);
+                    $totalReturned = (float)($firstWin->_win_total_returned ?? 0);
+                    $netPurchased = (float)($firstWin->_win_net_purchased ?? 0);
+                    $totalPaid = (float)($firstWin->_win_total_paid ?? 0);
+                    $netPaid = (float)($firstWin->_win_net_paid ?? 0);
+                    $totalDue = (float)($firstWin->_win_total_due ?? 0);
+                    $totalNetDue = (float)($firstWin->_win_net_due ?? 0);
+                    $totalCreditBalance = (float)($firstWin->_win_credit_balance ?? 0);
+                }
+                foreach ($suppliers as $supItem) {
+                    unset(
+                        $supItem->_win_total_suppliers,
+                        $supItem->_win_total_purchased,
+                        $supItem->_win_total_returned,
+                        $supItem->_win_net_purchased,
+                        $supItem->_win_total_paid,
+                        $supItem->_win_net_paid,
+                        $supItem->_win_total_due,
+                        $supItem->_win_net_due,
+                        $supItem->_win_credit_balance
+                    );
+                }
+            }
         }
 
         $avgPurchased = $totalSuppliers > 0 ? ($totalPurchased / $totalSuppliers) : 0.0;
@@ -3159,6 +4012,27 @@ class ReportController extends Controller
             'last_page' => $lastPage,
             'has_more' => $hasMore,
         ];
+
+        $availableCategories = (!$skipSummary && $page === 1)
+            ? DB::table('suppliers')
+                ->whereNotNull('category')
+                ->where('category', '!=', '')
+                ->distinct()
+                ->orderBy('category')
+                ->pluck('category')
+                ->values()
+                ->all()
+            : [];
+        $availableTerms = (!$skipSummary && $page === 1)
+            ? DB::table('suppliers')
+                ->whereNotNull('payment_terms')
+                ->where('payment_terms', '!=', '')
+                ->distinct()
+                ->orderBy('payment_terms')
+                ->pluck('payment_terms')
+                ->values()
+                ->all()
+            : [];
 
         $summary = [
             'cost_masked' => !$canViewCost,
@@ -3191,6 +4065,8 @@ class ReportController extends Controller
                 'total_credit_balance' => round($totalCreditBalance, 2),
                 'average_purchased' => $avgPurchased,
                 'average_net_purchased' => $avgNetPurchased,
+                'available_categories' => $availableCategories,
+                'available_payment_terms' => $availableTerms,
                 'summary' => $summary,
                 'pagination' => $pagination,
                 'suppliers' => $suppliers,
@@ -3216,6 +4092,15 @@ class ReportController extends Controller
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse');
+        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
+        $warehouseIdResolved = $hasWarehouseFilter ? $this->resolveWarehouseIdParam((string)$warehouse) : null;
+        if (!empty($allowedOutlets) && $warehouseIdResolved !== null && !in_array($warehouseIdResolved, $allowedOutlets, true)) {
+            return $this->noStoreJson([
+                'status' => 'error',
+                'message' => 'Unauthorized outlet access.',
+            ], 403);
+        }
+
         $search = trim((string)$request->input('search', ''));
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
@@ -3233,6 +4118,40 @@ class ReportController extends Controller
                 });
             }
         };
+        $applyWhScope = function ($q) use ($hasWarehouseFilter, $warehouse, $warehouseIdResolved) {
+            if (!$hasWarehouseFilter) {
+                return;
+            }
+            $q->where(function ($wq) use ($warehouse, $warehouseIdResolved) {
+                $wq->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null) {
+                    $wq->orWhere('warehouse_id', $warehouseIdResolved);
+                }
+            });
+        };
+        $applyPoSearch = function ($q) use ($search) {
+            if ($search === '') {
+                return;
+            }
+            $q->where(function ($sq) use ($search) {
+                $sq->where('reference_no', 'like', "%{$search}%")
+                    ->orWhere('payment_type', 'like', "%{$search}%")
+                    ->orWhere('payment_status', 'like', "%{$search}%")
+                    ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        };
+        $applyPrSearch = function ($q) use ($search) {
+            if ($search === '') {
+                return;
+            }
+            $q->where(function ($sq) use ($search) {
+                $sq->where('reference_no', 'like', "%{$search}%")
+                    ->orWhere('purchase_reference_no', 'like', "%{$search}%")
+                    ->orWhere('payment_type', 'like', "%{$search}%")
+                    ->orWhere('return_reason', 'like', "%{$search}%")
+                    ->orWhere('warehouse_name', 'like', "%{$search}%");
+            });
+        };
 
         $purchQuery = DB::table('purchases')
             ->whereIn('status', ['Received', 'Completed'])
@@ -3241,18 +4160,9 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $purchQuery->whereIn('warehouse_id', $allowedOutlets);
         }
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $purchQuery->where('warehouse_name', $warehouse);
-        }
+        $applyWhScope($purchQuery);
         $this->applyReportDateRange($purchQuery, !empty($startDate) ? (string)$startDate : null, !empty($endDate) ? (string)$endDate : null, 'date');
-        if (!empty($search)) {
-            $purchQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('payment_type', 'like', "%{$search}%")
-                  ->orWhere('payment_status', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
-            });
-        }
+        $applyPoSearch($purchQuery);
 
         $purchItemCountSub = DB::table('purchase_items')
             ->select('purchase_id', DB::raw('COUNT(*) as items_count'))
@@ -3288,19 +4198,9 @@ class ReportController extends Controller
             ->whereIn('status', ['Completed', 'Received'])
             ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
             ->where($applySupMatch);
-        if (!empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all') {
-            $returnsQuery->where('warehouse_name', $warehouse);
-        }
+        $applyWhScope($returnsQuery);
         $this->applyReportDateRange($returnsQuery, !empty($startDate) ? (string)$startDate : null, !empty($endDate) ? (string)$endDate : null, 'date');
-        if (!empty($search)) {
-            $returnsQuery->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('purchase_reference_no', 'like', "%{$search}%")
-                  ->orWhere('payment_type', 'like', "%{$search}%")
-                  ->orWhere('return_reason', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%");
-            });
-        }
+        $applyPrSearch($returnsQuery);
 
         $rawReturnsPage = (clone $returnsQuery)
             ->select([
@@ -3319,9 +4219,8 @@ class ReportController extends Controller
 
         $hasEndDate = !empty($endDate);
         $hasStartDate = !empty($startDate);
-        $hasWarehouseFilter = !empty($warehouse) && $warehouse !== 'All' && $warehouse !== 'all';
         $isDateFiltered = $hasStartDate || $hasEndDate;
-        $isFiltered = $isDateFiltered || $hasWarehouseFilter || !empty($search) || !empty($allowedOutlets);
+        $isFiltered = $isDateFiltered || $hasWarehouseFilter || $search !== '' || !empty($allowedOutlets);
         $asOfEnd = $hasEndDate ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
 
         // Compute summary totals cleanly via SQL or single cumulative pass BEFORE mapping paginated rows
@@ -3361,9 +4260,8 @@ class ReportController extends Controller
                 if (!empty($allowedOutlets)) {
                     $cumPoQuery->whereIn('warehouse_id', $allowedOutlets);
                 }
-                if ($hasWarehouseFilter) {
-                    $cumPoQuery->where('warehouse_name', $warehouse);
-                }
+                $applyWhScope($cumPoQuery);
+                $applyPoSearch($cumPoQuery);
                 if ($hasEndDate) {
                     $this->applyReportDateRange($cumPoQuery, null, (string)$endDate, 'date');
                 }
@@ -3373,9 +4271,8 @@ class ReportController extends Controller
                     ->whereIn('status', ['Completed', 'Received'])
                     ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
                     ->where($applySupMatch);
-                if ($hasWarehouseFilter) {
-                    $cumPrQuery->where('warehouse_name', $warehouse);
-                }
+                $applyWhScope($cumPrQuery);
+                $applyPrSearch($cumPrQuery);
                 if ($hasEndDate) {
                     $this->applyReportDateRange($cumPrQuery, null, (string)$endDate, 'date');
                 }
@@ -3391,19 +4288,15 @@ class ReportController extends Controller
                 }
 
                 foreach ($cumPoRows as $cPo) {
-                    $totalPaid += $accounting->sumPayloadPaymentsInRange(
+                    [$paidInPeriod, $paidClosing] = $accounting->sumPayloadPaymentsRangeAndAsOf(
                         $cPo->payments_payload ?? null,
                         (float)$cPo->paid_amount,
                         (string)$cPo->date,
                         $rangeStartDt,
-                        $rangeEndDt
-                    );
-                    $paidClosing = $accounting->sumPayloadPaymentsAsOf(
-                        $cPo->payments_payload ?? null,
-                        (float)$cPo->paid_amount,
-                        (string)$cPo->date,
+                        $rangeEndDt,
                         $closingCutoff
                     );
+                    $totalPaid += $paidInPeriod;
                     $credit = isset($cumMaps['po_has_any_alloc'][$cPo->id])
                         ? (float)($cumMaps['po_alloc'][$cPo->id] ?? 0.0)
                         : (float)($cPo->returned_credit_amount ?? 0.0);
@@ -3411,19 +4304,15 @@ class ReportController extends Controller
                 }
 
                 foreach ($cumPrRows as $cPr) {
-                    $totalRefunded += $accounting->sumPayloadPaymentsInRange(
+                    [$refundedInPeriod, $refundedClosing] = $accounting->sumPayloadPaymentsRangeAndAsOf(
                         $cPr->payments_payload ?? null,
                         (float)$cPr->paid_amount,
                         (string)$cPr->date,
                         $rangeStartDt,
-                        $rangeEndDt
-                    );
-                    $refundedClosing = $accounting->sumPayloadPaymentsAsOf(
-                        $cPr->payments_payload ?? null,
-                        (float)$cPr->paid_amount,
-                        (string)$cPr->date,
+                        $rangeEndDt,
                         $closingCutoff
                     );
+                    $totalRefunded += $refundedInPeriod;
                     $cPrDue = round(max(0.0, (float)$cPr->grand_total - $refundedClosing), 2);
                     $totalReturnDue += $cPrDue;
                     $unallocatedReturnCredit += round(max(0.0, $cPrDue - (float)($cumMaps['pr_alloc'][$cPr->id] ?? 0.0)), 2);
@@ -3434,11 +4323,11 @@ class ReportController extends Controller
                 $totalReturnDue = round($totalReturnDue, 2);
                 $unallocatedReturnCredit = round($unallocatedReturnCredit, 2);
 
-                $openAdjMap = (!$hasWarehouseFilter && empty($allowedOutlets))
+                $openAdjMap = (!$hasWarehouseFilter && empty($allowedOutlets) && $search === '')
                     ? $accounting->computeSupplierOpeningBalanceAdjustments([$id], $hasEndDate ? $closingCutoff : null)
                     : [];
                 $openingBalanceAdjustment = round((float)($openAdjMap[$id]['opening_adjustment'] ?? 0.0), 2);
-                $openingBalance = ($hasWarehouseFilter || !empty($allowedOutlets)) ? 0.0 : $openingBalanceAdjustment;
+                $openingBalance = ($hasWarehouseFilter || !empty($allowedOutlets) || $search !== '') ? 0.0 : $openingBalanceAdjustment;
             } else {
                 $poSum = (clone $purchQuery)->selectRaw('
                     COUNT(*) as cnt,
@@ -3550,8 +4439,8 @@ class ReportController extends Controller
         $signedNetDue = round($totalDue - $unallocatedReturnCredit + $openingBalance, 2);
         $positivePayable = round(max(0.0, $signedNetDue), 2);
         $creditBalance = round(max(0.0, -$signedNetDue), 2);
-        $netPurchased = max(0.0, $totalPurchased - $totalReturned);
-        $netPaid = max(0.0, $totalPaid - $totalRefunded);
+        $netPurchased = round($totalPurchased - $totalReturned, 2);
+        $netPaid = round($totalPaid - $totalRefunded, 2);
         $returnRatePct = $totalPurchased > 0 ? round(($totalReturned / $totalPurchased) * 100, 2) : 0.0;
         $paymentRatePct = $totalPurchased > 0 ? round(($totalPaid / $totalPurchased) * 100, 2) : 100.0;
         $averagePurchaseValue = $poPeriodCount > 0 ? round($totalPurchased / $poPeriodCount, 2) : 0.0;
@@ -3610,7 +4499,7 @@ class ReportController extends Controller
                     'returned_credit' => $canViewCost ? round($totalReturnDue, 2) : null,
                     'unallocated_credit' => $canViewCost ? $unallocatedReturnCredit : null,
                     'total_purchases_count' => $poPeriodCount,
-                    'total_purchased_amount' => $canViewCost ? ($isFiltered ? $totalPurchased : ($totalPurchased > 0 ? $totalPurchased : (float)($supplier->total_purchased ?? 0))) : null,
+                    'total_purchased_amount' => $canViewCost ? $totalPurchased : null,
                     'net_purchased_amount' => $canViewCost ? $netPurchased : null,
                     'total_paid_amount' => $canViewCost ? $totalPaid : null,
                     'net_due' => $canViewCost ? $signedNetDue : null,
@@ -3648,6 +4537,181 @@ class ReportController extends Controller
         ]);
     }
 
+    private function applyStockStatusFilter($query, string $stockStatus, ?int $warehouseId, array $allowedOutlets): void
+    {
+        if ($stockStatus === '' || $stockStatus === 'All') {
+            return;
+        }
+
+        $scopeWh = $warehouseId !== null
+            ? [$warehouseId]
+            : (!empty($allowedOutlets) ? array_values(array_map('intval', $allowedOutlets)) : null);
+        $alertSqlExpr = 'COALESCE(NULLIF(products.alert_quantity, 0), NULLIF(products.stock_alert, 0), NULLIF(products.low_qty, 0), 10)';
+
+        if ($stockStatus === 'in_stock') {
+            if ($scopeWh !== null) {
+                $query->whereExists(function ($sq) use ($scopeWh) {
+                    $sq->select(DB::raw(1))
+                        ->from('stock_balances as sb')
+                        ->whereColumn('sb.product_id', 'products.id');
+                    if (count($scopeWh) === 1) {
+                        $sq->where('sb.warehouse_id', $scopeWh[0])
+                           ->where('sb.quantity', '>', 0);
+                    } else {
+                        $sq->whereIn('sb.warehouse_id', $scopeWh)
+                           ->groupBy('sb.product_variant_id')
+                           ->havingRaw('SUM(sb.quantity) > 0');
+                    }
+                });
+            } else {
+                $query->where('stock_quantity', '>', 0);
+            }
+            return;
+        }
+
+        if ($stockStatus === 'out_of_stock') {
+            if ($scopeWh !== null) {
+                $query->where(function ($oq) use ($scopeWh) {
+                    $oq->whereNotExists(function ($sq) use ($scopeWh) {
+                        $sq->select(DB::raw(1))
+                           ->from('stock_balances as sb')
+                           ->whereColumn('sb.product_id', 'products.id');
+                        if (count($scopeWh) === 1) {
+                            $sq->where('sb.warehouse_id', $scopeWh[0])
+                               ->where('sb.quantity', '>', 0);
+                        } else {
+                            $sq->whereIn('sb.warehouse_id', $scopeWh)
+                               ->groupBy('sb.product_variant_id')
+                               ->havingRaw('SUM(sb.quantity) > 0');
+                        }
+                    })->orWhereExists(function ($vq) use ($scopeWh) {
+                        $vq->select(DB::raw(1))
+                           ->from('product_variants as pv')
+                           ->leftJoin('stock_balances as sb', function ($j) use ($scopeWh) {
+                               $j->on('sb.product_variant_id', '=', 'pv.id');
+                               if (count($scopeWh) === 1) {
+                                   $j->where('sb.warehouse_id', $scopeWh[0]);
+                               } else {
+                                   $j->whereIn('sb.warehouse_id', $scopeWh);
+                               }
+                           })
+                           ->whereColumn('pv.product_id', 'products.id')
+                           ->where('products.has_variants', 1)
+                           ->groupBy('pv.id')
+                           ->havingRaw('COALESCE(SUM(sb.quantity), 0) <= 0');
+                    });
+                });
+            } else {
+                $query->where(function ($oq) {
+                    $oq->where('products.stock_quantity', '<=', 0)
+                       ->orWhereExists(function ($vq) {
+                           $vq->select(DB::raw(1))
+                              ->from('product_variants as pv')
+                              ->leftJoin('stock_balances as sb', 'sb.product_variant_id', '=', 'pv.id')
+                              ->whereColumn('pv.product_id', 'products.id')
+                              ->where('products.has_variants', 1)
+                              ->groupBy('pv.id')
+                              ->havingRaw('COALESCE(SUM(sb.quantity), 0) <= 0');
+                       });
+                });
+            }
+            return;
+        }
+
+        if ($stockStatus === 'low_stock_only') {
+            if ($scopeWh !== null) {
+                $query->whereExists(function ($sq) use ($scopeWh, $alertSqlExpr) {
+                    $sq->select(DB::raw(1))
+                       ->from('stock_balances as sb')
+                       ->whereColumn('sb.product_id', 'products.id');
+                    if (count($scopeWh) === 1) {
+                        $sq->where('sb.warehouse_id', $scopeWh[0])
+                           ->where('sb.quantity', '>', 0)
+                           ->whereRaw("sb.quantity <= {$alertSqlExpr}");
+                    } else {
+                        $sq->whereIn('sb.warehouse_id', $scopeWh)
+                           ->groupBy('sb.product_variant_id')
+                           ->havingRaw("SUM(sb.quantity) > 0 AND SUM(sb.quantity) <= {$alertSqlExpr}");
+                    }
+                });
+            } else {
+                $query->where(function ($q) use ($alertSqlExpr) {
+                    $q->where(function ($sp) use ($alertSqlExpr) {
+                        $sp->where('products.stock_quantity', '>', 0)
+                           ->whereRaw("products.stock_quantity <= {$alertSqlExpr}");
+                    })
+                    ->orWhereExists(function ($vq) use ($alertSqlExpr) {
+                        $vq->select(DB::raw(1))
+                           ->from('product_variants as pv')
+                           ->leftJoin('stock_balances as sb', 'sb.product_variant_id', '=', 'pv.id')
+                           ->whereColumn('pv.product_id', 'products.id')
+                           ->groupBy('pv.id')
+                           ->havingRaw("COALESCE(SUM(sb.quantity), 0) > 0 AND COALESCE(SUM(sb.quantity), 0) <= {$alertSqlExpr}");
+                    });
+                });
+            }
+            return;
+        }
+
+        if ($stockStatus === 'low_stock') {
+            if ($scopeWh !== null) {
+                $query->where(function ($sq) use ($scopeWh, $alertSqlExpr) {
+                    $sq->where(function ($sp) use ($scopeWh, $alertSqlExpr) {
+                        $sp->where(function ($nv) {
+                            $nv->where('products.has_variants', 0)
+                               ->orWhereNull('products.has_variants');
+                        });
+                        if (count($scopeWh) === 1) {
+                            $sp->whereNotExists(function ($above) use ($scopeWh, $alertSqlExpr) {
+                                $above->select(DB::raw(1))
+                                      ->from('stock_balances as sb')
+                                      ->whereColumn('sb.product_id', 'products.id')
+                                      ->where('sb.warehouse_id', $scopeWh[0])
+                                      ->whereRaw("sb.quantity > {$alertSqlExpr}");
+                            });
+                        } else {
+                            $sp->whereNotExists(function ($above) use ($scopeWh, $alertSqlExpr) {
+                                $above->select(DB::raw(1))
+                                      ->from('stock_balances as sb')
+                                      ->whereColumn('sb.product_id', 'products.id')
+                                      ->whereIn('sb.warehouse_id', $scopeWh)
+                                      ->groupBy('sb.product_variant_id')
+                                      ->havingRaw("SUM(sb.quantity) > {$alertSqlExpr}");
+                            });
+                        }
+                    })->orWhereExists(function ($vq) use ($scopeWh, $alertSqlExpr) {
+                        $vq->select(DB::raw(1))
+                           ->from('product_variants as pv')
+                           ->leftJoin('stock_balances as sb', function ($j) use ($scopeWh) {
+                               $j->on('sb.product_variant_id', '=', 'pv.id');
+                               if (count($scopeWh) === 1) {
+                                   $j->where('sb.warehouse_id', $scopeWh[0]);
+                               } else {
+                                   $j->whereIn('sb.warehouse_id', $scopeWh);
+                               }
+                           })
+                           ->whereColumn('pv.product_id', 'products.id')
+                           ->where('products.has_variants', 1)
+                           ->groupBy('pv.id')
+                           ->havingRaw("COALESCE(SUM(sb.quantity), 0) <= {$alertSqlExpr}");
+                    });
+                });
+            } else {
+                $query->where(function ($q) use ($alertSqlExpr) {
+                    $q->whereRaw("products.stock_quantity <= {$alertSqlExpr}")
+                      ->orWhereExists(function ($vq) use ($alertSqlExpr) {
+                          $vq->select(DB::raw(1))
+                             ->from('product_variants as pv')
+                             ->leftJoin('stock_balances as sb', 'sb.product_variant_id', '=', 'pv.id')
+                             ->whereColumn('pv.product_id', 'products.id')
+                             ->groupBy('pv.id')
+                             ->havingRaw("COALESCE(SUM(sb.quantity), 0) <= {$alertSqlExpr}");
+                      });
+                });
+            }
+        }
+    }
+
     public function stockReport(Request $request)
     {
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
@@ -3671,43 +4735,9 @@ class ReportController extends Controller
         $accounting = $this->accounting();
         $canViewCost = $accounting->canViewCost($request);
 
-        $query = Product::query()
-            ->select([
-                'id', 'uuid', 'code', 'sku', 'barcode', 'name', 'alternative_name',
-                'category_name', 'brand_name', 'unit_name',
-                'cost_price', 'selling_price', 'purchase_price', 'retail_price',
-                'stock_quantity', 'alert_quantity', 'stock_alert', 'low_qty',
-                'has_variants', 'image_url', 'status', 'is_active',
-            ])
-            ->with([
-                'variants:id,product_id,name,sku,cost_price,selling_price,is_active,sort_order',
-                'variants.values:id,product_variant_id,attribute_name,attribute_value',
-                'variants.stockBalances' => function ($q) use ($warehouseId, $allowedOutlets) {
-                    $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId);
-                    } elseif (!empty($allowedOutlets)) {
-                        $q->whereIn('warehouse_id', $allowedOutlets);
-                    }
-                },
-                'stockBalances' => function ($q) use ($warehouseId, $allowedOutlets) {
-                    $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId);
-                    } elseif (!empty($allowedOutlets)) {
-                        $q->whereIn('warehouse_id', $allowedOutlets);
-                    }
-                },
-            ]);
-
-        if ($warehouseId !== null) {
-            $query->withSum(['stockBalances as warehouse_stock' => function ($q) use ($warehouseId) {
-                $q->where('warehouse_id', $warehouseId);
-            }], 'quantity');
-        } elseif (!empty($allowedOutlets)) {
-            $query->withSum(['stockBalances as warehouse_stock' => function ($q) use ($allowedOutlets) {
-                $q->whereIn('warehouse_id', $allowedOutlets);
-            }], 'quantity');
+        // Build pure filter query first (no select/with/withSum bindings) so cloned count/id subqueries stay binding-clean
+        $query = Product::query();
+        if ($warehouseId === null && !empty($allowedOutlets)) {
             $query->where(function ($wq) use ($allowedOutlets) {
                 $wq->whereHas('stockBalances', function ($q) use ($allowedOutlets) {
                     $q->whereIn('warehouse_id', $allowedOutlets);
@@ -3718,31 +4748,37 @@ class ReportController extends Controller
         }
 
         if (!empty($search)) {
-            $query->where(function ($q) use ($search) {
-                $q->where('code', $search)
-                  ->orWhere('sku', $search)
-                  ->orWhere('barcode', $search)
-                  ->orWhere('code', 'like', "%{$search}%")
+            $varSearchIds1 = DB::table('product_variants')
+                ->whereNull('deleted_at')
+                ->where(function ($vq) use ($search) {
+                    $vq->where('name', 'like', "%{$search}%")
+                       ->orWhere('sku', 'like', "%{$search}%")
+                       ->orWhere('barcode', 'like', "%{$search}%");
+                })
+                ->pluck('product_id')
+                ->all();
+            $varSearchIds2 = DB::table('product_variants as pv')
+                ->join('product_variant_values as pvv', 'pv.id', '=', 'pvv.product_variant_id')
+                ->whereNull('pv.deleted_at')
+                ->where(function ($av) use ($search) {
+                    $av->where('pvv.attribute_value', 'like', "%{$search}%")
+                       ->orWhere('pvv.attribute_name', 'like', "%{$search}%");
+                })
+                ->pluck('pv.product_id')
+                ->all();
+            $varSearchIds = array_values(array_unique(array_map('intval', array_merge($varSearchIds1, $varSearchIds2))));
+
+            $query->where(function ($q) use ($search, $varSearchIds) {
+                $q->where('code', 'like', "%{$search}%")
                   ->orWhere('sku', 'like', "%{$search}%")
                   ->orWhere('barcode', 'like', "%{$search}%")
                   ->orWhere('name', 'like', "%{$search}%")
                   ->orWhere('alternative_name', 'like', "%{$search}%")
                   ->orWhere('brand_name', 'like', "%{$search}%")
-                  ->orWhere('category_name', 'like', "%{$search}%")
-                  ->orWhereIn('id', function ($sub) use ($search) {
-                      $sub->select('product_id')
-                          ->from('product_variants')
-                          ->where('name', 'like', "%{$search}%")
-                          ->orWhere('sku', 'like', "%{$search}%")
-                          ->orWhere('barcode', 'like', "%{$search}%");
-                  })
-                  ->orWhereIn('id', function ($sub) use ($search) {
-                      $sub->select('pv.product_id')
-                          ->from('product_variants as pv')
-                          ->join('product_variant_values as pvv', 'pv.id', '=', 'pvv.product_variant_id')
-                          ->where('pvv.attribute_value', 'like', "%{$search}%")
-                          ->orWhere('pvv.attribute_name', 'like', "%{$search}%");
-                  });
+                  ->orWhere('category_name', 'like', "%{$search}%");
+                if (!empty($varSearchIds)) {
+                    $q->orWhereIn('id', $varSearchIds);
+                }
             });
         }
 
@@ -3754,89 +4790,7 @@ class ReportController extends Controller
             $query->where('brand_name', $brand);
         }
 
-        if ($stockStatus !== 'All' && !empty($stockStatus)) {
-            if ($stockStatus === 'in_stock') {
-                if ($warehouseId !== null) {
-                    $query->whereHas('stockBalances', function ($q) use ($warehouseId) {
-                        $q->where('warehouse_id', $warehouseId)->where('quantity', '>', 0);
-                    });
-                } else {
-                    $query->where('stock_quantity', '>', 0);
-                }
-            } else if ($stockStatus === 'out_of_stock') {
-                if ($warehouseId !== null) {
-                    $query->whereDoesntHave('stockBalances', function ($q) use ($warehouseId) {
-                        $q->where('warehouse_id', $warehouseId)->where('quantity', '>', 0);
-                    });
-                } else {
-                    $query->where('stock_quantity', '<=', 0);
-                }
-            } else if ($stockStatus === 'low_stock_only') {
-                if ($warehouseId !== null) {
-                    $query->where(function ($sq) use ($warehouseId) {
-                        $sq->whereHas('stockBalances', function ($q) use ($warehouseId) {
-                            $q->where('warehouse_id', $warehouseId)
-                              ->where('quantity', '>', 0)
-                              ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
-                        })
-                        ->orWhereHas('variants', function ($vq) use ($warehouseId) {
-                            $vq->whereHas('stockBalances', function ($sbq) use ($warehouseId) {
-                                $sbq->where('warehouse_id', $warehouseId)
-                                    ->where('quantity', '>', 0)
-                                    ->whereRaw('quantity <= 10');
-                            });
-                        });
-                    });
-                } else {
-                    $query->where(function ($q) {
-                        $q->where('stock_quantity', '>', 0)
-                          ->where(function ($sub) {
-                              $sub->whereColumn('stock_quantity', '<=', 'alert_quantity')
-                                  ->orWhereColumn('stock_quantity', '<=', 'stock_alert')
-                                  ->orWhereColumn('stock_quantity', '<=', 'low_qty')
-                                  ->orWhere('stock_quantity', '<=', 10);
-                          })
-                          ->orWhereHas('variants', function ($vq) {
-                              $vq->whereHas('stockBalances', function ($sbq) {
-                                  $sbq->select('product_variant_id')
-                                      ->groupBy('product_variant_id')
-                                      ->havingRaw('COALESCE(SUM(quantity), 0) > 0 AND COALESCE(SUM(quantity), 0) <= 10');
-                              });
-                          });
-                    });
-                }
-            } else if ($stockStatus === 'low_stock') {
-                if ($warehouseId !== null) {
-                    $query->where(function ($sq) use ($warehouseId) {
-                        $sq->whereHas('stockBalances', function ($q) use ($warehouseId) {
-                            $q->where('warehouse_id', $warehouseId)
-                              ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
-                        })
-                        ->orWhereHas('variants', function ($vq) use ($warehouseId) {
-                            $vq->whereHas('stockBalances', function ($sbq) use ($warehouseId) {
-                                $sbq->where('warehouse_id', $warehouseId)
-                                    ->whereRaw('quantity <= 10');
-                            });
-                        })
-                        ->orWhere('stock_quantity', '<=', 0);
-                    });
-                } else {
-                    $query->where(function ($q) {
-                        $q->whereColumn('stock_quantity', '<=', 'alert_quantity')
-                          ->orWhereColumn('stock_quantity', '<=', 'stock_alert')
-                          ->orWhereColumn('stock_quantity', '<=', 'low_qty')
-                          ->orWhere('stock_quantity', '<=', 10)
-                          ->orWhereHas('variants', function ($vq) {
-                              $vq->whereHas('stockBalances', function ($sbq) {
-                                  $sbq->select('product_variant_id')
-                                      ->groupBy('product_variant_id')
-                                      ->havingRaw('COALESCE(SUM(quantity), 0) <= 10');
-                              });
-                          });
-                    });
-                }
-            }
-        }
+        $this->applyStockStatusFilter($query, (string)$stockStatus, $warehouseId, $allowedOutlets);
 
         $baseQuery = clone $query;
         $hasProductFilters = !empty($search)
@@ -3852,85 +4806,184 @@ class ReportController extends Controller
         $totalRetail = 0.0;
         $maskedStockSummary = [];
 
+        $deficitQty = 0.0;
+        $restockCost = 0.0;
+        $totalVariants = 0;
+
+        $lowStockCount = 0;
+        $outOfStockCount = 0;
+        $impactedSkusCount = 0;
+
+        $matchingIds = null;
+        $matchingSubQuery = null;
         if (!$skipSummary) {
-            // Authoritative Valuation via SQL-level FIFO Batch Subledger (plus Master & Variant Reconciliation)
-            if ($hasProductFilters) {
-                $matchingQuery = clone $baseQuery;
-                $matchingQuery->setEagerLoads([])->reorder();
-                $matchingQuery->getQuery()->columns = null;
-                $matchingIds = $matchingQuery->pluck('id')->map(fn($id) => (int)$id)->all();
-                $totalProducts = count($matchingIds);
-            } else {
-                $countQuery = clone $baseQuery;
-                $countQuery->setEagerLoads([])->reorder();
-                $countQuery->getQuery()->columns = null;
-                $totalProducts = (int)$countQuery->count();
-                $matchingIds = null;
+            $countQuery = clone $baseQuery;
+            $countQuery->setEagerLoads([])->reorder();
+            $countQuery->getQuery()->columns = null;
+            $totalProducts = (int)$countQuery->count();
+
+            if ($totalProducts > 0 && $hasProductFilters) {
+                if ($totalProducts <= 400) {
+                    $matchingQuery = clone $baseQuery;
+                    $matchingQuery->setEagerLoads([])->reorder();
+                    $matchingQuery->getQuery()->columns = null;
+                    $matchingIds = $matchingQuery->pluck('id')->map(fn($id) => (int)$id)->all();
+                } else {
+                    $matchingSubQuery = (clone $baseQuery);
+                    $matchingSubQuery->setEagerLoads([])->reorder();
+                    $matchingSubQuery->getQuery()->columns = null;
+                    $matchingSubQuery->select('products.id');
+                }
             }
 
-            $valuation = app(InventoryReconciliationService::class)->computeValuationSummary(
-                $warehouseId !== null ? (int)$warehouseId : null,
-                !empty($allowedOutlets) ? $allowedOutlets : null,
-                $matchingIds
-            );
+            if ($totalProducts > 0) {
+                $valuation = app(InventoryReconciliationService::class)->computeValuationSummary(
+                    $warehouseId !== null ? (int)$warehouseId : null,
+                    !empty($allowedOutlets) ? $allowedOutlets : null,
+                    $matchingIds,
+                    $hasProductFilters ? null : $totalProducts,
+                    false,
+                    $matchingSubQuery
+                );
 
-            $totalQuantity = round((float)$valuation['total_book_qty'], 4);
-            $masterTotalCost = round((float)$valuation['master_valuation'], 2);
-            $fifoBatchTotalCost = round((float)$valuation['fifo_batch_valuation'], 2);
-            $totalCost = round((float)$valuation['effective_valuation'], 2);
-            $totalRetail = round((float)$valuation['retail_valuation'], 2);
+                $totalQuantity = round((float)$valuation['total_book_qty'], 4);
+                $masterTotalCost = round((float)$valuation['master_valuation'], 2);
+                $fifoBatchTotalCost = round((float)$valuation['fifo_batch_valuation'], 2);
+                $totalCost = round((float)$valuation['effective_valuation'], 2);
+                $totalRetail = round((float)$valuation['retail_valuation'], 2);
 
-            if ($warehouseId !== null || !empty($allowedOutlets)) {
-                $totalsQ = StockBalance::query()
-                    ->join('products', 'stock_balances.product_id', '=', 'products.id')
-                    ->leftJoin('product_variants', 'stock_balances.product_variant_id', '=', 'product_variants.id')
-                    ->whereNull('products.deleted_at');
-                if ($hasProductFilters) {
+                $effAlertProd = 'COALESCE(NULLIF(p.alert_quantity, 0), NULLIF(p.stock_alert, 0), NULLIF(p.low_qty, 0), 10)';
+                $prodCostExpr = 'COALESCE(NULLIF(p.cost_price, 0), NULLIF(p.purchase_price, 0), 0)';
+                $varCostExpr = 'COALESCE(NULLIF(pv.cost_price, 0), NULLIF(p.cost_price, 0), NULLIF(p.purchase_price, 0), 0)';
+                $useWhBalances = ($warehouseId !== null || !empty($allowedOutlets));
+
+                $filterIdsLimit = 400;
+                $canUseMatchingIdsInSql = $matchingIds !== null && count($matchingIds) <= $filterIdsLimit;
+
+                // 1) Simple products: warehouse-accurate SKU health & deficit (plus edge case has_variants=1 with 0 variant rows)
+                $simpleQ = DB::table('products as p')
+                    ->whereNull('p.deleted_at')
+                    ->where(function ($q) {
+                        $q->where('p.has_variants', 0)
+                          ->orWhereNull('p.has_variants');
+                    });
+                if ($canUseMatchingIdsInSql) {
+                    $simpleQ->whereIn('p.id', $matchingIds);
+                } elseif ($hasProductFilters || (!empty($allowedOutlets) && $warehouseId === null)) {
                     $subQuery = clone $baseQuery;
                     $subQuery->setEagerLoads([])->reorder();
                     $subQuery->getQuery()->columns = null;
-                    $totalsQ->whereIn('stock_balances.product_id', $subQuery->select('id'));
+                    $simpleQ->whereIn('p.id', $subQuery->select('id'));
                 }
-                if ($warehouseId !== null) {
-                    $totalsQ->where('stock_balances.warehouse_id', $warehouseId);
-                } else {
-                    $totalsQ->whereIn('stock_balances.warehouse_id', $allowedOutlets);
-                }
-                $totals = $totalsQ->selectRaw('
-                        COALESCE(SUM(CASE WHEN COALESCE(products.alert_quantity, 10) > stock_balances.quantity THEN COALESCE(products.alert_quantity, 10) - stock_balances.quantity ELSE 0 END), 0) as total_deficit_qty,
-                        COALESCE(SUM((CASE WHEN COALESCE(products.alert_quantity, 10) > stock_balances.quantity THEN COALESCE(products.alert_quantity, 10) - stock_balances.quantity ELSE 0 END) * COALESCE(product_variants.cost_price, products.cost_price, products.purchase_price, 0)), 0) as estimated_restock_cost
-                    ')
-                    ->first();
-            } else {
-                $summaryAggQuery = clone $baseQuery;
-                $summaryAggQuery->setEagerLoads([])->reorder();
-                $summaryAggQuery->getQuery()->columns = null;
-                $summaryAgg = $summaryAggQuery
-                    ->select(DB::raw('
-                        COALESCE(SUM(CASE WHEN COALESCE(alert_quantity, 10) > stock_quantity THEN COALESCE(alert_quantity, 10) - stock_quantity ELSE 0 END), 0) as total_deficit_qty,
-                        COALESCE(SUM((CASE WHEN COALESCE(alert_quantity, 10) > stock_quantity THEN COALESCE(alert_quantity, 10) - stock_quantity ELSE 0 END) * COALESCE(cost_price, purchase_price, 0)), 0) as estimated_restock_cost
-                    '))
-                    ->first();
-            }
 
-            if ($hasProductFilters || !empty($allowedOutlets)) {
-                $varSubQuery = clone $baseQuery;
-                $varSubQuery->setEagerLoads([])->reorder();
-                $varSubQuery->getQuery()->columns = null;
-                $totalVariants = (int)DB::table('product_variants')
-                    ->whereIn('product_id', $varSubQuery->select('id'))
-                    ->count();
-            } else {
-                $totalVariants = (int)DB::table('product_variants')
-                    ->join('products', 'products.id', '=', 'product_variants.product_id')
-                    ->whereNull('products.deleted_at')
-                    ->count();
+                if ($useWhBalances) {
+                    $sbProdSub = DB::table('stock_balances')
+                        ->select(['product_id', DB::raw('SUM(quantity) as wh_qty')])
+                        ->groupBy('product_id');
+                    if ($warehouseId !== null) {
+                        $sbProdSub->where('warehouse_id', $warehouseId);
+                    } else {
+                        $sbProdSub->whereIn('warehouse_id', $allowedOutlets);
+                    }
+                    $simpleQ->leftJoinSub($sbProdSub, 'sb_p', fn($j) => $j->on('sb_p.product_id', '=', 'p.id'));
+                    $sQtyExpr = 'COALESCE(sb_p.wh_qty, 0)';
+                } else {
+                    $sQtyExpr = 'COALESCE(p.stock_quantity, 0)';
+                }
+
+                $healthSelect = function (string $qtyExpr, string $costExpr, bool $includeCount = false) use ($effAlertProd, $stockStatus) {
+                    $lowCond = "({$qtyExpr}) > 0 AND ({$qtyExpr}) <= ({$effAlertProd})";
+                    $outCond = "({$qtyExpr}) <= 0";
+                    if ($stockStatus === 'low_stock_only') {
+                        $lowExpr = "CASE WHEN {$lowCond} THEN 1 ELSE 0 END";
+                        $outExpr = '0';
+                        $defCond = "CASE WHEN {$lowCond} THEN ({$effAlertProd}) - ({$qtyExpr}) ELSE 0 END";
+                    } elseif ($stockStatus === 'out_of_stock') {
+                        $lowExpr = '0';
+                        $outExpr = "CASE WHEN {$outCond} THEN 1 ELSE 0 END";
+                        $defCond = "CASE WHEN {$outCond} AND ({$effAlertProd}) > ({$qtyExpr}) THEN ({$effAlertProd}) - ({$qtyExpr}) ELSE 0 END";
+                    } else {
+                        $lowExpr = "CASE WHEN {$lowCond} THEN 1 ELSE 0 END";
+                        $outExpr = "CASE WHEN {$outCond} THEN 1 ELSE 0 END";
+                        $defCond = "CASE WHEN ({$effAlertProd}) > ({$qtyExpr}) THEN ({$effAlertProd}) - ({$qtyExpr}) ELSE 0 END";
+                    }
+                    $prefix = $includeCount ? 'COUNT(*) as var_cnt, ' : '';
+                    return "{$prefix}
+                        COALESCE(SUM({$lowExpr}), 0) as low_cnt,
+                        COALESCE(SUM({$outExpr}), 0) as out_cnt,
+                        COALESCE(SUM({$defCond}), 0) as deficit_qty,
+                        COALESCE(SUM(({$defCond}) * ({$costExpr})), 0) as restock_cost";
+                };
+
+                $simpleAgg = $simpleQ->selectRaw($healthSelect($sQtyExpr, $prodCostExpr))->first();
+
+                // Edge case: variant-flagged products with zero variant rows
+                $orphanVarQ = DB::table('products as p')
+                    ->whereNull('p.deleted_at')
+                    ->where('p.has_variants', 1)
+                    ->whereNotExists(function ($vq) {
+                        $vq->select(DB::raw(1))
+                           ->from('product_variants as pv0')
+                           ->whereColumn('pv0.product_id', 'p.id');
+                    });
+                if ($canUseMatchingIdsInSql) {
+                    $orphanVarQ->whereIn('p.id', $matchingIds);
+                } elseif ($hasProductFilters || (!empty($allowedOutlets) && $warehouseId === null)) {
+                    $orphanSub = clone $baseQuery;
+                    $orphanSub->setEagerLoads([])->reorder();
+                    $orphanSub->getQuery()->columns = null;
+                    $orphanVarQ->whereIn('p.id', $orphanSub->select('id'));
+                }
+                if ($useWhBalances) {
+                    $sbOrphanSub = DB::table('stock_balances')
+                        ->select(['product_id', DB::raw('SUM(quantity) as wh_qty')])
+                        ->groupBy('product_id');
+                    if ($warehouseId !== null) {
+                        $sbOrphanSub->where('warehouse_id', $warehouseId);
+                    } else {
+                        $sbOrphanSub->whereIn('warehouse_id', $allowedOutlets);
+                    }
+                    $orphanVarQ->leftJoinSub($sbOrphanSub, 'sb_p', fn($j) => $j->on('sb_p.product_id', '=', 'p.id'));
+                }
+                $orphanAgg = $orphanVarQ->selectRaw($healthSelect($sQtyExpr, $prodCostExpr))->first();
+
+                // 2) Active Variant SKUs: compute warehouse-accurate SKU health, deficit & totalVariants
+                $sbVarSub = DB::table('stock_balances')
+                    ->select(['product_variant_id', DB::raw('SUM(quantity) as var_qty')])
+                    ->whereNotNull('product_variant_id')
+                    ->groupBy('product_variant_id');
+                if ($warehouseId !== null) {
+                    $sbVarSub->where('warehouse_id', $warehouseId);
+                } elseif (!empty($allowedOutlets)) {
+                    $sbVarSub->whereIn('warehouse_id', $allowedOutlets);
+                }
+
+                $varQ = DB::table('product_variants as pv')
+                    ->join('products as p', 'p.id', '=', 'pv.product_id')
+                    ->leftJoinSub($sbVarSub, 'sb_v', fn($j) => $j->on('sb_v.product_variant_id', '=', 'pv.id'))
+                    ->whereNull('p.deleted_at')
+                    ->where('p.has_variants', 1);
+                if ($canUseMatchingIdsInSql) {
+                    $varQ->whereIn('pv.product_id', $matchingIds);
+                } elseif ($hasProductFilters || (!empty($allowedOutlets) && $warehouseId === null)) {
+                    $varSubQuery = clone $baseQuery;
+                    $varSubQuery->setEagerLoads([])->reorder();
+                    $varSubQuery->getQuery()->columns = null;
+                    $varQ->whereIn('pv.product_id', $varSubQuery->select('id'));
+                }
+
+                $vQtyExpr = 'COALESCE(sb_v.var_qty, 0)';
+                $varAgg = $varQ->selectRaw($healthSelect($vQtyExpr, $varCostExpr, true))->first();
+
+                $totalVariants = (int)($varAgg->var_cnt ?? 0);
+                $lowStockCount = (int)($simpleAgg->low_cnt ?? 0) + (int)($orphanAgg->low_cnt ?? 0) + (int)($varAgg->low_cnt ?? 0);
+                $outOfStockCount = (int)($simpleAgg->out_cnt ?? 0) + (int)($orphanAgg->out_cnt ?? 0) + (int)($varAgg->out_cnt ?? 0);
+                $impactedSkusCount = $lowStockCount + $outOfStockCount;
+                $deficitQty = round((float)($simpleAgg->deficit_qty ?? 0) + (float)($orphanAgg->deficit_qty ?? 0) + (float)($varAgg->deficit_qty ?? 0), 4);
+                $restockCost = round((float)($simpleAgg->restock_cost ?? 0) + (float)($orphanAgg->restock_cost ?? 0) + (float)($varAgg->restock_cost ?? 0), 2);
             }
             $totalSkus = $totalProducts + $totalVariants;
-
             $grossMarginPercent = $totalRetail > 0 ? round((($totalRetail - $totalCost) / $totalRetail) * 100, 2) : 0;
-            $deficitQty = (float)($totals->total_deficit_qty ?? ($summaryAgg->total_deficit_qty ?? 0));
-            $restockCost = (float)($totals->estimated_restock_cost ?? ($summaryAgg->estimated_restock_cost ?? 0));
 
             $maskedStockSummary = $accounting->maskFinancialSummary([
                 'total_products' => $totalProducts,
@@ -3944,7 +4997,19 @@ class ReportController extends Controller
                 'gross_margin_percent' => $grossMarginPercent,
                 'total_deficit_quantity' => $deficitQty,
                 'estimated_restock_cost' => $restockCost,
-            ], $canViewCost, ['total_products', 'total_skus', 'total_quantity', 'total_retail_value', 'total_deficit_quantity']);
+                'low_stock_count' => $lowStockCount,
+                'out_of_stock_count' => $outOfStockCount,
+                'impacted_skus_count' => $impactedSkusCount,
+            ], $canViewCost, [
+                'total_products',
+                'total_skus',
+                'total_quantity',
+                'total_retail_value',
+                'total_deficit_quantity',
+                'low_stock_count',
+                'out_of_stock_count',
+                'impacted_skus_count',
+            ]);
         } elseif ($knownTotal !== null) {
             $totalProducts = $knownTotal;
         } else {
@@ -3954,16 +5019,61 @@ class ReportController extends Controller
             $totalProducts = (int)$countQuery->count();
         }
 
-        // Fast Slice Pagination (No duplicate COUNT(*)) & Dedicated StockReportResource
-        if ($warehouseId !== null) {
-            $query->orderBy('warehouse_stock', 'asc')->orderBy('id', 'asc');
+        if (!$skipSummary && $totalProducts === 0) {
+            $pageItems = collect();
+            $hasMore = false;
         } else {
-            $query->orderBy('stock_quantity', 'asc')->orderBy('id', 'asc');
+            $listBase = ($matchingIds !== null && count($matchingIds) <= 400)
+                ? Product::query()->whereIn('id', $matchingIds)
+                : (clone $baseQuery);
+            $listQuery = $listBase
+                ->select([
+                    'id', 'uuid', 'code', 'sku', 'barcode', 'name', 'alternative_name',
+                    'category_name', 'brand_name', 'unit_name',
+                    'cost_price', 'selling_price', 'purchase_price', 'retail_price',
+                    'stock_quantity', 'alert_quantity', 'stock_alert', 'low_qty',
+                    'has_variants', 'image_url', 'status', 'is_active',
+                ])
+                ->with([
+                    'variants:id,product_id,name,sku,cost_price,selling_price,is_active,sort_order',
+                    'variants.values:id,product_variant_id,attribute_name,attribute_value',
+                    'variants.stockBalances' => function ($q) use ($warehouseId, $allowedOutlets) {
+                        $q->select(['id', 'product_variant_id', 'warehouse_id', 'quantity']);
+                        if ($warehouseId !== null) {
+                            $q->where('warehouse_id', $warehouseId);
+                        } elseif (!empty($allowedOutlets)) {
+                            $q->whereIn('warehouse_id', $allowedOutlets);
+                        }
+                    },
+                    'stockBalances' => function ($q) use ($warehouseId, $allowedOutlets) {
+                        $q->select(['id', 'product_id', 'warehouse_id', 'product_variant_id', 'quantity']);
+                        if ($warehouseId !== null) {
+                            $q->where('warehouse_id', $warehouseId);
+                        } elseif (!empty($allowedOutlets)) {
+                            $q->whereIn('warehouse_id', $allowedOutlets);
+                        }
+                    },
+                ]);
+
+            if ($warehouseId !== null) {
+                $listQuery->withSum(['stockBalances as warehouse_stock' => function ($q) use ($warehouseId) {
+                    $q->where('warehouse_id', $warehouseId);
+                }], 'quantity');
+                $listQuery->orderBy('warehouse_stock', 'asc')->orderBy('id', 'asc');
+            } elseif (!empty($allowedOutlets)) {
+                $listQuery->withSum(['stockBalances as warehouse_stock' => function ($q) use ($allowedOutlets) {
+                    $q->whereIn('warehouse_id', $allowedOutlets);
+                }], 'quantity');
+                $listQuery->orderBy('stock_quantity', 'asc')->orderBy('id', 'asc');
+            } else {
+                $listQuery->orderBy('stock_quantity', 'asc')->orderBy('id', 'asc');
+            }
+            $rows = $listQuery->offset(($page - 1) * $perPage)->limit($perPage + 1)->get();
+            $hasMore = $rows->count() > $perPage;
+            $pageItems = $hasMore ? $rows->slice(0, $perPage)->values() : $rows->values();
         }
-        $rows = $query->offset(($page - 1) * $perPage)->limit($perPage + 1)->get();
-        $hasMore = $rows->count() > $perPage;
-        $pageItems = $hasMore ? $rows->slice(0, $perPage)->values() : $rows->values();
         $lastPage = max(1, (int)ceil($totalProducts / max(1, $perPage)));
+        $request->attributes->set('_stock_report_can_view_cost', $canViewCost);
 
         $responsePayload = [
             'status' => 'success',
@@ -4001,7 +5111,7 @@ class ReportController extends Controller
         $brand = $request->input('brand', 'All');
         $stockStatus = $request->input('stock_status', 'All');
         $search = trim($request->input('search', ''));
-        $isLowStock = ($stockStatus === 'low_stock');
+        $isLowStock = ($stockStatus === 'low_stock' || $stockStatus === 'low_stock_only');
         $allowedOutlets = $this->extractAllowedOutletIds($request);
 
         $query = Product::query()
@@ -4074,57 +5184,7 @@ class ReportController extends Controller
             });
         }
 
-        if ($stockStatus === 'in_stock') {
-            if ($warehouseId !== null || !empty($allowedOutlets)) {
-                $scopeWh = $warehouseId !== null ? [$warehouseId] : $allowedOutlets;
-                $query->whereHas('stockBalances', fn($q) => $q->whereIn('warehouse_id', $scopeWh)->where('quantity', '>', 0));
-            } else {
-                $query->where('stock_quantity', '>', 0);
-            }
-        } elseif ($stockStatus === 'low_stock') {
-            if ($warehouseId !== null || !empty($allowedOutlets)) {
-                $scopeWh = $warehouseId !== null ? [$warehouseId] : $allowedOutlets;
-                $query->where(function ($sq) use ($scopeWh) {
-                    $sq->whereHas('stockBalances', function ($q) use ($scopeWh) {
-                        $q->whereIn('warehouse_id', $scopeWh)
-                          ->whereRaw('quantity <= COALESCE((SELECT alert_quantity FROM products WHERE products.id = stock_balances.product_id), 10)');
-                    })->orWhereHas('variants.stockBalances', function ($sbq) use ($scopeWh) {
-                        $sbq->whereIn('warehouse_id', $scopeWh)
-                            ->whereRaw('quantity <= 10');
-                    });
-                });
-            } else {
-                $query->where(function ($q) {
-                    $q->whereColumn('stock_quantity', '<=', 'alert_quantity')
-                      ->orWhereColumn('stock_quantity', '<=', 'stock_alert')
-                      ->orWhereColumn('stock_quantity', '<=', 'low_qty')
-                      ->orWhere('stock_quantity', '<=', 10)
-                      ->orWhereHas('variants', function ($vq) {
-                          $vq->whereHas('stockBalances', function ($sbq) {
-                              $sbq->select('product_variant_id')
-                                  ->groupBy('product_variant_id')
-                                  ->havingRaw('COALESCE(SUM(quantity), 0) <= 10');
-                          });
-                      });
-                });
-            }
-        } elseif ($stockStatus === 'out_of_stock') {
-            if ($warehouseId !== null || !empty($allowedOutlets)) {
-                $scopeWh = $warehouseId !== null ? [$warehouseId] : $allowedOutlets;
-                $query->whereDoesntHave('stockBalances', fn($q) => $q->whereIn('warehouse_id', $scopeWh)->where('quantity', '>', 0));
-            } else {
-                $query->where(function ($q) {
-                    $q->where('stock_quantity', '<=', 0)
-                      ->orWhereHas('variants', function ($vq) {
-                          $vq->whereHas('stockBalances', function ($sbq) {
-                              $sbq->select('product_variant_id')
-                                  ->groupBy('product_variant_id')
-                                  ->havingRaw('COALESCE(SUM(quantity), 0) <= 0');
-                          });
-                      });
-                });
-            }
-        }
+        $this->applyStockStatusFilter($query, (string)$stockStatus, $warehouseId, $allowedOutlets);
 
         $idQuery = clone $query;
         $idQuery->setEagerLoads([])->reorder();
@@ -4288,72 +5348,86 @@ class ReportController extends Controller
     {
         $page = max(1, (int)$request->input('page', 1));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
-        $warehouse = $request->input('warehouse_name', 'All');
+        $rawLimit = $request->has('limit') ? (int)$request->input('limit') : 0;
+        $topCap = ($rawLimit > 0 && $rawLimit !== 50) ? $rawLimit : 0;
+        $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
+        $warehouseIdResolved = ($warehouse !== 'All' && !empty($warehouse)) ? $this->resolveWarehouseIdParam((string)$warehouse) : null;
         $category = $request->input('category_name', 'All');
         $startDate = $request->input('start_date');
         $endDate = $request->input('end_date');
         $search = trim((string)$request->input('search', ''));
         $sortBy = $request->input('sort_by', 'revenue');
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
         $canViewCost = $this->accounting()->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
-
-        $query = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
-        $this->applyActiveDocumentFilter($query, 'sales.status');
-        if (!empty($allowedOutlets)) {
-            $query->whereIn('sales.warehouse_id', $allowedOutlets);
+        if (!empty($allowedOutlets) && $warehouseIdResolved !== null && !in_array($warehouseIdResolved, $allowedOutlets, true)) {
+            return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
         }
-        $query->when($warehouse !== 'All' && !empty($warehouse), function ($q) use ($warehouse) {
+
+        $salesAgg = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
+        $this->applyActiveDocumentFilter($salesAgg, 'sales.status');
+        if (!empty($allowedOutlets)) {
+            $salesAgg->whereIn('sales.warehouse_id', $allowedOutlets);
+        }
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $salesAgg->where(function ($q) use ($warehouse, $warehouseIdResolved) {
                 $q->where('sales.warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null) {
+                    $q->orWhere('sales.warehouse_id', $warehouseIdResolved);
+                }
             });
-        $this->applyReportDateRange($query, $startDate, $endDate, 'sales.date');
+        }
+        $this->applyReportDateRange($salesAgg, $startDate, $endDate, 'sales.date');
+        $salesAggSelect = [
+            'sale_items.product_id',
+            DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_sold_quantity'),
+            DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales_revenue'),
+            DB::raw('COALESCE(SUM(COALESCE(NULLIF(sale_items.total_cogs, 0), sale_items.base_unit_cost * sale_items.quantity, 0)), 0) as total_sales_cogs'),
+        ];
+        if (!empty($search)) {
+            $salesAggSelect[] = DB::raw('MIN(sale_items.product_name) as si_product_name');
+            $salesAggSelect[] = DB::raw('MIN(sale_items.product_code) as si_product_code');
+        }
+        $salesAgg->select($salesAggSelect)->groupBy('sale_items.product_id');
+
+        $query = DB::query()
+            ->fromSub($salesAgg, 'sa')
+            ->leftJoin('products', 'sa.product_id', '=', 'products.id');
+
+        // Scope displayed stock_quantity to selected warehouse / RBAC outlets when active
+        $useWhStock = ($warehouseIdResolved !== null || !empty($allowedOutlets));
+        if ($useWhStock) {
+            $sbSub = DB::table('stock_balances')
+                ->select(['product_id', DB::raw('SUM(quantity) as wh_stock')])
+                ->groupBy('product_id');
+            if ($warehouseIdResolved !== null) {
+                $sbSub->where('warehouse_id', $warehouseIdResolved);
+            } elseif (!empty($allowedOutlets)) {
+                $sbSub->whereIn('warehouse_id', $allowedOutlets);
+            }
+            $query->leftJoinSub($sbSub, 'wh_sb', fn($j) => $j->on('wh_sb.product_id', '=', 'sa.product_id'));
+        }
+
         $query->when($category !== 'All' && !empty($category), function ($q) use ($category) {
                 $q->where('products.category_name', $category);
             })
             ->when(!empty($search), function ($q) use ($search) {
                 $q->where(function ($sq) use ($search) {
-                    $sq->where('sale_items.product_name', 'like', "%{$search}%")
-                       ->orWhere('sale_items.product_code', 'like', "%{$search}%")
-                       ->orWhere('products.name', 'like', "%{$search}%")
+                    $sq->where('products.name', 'like', "%{$search}%")
                        ->orWhere('products.code', 'like', "%{$search}%")
                        ->orWhere('products.alternative_name', 'like', "%{$search}%")
                        ->orWhere('products.brand_name', 'like', "%{$search}%")
-                       ->orWhere('products.category_name', 'like', "%{$search}%");
+                       ->orWhere('products.category_name', 'like', "%{$search}%")
+                       ->orWhere('sa.si_product_name', 'like', "%{$search}%")
+                       ->orWhere('sa.si_product_code', 'like', "%{$search}%");
                 });
-            })
-            ->select(
-                'sale_items.product_id',
-                'sale_items.product_name',
-                'sale_items.product_code',
-                'products.code as master_code',
-                'products.alternative_name',
-                'products.brand_name',
-                'products.category_name',
-                'products.cost_price',
-                'products.retail_price',
-                'products.stock_quantity',
-                'products.alert_quantity',
-                'products.has_variants',
-                'products.image_url',
-                DB::raw('COALESCE(SUM(sale_items.quantity), 0) as total_sold_quantity'),
-                DB::raw('COALESCE(SUM(sale_items.subtotal), 0) as total_sales_revenue')
-            )
-            ->groupBy(
-                'sale_items.product_id',
-                'sale_items.product_name',
-                'sale_items.product_code',
-                'products.code',
-                'products.alternative_name',
-                'products.brand_name',
-                'products.category_name',
-                'products.cost_price',
-                'products.retail_price',
-                'products.stock_quantity',
-                'products.alert_quantity',
-                'products.has_variants',
-                'products.image_url'
-            );
+            });
+
+        $stockSelect = $useWhStock
+            ? DB::raw('COALESCE(wh_sb.wh_stock, 0) as resolved_stock_quantity')
+            : DB::raw('COALESCE(products.stock_quantity, 0) as resolved_stock_quantity');
 
         // Deduct active completed Sale Returns matching the same branch / date filters before sorting & pagination
         $retByProd = [];
@@ -4365,10 +5439,17 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $srQ->whereIn('warehouse_id', $allowedOutlets);
         }
-        $srQ->when($warehouse !== 'All' && !empty($warehouse), fn($q) => $q->where('warehouse_name', $warehouse));
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $srQ->where(function ($q) use ($warehouse, $warehouseIdResolved) {
+                $q->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null) {
+                    $q->orWhere('warehouse_id', $warehouseIdResolved);
+                }
+            });
+        }
         $this->applyReportDateRange($srQ, $startDate, $endDate, 'date');
-        foreach ($srQ->select(['items_payload'])->cursor() as $srRow) {
-            $srItems = json_decode((string)$srRow->items_payload, true);
+        foreach ($srQ->pluck('items_payload') as $payloadStr) {
+            $srItems = json_decode((string)$payloadStr, true);
             if (!is_array($srItems)) {
                 continue;
             }
@@ -4387,39 +5468,43 @@ class ReportController extends Controller
             }
         }
 
-        $topProductsRaw = $query->get();
+        $selectColumns = [
+            'sa.product_id',
+            !empty($search)
+                ? DB::raw("COALESCE(NULLIF(products.name, ''), NULLIF(sa.si_product_name, ''), 'Product') as product_name")
+                : DB::raw("COALESCE(NULLIF(products.name, ''), '') as product_name"),
+            !empty($search)
+                ? DB::raw("COALESCE(NULLIF(products.code, ''), NULLIF(sa.si_product_code, ''), '') as product_code")
+                : DB::raw("COALESCE(NULLIF(products.code, ''), '') as product_code"),
+            'products.code as master_code',
+            'products.alternative_name',
+            'products.brand_name',
+            'products.category_name',
+            DB::raw('COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0) as master_cost_price'),
+            DB::raw('COALESCE(NULLIF(products.retail_price, 0), NULLIF(products.selling_price, 0), 0) as master_retail_price'),
+            $stockSelect,
+            'products.alert_quantity',
+            'products.has_variants',
+            'products.image_url',
+            'sa.total_sold_quantity',
+            'sa.total_sales_revenue',
+            'sa.total_sales_cogs',
+        ];
 
-        $topProducts = [];
-        $totalRevenue = 0.0;
-        $totalQuantity = 0.0;
-
-        foreach ($topProductsRaw as $p) {
-            $pid = (int)$p->product_id;
-            $retQty = $retByProd[$pid]['qty'] ?? 0.0;
-            $retRev = $retByProd[$pid]['rev'] ?? 0.0;
-            $rawSoldQty = (float)$p->total_sold_quantity;
-            $rawSalesRev = (float)$p->total_sales_revenue;
-            $deductQty = min($rawSoldQty, $retQty);
-            $deductRev = min($rawSalesRev, $retRev);
-            if ($pid > 0 && isset($retByProd[$pid])) {
-                $retByProd[$pid]['qty'] = max(0.0, $retQty - $deductQty);
-                $retByProd[$pid]['rev'] = max(0.0, $retRev - $deductRev);
-            }
-
-            $soldQty = round(max(0.0, $rawSoldQty - $deductQty), 4);
-            $salesRev = round(max(0.0, $rawSalesRev - $deductRev), 2);
-            if ($soldQty <= 0.0001) {
-                continue;
-            }
-            $totalQuantity += $soldQty;
-            $totalRevenue += $salesRev;
-
+        $formatProductRow = function ($p, float $soldQty, float $salesRev, float $salesCogs) use ($canViewCost): array {
             $code = $p->product_code ?: ($p->master_code ?: '');
-            $price = (float)($p->retail_price ?? ($soldQty > 0 ? ($salesRev / $soldQty) : 0));
+            // Use weighted-average realized selling price so Units Sold x Price reconciles with Net Revenue
+            $price = $soldQty > 0
+                ? round($salesRev / $soldQty, 2)
+                : (float)($p->master_retail_price ?? 0);
+            $masterCost = (float)($p->master_cost_price ?? 0);
+            $effectiveCogs = $salesCogs > 0 ? round($salesCogs, 2) : round($soldQty * $masterCost, 2);
+            $grossProfit = round($salesRev - $effectiveCogs, 2);
+            $marginPct = $salesRev > 0 ? round(($grossProfit / $salesRev) * 100, 2) : 0.0;
 
-            $topProducts[] = [
-                'product_id' => $pid,
-                'id' => $pid,
+            return [
+                'product_id' => (int)$p->product_id,
+                'id' => (int)$p->product_id,
                 'product_name' => $p->product_name ?: 'Product',
                 'name' => $p->product_name ?: 'Product',
                 'code' => $code,
@@ -4429,10 +5514,14 @@ class ReportController extends Controller
                 'brand' => $p->brand_name ?? 'Generic',
                 'category_name' => $p->category_name ?? 'General',
                 'category' => $p->category_name ?? 'General',
-                'cost_price' => $canViewCost ? (float)($p->cost_price ?? 0) : null,
+                'cost_price' => $canViewCost ? ($soldQty > 0 ? round($effectiveCogs / $soldQty, 2) : $masterCost) : null,
+                'total_cost' => $canViewCost ? $effectiveCogs : null,
+                'gross_profit' => $canViewCost ? $grossProfit : null,
+                'profit_margin' => $canViewCost ? $marginPct : null,
+                'cost_masked' => !$canViewCost,
                 'price' => $price,
                 'retail_price' => $price,
-                'stock_quantity' => (float)($p->stock_quantity ?? 0),
+                'stock_quantity' => (float)($p->resolved_stock_quantity ?? 0),
                 'alert_quantity' => (float)($p->alert_quantity ?? 0),
                 'has_variants' => (bool)($p->has_variants ?? false),
                 'total_sold_quantity' => $soldQty,
@@ -4442,23 +5531,237 @@ class ReportController extends Controller
                 'total_revenue' => $salesRev,
                 'image_url' => $p->image_url ?? '',
             ];
+        };
+
+        $offset = ($page - 1) * $perPage;
+        $pagedTopProducts = [];
+        $totalCount = 0;
+        $totalRevenue = 0.0;
+        $totalQuantity = 0.0;
+        $hasMore = false;
+
+        if (empty($retByProd)) {
+            // Fast SQL-level summary + LIMIT/OFFSET pagination when no matching sale returns exist
+            $countSqlQ = clone $query;
+            $countSqlQ->whereRaw('sa.total_sold_quantity > 0.0001');
+
+            $listSqlQ = clone $countSqlQ;
+            $listSqlQ->select($selectColumns);
+            if ($sortBy === 'quantity') {
+                $listSqlQ->orderByDesc('sa.total_sold_quantity')->orderByDesc('sa.total_sales_revenue');
+            } else {
+                $listSqlQ->orderByDesc('sa.total_sales_revenue')->orderByDesc('sa.total_sold_quantity');
+            }
+
+            if ($topCap > 0) {
+                if (!$skipSummary) {
+                    $cappedSub = (clone $listSqlQ)
+                        ->select(['sa.product_id', 'sa.total_sales_revenue', 'sa.total_sold_quantity'])
+                        ->limit($topCap);
+                    $agg = DB::query()->fromSub($cappedSub, 'ts_cap')->selectRaw('
+                        COUNT(*) as total_products,
+                        COALESCE(SUM(total_sales_revenue), 0) as total_revenue,
+                        COALESCE(SUM(total_sold_quantity), 0) as total_quantity
+                    ')->first();
+                    $totalCount = (int)($agg->total_products ?? 0);
+                    $totalRevenue = (float)($agg->total_revenue ?? 0.0);
+                    $totalQuantity = (float)($agg->total_quantity ?? 0.0);
+                } elseif ($knownTotal !== null && $page > 1) {
+                    $totalCount = min($knownTotal, $topCap);
+                } else {
+                    $totalCount = min((int)(clone $countSqlQ)->count(), $topCap);
+                }
+            } else {
+                if (!$skipSummary) {
+                    $agg = (clone $countSqlQ)->selectRaw('
+                        COUNT(*) as total_products,
+                        COALESCE(SUM(sa.total_sales_revenue), 0) as total_revenue,
+                        COALESCE(SUM(sa.total_sold_quantity), 0) as total_quantity
+                    ')->first();
+                    $totalCount = (int)($agg->total_products ?? 0);
+                    $totalRevenue = (float)($agg->total_revenue ?? 0.0);
+                    $totalQuantity = (float)($agg->total_quantity ?? 0.0);
+                } elseif ($knownTotal !== null && $page > 1) {
+                    $totalCount = $knownTotal;
+                } else {
+                    $totalCount = (int)(clone $countSqlQ)->count();
+                }
+            }
+
+            $remaining = $topCap > 0 ? max(0, $topCap - $offset) : $perPage;
+            $fetchLimit = min($perPage, $remaining);
+            if ($fetchLimit > 0) {
+                $rows = $listSqlQ->offset($offset)->limit($fetchLimit + 1)->get();
+                $hasMoreFromRows = $rows->count() > $fetchLimit;
+                $slice = $hasMoreFromRows ? $rows->slice(0, $fetchLimit) : $rows;
+                // Fallback name/code lookup only for deleted products without products row
+                $missingPids = $slice->filter(fn($r) => empty($r->product_name))->pluck('product_id')->all();
+                $fallbackByPid = [];
+                if (!empty($missingPids)) {
+                    $fallbackByPid = DB::table('sale_items')
+                        ->whereIn('product_id', $missingPids)
+                        ->select(['product_id', DB::raw('MIN(product_name) as pn'), DB::raw('MIN(product_code) as pc')])
+                        ->groupBy('product_id')
+                        ->get()
+                        ->keyBy('product_id');
+                }
+                foreach ($slice as $p) {
+                    if (empty($p->product_name) && isset($fallbackByPid[$p->product_id])) {
+                        $p->product_name = $fallbackByPid[$p->product_id]->pn ?: 'Product';
+                        if (empty($p->product_code)) {
+                            $p->product_code = $fallbackByPid[$p->product_id]->pc ?: '';
+                        }
+                    } elseif (empty($p->product_name)) {
+                        $p->product_name = 'Product';
+                    }
+                    $soldQty = round((float)$p->total_sold_quantity, 4);
+                    $salesRev = round((float)$p->total_sales_revenue, 2);
+                    $salesCogs = (float)($p->total_sales_cogs ?? 0);
+                    $pagedTopProducts[] = $formatProductRow($p, $soldQty, $salesRev, $salesCogs);
+                }
+                $hasMore = ($topCap > 0)
+                    ? (($offset + count($pagedTopProducts)) < $topCap && $hasMoreFromRows)
+                    : (($offset + count($pagedTopProducts)) < $totalCount);
+            }
+        } else {
+            // Lightweight numeric-only scan to compute net qty/revenue after returns before hydrating ONLY the <= 50 page products
+            $aggRaw = (clone $query)->select([
+                'sa.product_id',
+                'sa.total_sold_quantity',
+                'sa.total_sales_revenue',
+                'sa.total_sales_cogs',
+            ])->get();
+            $rankedTuples = [];
+
+            foreach ($aggRaw as $p) {
+                $pid = (int)$p->product_id;
+                $retQty = $retByProd[$pid]['qty'] ?? 0.0;
+                $retRev = $retByProd[$pid]['rev'] ?? 0.0;
+                $rawSoldQty = (float)$p->total_sold_quantity;
+                $rawSalesRev = (float)$p->total_sales_revenue;
+                $rawSalesCogs = (float)($p->total_sales_cogs ?? 0);
+                $deductQty = min($rawSoldQty, $retQty);
+                $deductRev = min($rawSalesRev, $retRev);
+                if ($pid > 0 && isset($retByProd[$pid])) {
+                    $retByProd[$pid]['qty'] = max(0.0, $retQty - $deductQty);
+                    $retByProd[$pid]['rev'] = max(0.0, $retRev - $deductRev);
+                }
+
+                $soldQty = round(max(0.0, $rawSoldQty - $deductQty), 4);
+                $salesRev = round(max(0.0, $rawSalesRev - $deductRev), 2);
+                if ($soldQty <= 0.0001) {
+                    continue;
+                }
+                $netCogs = ($rawSoldQty > 0 && $rawSalesCogs > 0)
+                    ? ($rawSalesCogs * ($soldQty / $rawSoldQty))
+                    : 0.0;
+
+                // [0]=pid, [1]=soldQty, [2]=salesRev, [3]=netCogs
+                $rankedTuples[] = [$pid, $soldQty, $salesRev, $netCogs];
+            }
+
+            usort($rankedTuples, function ($a, $b) use ($sortBy) {
+                if ($sortBy === 'quantity') {
+                    $cmp = $b[1] <=> $a[1];
+                    return $cmp !== 0 ? $cmp : ($b[2] <=> $a[2]);
+                }
+                $cmp = $b[2] <=> $a[2];
+                return $cmp !== 0 ? $cmp : ($b[1] <=> $a[1]);
+            });
+
+            if ($topCap > 0 && count($rankedTuples) > $topCap) {
+                $rankedTuples = array_slice($rankedTuples, 0, $topCap);
+            }
+            if (!$skipSummary) {
+                foreach ($rankedTuples as $tp) {
+                    $totalQuantity += $tp[1];
+                    $totalRevenue += $tp[2];
+                }
+            }
+
+            $totalCount = ($skipSummary && $knownTotal !== null && $page > 1 && $topCap === 0)
+                ? $knownTotal
+                : count($rankedTuples);
+            $pageTuples = array_slice($rankedTuples, $offset, $perPage);
+            $pagePids = array_values(array_unique(array_column($pageTuples, 0)));
+
+            if (!empty($pagePids)) {
+                // Direct PK-indexed product hydration (~2ms instead of re-running the full sales JOIN subquery!)
+                $prodQ = DB::table('products')->whereIn('id', $pagePids);
+                if ($useWhStock) {
+                    $sbHydrateSub = DB::table('stock_balances')
+                        ->select(['product_id', DB::raw('SUM(quantity) as wh_stock')])
+                        ->whereIn('product_id', $pagePids)
+                        ->groupBy('product_id');
+                    if ($warehouseIdResolved !== null) {
+                        $sbHydrateSub->where('warehouse_id', $warehouseIdResolved);
+                    } elseif (!empty($allowedOutlets)) {
+                        $sbHydrateSub->whereIn('warehouse_id', $allowedOutlets);
+                    }
+                    $prodQ->leftJoinSub($sbHydrateSub, 'wh_sb', fn($j) => $j->on('wh_sb.product_id', '=', 'products.id'));
+                    $hydrateStockSel = DB::raw('COALESCE(wh_sb.wh_stock, 0) as resolved_stock_quantity');
+                } else {
+                    $hydrateStockSel = DB::raw('COALESCE(products.stock_quantity, 0) as resolved_stock_quantity');
+                }
+
+                $hydratedById = [];
+                $prodRows = $prodQ->select([
+                    'products.id as product_id',
+                    'products.name as product_name',
+                    'products.code as product_code',
+                    'products.code as master_code',
+                    'products.alternative_name',
+                    'products.brand_name',
+                    'products.category_name',
+                    DB::raw('COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0) as master_cost_price'),
+                    DB::raw('COALESCE(NULLIF(products.retail_price, 0), NULLIF(products.selling_price, 0), 0) as master_retail_price'),
+                    $hydrateStockSel,
+                    'products.alert_quantity',
+                    'products.has_variants',
+                    'products.image_url',
+                ])->get();
+                foreach ($prodRows as $pr) {
+                    $hydratedById[(int)$pr->product_id] = $pr;
+                }
+
+                // Fallback only if any top-selling product record was hard-deleted from products table
+                $missingIds = array_values(array_diff($pagePids, array_keys($hydratedById)));
+                if (!empty($missingIds)) {
+                    $siFallbacks = DB::table('sale_items')
+                        ->whereIn('product_id', $missingIds)
+                        ->select(['product_id', DB::raw('MIN(product_name) as pn'), DB::raw('MIN(product_code) as pc')])
+                        ->groupBy('product_id')
+                        ->get();
+                    foreach ($siFallbacks as $sf) {
+                        $hydratedById[(int)$sf->product_id] = (object)[
+                            'product_id' => (int)$sf->product_id,
+                            'product_name' => $sf->pn ?: 'Product',
+                            'product_code' => $sf->pc ?: '',
+                            'master_code' => $sf->pc ?: '',
+                            'alternative_name' => '',
+                            'brand_name' => 'Generic',
+                            'category_name' => 'General',
+                            'master_cost_price' => 0.0,
+                            'master_retail_price' => 0.0,
+                            'resolved_stock_quantity' => 0.0,
+                            'alert_quantity' => 0.0,
+                            'has_variants' => false,
+                            'image_url' => '',
+                        ];
+                    }
+                }
+
+                foreach ($pageTuples as $tp) {
+                    $row = $hydratedById[$tp[0]] ?? null;
+                    if ($row !== null) {
+                        $pagedTopProducts[] = $formatProductRow($row, $tp[1], $tp[2], $tp[3]);
+                    }
+                }
+            }
+            $hasMore = ($offset + count($pagedTopProducts)) < $totalCount;
         }
 
-        usort($topProducts, function ($a, $b) use ($sortBy) {
-            if ($sortBy === 'quantity') {
-                $cmp = $b['total_sold_quantity'] <=> $a['total_sold_quantity'];
-                return $cmp !== 0 ? $cmp : ($b['total_sales_revenue'] <=> $a['total_sales_revenue']);
-            }
-            $cmp = $b['total_sales_revenue'] <=> $a['total_sales_revenue'];
-            return $cmp !== 0 ? $cmp : ($b['total_sold_quantity'] <=> $a['total_sold_quantity']);
-        });
-
-        $totalCount = count($topProducts);
         $lastPage = max(1, (int)ceil($totalCount / max(1, $perPage)));
-        $offset = ($page - 1) * $perPage;
-        $pagedTopProducts = array_values(array_slice($topProducts, $offset, $perPage));
-        $hasMore = ($offset + count($pagedTopProducts)) < $totalCount;
-
         $globalProductsCount = $totalCount;
         $globalTotalRevenue = round($totalRevenue, 2);
         $globalTotalQuantity = round($totalQuantity, 2);
@@ -5767,6 +7070,7 @@ class ReportController extends Controller
         }
         $category = trim((string)$request->input('category', $request->input('category_name', 'All')));
         $search = trim((string)$request->input('search', ''));
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $page = max(1, (int)$request->input('page', 1));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
@@ -5777,6 +7081,8 @@ class ReportController extends Controller
             : "CONCAT(products.name, ' (', product_variants.name, ')')";
 
         $buildAlertQuery = function () use ($threshold, $scopeWhIds, $category, $search, $hasVariantsTable, $varNameExpr) {
+            $effProdThreshold = 'COALESCE(NULLIF(products.alert_quantity, 0), NULLIF(products.stock_alert, 0), NULLIF(products.low_qty, 0), ?)';
+            $effSimpleThreshold = 'COALESCE(NULLIF(alert_quantity, 0), NULLIF(stock_alert, 0), NULLIF(low_qty, 0), ?)';
             if (!empty($scopeWhIds)) {
                 $singleQuery = DB::table('products')
                     ->leftJoin('stock_balances', function ($join) use ($scopeWhIds) {
@@ -5804,7 +7110,7 @@ class ReportController extends Controller
                         COALESCE(NULLIF(products.code, ''), products.sku, '') as sku,
                         COALESCE(products.category_name, 'General') as category,
                         COALESCE(SUM(stock_balances.quantity), 0) as current_stock,
-                        COALESCE(NULLIF(products.alert_quantity, 0), NULLIF(products.stock_alert, 0), NULLIF(products.low_qty, 0), ?) as min_stock,
+                        {$effProdThreshold} as min_stock,
                         COALESCE(products.unit_name, 'pcs') as unit,
                         0 as is_variant
                     ", [$threshold])
@@ -5812,15 +7118,15 @@ class ReportController extends Controller
                         'products.id', 'products.name', 'products.code', 'products.sku', 'products.category_name',
                         'products.unit_name', 'products.alert_quantity', 'products.stock_alert', 'products.low_qty'
                     )
-                    ->havingRaw('COALESCE(SUM(stock_balances.quantity), 0) <= ?', [$threshold]);
+                    ->havingRaw("COALESCE(SUM(stock_balances.quantity), 0) <= {$effProdThreshold}", [$threshold]);
             } else {
                 $singleQuery = DB::table('products')
                     ->where(function ($q) {
                         $q->where('has_variants', false)->orWhereNull('has_variants');
                     })
                     ->whereNull('deleted_at')
-                    ->where(function ($q) use ($threshold) {
-                        $q->where('stock_quantity', '<=', $threshold)
+                    ->where(function ($q) use ($threshold, $effSimpleThreshold) {
+                        $q->whereRaw("COALESCE(stock_quantity, 0) <= {$effSimpleThreshold}", [$threshold])
                           ->orWhere('stock_quantity', '<=', 0);
                     });
                 if ($category !== '' && $category !== 'All') {
@@ -5839,7 +7145,7 @@ class ReportController extends Controller
                     COALESCE(NULLIF(code, ''), sku, '') as sku,
                     COALESCE(category_name, 'General') as category,
                     COALESCE(stock_quantity, 0) as current_stock,
-                    COALESCE(NULLIF(alert_quantity, 0), NULLIF(stock_alert, 0), NULLIF(low_qty, 0), ?) as min_stock,
+                    {$effSimpleThreshold} as min_stock,
                     COALESCE(unit_name, 'pcs') as unit,
                     0 as is_variant
                 ", [$threshold]);
@@ -5874,7 +7180,7 @@ class ReportController extends Controller
                         COALESCE(NULLIF(product_variants.sku, ''), products.code, '') as sku,
                         COALESCE(products.category_name, 'General') as category,
                         COALESCE(SUM(stock_balances.quantity), 0) as current_stock,
-                        COALESCE(NULLIF(products.alert_quantity, 0), NULLIF(products.stock_alert, 0), NULLIF(products.low_qty, 0), ?) as min_stock,
+                        {$effProdThreshold} as min_stock,
                         COALESCE(products.unit_name, 'pcs') as unit,
                         1 as is_variant
                     ", [$threshold])
@@ -5883,7 +7189,7 @@ class ReportController extends Controller
                         'products.code', 'products.category_name', 'products.unit_name',
                         'products.alert_quantity', 'products.stock_alert', 'products.low_qty'
                     )
-                    ->havingRaw('COALESCE(SUM(stock_balances.quantity), 0) <= ?', [$threshold]);
+                    ->havingRaw("COALESCE(SUM(stock_balances.quantity), 0) <= {$effProdThreshold}", [$threshold]);
 
                 return $singleQuery->unionAll($varQ);
             }
@@ -5891,7 +7197,6 @@ class ReportController extends Controller
             return $singleQuery;
         };
 
-        $totalCount = $knownTotal ?? (int)DB::query()->fromSub($buildAlertQuery(), 'alerts')->count();
         $rows = DB::query()
             ->fromSub($buildAlertQuery(), 'alerts')
             ->orderBy('current_stock', 'asc')
@@ -5903,6 +7208,15 @@ class ReportController extends Controller
 
         $hasMore = $rows->count() > $perPage;
         $pageRows = $hasMore ? $rows->slice(0, $perPage)->values() : $rows->values();
+        if (!$hasMore && ($page === 1 || $knownTotal === null)) {
+            $totalCount = (($page - 1) * $perPage) + $pageRows->count();
+        } elseif ($knownTotal !== null && ($skipSummary || $page > 1)) {
+            $totalCount = $knownTotal;
+        } elseif ($knownTotal !== null) {
+            $totalCount = $knownTotal;
+        } else {
+            $totalCount = (int)DB::query()->fromSub($buildAlertQuery(), 'alerts')->count();
+        }
         $items = $pageRows->map(function ($r) {
             return [
                 'id' => (int)$r->id,
@@ -5938,11 +7252,12 @@ class ReportController extends Controller
      */
     public function saleReturnsReport(Request $request)
     {
+        $accounting = $this->accounting();
         $warehouse = $request->input('warehouse', 'All');
         $customer = $request->input('customer', 'All');
         $status = $request->input('status', 'All');
         $paymentStatus = $request->input('payment_status', 'All');
-        $paymentType = $request->input('payment_type', 'All');
+        $paymentType = $request->input('payment_type') ?? $request->input('refund_method', 'All');
         $userName = $request->input('user_name', 'All');
         $startDate = $request->input('start_date') ?? $request->input('date_from');
         $endDate = $request->input('end_date') ?? $request->input('date_to');
@@ -5953,22 +7268,67 @@ class ReportController extends Controller
         $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
         $allowedOutlets = $this->extractAllowedOutletIds($request);
 
+        // Enforce outlet branch isolation (403) before executing queries
+        $requestedWhId = null;
+        if ($warehouse !== 'All' && !empty($warehouse)) {
+            $requestedWhId = $this->resolveWarehouseIdParam((string)$warehouse);
+            if (!empty($allowedOutlets)) {
+                if ($requestedWhId !== null && !in_array($requestedWhId, $allowedOutlets, true)) {
+                    return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                }
+                if ($requestedWhId === null && is_numeric($warehouse) && !in_array((int)$warehouse, $allowedOutlets, true)) {
+                    return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                }
+                if ($requestedWhId === null && !is_numeric($warehouse)) {
+                    $allowedNames = DB::table('outlets')
+                        ->whereIn('id', $allowedOutlets)
+                        ->pluck('name')
+                        ->map(fn ($n) => strtolower(trim((string)$n)))
+                        ->all();
+                    if (!in_array(strtolower(trim((string)$warehouse)), $allowedNames, true)) {
+                        return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+                    }
+                }
+            }
+        }
+        if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
+            $explicitWhId = (int)$request->input('warehouse_id');
+            if (!empty($allowedOutlets) && !in_array($explicitWhId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized outlet access.'], 403);
+            }
+        }
+
         $query = DB::table('sale_returns');
         if (!empty($allowedOutlets)) {
             $query->whereIn('warehouse_id', $allowedOutlets);
         }
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where(function ($q) use ($warehouse) {
-                $q->where('warehouse_id', $warehouse)
-                  ->orWhere('warehouse_name', $warehouse);
-            });
+            $whId = $requestedWhId;
+            if ($whId !== null) {
+                $query->where(function ($q) use ($warehouse, $whId) {
+                    $q->where('warehouse_id', $whId)
+                      ->orWhere('warehouse_name', $warehouse);
+                });
+            } elseif (is_numeric($warehouse)) {
+                $query->where('warehouse_id', -1);
+            } else {
+                $query->where('warehouse_name', $warehouse);
+            }
+        }
+
+        if ($request->filled('warehouse_id') && $request->input('warehouse_id') !== 'All') {
+            $query->where('warehouse_id', (int)$request->input('warehouse_id'));
         }
 
         if ($customer !== 'All' && !empty($customer)) {
             $query->where(function ($q) use ($customer) {
-                $q->where('customer_id', $customer)
-                  ->orWhere('customer_name', $customer);
+                if (is_numeric($customer)) {
+                    $q->where('customer_id', (int)$customer)
+                      ->orWhere('customer_name', (string)$customer);
+                } else {
+                    $q->where('customer_name', $customer);
+                }
             });
         }
 
@@ -5982,12 +7342,30 @@ class ReportController extends Controller
             $query->where('payment_status', $paymentStatus);
         }
 
-        if ($paymentType !== 'All' && !empty($paymentType)) {
-            $query->where('payment_type', $paymentType);
+        $hasPaymentTypeFilter = $paymentType !== 'All' && !empty($paymentType);
+        $isSplitFilter = $hasPaymentTypeFilter && strcasecmp((string)$paymentType, 'Split Payment') === 0;
+        $isStoreCreditFilter = $hasPaymentTypeFilter && strcasecmp((string)$paymentType, 'Store Credit') === 0;
+
+        if ($hasPaymentTypeFilter) {
+            $query->where(function ($q) use ($paymentType, $isSplitFilter, $isStoreCreditFilter) {
+                $q->where('payment_type', $paymentType)
+                  ->orWhere('refund_tender', $paymentType);
+                if ($isStoreCreditFilter) {
+                    $q->orWhere('due_amount', '>', 0.005);
+                } elseif (!$isSplitFilter) {
+                    $q->orWhere(function ($sq) use ($paymentType) {
+                        $sq->where('payment_type', 'Split Payment')
+                           ->where('payments_payload', 'like', '%' . addcslashes((string)$paymentType, '%_\\') . '%');
+                    });
+                }
+            });
         }
 
         if ($userName !== 'All' && !empty($userName)) {
-            $query->where('created_by', $userName);
+            $query->where(function ($q) use ($userName) {
+                $q->where('created_by', $userName)
+                  ->orWhere('user_name', $userName);
+            });
         }
 
         $this->applyReportDateRange($query, $startDate, $endDate, 'date');
@@ -5998,7 +7376,9 @@ class ReportController extends Controller
                   ->orWhere('sale_reference_no', 'like', "%{$search}%")
                   ->orWhere('customer_name', 'like', "%{$search}%")
                   ->orWhere('warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('return_reason', 'like', "%{$search}%")
                   ->orWhere('created_by', 'like', "%{$search}%")
+                  ->orWhere('user_name', 'like', "%{$search}%")
                   ->orWhere('notes', 'like', "%{$search}%");
             });
         }
@@ -6007,85 +7387,114 @@ class ReportController extends Controller
         $totalReturnedAmt = 0.0;
         $totalPaidAmt = 0.0;
         $totalDueAmt = 0.0;
+        $cashRefunded = 0.0;
+        $digitalRefunded = 0.0;
         $avgReturnAmt = 0.0;
         $byPaymentMethodList = [];
         $byProductList = [];
 
-        if (!$skipSummary) {
-            // High-Performance KPI Aggregation in Single DB Query
-            $summary = (clone $query)->selectRaw('
-                COUNT(*) as total_returns,
-                COALESCE(SUM(grand_total), 0) as total_returned_amount,
-                COALESCE(SUM(paid_amount), 0) as total_paid_amount,
-                COALESCE(SUM(due_amount), 0) as total_due_amount
-            ')->first();
-
-            $totalReturnsCount = (int)($summary->total_returns ?? 0);
-            $totalReturnedAmt = (float)($summary->total_returned_amount ?? 0);
-            $totalPaidAmt = (float)($summary->total_paid_amount ?? 0);
-            $totalDueAmt = (float)($summary->total_due_amount ?? 0);
-            $avgReturnAmt = $totalReturnsCount > 0 ? round($totalReturnedAmt / $totalReturnsCount, 2) : 0.0;
-
-            // Breakdown by Refund Tender / Payment Method
-            $paymentBreakdown = (clone $query)->select(
-                DB::raw("COALESCE(NULLIF(payment_type, ''), 'Cash') as method_name"),
-                DB::raw('COUNT(*) as count'),
-                DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded'),
-                DB::raw('COALESCE(SUM(grand_total), 0) as total_returned')
-            )
-            ->groupBy('method_name')
-            ->orderByDesc('total_refunded')
-            ->get();
-
-            foreach ($paymentBreakdown as $pb) {
-                $pRefunded = (float)$pb->total_refunded;
-                $byPaymentMethodList[] = [
-                    'payment_type' => $pb->method_name,
-                    'count' => (int)$pb->count,
-                    'total' => $pRefunded,
-                    'total_amount' => $pRefunded,
-                    'total_returned' => (float)$pb->total_returned,
-                    'percentage' => $totalPaidAmt > 0 ? round(($pRefunded / $totalPaidAmt) * 100, 2) : 0.0,
-                ];
-            }
-
-            // Streaming Breakdown by Product across full filtered scope (no arbitrary 1,000-row cutoff)
+        if (!$skipSummary && $page === 1) {
+            // Single streaming pass computes KPI totals + tender reconciliation + by-product breakdown together (avoids double scan)
+            $tenderMap = [];
             $productMap = [];
             $payloadCursor = (clone $query)
-                ->whereNotNull('items_payload')
-                ->where('items_payload', '!=', '')
-                ->where('items_payload', '!=', '[]')
-                ->select(['items_payload'])
+                ->select([
+                    'id',
+                    'grand_total',
+                    'paid_amount',
+                    'due_amount',
+                    'payment_type',
+                    DB::raw("CASE WHEN payment_type = 'Split Payment' THEN payments_payload ELSE NULL END as payments_payload"),
+                    'items_payload',
+                ])
                 ->cursor();
+
             foreach ($payloadCursor as $row) {
-                $decoded = json_decode((string)$row->items_payload, true);
-                if (!is_array($decoded)) {
-                    continue;
+                $rowId = (int)$row->id;
+                $rowGrand = (float)($row->grand_total ?? 0);
+                $rowPaid = (float)($row->paid_amount ?? 0);
+                $rowDue = (float)($row->due_amount ?? 0);
+                $fallbackMethod = trim((string)($row->payment_type ?? ''));
+                if ($fallbackMethod === '') {
+                    $fallbackMethod = 'Cash';
                 }
-                foreach ($decoded as $item) {
-                    if (!is_array($item)) {
-                        continue;
+
+                $totalReturnsCount++;
+                $totalReturnedAmt += $rowGrand;
+                $totalPaidAmt += $rowPaid;
+                $totalDueAmt += $rowDue;
+
+                $this->accumulateReturnTenderRow(
+                    $tenderMap,
+                    $rowId,
+                    $rowGrand,
+                    $rowPaid,
+                    $fallbackMethod,
+                    $row->payments_payload ?? null,
+                    'Store Credit'
+                );
+
+                if (!empty($row->items_payload) && $row->items_payload !== '[]') {
+                    $decoded = is_string($row->items_payload)
+                        ? json_decode($row->items_payload, true)
+                        : $row->items_payload;
+                    if (is_array($decoded)) {
+                        foreach ($decoded as $item) {
+                            if (!is_array($item)) {
+                                continue;
+                            }
+                            $pName = (string)($item['product_name'] ?? $item['name'] ?? 'Returned Item');
+                            $pCode = (string)($item['product_code'] ?? $item['code'] ?? 'SKU-001');
+                            $qty = (float)($item['quantity'] ?? $item['qty'] ?? 1);
+                            $subtotal = (float)($item['subtotal'] ?? $item['total'] ?? ($qty * (float)($item['unit_price'] ?? 0)));
+                            $key = $pCode . '|' . $pName;
+                            if (!isset($productMap[$key])) {
+                                $productMap[$key] = [
+                                    'product_name' => $pName,
+                                    'product_code' => $pCode,
+                                    'quantity' => 0.0,
+                                    'total_amount' => 0.0,
+                                ];
+                            }
+                            $productMap[$key]['quantity'] += $qty;
+                            $productMap[$key]['total_amount'] += $subtotal;
+                        }
                     }
-                    $pName = (string)($item['product_name'] ?? $item['name'] ?? 'Returned Item');
-                    $pCode = (string)($item['product_code'] ?? $item['code'] ?? 'SKU-001');
-                    $qty = (float)($item['quantity'] ?? $item['qty'] ?? 1);
-                    $subtotal = (float)($item['subtotal'] ?? $item['total'] ?? ($qty * (float)($item['unit_price'] ?? 0)));
-                    $key = $pCode . '|' . $pName;
-                    if (!isset($productMap[$key])) {
-                        $productMap[$key] = [
-                            'product_name' => $pName,
-                            'product_code' => $pCode,
-                            'quantity' => 0.0,
-                            'total_amount' => 0.0,
-                        ];
-                    }
-                    $productMap[$key]['quantity'] += $qty;
-                    $productMap[$key]['total_amount'] += $subtotal;
                 }
             }
 
+            $totalReturnedAmt = round($totalReturnedAmt, 2);
+            $totalPaidAmt = round($totalPaidAmt, 2);
+            $totalDueAmt = round($totalDueAmt, 2);
+            $avgReturnAmt = $totalReturnsCount > 0 ? round($totalReturnedAmt / $totalReturnsCount, 2) : 0.0;
+
+            $tenderPercentDenominator = $totalPaidAmt > 0 ? $totalPaidAmt : $totalReturnedAmt;
+            foreach ($tenderMap as $methodName => $pb) {
+                $pRefunded = round((float)$pb['total_refunded'], 2);
+                $pReturned = round((float)$pb['total_returned'], 2);
+                if ($accounting->isCashPaymentType($methodName)) {
+                    $cashRefunded += $pRefunded;
+                } elseif (!in_array(strtolower($methodName), ['', 'store credit', 'credit note', 'unpaid', 'n/a', 'split payment'], true)) {
+                    $digitalRefunded += $pRefunded;
+                }
+                $byPaymentMethodList[] = [
+                    'payment_type' => $methodName,
+                    'count' => count($pb['voucher_ids']),
+                    'total' => $pRefunded,
+                    'total_amount' => $pRefunded,
+                    'total_returned' => $pReturned,
+                    'percentage' => $totalPaidAmt > 0
+                        ? round(($pRefunded / $totalPaidAmt) * 100, 2)
+                        : ($tenderPercentDenominator > 0 ? round(($pReturned / $tenderPercentDenominator) * 100, 2) : 0.0),
+                ];
+            }
+            usort($byPaymentMethodList, static function ($a, $b) {
+                $cmp = $b['total_amount'] <=> $a['total_amount'];
+                return $cmp !== 0 ? $cmp : ($b['total_returned'] <=> $a['total_returned']);
+            });
+
             foreach ($productMap as $prod) {
-                $amt = (float)$prod['total_amount'];
+                $amt = round((float)$prod['total_amount'], 2);
                 $byProductList[] = [
                     'product_name' => $prod['product_name'],
                     'product_code' => $prod['product_code'],
@@ -6095,9 +7504,7 @@ class ReportController extends Controller
                     'percentage' => $totalReturnedAmt > 0 ? round(($amt / $totalReturnedAmt) * 100, 2) : 0.0,
                 ];
             }
-            usort($byProductList, function ($a, $b) {
-                return $b['total_amount'] <=> $a['total_amount'];
-            });
+            usort($byProductList, static fn($a, $b) => $b['total_amount'] <=> $a['total_amount']);
         } elseif ($knownTotal !== null) {
             $totalReturnsCount = $knownTotal;
         } else {
@@ -6154,6 +7561,75 @@ class ReportController extends Controller
             ];
         })->all();
 
+        $availableCustomers = [];
+        $availablePaymentTypes = [];
+        $availableUsers = [];
+        if (!$skipSummary && $page === 1) {
+            // Index-fast lookups instead of unindexed full-table scans on sale_returns.customer_name / coalesce(user_name, created_by)
+            $customerNames = DB::table('customers')
+                ->whereNotNull('name')
+                ->where('name', '!=', '')
+                ->orderBy('name')
+                ->limit(500)
+                ->pluck('name')
+                ->merge(
+                    DB::table('sale_returns')
+                        ->whereNull('customer_id')
+                        ->whereNotNull('customer_name')
+                        ->where('customer_name', '!=', '')
+                        ->distinct()
+                        ->limit(50)
+                        ->pluck('customer_name')
+                )
+                ->map(fn ($v) => trim((string)$v))
+                ->filter(fn ($v) => $v !== '')
+                ->unique()
+                ->values()
+                ->all();
+            natcasesort($customerNames);
+            $availableCustomers = array_values($customerNames);
+
+            $availablePaymentTypes = DB::table('sale_returns')
+                ->whereNotNull('payment_type')
+                ->where('payment_type', '!=', '')
+                ->distinct()
+                ->limit(50)
+                ->pluck('payment_type')
+                ->merge(
+                    DB::table('sale_returns')
+                        ->whereNotNull('refund_tender')
+                        ->where('refund_tender', '!=', '')
+                        ->distinct()
+                        ->limit(50)
+                        ->pluck('refund_tender')
+                )
+                ->unique()
+                ->sort()
+                ->values()
+                ->all();
+
+            $userNamesList = DB::table('sale_returns')
+                ->whereNotNull('created_by')
+                ->where('created_by', '!=', '')
+                ->distinct()
+                ->limit(200)
+                ->pluck('created_by')
+                ->merge(
+                    DB::table('users')
+                        ->whereNotNull('name')
+                        ->where('name', '!=', '')
+                        ->limit(200)
+                        ->pluck('name')
+                )
+                ->map(fn ($v) => trim((string)$v))
+                ->filter(fn ($v) => $v !== '')
+                ->unique()
+                ->values()
+                ->all();
+            natcasesort($userNamesList);
+            $availableUsers = array_values($userNamesList);
+        }
+
         return $this->noStoreJson([
             'status' => 'success',
             'summary' => [
@@ -6161,8 +7637,14 @@ class ReportController extends Controller
                 'total_returned_amount' => $totalReturnedAmt,
                 'total_paid_amount' => $totalPaidAmt,
                 'total_due_amount' => $totalDueAmt,
+                'cash_refunded' => round($cashRefunded, 2),
+                'digital_refunded' => round($digitalRefunded, 2),
+                'store_credit_issued' => $totalDueAmt,
                 'average_return_amount' => $avgReturnAmt,
             ],
+            'available_customers' => $availableCustomers,
+            'available_payment_types' => $availablePaymentTypes,
+            'available_users' => $availableUsers,
             'data' => $items,
             'by_product' => $byProductList,
             'by_refund_tender' => $byPaymentMethodList,
@@ -6187,7 +7669,7 @@ class ReportController extends Controller
         $supplier = $request->input('supplier') ?? $request->input('supplier_id') ?? 'All';
         $status = $request->input('status', 'All');
         $paymentStatus = $request->input('payment_status', 'All');
-        $paymentType = $request->input('payment_type', 'All');
+        $paymentType = $request->input('payment_type') ?? $request->input('refund_method', 'All');
         $userName = $request->input('user_name') ?? $request->input('created_by') ?? 'All';
         $startDate = $request->input('start_date') ?? $request->input('date_from');
         $endDate = $request->input('end_date') ?? $request->input('date_to');
@@ -6202,6 +7684,27 @@ class ReportController extends Controller
         $accounting = $this->accounting();
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
+        $resolvedWarehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
+        if (!empty($allowedOutlets)) {
+            if ($resolvedWarehouseId !== null && !in_array($resolvedWarehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                if ($resolvedWarehouseId === null && is_numeric($warehouse) && !in_array((int)$warehouse, $allowedOutlets, true)) {
+                    return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+                }
+                if ($resolvedWarehouseId === null && !is_numeric($warehouse)) {
+                    $allowedNames = DB::table('outlets')
+                        ->whereIn('id', $allowedOutlets)
+                        ->pluck('name')
+                        ->map(fn ($n) => strtolower(trim((string)$n)))
+                        ->all();
+                    if (!in_array(strtolower(trim((string)$warehouse)), $allowedNames, true)) {
+                        return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+                    }
+                }
+            }
+        }
 
         $query = DB::table('purchase_returns');
         if (!empty($allowedOutlets)) {
@@ -6209,17 +7712,23 @@ class ReportController extends Controller
         }
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where(function ($q) use ($warehouse) {
-                $q->where('warehouse_id', $warehouse)
-                  ->orWhere('outlet_id', $warehouse)
-                  ->orWhere('warehouse_name', $warehouse);
+            $query->where(function ($q) use ($warehouse, $resolvedWarehouseId) {
+                $q->where('warehouse_name', (string)$warehouse);
+                if ($resolvedWarehouseId !== null) {
+                    $q->orWhere('warehouse_id', $resolvedWarehouseId)
+                      ->orWhere('outlet_id', $resolvedWarehouseId);
+                }
             });
         }
 
         if ($supplier !== 'All' && !empty($supplier)) {
             $query->where(function ($q) use ($supplier) {
-                $q->where('supplier_id', $supplier)
-                  ->orWhere('supplier_name', $supplier);
+                if (is_numeric($supplier)) {
+                    $q->where('supplier_id', (int)$supplier)
+                      ->orWhere('supplier_name', (string)$supplier);
+                } else {
+                    $q->where('supplier_name', (string)$supplier);
+                }
             });
         }
 
@@ -6241,7 +7750,9 @@ class ReportController extends Controller
         if ($paymentType !== 'All' && !empty($paymentType)) {
             $query->where(function ($q) use ($paymentType) {
                 $q->where('payment_type', $paymentType);
-                if ($paymentType !== 'Split Payment') {
+                if (strcasecmp((string)$paymentType, 'Credit Note') === 0) {
+                    $q->orWhere('due_amount', '>', 0.005);
+                } elseif ($paymentType !== 'Split Payment') {
                     $q->orWhere(function ($sq) use ($paymentType) {
                         $sq->where('payment_type', 'Split Payment')
                            ->where('payments_payload', 'like', '%' . addcslashes((string)$paymentType, '%_\\') . '%');
@@ -6295,130 +7806,57 @@ class ReportController extends Controller
         $totalReturnedAmt = 0.0;
         $totalPaidAmt = 0.0;
         $totalDueAmt = 0.0;
+        $cashRefunded = 0.0;
+        $digitalRefunded = 0.0;
         $avgReturnAmt = 0.0;
         $byPaymentMethodList = [];
         $byProductList = [];
 
-        if (!$skipSummary) {
-            // High-Performance KPI Aggregation in Single DB Query
-            $summary = (clone $query)->selectRaw('
-                COUNT(*) as total_returns,
-                COALESCE(SUM(grand_total), 0) as total_returned_amount,
-                COALESCE(SUM(paid_amount), 0) as total_paid_amount,
-                COALESCE(SUM(due_amount), 0) as total_due_amount
-            ')->first();
-
-            $totalReturnsCount = (int)($summary->total_returns ?? 0);
-            $totalReturnedAmt = (float)($summary->total_returned_amount ?? 0);
-            $totalPaidAmt = (float)($summary->total_paid_amount ?? 0);
-            $totalDueAmt = (float)($summary->total_due_amount ?? 0);
-            $avgReturnAmt = $totalReturnsCount > 0 ? round($totalReturnedAmt / $totalReturnsCount, 2) : 0.0;
-
-            // Single streaming pass across ALL matching rows for accurate Split Payment & Product breakdowns
+        if (!$skipSummary && $page === 1) {
+            // Single streaming pass computes KPI totals + Split Payment & Product breakdowns together (avoids double scan)
             $tenderMap = [];
             $productMap = [];
 
             $payloadCursor = (clone $query)
-                ->select('id', 'reference_no', 'grand_total', 'paid_amount', 'payment_type', 'payments_payload', 'items_payload')
+                ->select([
+                    'id',
+                    'grand_total',
+                    'paid_amount',
+                    'due_amount',
+                    'payment_type',
+                    DB::raw("CASE WHEN payment_type = 'Split Payment' THEN payments_payload ELSE NULL END as payments_payload"),
+                    'items_payload',
+                ])
                 ->cursor();
 
             foreach ($payloadCursor as $row) {
                 $rowId = (int)$row->id;
                 $rowGrand = (float)($row->grand_total ?? 0);
                 $rowPaid = (float)($row->paid_amount ?? 0);
+                $rowDue = (float)($row->due_amount ?? 0);
                 $fallbackMethod = trim((string)($row->payment_type ?? ''));
                 if ($fallbackMethod === '') {
                     $fallbackMethod = 'Cash';
                 }
 
+                $totalReturnsCount++;
+                $totalReturnedAmt += $rowGrand;
+                $totalPaidAmt += $rowPaid;
+                $totalDueAmt += $rowDue;
+
                 // A. Settlement / Refund Tender attribution (splitting Split Payment payloads by leg)
-                $allocatedFromLegs = false;
-                if (!empty($row->payments_payload)) {
-                    $decodedPayments = is_string($row->payments_payload)
-                        ? json_decode($row->payments_payload, true)
-                        : $row->payments_payload;
-                    if (is_array($decodedPayments) && !empty($decodedPayments)) {
-                        $validLegs = [];
-                        $legsSum = 0.0;
-                        foreach ($decodedPayments as $leg) {
-                            if (!is_array($leg)) {
-                                continue;
-                            }
-                            $legAmt = (float)($leg['amount'] ?? 0);
-                            if ($legAmt <= 0) {
-                                continue;
-                            }
-                            $legType = trim((string)($leg['payment_type'] ?? $leg['method'] ?? ''));
-                            if ($legType === '' || $legType === 'Split Payment') {
-                                $legType = $fallbackMethod === 'Split Payment' ? 'Cash' : $fallbackMethod;
-                            }
-                            $validLegs[] = ['type' => $legType, 'amount' => $legAmt];
-                            $legsSum += $legAmt;
-                        }
-
-                        if ($legsSum > 0 && !empty($validLegs)) {
-                            $allocatedFromLegs = true;
-                            $paidScale = ($legsSum > $rowPaid + 0.01 && $legsSum > 0) ? ($rowPaid / $legsSum) : 1.0;
-                            foreach ($validLegs as $vLeg) {
-                                $m = $vLeg['type'];
-                                if (!isset($tenderMap[$m])) {
-                                    $tenderMap[$m] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                                }
-                                $legPaidAmt = $vLeg['amount'] * $paidScale;
-                                $tenderMap[$m]['voucher_ids'][$rowId] = true;
-                                $tenderMap[$m]['total_refunded'] += $legPaidAmt;
-                                $tenderMap[$m]['total_returned'] += $legPaidAmt;
-                            }
-                            if ($rowPaid - $legsSum > 0.01) {
-                                $residualMethod = $fallbackMethod === 'Split Payment' ? 'Cash' : $fallbackMethod;
-                                if (!isset($tenderMap[$residualMethod])) {
-                                    $tenderMap[$residualMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                                }
-                                $resAmt = $rowPaid - $legsSum;
-                                $tenderMap[$residualMethod]['voucher_ids'][$rowId] = true;
-                                $tenderMap[$residualMethod]['total_refunded'] += $resAmt;
-                                $tenderMap[$residualMethod]['total_returned'] += $resAmt;
-                            }
-                            $unpaidCreditAmt = $rowGrand - $rowPaid;
-                            if ($unpaidCreditAmt > 0.01) {
-                                if (!isset($tenderMap['Credit Note'])) {
-                                    $tenderMap['Credit Note'] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                                }
-                                $tenderMap['Credit Note']['voucher_ids'][$rowId] = true;
-                                $tenderMap['Credit Note']['total_returned'] += $unpaidCreditAmt;
-                            }
-                        }
-                    }
-                }
-
-                if (!$allocatedFromLegs) {
-                    $paidTargetMethod = ($rowPaid > 0.01 && $fallbackMethod === 'Split Payment') ? 'Cash' : $fallbackMethod;
-                    if ($rowPaid > 0.01) {
-                        if (!isset($tenderMap[$paidTargetMethod])) {
-                            $tenderMap[$paidTargetMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                        }
-                        $tenderMap[$paidTargetMethod]['voucher_ids'][$rowId] = true;
-                        $tenderMap[$paidTargetMethod]['total_refunded'] += $rowPaid;
-                        $tenderMap[$paidTargetMethod]['total_returned'] += $rowPaid;
-                        $unpaidCreditAmt = $rowGrand - $rowPaid;
-                        if ($unpaidCreditAmt > 0.01) {
-                            if (!isset($tenderMap['Credit Note'])) {
-                                $tenderMap['Credit Note'] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                            }
-                            $tenderMap['Credit Note']['voucher_ids'][$rowId] = true;
-                            $tenderMap['Credit Note']['total_returned'] += $unpaidCreditAmt;
-                        }
-                    } else {
-                        if (!isset($tenderMap[$fallbackMethod])) {
-                            $tenderMap[$fallbackMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
-                        }
-                        $tenderMap[$fallbackMethod]['voucher_ids'][$rowId] = true;
-                        $tenderMap[$fallbackMethod]['total_returned'] += $rowGrand;
-                    }
-                }
+                $this->accumulateReturnTenderRow(
+                    $tenderMap,
+                    $rowId,
+                    $rowGrand,
+                    $rowPaid,
+                    $fallbackMethod,
+                    $row->payments_payload ?? null,
+                    'Credit Note'
+                );
 
                 // B. Product Return Breakdown
-                if (!empty($row->items_payload)) {
+                if (!empty($row->items_payload) && $row->items_payload !== '[]') {
                     $decodedItems = is_string($row->items_payload)
                         ? json_decode($row->items_payload, true)
                         : $row->items_payload;
@@ -6452,10 +7890,20 @@ class ReportController extends Controller
                 }
             }
 
+            $totalReturnedAmt = round($totalReturnedAmt, 2);
+            $totalPaidAmt = round($totalPaidAmt, 2);
+            $totalDueAmt = round($totalDueAmt, 2);
+            $avgReturnAmt = $totalReturnsCount > 0 ? round($totalReturnedAmt / $totalReturnsCount, 2) : 0.0;
+
             $tenderPercentDenominator = $totalReturnedAmt > 0 ? $totalReturnedAmt : $totalPaidAmt;
             foreach ($tenderMap as $methodName => $pb) {
                 $pRefunded = round((float)$pb['total_refunded'], 2);
                 $pReturned = round((float)$pb['total_returned'], 2);
+                if ($accounting->isCashPaymentType($methodName)) {
+                    $cashRefunded += $pRefunded;
+                } elseif (!in_array(strtolower($methodName), ['', 'credit note', 'store credit', 'unpaid', 'n/a', 'split payment'], true)) {
+                    $digitalRefunded += $pRefunded;
+                }
                 $shareBasis = $totalReturnedAmt > 0 ? $pReturned : $pRefunded;
                 $byPaymentMethodList[] = [
                     'payment_type' => $methodName,
@@ -6630,13 +8078,71 @@ class ReportController extends Controller
             'total_returned_amount' => $totalReturnedAmt,
             'total_paid_amount' => $totalPaidAmt,
             'total_due_amount' => $totalDueAmt,
+            'cash_refunded' => round($cashRefunded, 2),
+            'digital_refunded' => round($digitalRefunded, 2),
+            'credit_note_issued' => $totalDueAmt,
             'average_return_amount' => $avgReturnAmt,
         ], $canViewCost, ['total_returns']);
+
+        $availableSuppliers = [];
+        $availablePaymentTypes = [];
+        $availableUsers = [];
+        if (!$skipSummary && $page === 1) {
+            $availableSuppliers = DB::table('purchase_returns')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->whereNotNull('supplier_name')
+                ->where('supplier_name', '!=', '')
+                ->distinct()
+                ->orderBy('supplier_name')
+                ->pluck('supplier_name')
+                ->values()
+                ->all();
+
+            $availablePaymentTypes = DB::table('purchase_returns')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->whereNotNull('payment_type')
+                ->where('payment_type', '!=', '')
+                ->distinct()
+                ->limit(50)
+                ->pluck('payment_type')
+                ->unique()
+                ->sort()
+                ->values()
+                ->all();
+
+            // Index-only scans on idx_pr_user_name + idx_pr_created_by instead of unindexed COALESCE full scan
+            $userNamesCol = DB::table('purchase_returns')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                ->whereNotNull('user_name')
+                ->where('user_name', '!=', '')
+                ->distinct()
+                ->limit(200)
+                ->pluck('user_name')
+                ->merge(
+                    DB::table('purchase_returns')
+                        ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                        ->whereNotNull('created_by')
+                        ->where('created_by', '!=', '')
+                        ->distinct()
+                        ->limit(200)
+                        ->pluck('created_by')
+                )
+                ->map(fn ($v) => trim((string)$v))
+                ->filter(fn ($v) => $v !== '')
+                ->unique()
+                ->values()
+                ->all();
+            natcasesort($userNamesCol);
+            $availableUsers = array_values($userNamesCol);
+        }
 
         return $this->noStoreJson([
             'status' => 'success',
             'summary' => $maskedSummary,
             'cost_masked' => !$canViewCost,
+            'available_suppliers' => $availableSuppliers,
+            'available_payment_types' => $availablePaymentTypes,
+            'available_users' => $availableUsers,
             'data' => $items,
             'by_product' => $byProductList,
             'by_refund_tender' => $byPaymentMethodList,
@@ -6667,23 +8173,44 @@ class ReportController extends Controller
         $endDate = $request->input('end_date') ?? $request->input('to_date');
         $singleDate = $request->input('date');
         $search = trim((string)$request->input('search', ''));
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $accounting = $this->accounting();
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
+        $resolvedWarehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouseFilter) ? (string)$warehouseFilter : null);
+        if (!empty($allowedOutlets) && $warehouseFilter !== 'All' && !empty($warehouseFilter)) {
+            if ($resolvedWarehouseId === null || !in_array($resolvedWarehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
 
         $effStartDate = !empty($singleDate) ? (string)$singleDate : ($startDate ? (string)$startDate : null);
         $effEndDate = !empty($singleDate) ? (string)$singleDate : ($endDate ? (string)$endDate : null);
 
-        $applyBucketFilters = function ($q, string $dateCol, ?string $wNameCol = 'warehouse_name', string $whIdCol = 'warehouse_id') use ($warehouseFilter, $effStartDate, $effEndDate, $allowedOutlets) {
+        $applyBucketFilters = function ($q, string $dateCol, ?string $wNameCol = 'warehouse_name', string $whIdCol = 'warehouse_id') use ($warehouseFilter, $resolvedWarehouseId, &$effStartDate, &$effEndDate, $allowedOutlets) {
             if (!empty($allowedOutlets)) {
                 $q->whereIn($whIdCol, $allowedOutlets);
             }
             if ($warehouseFilter !== 'All' && !empty($warehouseFilter)) {
-                $q->where(function ($wq) use ($warehouseFilter, $wNameCol, $whIdCol) {
+                $q->where(function ($wq) use ($warehouseFilter, $resolvedWarehouseId, $wNameCol, $whIdCol) {
                     if (is_numeric($warehouseFilter)) {
-                        $wq->whereRaw("COALESCE({$whIdCol}, 1) = ?", [(int)$warehouseFilter]);
+                        $whNum = (int)$warehouseFilter;
+                        if ($whNum === 1) {
+                            $wq->where($whIdCol, 1)->orWhereNull($whIdCol);
+                        } else {
+                            $wq->where($whIdCol, $whNum);
+                        }
+                    } elseif ($resolvedWarehouseId !== null && $wNameCol !== null) {
+                        $wq->where(function ($inner) use ($whIdCol, $resolvedWarehouseId, $wNameCol, $warehouseFilter) {
+                            $inner->where($whIdCol, $resolvedWarehouseId)
+                                  ->orWhere(function ($sub) use ($whIdCol, $wNameCol, $warehouseFilter) {
+                                      $sub->whereNull($whIdCol)
+                                          ->where($wNameCol, $warehouseFilter);
+                                  });
+                        });
                     } elseif ($wNameCol !== null) {
                         $wq->where($wNameCol, $warehouseFilter);
                     }
@@ -6693,43 +8220,23 @@ class ReportController extends Controller
             return $q;
         };
 
-        // 1. Fetch active non-voided sales and resolve true cash/card/digital split receipts via chunked sale_payments
-        $salesBaseQ = DB::table('sales')
-            ->select([
-                'id',
-                DB::raw("SUBSTRING(date, 1, 10) as sale_date"),
-                DB::raw("COALESCE(warehouse_id, 1) as w_id"),
-                DB::raw("COALESCE(warehouse_name, 'Main Branch Outlet') as w_name"),
-                'grand_total',
-                'paid_amount',
-                'tax_amount',
-                'shipping',
-                'discount',
-                'payment_type',
-                'date',
-                'created_by',
-                'user_name',
-                'user_role',
-            ]);
-        $this->applyActiveDocumentFilter($salesBaseQ, 'status');
-        $applyBucketFilters($salesBaseQ, 'date', 'warehouse_name', 'warehouse_id');
+        $hasSpTable = $accounting->schemaHasTable('sale_payments');
+        $hasEpTable = $accounting->schemaHasTable('expense_payments');
+        $hasSrCostLayers = $accounting->schemaHasTable('sale_return_cost_layers') && DB::table('sale_return_cost_layers')->exists();
+        $hasLateOfflineCol = $accounting->schemaHasColumn('sales', 'late_offline_reconciliation');
 
-        $saleRows = $salesBaseQ->orderByDesc('date')->get();
-        $saleIdsWithPayments = [];
-        $siTaxBySale = [];
-        if ($saleRows->isNotEmpty()) {
-            $saleIdList = $saleRows->pluck('id')->all();
-            foreach (array_chunk($saleIdList, 400) as $idChunk) {
-                if ($accounting->schemaHasTable('sale_payments')) {
-                    foreach (DB::table('sale_payments')->whereIn('sale_id', $idChunk)->distinct()->pluck('sale_id') as $spSid) {
-                        $saleIdsWithPayments[(int)$spSid] = true;
-                    }
-                }
-                foreach (DB::table('sale_items')->whereIn('sale_id', $idChunk)->selectRaw('sale_id, COALESCE(SUM(tax), 0) as line_tax')->groupBy('sale_id')->get() as $itRow) {
-                    $siTaxBySale[(int)$itRow->sale_id] = (float)$itRow->line_tax;
-                }
-            }
-        }
+        $cashCondSql = static function (string $col): string {
+            $lc = "LOWER(TRIM(COALESCE({$col}, '')))";
+            return "({$lc} LIKE '%cash%' AND {$lc} NOT LIKE '%non-cash%' AND {$lc} NOT LIKE '%non cash%' AND {$lc} NOT LIKE '%cashless%')";
+        };
+        $cardCondSql = static function (string $col): string {
+            $lc = "LOWER(TRIM(COALESCE({$col}, '')))";
+            return "({$lc} IN ('card', 'pos card', 'visa', 'mastercard', 'credit card', 'debit card') OR {$lc} LIKE '%card%')";
+        };
+        $nonEmptyActiveTenderSql = static function (string $col): string {
+            $lc = "LOWER(TRIM(COALESCE({$col}, '')))";
+            return "{$lc} NOT IN ('', 'unpaid', 'n/a', 'split payment', 'credit', 'credit note', 'store credit')";
+        };
 
         // Helper to initialize a day+warehouse bucket cleanly
         $initZBucket = static function (string $d, int $wId, string $wName = 'Main Branch Outlet'): object {
@@ -6754,56 +8261,237 @@ class ReportController extends Controller
             ];
         };
 
-        // Group active sales accrual (tax-exclusive ex-shipping) into (sale_date, w_id) buckets
-        $hasLateOfflineCol = $accounting->schemaHasColumn('sales', 'late_offline_reconciliation');
-        $dayBuckets = [];
-        foreach ($saleRows as $sRow) {
-            $d    = (string)$sRow->sale_date;
-            $wId  = (int)$sRow->w_id;
-            $bKey = $d . '_' . $wId;
-            if (!isset($dayBuckets[$bKey])) {
-                $dayBuckets[$bKey] = $initZBucket($d, $wId, (string)$sRow->w_name);
-                $dayBuckets[$bKey]->last_date = (string)$sRow->date;
-                $dayBuckets[$bKey]->creator = (string)($sRow->created_by ?? 'Super Admin');
-                $dayBuckets[$bKey]->u_name = (string)($sRow->user_name ?? ($sRow->created_by ?? 'Super Admin'));
-                $dayBuckets[$bKey]->u_role = (string)($sRow->user_role ?? 'Cashier');
-            }
+        // Lightweight date window slicing when skip_summary=1 & no post-SQL filters apply
+        $canSlicePageEarly = $skipSummary
+            && $knownTotal !== null
+            && ($registerFilter === 'All' || empty($registerFilter))
+            && ($statusFilter === 'All' || empty($statusFilter))
+            && ($paymentStatusFilter === 'All' || empty($paymentStatusFilter))
+            && empty($search)
+            && empty($singleDate);
 
-            $bucket = $dayBuckets[$bKey];
-            $bucket->tx_count++;
-            $lineTax = (float)($siTaxBySale[(int)$sRow->id] ?? 0.0);
-            $orderTax = (float)($sRow->tax_amount ?? 0.0);
-            $shipping = (float)($sRow->shipping ?? 0.0);
-            $exTaxMerch = max(0.0, (float)$sRow->grand_total - $orderTax - $lineTax - $shipping);
-            $bucket->gross_sales += $exTaxMerch;
-            $bucket->tax_amount  += ($orderTax + $lineTax);
-            $bucket->discount    += (float)$sRow->discount;
-            if ((string)$sRow->date > $bucket->last_date) {
-                $bucket->last_date = (string)$sRow->date;
-            }
+        if ($canSlicePageEarly) {
+            $pageOffset = ($page - 1) * $perPage;
+            $keyQueries = [];
+            $sqKeys = DB::table('sales')->whereNotNull('date');
+            $this->applyActiveDocumentFilter($sqKeys, 'sales.status');
+            $applyBucketFilters($sqKeys, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
+            $keyQueries[] = $sqKeys->selectRaw("SUBSTRING(sales.date, 1, 10) as d_date, COALESCE(sales.warehouse_id, 1) as w_id")
+                ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"));
 
-            // Fallback tender collection only when sale has ZERO sale_payments rows
-            if (!isset($saleIdsWithPayments[(int)$sRow->id]) && (float)$sRow->paid_amount > 0.0001) {
-                $amt = (float)$sRow->paid_amount;
-                $ptRaw = (string)($sRow->payment_type ?? 'cash');
-                $pt  = strtolower(trim($ptRaw));
-                if ($accounting->isCashPaymentType($ptRaw)) {
-                    $bucket->cash_sales += $amt;
-                    $bucket->cash_count++;
-                } elseif (in_array($pt, ['card', 'visa', 'mastercard', 'credit card', 'debit card'], true)) {
-                    $bucket->card_sales += $amt;
-                    $bucket->card_count++;
-                } elseif (!in_array($pt, ['', 'unpaid', 'n/a', 'split payment'], true)) {
-                    $bucket->digital_sales += $amt;
-                    $bucket->digital_count++;
+            $sliceSourceDefs = [
+                ['table' => 'purchases', 'dateCol' => 'date', 'statuses' => ['Received', 'Completed']],
+                ['table' => 'purchase_returns', 'dateCol' => 'date', 'statuses' => ['Completed', 'Received']],
+                ['table' => 'sale_returns', 'dateCol' => 'date', 'statuses' => null, 'activeDoc' => true],
+                ['table' => 'expenses', 'dateCol' => 'date', 'statuses' => null, 'activeExp' => true],
+            ];
+            if ($accounting->schemaHasTable('cash_registers')) {
+                $sliceSourceDefs[] = ['table' => 'cash_registers', 'dateCol' => 'opened_at', 'statuses' => null];
+            }
+            $bucketUnion = null;
+            foreach ($sliceSourceDefs as $src) {
+                if (!$accounting->schemaHasTable($src['table'])) {
+                    continue;
                 }
+                $eq = DB::table($src['table'])->whereNotNull($src['dateCol']);
+                if ($src['statuses'] !== null) {
+                    $eq->whereIn('status', $src['statuses']);
+                }
+                if ($src['table'] === 'purchases') {
+                    $this->excludeOpeningStockPurchases($eq, 'payment_type');
+                }
+                if (!empty($src['activeDoc'])) {
+                    $this->applyActiveDocumentFilter($eq, 'status');
+                }
+                if (!empty($src['activeExp'])) {
+                    $eq->where(function ($q) {
+                        $q->whereNull('payment_status')
+                          ->orWhereNotIn('payment_status', [
+                              'Pending', 'pending', 'PENDING',
+                              'Draft', 'draft', 'DRAFT',
+                              'Voided', 'voided', 'VOIDED',
+                          ]);
+                    });
+                }
+                $applyBucketFilters($eq, $src['dateCol'], 'warehouse_name', 'warehouse_id');
+                $sub = $eq->selectRaw("SUBSTRING({$src['dateCol']}, 1, 10) as d_date, COALESCE(warehouse_id, 1) as w_id")
+                    ->groupBy(DB::raw("SUBSTRING({$src['dateCol']}, 1, 10)"), DB::raw("COALESCE(warehouse_id, 1)"));
+                $keyQueries[] = $sub;
+            }
+            $baseUnion = array_shift($keyQueries);
+            foreach ($keyQueries as $kq) {
+                $baseUnion->union($kq);
+            }
+            $pagedKeys = DB::query()
+                ->fromSub($baseUnion, 'zb')
+                ->orderByDesc('d_date')
+                ->orderBy('w_id')
+                ->offset($pageOffset)
+                ->limit($perPage)
+                ->get();
+
+            if ($pagedKeys->isEmpty()) {
+                return $this->noStoreJson([
+                    'status' => 'success',
+                    'cost_masked' => !$canViewCost,
+                    'available_registers' => [],
+                    'summary' => [
+                        'cost_masked' => !$canViewCost,
+                        'total_reports' => $knownTotal,
+                        'total_gross_sales' => 0.0,
+                        'total_net_sales' => 0.0,
+                        'total_closing_cash' => 0.0,
+                        'total_discrepancy' => 0.0,
+                    ],
+                    'data' => [],
+                    'current_day' => null,
+                    'pagination' => [
+                        'current_page' => $page,
+                        'per_page' => $perPage,
+                        'total' => $knownTotal,
+                        'last_page' => max(1, (int)ceil($knownTotal / max(1, $perPage))),
+                        'has_more' => false,
+                    ],
+                ]);
+            }
+            $effStartDate = (string)$pagedKeys->min('d_date');
+            $effEndDate = (string)$pagedKeys->max('d_date');
+            $allowedPageBucketSet = [];
+            foreach ($pagedKeys as $pk) {
+                $allowedPageBucketSet[((string)$pk->d_date) . '_' . (int)$pk->w_id] = true;
+            }
+        } else {
+            $allowedPageBucketSet = null;
+        }
+
+        // 1. SQL-aggregated Sales + COGS + Line Tax grouped by (day, warehouse_id) — fast index scan without joining products when total_cogs > 0
+        $cogsAndLineTaxQ = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
+        $this->applyActiveDocumentFilter($cogsAndLineTaxQ, 'sales.status');
+        $applyBucketFilters($cogsAndLineTaxQ, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
+        $cogsAndLineTaxRows = $cogsAndLineTaxQ->selectRaw("
+                SUBSTRING(sales.date, 1, 10) as sale_date,
+                COALESCE(sales.warehouse_id, 1) as w_id,
+                COALESCE(SUM(COALESCE(sale_items.tax, 0)), 0) as line_tax,
+                COALESCE(SUM(CASE WHEN COALESCE(sale_items.total_cogs, 0) > 0 THEN sale_items.total_cogs ELSE 0 END), 0) as total_cogs,
+                COALESCE(SUM(CASE WHEN COALESCE(sale_items.total_cogs, 0) <= 0 THEN 1 ELSE 0 END), 0) as missing_cogs_cnt
+            ")
+            ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"))
+            ->get();
+
+        $cogsAgg = [];
+        $lineTaxByBucket = [];
+        $missingCogsCnt = 0;
+        foreach ($cogsAndLineTaxRows as $cr) {
+            $bKey = $cr->sale_date . '_' . (int)$cr->w_id;
+            $cogsAgg[$bKey] = (float)$cr->total_cogs;
+            $lineTaxByBucket[$bKey] = (float)$cr->line_tax;
+            $missingCogsCnt += (int)($cr->missing_cogs_cnt ?? 0);
+        }
+
+        // Fallback lookup ONLY when any sale_item row lacks total_cogs (avoids joining 2 product tables across all rows)
+        if ($missingCogsCnt > 0) {
+            $missingCogsQ = DB::table('sale_items')
+                ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+                ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
+                ->whereRaw('COALESCE(sale_items.total_cogs, 0) <= 0');
+            $this->applyActiveDocumentFilter($missingCogsQ, 'sales.status');
+            $applyBucketFilters($missingCogsQ, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
+            foreach ($missingCogsQ->selectRaw("
+                    SUBSTRING(sales.date, 1, 10) as sale_date,
+                    COALESCE(sales.warehouse_id, 1) as w_id,
+                    COALESCE(SUM(
+                        COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)
+                    ), 0) as fb_cogs
+                ")
+                ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"))
+                ->get() as $mc) {
+                $bKey = $mc->sale_date . '_' . (int)$mc->w_id;
+                $cogsAgg[$bKey] = ($cogsAgg[$bKey] ?? 0.0) + (float)$mc->fb_cogs;
             }
         }
 
-        // Attribute actual payment collections strictly by sale_payments.payment_date (excluding late-offline cash from drawer cash if flagged)
-        if ($accounting->schemaHasTable('sale_payments')) {
+        $sCashExpr = $cashCondSql("COALESCE(sales.payment_type, 'cash')");
+        $sCardExpr = $cardCondSql("COALESCE(sales.payment_type, 'cash')");
+        $sActiveTenderExpr = $nonEmptyActiveTenderSql("COALESCE(sales.payment_type, 'cash')");
+
+        $salesGroupQ = DB::table('sales');
+        $this->applyActiveDocumentFilter($salesGroupQ, 'sales.status');
+        $applyBucketFilters($salesGroupQ, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
+        $salesAggRows = $salesGroupQ->selectRaw("
+            SUBSTRING(sales.date, 1, 10) as sale_date,
+            COALESCE(sales.warehouse_id, 1) as w_id,
+            MAX(COALESCE(sales.warehouse_name, 'Main Branch Outlet')) as w_name,
+            COUNT(*) as tx_count,
+            COALESCE(SUM(CASE WHEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.tax_amount, 0) - COALESCE(sales.shipping, 0)) > 0 THEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.tax_amount, 0) - COALESCE(sales.shipping, 0)) ELSE 0 END), 0) as pre_line_tax_sales,
+            COALESCE(SUM(COALESCE(sales.tax_amount, 0)), 0) as order_tax,
+            COALESCE(SUM(COALESCE(sales.discount, 0)), 0) as discount_sum,
+            MAX(sales.date) as last_date,
+            MAX(COALESCE(sales.created_by, 'Super Admin')) as creator,
+            MAX(COALESCE(sales.user_name, sales.created_by, 'Super Admin')) as u_name,
+            MAX(COALESCE(sales.user_role, 'Cashier')) as u_role
+        ")
+            ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"))
+            ->get();
+
+        // Separate fallback query for legacy sales with zero sale_payments rows (ONLY_FULL_GROUP_BY safe)
+        $fbByBucket = [];
+        $salesFbQ = DB::table('sales')
+            ->where('sales.paid_amount', '>', 0.0001)
+            ->when($hasSpTable, fn ($q) => $q->whereNotExists(function ($sub) {
+                $sub->select(DB::raw(1))->from('sale_payments')->whereColumn('sale_payments.sale_id', 'sales.id');
+            }));
+        $this->applyActiveDocumentFilter($salesFbQ, 'sales.status');
+        $applyBucketFilters($salesFbQ, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
+        foreach ($salesFbQ->selectRaw("
+            SUBSTRING(sales.date, 1, 10) as sale_date,
+            COALESCE(sales.warehouse_id, 1) as w_id,
+            COALESCE(SUM(CASE WHEN {$sCashExpr} THEN sales.paid_amount ELSE 0 END), 0) as fb_cash,
+            COALESCE(SUM(CASE WHEN {$sCashExpr} THEN 1 ELSE 0 END), 0) as fb_cash_cnt,
+            COALESCE(SUM(CASE WHEN NOT {$sCashExpr} AND {$sCardExpr} THEN sales.paid_amount ELSE 0 END), 0) as fb_card,
+            COALESCE(SUM(CASE WHEN NOT {$sCashExpr} AND {$sCardExpr} THEN 1 ELSE 0 END), 0) as fb_card_cnt,
+            COALESCE(SUM(CASE WHEN NOT {$sCashExpr} AND NOT {$sCardExpr} AND {$sActiveTenderExpr} THEN sales.paid_amount ELSE 0 END), 0) as fb_digital,
+            COALESCE(SUM(CASE WHEN NOT {$sCashExpr} AND NOT {$sCardExpr} AND {$sActiveTenderExpr} THEN 1 ELSE 0 END), 0) as fb_digital_cnt
+        ")
+            ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"))
+            ->get() as $fb) {
+            $fbByBucket[$fb->sale_date . '_' . (int)$fb->w_id] = $fb;
+        }
+
+        $dayBuckets = [];
+        foreach ($salesAggRows as $sr) {
+            $d = trim((string)$sr->sale_date);
+            if ($d === '') continue;
+            $wId = (int)$sr->w_id;
+            $bKey = $d . '_' . $wId;
+            $b = $initZBucket($d, $wId, (string)$sr->w_name);
+            $b->tx_count = (int)$sr->tx_count;
+            $lineTax = (float)($lineTaxByBucket[$bKey] ?? 0.0);
+            $b->gross_sales = max(0.0, (float)$sr->pre_line_tax_sales - $lineTax);
+            $b->tax_amount = (float)$sr->order_tax + $lineTax;
+            $b->discount = (float)$sr->discount_sum;
+            $fb = $fbByBucket[$bKey] ?? null;
+            if ($fb) {
+                $b->cash_sales = (float)$fb->fb_cash;
+                $b->cash_count = (int)$fb->fb_cash_cnt;
+                $b->card_sales = (float)$fb->fb_card;
+                $b->card_count = (int)$fb->fb_card_cnt;
+                $b->digital_sales = (float)$fb->fb_digital;
+                $b->digital_count = (int)$fb->fb_digital_cnt;
+            }
+            $b->last_date = (string)($sr->last_date ?: ($d . ' 22:00:00'));
+            $b->creator = (string)($sr->creator ?: 'Super Admin');
+            $b->u_name = (string)($sr->u_name ?: $b->creator);
+            $b->u_role = (string)($sr->u_role ?: 'Cashier');
+            $dayBuckets[$bKey] = $b;
+        }
+
+        // Attribute actual payment collections strictly by sale_payments.payment_date in SQL
+        if ($hasSpTable) {
             $spQ = DB::table('sale_payments')
-                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id');
+                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
+                ->where('sale_payments.amount', '>', 0.0001);
             $this->applyActiveDocumentFilter($spQ, 'sales.status');
             $applyBucketFilters($spQ, 'sale_payments.payment_date', 'sales.warehouse_name', 'sales.warehouse_id');
             if ($hasLateOfflineCol) {
@@ -6812,17 +8500,24 @@ class ReportController extends Controller
                         ->orWhere('sales.late_offline_reconciliation', false);
                 });
             }
-            $spCollectionRows = $spQ->selectRaw("
+            $spCashExpr = $cashCondSql('sale_payments.payment_type');
+            $spCardExpr = $cardCondSql('sale_payments.payment_type');
+            $spActiveExpr = $nonEmptyActiveTenderSql('sale_payments.payment_type');
+            $spAggRows = $spQ->selectRaw("
                 SUBSTRING(COALESCE(sale_payments.payment_date, sales.date), 1, 10) as pay_date,
                 COALESCE(sales.warehouse_id, 1) as w_id,
-                COALESCE(sales.warehouse_name, 'Main Branch Outlet') as w_name,
-                sale_payments.payment_type,
-                sale_payments.amount
-            ")->get();
+                MAX(COALESCE(sales.warehouse_name, 'Main Branch Outlet')) as w_name,
+                COALESCE(SUM(CASE WHEN {$spCashExpr} THEN sale_payments.amount ELSE 0 END), 0) as cash_amt,
+                COALESCE(SUM(CASE WHEN {$spCashExpr} THEN 1 ELSE 0 END), 0) as cash_cnt,
+                COALESCE(SUM(CASE WHEN NOT {$spCashExpr} AND {$spCardExpr} THEN sale_payments.amount ELSE 0 END), 0) as card_amt,
+                COALESCE(SUM(CASE WHEN NOT {$spCashExpr} AND {$spCardExpr} THEN 1 ELSE 0 END), 0) as card_cnt,
+                COALESCE(SUM(CASE WHEN NOT {$spCashExpr} AND NOT {$spCardExpr} AND {$spActiveExpr} THEN sale_payments.amount ELSE 0 END), 0) as dig_amt,
+                COALESCE(SUM(CASE WHEN NOT {$spCashExpr} AND NOT {$spCardExpr} AND {$spActiveExpr} THEN 1 ELSE 0 END), 0) as dig_cnt
+            ")
+                ->groupBy(DB::raw("SUBSTRING(COALESCE(sale_payments.payment_date, sales.date), 1, 10)"), DB::raw("COALESCE(sales.warehouse_id, 1)"))
+                ->get();
 
-            foreach ($spCollectionRows as $sp) {
-                $amt = (float)($sp->amount ?? 0);
-                if ($amt <= 0.0001) continue;
+            foreach ($spAggRows as $sp) {
                 $d = trim((string)($sp->pay_date ?? ''));
                 if ($d === '') continue;
                 $wId = (int)$sp->w_id;
@@ -6831,122 +8526,97 @@ class ReportController extends Controller
                     $dayBuckets[$bKey] = $initZBucket($d, $wId, (string)$sp->w_name);
                 }
                 $bucket = $dayBuckets[$bKey];
-                $ptRaw = (string)($sp->payment_type ?? '');
-                $pt = strtolower(trim($ptRaw));
-                if ($accounting->isCashPaymentType($ptRaw)) {
-                    $bucket->cash_sales += $amt;
-                    $bucket->cash_count++;
-                } elseif (in_array($pt, ['card', 'visa', 'mastercard', 'credit card', 'debit card'], true)) {
-                    $bucket->card_sales += $amt;
-                    $bucket->card_count++;
-                } elseif (!in_array($pt, ['', 'unpaid', 'n/a', 'split payment'], true)) {
-                    $bucket->digital_sales += $amt;
-                    $bucket->digital_count++;
-                }
+                $bucket->cash_sales += (float)$sp->cash_amt;
+                $bucket->cash_count += (int)$sp->cash_cnt;
+                $bucket->card_sales += (float)$sp->card_amt;
+                $bucket->card_count += (int)$sp->card_cnt;
+                $bucket->digital_sales += (float)$sp->dig_amt;
+                $bucket->digital_count += (int)$sp->dig_cnt;
             }
         }
 
-        $extraSources = [
-            ['table' => 'purchases', 'dateCol' => 'date', 'statuses' => ['Received', 'Completed'], 'wNameCol' => 'warehouse_name'],
-            ['table' => 'purchase_returns', 'dateCol' => 'date', 'statuses' => ['Completed', 'Received'], 'wNameCol' => 'warehouse_name'],
-            ['table' => 'sale_returns', 'dateCol' => 'date', 'statuses' => null, 'wNameCol' => 'warehouse_name', 'activeDoc' => true],
-            ['table' => 'expenses', 'dateCol' => 'date', 'statuses' => null, 'wNameCol' => 'warehouse_name', 'activeExp' => true],
-        ];
         $hasCashRegisters = $accounting->schemaHasTable('cash_registers');
-        if ($hasCashRegisters) {
-            $extraSources[] = ['table' => 'cash_registers', 'dateCol' => 'opened_at', 'statuses' => null, 'wNameCol' => 'warehouse_name'];
+
+        // 2. Aggregate Active Returns (single SQL scan; only parses payloads for line-tax or multi-leg/split rows!)
+        $returnsMap = [];
+        $hasItemsTaxExpr = "COALESCE(sale_returns.items_payload, '') LIKE '%\"tax\"%'";
+        $hasSplitPayExpr = "(sale_returns.payments_payload IS NOT NULL AND sale_returns.payments_payload != '' AND sale_returns.payments_payload != '[]')";
+        $needsSplitRetParseExpr = "({$hasItemsTaxExpr} OR LOWER(TRIM(COALESCE(sale_returns.payment_type, ''))) LIKE '%split%' OR LOWER(TRIM(COALESCE(sale_returns.refund_tender, ''))) LIKE '%split%' OR COALESCE(sale_returns.payments_payload, '') LIKE '%},%' OR (COALESCE(sale_returns.payment_type, '') = '' AND COALESCE(sale_returns.refund_tender, '') = '' AND {$hasSplitPayExpr}))";
+        $stdRetQ = DB::table('sale_returns');
+        if ($hasSrCostLayers) {
+            $srLayerSub = DB::table('sale_return_cost_layers')
+                ->select('sale_return_id', DB::raw('COALESCE(SUM(total_cost), 0) as layer_cost'))
+                ->groupBy('sale_return_id');
+            $stdRetQ->leftJoinSub($srLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sale_returns.id');
         }
-
-        foreach ($extraSources as $src) {
-            if (!$accounting->schemaHasTable($src['table'])) {
-                continue;
-            }
-            $eq = DB::table($src['table'])
-                ->whereNotNull($src['dateCol']);
-            if ($src['statuses'] !== null) {
-                $eq->whereIn('status', $src['statuses']);
-            }
-            if (!empty($src['activeDoc'])) {
-                $this->applyActiveDocumentFilter($eq, 'status');
-            }
-            if (!empty($src['activeExp'])) {
-                $eq->where(function ($q) {
-                    $q->whereNull('payment_status')
-                      ->orWhereNotIn('payment_status', [
-                          'Pending', 'pending', 'PENDING',
-                          'Draft', 'draft', 'DRAFT',
-                          'Voided', 'voided', 'VOIDED',
-                      ]);
-                });
-            }
-            $applyBucketFilters($eq, $src['dateCol'], $src['wNameCol']);
-            $rows = $eq->selectRaw(
-                "SUBSTRING({$src['dateCol']}, 1, 10) as d_date, COALESCE(warehouse_id, 1) as w_id, MAX(COALESCE(warehouse_name, 'Main Branch Outlet')) as w_name"
-            )
-                ->groupBy(DB::raw("SUBSTRING({$src['dateCol']}, 1, 10)"), 'warehouse_id')
-                ->get();
-            foreach ($rows as $er) {
-                $d = trim((string)($er->d_date ?? ''));
-                if ($d === '') {
-                    continue;
-                }
-                $wId = (int)$er->w_id;
-                $bKey = $d . '_' . $wId;
-                if (!isset($dayBuckets[$bKey])) {
-                    $dayBuckets[$bKey] = (object)[
-                        'sale_date' => $d,
-                        'w_id' => $wId,
-                        'w_name' => $er->w_name ?: 'Main Branch Outlet',
-                        'tx_count' => 0,
-                        'gross_sales' => 0.0,
-                        'tax_amount' => 0.0,
-                        'discount' => 0.0,
-                        'cash_sales' => 0.0,
-                        'card_sales' => 0.0,
-                        'digital_sales' => 0.0,
-                        'cash_count' => 0,
-                        'card_count' => 0,
-                        'digital_count' => 0,
-                        'last_date' => $d . ' 22:00:00',
-                        'creator' => 'Super Admin',
-                        'u_name' => 'Super Admin',
-                        'u_role' => 'Super Admin',
-                    ];
-                }
-            }
-        }
-
-        $salesGroups = array_values($dayBuckets);
-        usort($salesGroups, function ($a, $b) {
-            $cmp = strcmp((string)$b->sale_date, (string)$a->sale_date);
-            return $cmp !== 0 ? $cmp : ((int)$a->w_id <=> (int)$b->w_id);
-        });
-
-        // 2. Aggregate Active Returns (scoped + joined COGS subquery), Expenses (scoped + chunked), and COGS (scoped)
-        $srLayerSub = DB::table('sale_return_cost_layers')
-            ->select('sale_return_id', DB::raw('COALESCE(SUM(total_cost), 0) as layer_cost'))
-            ->groupBy('sale_return_id');
-        $retRowsQ = DB::table('sale_returns')
-            ->leftJoinSub($srLayerSub, 'srcl', 'srcl.sale_return_id', '=', 'sale_returns.id');
-        $this->applyActiveDocumentFilter($retRowsQ, 'sale_returns.status');
-        $applyBucketFilters($retRowsQ, 'sale_returns.date', 'sale_returns.warehouse_name', 'sale_returns.warehouse_id');
-        $retRows = $retRowsQ->selectRaw("
-            sale_returns.id,
+        $this->applyActiveDocumentFilter($stdRetQ, 'sale_returns.status');
+        $applyBucketFilters($stdRetQ, 'sale_returns.date', 'sale_returns.warehouse_name', 'sale_returns.warehouse_id');
+        $stdRetQ->whereRaw("NOT {$needsSplitRetParseExpr}");
+        $retCogsExpr = $hasSrCostLayers
+            ? "COALESCE(NULLIF(sale_returns.return_cost_total, 0), COALESCE(srcl.layer_cost, 0))"
+            : "COALESCE(sale_returns.return_cost_total, 0)";
+        $retCashCond = $cashCondSql("COALESCE(NULLIF(sale_returns.refund_tender, ''), sale_returns.payment_type, 'cash')");
+        $retExTaxSql = '(COALESCE(sale_returns.grand_total, 0) - COALESCE(sale_returns.tax_amount, 0) - COALESCE(sale_returns.shipping, 0))';
+        foreach ($stdRetQ->selectRaw("
             SUBSTRING(sale_returns.date, 1, 10) as ret_date,
             COALESCE(sale_returns.warehouse_id, 1) as w_id,
-            sale_returns.grand_total,
-            COALESCE(sale_returns.tax_amount, 0) as tax_amount,
-            COALESCE(sale_returns.shipping, 0) as shipping,
-            sale_returns.paid_amount,
-            sale_returns.refund_tender,
-            sale_returns.payment_type,
-            sale_returns.payments_payload,
-            COALESCE(NULLIF(sale_returns.return_cost_total, 0), COALESCE(srcl.layer_cost, 0)) as ret_cogs
-        ")->get();
+            MAX(COALESCE(sale_returns.warehouse_name, 'Main Branch Outlet')) as w_name,
+            COALESCE(SUM(CASE WHEN {$retExTaxSql} > 0 THEN {$retExTaxSql} ELSE 0 END), 0) as total_returns,
+            COALESCE(SUM(CASE WHEN COALESCE(sale_returns.paid_amount, 0) > 0 AND {$retCashCond} THEN sale_returns.paid_amount ELSE 0 END), 0) as cash_refunds,
+            COALESCE(SUM({$retCogsExpr}), 0) as returned_cogs
+        ")
+            ->groupBy(DB::raw("SUBSTRING(sale_returns.date, 1, 10)"), DB::raw("COALESCE(sale_returns.warehouse_id, 1)"))
+            ->get() as $srAgg) {
+            $d = trim((string)($srAgg->ret_date ?? ''));
+            if ($d === '') continue;
+            $wId = (int)$srAgg->w_id;
+            $rKey = $d . '_' . $wId;
+            if (!isset($dayBuckets[$rKey])) {
+                $bucket = $initZBucket($d, $wId, (string)$srAgg->w_name);
+                $bucket->u_role = 'Super Admin';
+                $dayBuckets[$rKey] = $bucket;
+            }
+            $returnsMap[$rKey] = (object)[
+                'total_returns' => (float)$srAgg->total_returns,
+                'cash_refunds'  => (float)$srAgg->cash_refunds,
+                'returned_cogs' => (float)$srAgg->returned_cogs,
+            ];
+        }
 
-        $returnsMap = [];
-        foreach ($retRows as $rRow) {
-            $rKey = $rRow->ret_date . '_' . (int)$rRow->w_id;
+        $splitRetQ = DB::table('sale_returns');
+        if ($hasSrCostLayers) {
+            $srLayerSub2 = DB::table('sale_return_cost_layers')
+                ->select('sale_return_id', DB::raw('COALESCE(SUM(total_cost), 0) as layer_cost'))
+                ->groupBy('sale_return_id');
+            $splitRetQ->leftJoinSub($srLayerSub2, 'srcl', 'srcl.sale_return_id', '=', 'sale_returns.id');
+        }
+        $this->applyActiveDocumentFilter($splitRetQ, 'sale_returns.status');
+        $applyBucketFilters($splitRetQ, 'sale_returns.date', 'sale_returns.warehouse_name', 'sale_returns.warehouse_id');
+        $splitRetQ->whereRaw($needsSplitRetParseExpr);
+        foreach ($splitRetQ->selectRaw("
+                sale_returns.id,
+                SUBSTRING(sale_returns.date, 1, 10) as ret_date,
+                COALESCE(sale_returns.warehouse_id, 1) as w_id,
+                sale_returns.warehouse_name as w_name,
+                sale_returns.grand_total,
+                COALESCE(sale_returns.tax_amount, 0) as tax_amount,
+                COALESCE(sale_returns.shipping, 0) as shipping,
+                sale_returns.paid_amount,
+                sale_returns.refund_tender,
+                sale_returns.payment_type,
+                sale_returns.items_payload,
+                sale_returns.payments_payload,
+                {$retCogsExpr} as ret_cogs
+            ")->cursor() as $rRow) {
+            $d = trim((string)($rRow->ret_date ?? ''));
+            if ($d === '') continue;
+            $wId = (int)$rRow->w_id;
+            $rKey = $d . '_' . $wId;
+            if (!isset($dayBuckets[$rKey])) {
+                $bucket = $initZBucket($d, $wId, (string)($rRow->w_name ?? 'Main Branch Outlet'));
+                $bucket->u_role = 'Super Admin';
+                $dayBuckets[$rKey] = $bucket;
+            }
             if (!isset($returnsMap[$rKey])) {
                 $returnsMap[$rKey] = (object)[
                     'total_returns' => 0.0,
@@ -6954,7 +8624,10 @@ class ReportController extends Controller
                     'returned_cogs' => 0.0,
                 ];
             }
-            $retExTaxMerch = max(0.0, (float)$rRow->grand_total - (float)$rRow->tax_amount - (float)$rRow->shipping);
+            $srLineTax = (!empty($rRow->items_payload) && str_contains((string)$rRow->items_payload, '"tax"'))
+                ? $accounting->extractPayloadLineTax($rRow->items_payload)
+                : 0.0;
+            $retExTaxMerch = max(0.0, (float)$rRow->grand_total - (float)$rRow->tax_amount - $srLineTax - (float)$rRow->shipping);
             $returnsMap[$rKey]->total_returns += $retExTaxMerch;
             $returnsMap[$rKey]->returned_cogs += (float)$rRow->ret_cogs;
 
@@ -6974,10 +8647,10 @@ class ReportController extends Controller
                 }
             }
         }
-        $returnsAgg = collect($returnsMap);
 
-        // Expenses: accrued total_expenses (excluding Pending/Draft/Voided) & actual cash_expenses
-        $expQ = DB::table('expenses')
+        // Expenses: pure SQL GROUP BY (total_expenses + cash_expenses via expense_payments & single-record fallback)
+        $expensesMap = [];
+        $expAccrualQ = DB::table('expenses')
             ->where(function ($q) {
                 $q->whereNull('payment_status')
                   ->orWhereNotIn('payment_status', [
@@ -6986,74 +8659,88 @@ class ReportController extends Controller
                       'Voided', 'voided', 'VOIDED',
                   ]);
             });
-        $applyBucketFilters($expQ, 'date', 'warehouse_name', 'warehouse_id');
-        $expRows = $expQ->selectRaw("id, SUBSTRING(date, 1, 10) as exp_date, COALESCE(warehouse_id, 1) as w_id, amount, paid_amount, due_amount, payment_status, payment_method")
-            ->get();
-        $expPayByExp = [];
-        if ($expRows->isNotEmpty() && $accounting->schemaHasTable('expense_payments')) {
-            foreach (array_chunk($expRows->pluck('id')->all(), 400) as $idChunk) {
-                foreach (DB::table('expense_payments')->whereIn('expense_id', $idChunk)->select(['expense_id', 'amount', 'payment_type'])->get() as $ep) {
-                    $expPayByExp[(int)$ep->expense_id][] = $ep;
-                }
+        $applyBucketFilters($expAccrualQ, 'date', 'warehouse_name', 'warehouse_id');
+        foreach ($expAccrualQ->selectRaw("
+            SUBSTRING(expenses.date, 1, 10) as exp_date,
+            COALESCE(expenses.warehouse_id, 1) as w_id,
+            MAX(COALESCE(expenses.warehouse_name, 'Main Branch Outlet')) as w_name,
+            COALESCE(SUM(expenses.amount), 0) as total_expenses
+        ")
+            ->groupBy(DB::raw("SUBSTRING(expenses.date, 1, 10)"), DB::raw("COALESCE(expenses.warehouse_id, 1)"))
+            ->get() as $eRow) {
+            $d = trim((string)($eRow->exp_date ?? ''));
+            if ($d === '') continue;
+            $wId = (int)$eRow->w_id;
+            $eKey = $d . '_' . $wId;
+            if (!isset($dayBuckets[$eKey])) {
+                $bucket = $initZBucket($d, $wId, (string)$eRow->w_name);
+                $bucket->u_role = 'Super Admin';
+                $dayBuckets[$eKey] = $bucket;
             }
+            $expensesMap[$eKey] = (object)[
+                'total_expenses' => (float)$eRow->total_expenses,
+                'cash_expenses'  => 0.0,
+            ];
         }
 
-        $expensesMap = [];
-        foreach ($expRows as $eRow) {
-            $eKey = $eRow->exp_date . '_' . (int)$eRow->w_id;
+        $expPmCashExpr = $cashCondSql("COALESCE(expenses.payment_method, 'cash')");
+        $expFallbackCashExpr = "CASE WHEN COALESCE(expenses.paid_amount, 0) > 0.0001 THEN expenses.paid_amount WHEN COALESCE(expenses.due_amount, 0) <= 0.0001 AND LOWER(TRIM(COALESCE(expenses.payment_status, ''))) IN ('', 'paid') THEN expenses.amount ELSE 0 END";
+        $expFbCashQ = DB::table('expenses')
+            ->when($hasEpTable, fn ($q) => $q->whereNotExists(function ($sub) {
+                $sub->select(DB::raw(1))->from('expense_payments')->whereColumn('expense_payments.expense_id', 'expenses.id');
+            }))
+            ->whereRaw("LOWER(TRIM(COALESCE(expenses.payment_status, ''))) != 'unpaid'")
+            ->where(function ($q) {
+                $q->whereNull('payment_status')
+                  ->orWhereNotIn('payment_status', [
+                      'Pending', 'pending', 'PENDING',
+                      'Draft', 'draft', 'DRAFT',
+                      'Voided', 'voided', 'VOIDED',
+                  ]);
+            })
+            ->whereRaw($expPmCashExpr);
+        $applyBucketFilters($expFbCashQ, 'date', 'warehouse_name', 'warehouse_id');
+        foreach ($expFbCashQ->selectRaw("
+            SUBSTRING(expenses.date, 1, 10) as exp_date,
+            COALESCE(expenses.warehouse_id, 1) as w_id,
+            COALESCE(SUM({$expFallbackCashExpr}), 0) as fb_cash_expenses
+        ")
+            ->groupBy(DB::raw("SUBSTRING(expenses.date, 1, 10)"), DB::raw("COALESCE(expenses.warehouse_id, 1)"))
+            ->get() as $efRow) {
+            $eKey = $efRow->exp_date . '_' . (int)$efRow->w_id;
             if (!isset($expensesMap[$eKey])) {
-                $expensesMap[$eKey] = (object)[
-                    'total_expenses' => 0.0,
-                    'cash_expenses'  => 0.0,
-                ];
+                $expensesMap[$eKey] = (object)['total_expenses' => 0.0, 'cash_expenses' => 0.0];
             }
-            $expensesMap[$eKey]->total_expenses += (float)$eRow->amount;
-
-            $legs = $expPayByExp[(int)$eRow->id] ?? [];
-            if (!empty($legs)) {
-                foreach ($legs as $ep) {
-                    $amt = (float)($ep->amount ?? 0);
-                    if ($amt > 0 && $accounting->isCashPaymentType($ep->payment_type ?? null)) {
-                        $expensesMap[$eKey]->cash_expenses += $amt;
-                    }
+            $expensesMap[$eKey]->cash_expenses += (float)$efRow->fb_cash_expenses;
+        }
+        if ($hasEpTable) {
+            $epCashQ = DB::table('expense_payments')
+                ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                ->where('expense_payments.amount', '>', 0)
+                ->where(function ($q) {
+                    $q->whereNull('expenses.payment_status')
+                      ->orWhereNotIn('expenses.payment_status', [
+                          'Pending', 'pending', 'PENDING',
+                          'Draft', 'draft', 'DRAFT',
+                          'Voided', 'voided', 'VOIDED',
+                      ]);
+                })
+                ->whereRaw($cashCondSql('expense_payments.payment_type'));
+            $applyBucketFilters($epCashQ, 'expenses.date', 'expenses.warehouse_name', 'expenses.warehouse_id');
+            foreach ($epCashQ->selectRaw("
+                SUBSTRING(expenses.date, 1, 10) as exp_date,
+                COALESCE(expenses.warehouse_id, 1) as w_id,
+                COALESCE(SUM(expense_payments.amount), 0) as cash_paid
+            ")
+                ->groupBy(DB::raw("SUBSTRING(expenses.date, 1, 10)"), DB::raw("COALESCE(expenses.warehouse_id, 1)"))
+                ->get() as $epRow) {
+                $eKey = $epRow->exp_date . '_' . (int)$epRow->w_id;
+                if (!isset($expensesMap[$eKey])) {
+                    $expensesMap[$eKey] = (object)['total_expenses' => 0.0, 'cash_expenses' => 0.0];
                 }
-            } else {
-                $pStat = strtolower(trim((string)($eRow->payment_status ?? '')));
-                $pmRaw = (string)($eRow->payment_method ?: 'cash');
-                if ($pStat !== 'unpaid' && $accounting->isCashPaymentType($pmRaw)) {
-                    $paid = (float)($eRow->paid_amount ?? 0);
-                    $due  = (float)($eRow->due_amount ?? 0);
-                    if ($paid > 0.0001) {
-                        $expensesMap[$eKey]->cash_expenses += $paid;
-                    } elseif ($due <= 0.0001 && in_array($pStat, ['', 'paid'], true)) {
-                        $expensesMap[$eKey]->cash_expenses += (float)$eRow->amount;
-                    }
-                }
+                $expensesMap[$eKey]->cash_expenses += (float)$epRow->cash_paid;
             }
         }
-        $expensesAgg = collect($expensesMap);
-
-        $cogsQ = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
-        $this->applyActiveDocumentFilter($cogsQ, 'sales.status');
-        $applyBucketFilters($cogsQ, 'sales.date', 'sales.warehouse_name', 'sales.warehouse_id');
-        $cogsAgg = $cogsQ->selectRaw("
-                SUBSTRING(sales.date, 1, 10) as sale_date,
-                COALESCE(sales.warehouse_id, 1) as w_id,
-                COALESCE(
-                    SUM(
-                        COALESCE(
-                            NULLIF(sale_items.total_cogs, 0),
-                            COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)
-                        )
-                    ), 0
-                ) as total_cogs
-            ")
-            ->groupBy(DB::raw("SUBSTRING(sales.date, 1, 10)"), 'sales.warehouse_id')
-            ->get()
-            ->keyBy(function ($c) { return $c->sale_date . '_' . $c->w_id; });
 
         // Pre-fetch ALL cash_registers, register transactions, linked PO/PR cash flows, and unlinked PO/PR cash flows ONCE
         $regSessionsByKey = [];
@@ -7062,7 +8749,14 @@ class ReportController extends Controller
             $regListQ = DB::table('cash_registers')->whereNotNull('opened_at');
             $applyBucketFilters($regListQ, 'opened_at', 'warehouse_name', 'warehouse_id');
             foreach ($regListQ->orderBy('id')->get() as $rRow) {
-                $rKey = substr((string)$rRow->opened_at, 0, 10) . '_' . (int)($rRow->warehouse_id ?? 1);
+                $d = substr((string)$rRow->opened_at, 0, 10);
+                $wId = (int)($rRow->warehouse_id ?? 1);
+                $rKey = $d . '_' . $wId;
+                if ($d !== '' && !isset($dayBuckets[$rKey])) {
+                    $bucket = $initZBucket($d, $wId, (string)($rRow->warehouse_name ?? 'Main Branch Outlet'));
+                    $bucket->u_role = 'Super Admin';
+                    $dayBuckets[$rKey] = $bucket;
+                }
                 $regSessionsByKey[$rKey][] = $rRow;
                 $allRegIds[] = (int)$rRow->id;
             }
@@ -7095,16 +8789,76 @@ class ReportController extends Controller
             ? $accounting->summarizeRegisterPurchaseCashFlowBatch($allRegIds)
             : [];
 
-        $batchUnlinkedCashDocs = function (string $table, array $statuses) use ($applyBucketFilters, $accounting): array {
+        // Single-pass purchase / purchase_return bucket discovery + unlinked cash aggregation (conditional split cursor)
+        $batchUnlinkedCashDocs = function (string $table, array $statuses, bool $exclOpening = false) use ($applyBucketFilters, $accounting, $cashCondSql, &$dayBuckets, $initZBucket): array {
             if (!$accounting->schemaHasTable($table)) {
                 return [];
             }
-            $docsQ = DB::table($table)
-                ->whereIn('status', $statuses)
-                ->where('paid_amount', '>', 0);
-            $applyBucketFilters($docsQ, 'date', 'warehouse_name', 'warehouse_id');
-            $docs = $docsQ->select(['id', 'date', 'warehouse_id', 'cash_register_id', 'payment_type', 'paid_amount', 'payments_payload'])->get();
             $totalsByKey = [];
+            $hasSplitCol = $accounting->schemaHasColumn($table, 'has_register_split');
+
+            $unlinkedPlainCashCond = "paid_amount > 0 AND cash_register_id IS NULL AND {$cashCondSql("COALESCE(payment_type, '')")} AND LOWER(TRIM(COALESCE(payment_type, ''))) NOT LIKE '%split%'";
+            if ($hasSplitCol) {
+                $unlinkedPlainCashCond .= " AND (has_register_split IS NULL OR has_register_split = 0)";
+            }
+            $splitOrBlankCond = "paid_amount > 0 AND (LOWER(TRIM(COALESCE(payment_type, ''))) LIKE '%split%' OR payment_type IS NULL OR payment_type = ''" . ($hasSplitCol ? " OR has_register_split = 1" : "") . ")";
+
+            $aggQ = DB::table($table)
+                ->whereNotNull('date')
+                ->whereIn('status', $statuses);
+            if ($exclOpening) {
+                $this->excludeOpeningStockPurchases($aggQ, 'payment_type');
+            }
+            $applyBucketFilters($aggQ, 'date', 'warehouse_name', 'warehouse_id');
+
+            $splitDocCnt = 0;
+            foreach ($aggQ->selectRaw("
+                SUBSTRING(date, 1, 10) as d_date,
+                COALESCE(warehouse_id, 1) as w_id,
+                MAX(COALESCE(warehouse_name, 'Main Branch Outlet')) as w_name,
+                COALESCE(SUM(CASE WHEN {$unlinkedPlainCashCond} THEN paid_amount ELSE 0 END), 0) as unlinked_cash_amt,
+                COALESCE(SUM(CASE WHEN {$splitOrBlankCond} THEN 1 ELSE 0 END), 0) as split_doc_cnt
+            ")
+                ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), DB::raw("COALESCE(warehouse_id, 1)"))
+                ->get() as $row) {
+                $splitDocCnt += (int)($row->split_doc_cnt ?? 0);
+                $d = trim((string)($row->d_date ?? ''));
+                if ($d === '') continue;
+                $wId = (int)$row->w_id;
+                $k = $d . '_' . $wId;
+                if (!isset($dayBuckets[$k])) {
+                    $bucket = $initZBucket($d, $wId, (string)$row->w_name);
+                    $bucket->u_role = 'Super Admin';
+                    $dayBuckets[$k] = $bucket;
+                }
+                $amt = (float)($row->unlinked_cash_amt ?? 0);
+                if ($amt > 0.0001) {
+                    $totalsByKey[$k] = round(($totalsByKey[$k] ?? 0.0) + $amt, 2);
+                }
+            }
+
+            if ($splitDocCnt <= 0) {
+                return $totalsByKey;
+            }
+
+            // Targeted PHP parsing ONLY when Split Payment or has_register_split rows exist
+            $docsQ = DB::table($table)
+                ->whereNotNull('date')
+                ->whereIn('status', $statuses)
+                ->where('paid_amount', '>', 0)
+                ->where(function ($q) use ($hasSplitCol) {
+                    $q->whereRaw("LOWER(TRIM(COALESCE(payment_type, ''))) LIKE '%split%'")
+                      ->orWhereNull('payment_type')
+                      ->orWhere('payment_type', '');
+                    if ($hasSplitCol) {
+                        $q->orWhere('has_register_split', true);
+                    }
+                });
+            if ($exclOpening) {
+                $this->excludeOpeningStockPurchases($docsQ, 'payment_type');
+            }
+            $applyBucketFilters($docsQ, 'date', 'warehouse_name', 'warehouse_id');
+            $docs = $docsQ->select(['id', 'date', 'warehouse_id', 'cash_register_id', 'payment_type', 'paid_amount', 'payments_payload'])->cursor();
             foreach ($docs as $doc) {
                 $k = substr((string)$doc->date, 0, 10) . '_' . (int)($doc->warehouse_id ?? 1);
                 $headerReg = !empty($doc->cash_register_id) ? (int)$doc->cash_register_id : null;
@@ -7142,11 +8896,25 @@ class ReportController extends Controller
             return $totalsByKey;
         };
 
-        $unlinkedPoByKey = $batchUnlinkedCashDocs('purchases', ['Received', 'Completed']);
-        $unlinkedPrByKey = $batchUnlinkedCashDocs('purchase_returns', ['Completed', 'Received']);
+        $unlinkedPoByKey = $batchUnlinkedCashDocs('purchases', ['Received', 'Completed'], true);
+        $unlinkedPrByKey = $batchUnlinkedCashDocs('purchase_returns', ['Completed', 'Received'], false);
+
+        if ($allowedPageBucketSet !== null) {
+            foreach (array_keys($dayBuckets) as $bk) {
+                if (!isset($allowedPageBucketSet[$bk])) {
+                    unset($dayBuckets[$bk]);
+                }
+            }
+        }
+        $salesGroups = array_values($dayBuckets);
+        usort($salesGroups, function ($a, $b) {
+            $cmp = strcmp((string)$b->sale_date, (string)$a->sale_date);
+            return $cmp !== 0 ? $cmp : ((int)$a->w_id <=> (int)$b->w_id);
+        });
 
         // 3. Assemble Sessions (Zero SQL inside loop)
         $items = [];
+        $availRegisters = [];
         $totalGrossSales = 0.0;
         $totalNetSales = 0.0;
         $totalClosingCash = 0.0;
@@ -7159,15 +8927,15 @@ class ReportController extends Controller
             $wName = $s->w_name;
             $key = $saleDate . '_' . $wId;
 
-            $ret = $returnsAgg->get($key);
-            $exp = $expensesAgg->get($key);
-            $cogsObj = $cogsAgg->get($key);
+            $ret = $returnsMap[$key] ?? null;
+            $exp = $expensesMap[$key] ?? null;
+            $cogsRaw = (float)($cogsAgg[$key] ?? 0.0);
 
             $gross = (float)$s->gross_sales;
             $returns = $ret ? (float)$ret->total_returns : 0.0;
             $returnedCogs = $ret ? (float)$ret->returned_cogs : 0.0;
             $expenses = $exp ? (float)$exp->total_expenses : 0.0;
-            $cogs = round(($cogsObj ? (float)$cogsObj->total_cogs : 0.0) - $returnedCogs, 2);
+            $cogs = round($cogsRaw - $returnedCogs, 2);
             $netSales = round($gross - $returns, 2);
             $grossProfit = round($netSales - $cogs, 2);
             $netProfit = round($grossProfit - $expenses, 2);
@@ -7223,19 +8991,34 @@ class ReportController extends Controller
             $cleanDate = str_replace('-', '', $saleDate);
             $refNo = 'ZR-' . $cleanDate . '-' . str_pad($wId, 2, '0', STR_PAD_LEFT);
             $registerId = 'REG-' . str_pad($wId, 2, '0', STR_PAD_LEFT);
+            $availRegisters[$registerId] = true;
 
-            if ($registerFilter !== 'All' && !empty($registerFilter) && $registerId !== $registerFilter) {
+            if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($registerId, (string)$registerFilter) !== 0) {
                 continue;
             }
 
-            $status = 'Closed';
-            if ($statusFilter !== 'All' && !empty($statusFilter) && strcasecmp($status, $statusFilter) !== 0) {
-                continue;
+            $hasOpenReg = $regSessions->isNotEmpty() && $regSessions->contains(function ($r) {
+                return strtolower(trim((string)($r->status ?? ''))) === 'open'
+                    || strtolower(trim((string)($r->status ?? ''))) === 'active';
+            });
+            $status = $hasOpenReg ? 'Open' : 'Closed';
+            if ($statusFilter !== 'All' && !empty($statusFilter)) {
+                $normStatFilter = strtolower(trim((string)$statusFilter));
+                if ($normStatFilter === 'audited' || $normStatFilter === 'closed') {
+                    if ($status !== 'Closed') continue;
+                } elseif (strcasecmp($status, (string)$statusFilter) !== 0) {
+                    continue;
+                }
             }
 
-            $paymentStatus = $discrepancy == 0 ? 'Reconciled' : 'Discrepancy';
-            if ($paymentStatusFilter !== 'All' && !empty($paymentStatusFilter) && strcasecmp($paymentStatus, $paymentStatusFilter) !== 0) {
-                continue;
+            $paymentStatus = abs($discrepancy) < 0.01 ? 'Reconciled' : 'Discrepancy';
+            if ($paymentStatusFilter !== 'All' && !empty($paymentStatusFilter)) {
+                $normPsFilter = strtolower(trim((string)$paymentStatusFilter));
+                if (in_array($normPsFilter, ['balanced', 'reconciled'], true)) {
+                    if ($paymentStatus !== 'Reconciled') continue;
+                } elseif (strcasecmp($paymentStatus, (string)$paymentStatusFilter) !== 0) {
+                    continue;
+                }
             }
 
             if (!empty($search)) {
@@ -7334,21 +9117,35 @@ class ReportController extends Controller
             }
 
             $items[] = $item;
-            $totalGrossSales += $gross;
-            $totalNetSales += $netSales;
-            $totalClosingCash += $closingCash;
-            $totalDiscrepancy += $discrepancy;
+            if (!$skipSummary) {
+                $totalGrossSales += $gross;
+                $totalNetSales += $netSales;
+                $totalClosingCash += $closingCash;
+                $totalDiscrepancy += $discrepancy;
+            }
         }
 
-        $totalReportsCount = count($items);
+        $totalReportsCount = ($skipSummary && $knownTotal !== null) ? $knownTotal : count($items);
         $lastPage = max(1, (int)ceil($totalReportsCount / max(1, $perPage)));
-        $offset = ($page - 1) * $perPage;
-        $pagedItems = array_slice($items, $offset, $perPage);
-        $hasMore = ($offset + count($pagedItems)) < $totalReportsCount;
+        if ($allowedPageBucketSet !== null) {
+            $pagedItems = $items;
+            $hasMore = (($page - 1) * $perPage + count($pagedItems)) < $totalReportsCount;
+        } else {
+            $offset = ($page - 1) * $perPage;
+            $pagedItems = array_slice($items, $offset, $perPage);
+            $hasMore = ($offset + count($pagedItems)) < $totalReportsCount;
+        }
+
+        $availableRegisters = [];
+        if (!$skipSummary && $page === 1) {
+            $availableRegisters = array_keys($availRegisters);
+            sort($availableRegisters, SORT_NATURAL | SORT_FLAG_CASE);
+        }
 
         return $this->noStoreJson([
             'status' => 'success',
             'cost_masked' => !$canViewCost,
+            'available_registers' => $availableRegisters,
             'summary' => [
                 'cost_masked' => !$canViewCost,
                 'total_reports' => $totalReportsCount,
@@ -7377,16 +9174,20 @@ class ReportController extends Controller
     public function registerReport(Request $request)
     {
         $accounting = $this->accounting();
-        $warehouse = $request->query('warehouse', 'All');
+        $warehouse = $request->query('warehouse') ?? $request->query('warehouse_id') ?? $request->query('outlet_id') ?? 'All';
         $cashier = $request->query('cashier', $request->query('user_name', 'All'));
         $registerFilter = $request->query('register', 'All');
         $statusFilter = $request->query('status', 'All');
+        $discrepancyFilter = $request->query('discrepancy', 'All');
         $paymentTypeFilter = $request->query('payment_type', $request->query('payment_method', 'All'));
         $startDate = (string)$request->query('start_date', $request->query('date_from', ''));
         $endDate = (string)$request->query('end_date', $request->query('date_to', ''));
         $search = trim((string)$request->query('search', ''));
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $allowedOutletNames = !empty($allowedOutlets)
@@ -7404,19 +9205,71 @@ class ReportController extends Controller
                 $targetWarehouseName = $outletObj ? $outletObj->name : (string)$warehouse;
             } else {
                 $targetWarehouseName = (string)$warehouse;
-                $outletObj = DB::table('outlets')->whereRaw('LOWER(name) = ?', [strtolower($targetWarehouseName)])->first()
-                    ?? ($accounting->schemaHasTable('warehouses') ? DB::table('warehouses')->whereRaw('LOWER(name) = ?', [strtolower($targetWarehouseName)])->first() : null);
+                $outletObj = DB::table('outlets')->where('name', $targetWarehouseName)->first()
+                    ?? ($accounting->schemaHasTable('warehouses') ? DB::table('warehouses')->where('name', $targetWarehouseName)->first() : null);
                 if ($outletObj) {
                     $targetWarehouseId = (int)$outletObj->id;
                 }
             }
         }
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && !empty($warehouse)) {
+            $isAllowedById = $targetWarehouseId !== null && in_array($targetWarehouseId, $allowedOutlets, true);
+            $isAllowedByName = $targetWarehouseId === null && $targetWarehouseName !== null && in_array($targetWarehouseName, $allowedOutletNames, true);
+            if (!$isAllowedById && !$isAllowedByName) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
+
+        $matchesDiscrepancy = static function (float $variance, string $filter): bool {
+            $norm = strtolower(trim($filter));
+            if ($norm === '' || $norm === 'all') {
+                return true;
+            }
+            if ($norm === 'balanced') {
+                return abs($variance) <= 0.009;
+            }
+            return abs($variance) > 0.009;
+        };
+
+        $matchesPaymentFilter = static function (string $primary, array $breakdown, string $filter): bool {
+            $norm = trim($filter);
+            if ($norm === '' || strcasecmp($norm, 'All') === 0) {
+                return true;
+            }
+            if (strcasecmp($primary, $norm) === 0) {
+                return true;
+            }
+            $activeTenders = 0;
+            foreach ($breakdown as $pb) {
+                if (!is_array($pb)) {
+                    continue;
+                }
+                $amt = (float)($pb['amount'] ?? 0);
+                if ($amt > 0.0001) {
+                    $activeTenders++;
+                    if (strcasecmp((string)($pb['method'] ?? ''), $norm) === 0) {
+                        return true;
+                    }
+                }
+            }
+            if (strcasecmp($norm, 'Split Payment') === 0 && $activeTenders > 1) {
+                return true;
+            }
+            return false;
+        };
+
+        $availRegisters = [];
+        $availCashiers = [];
+        $availPayTypes = [];
 
         $accountedSaleIds = [];
         $items = [];
         $realRegIds = [];
+        $skippedRealRegsCount = 0;
+        $hasSpTable = $accounting->schemaHasTable('sale_payments');
+        $hasRegTxTable = $accounting->schemaHasTable('cash_register_transactions');
 
-        // 1. Process Real Cash Registers (Batched queries — zero per-register N+1)
+        // 1. Process Real Cash Registers (Separated index-seeking queries — zero OR full-table scans)
         if ($accounting->schemaHasTable('cash_registers')) {
             $regQuery = DB::table('cash_registers');
             if (!empty($allowedOutlets)) {
@@ -7429,11 +9282,17 @@ class ReportController extends Controller
                     }
                 });
             }
-            if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
+            if ($targetWarehouseId !== null && $targetWarehouseName !== null) {
                 $regQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
-                    if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
-                    if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
+                    $q->where('warehouse_id', $targetWarehouseId)
+                        ->orWhere(function ($inner) use ($targetWarehouseName) {
+                            $inner->whereNull('warehouse_id')->where('warehouse_name', $targetWarehouseName);
+                        });
                 });
+            } elseif ($targetWarehouseId !== null) {
+                $regQuery->where('warehouse_id', $targetWarehouseId);
+            } elseif ($targetWarehouseName !== null) {
+                $regQuery->where('warehouse_name', $targetWarehouseName);
             }
             if ($cashier !== 'All' && !empty($cashier)) {
                 $regQuery->where('user_name', 'like', "%{$cashier}%");
@@ -7443,20 +9302,51 @@ class ReportController extends Controller
             $realRegs = $regQuery->orderByDesc('id')->get();
             $realRegIds = $realRegs->pluck('id')->map(fn($v) => (int)$v)->all();
 
-            // Pre-fetch drawer transactions (float_in, drop, void_refund) in 400-ID chunks
+            // Fast-path for Page 2+ (skip_summary=1 & offset >= real register count): only collect accounted sale IDs cleanly
+            $offset = ($page - 1) * $perPage;
+            $canSkipRealRegHydration = $skipSummary
+                && $knownTotal !== null
+                && $registerFilter === 'All'
+                && $paymentTypeFilter === 'All'
+                && strtolower(trim((string)$discrepancyFilter)) === 'all'
+                && $search === ''
+                && !in_array(strtolower($statusFilter), ['open', 'active'], true)
+                && $offset >= $realRegs->count();
+
+            if ($canSkipRealRegHydration) {
+                $skippedRealRegsCount = $realRegs->count();
+                if (!empty($realRegIds)) {
+                    foreach (array_chunk($realRegIds, 400) as $idChunk) {
+                        foreach (DB::table('sales')->whereIn('cash_register_id', $idChunk)->pluck('id') as $sid) {
+                            $accountedSaleIds[(int)$sid] = true;
+                        }
+                    }
+                }
+                $realRegs = collect();
+                $realRegIds = [];
+            }
+
+            // Pre-fetch drawer transactions (float_in, drop, void_refund) in SQL SUM per chunk
             $regTxAgg = [];
-            if ($accounting->schemaHasTable('cash_register_transactions') && !empty($realRegIds)) {
+            if ($hasRegTxTable && !empty($realRegIds)) {
                 foreach (array_chunk($realRegIds, 400) as $idChunk) {
-                    $txRows = DB::table('cash_register_transactions')
+                    $txAggRows = DB::table('cash_register_transactions')
                         ->whereIn('cash_register_id', $idChunk)
-                        ->select(['cash_register_id', 'type', 'amount'])
+                        ->selectRaw("
+                            cash_register_id,
+                            COALESCE(SUM(CASE WHEN type = 'float_in' THEN amount ELSE 0 END), 0) as float_in,
+                            COALESCE(SUM(CASE WHEN type IN ('drop', 'safe_drop') THEN amount ELSE 0 END), 0) as drop_amt,
+                            COALESCE(SUM(CASE WHEN type = 'void_refund' THEN amount ELSE 0 END), 0) as void_refund
+                        ")
+                        ->groupBy('cash_register_id')
                         ->get();
-                    foreach ($txRows as $tx) {
+                    foreach ($txAggRows as $tx) {
                         $rid = (int)$tx->cash_register_id;
-                        if (!isset($regTxAgg[$rid])) $regTxAgg[$rid] = ['float_in' => 0.0, 'drop' => 0.0, 'void_refund' => 0.0];
-                        if ($tx->type === 'float_in') $regTxAgg[$rid]['float_in'] += (float)$tx->amount;
-                        elseif ($tx->type === 'drop' || $tx->type === 'safe_drop') $regTxAgg[$rid]['drop'] += (float)$tx->amount;
-                        elseif ($tx->type === 'void_refund') $regTxAgg[$rid]['void_refund'] += (float)$tx->amount;
+                        $regTxAgg[$rid] = [
+                            'float_in' => (float)$tx->float_in,
+                            'drop' => (float)$tx->drop_amt,
+                            'void_refund' => (float)$tx->void_refund,
+                        ];
                     }
                 }
             }
@@ -7466,11 +9356,11 @@ class ReportController extends Controller
                 ? $accounting->summarizeRegisterPurchaseCashFlowBatch($realRegIds)
                 : [];
 
-            // Pre-compute time & warehouse envelope for unlinked fallback rows
             $nowStr = (string)now();
             $minOpenedAt = null;
             $maxClosedAt = null;
             $regMeta = [];
+            $regWhIds = [];
             $regWhNames = [];
             foreach ($realRegs as $r) {
                 $rid = (int)$r->id;
@@ -7478,68 +9368,84 @@ class ReportController extends Controller
                 $cAt = (string)($r->closed_at ?: $nowStr);
                 if ($minOpenedAt === null || $oAt < $minOpenedAt) $minOpenedAt = $oAt;
                 if ($maxClosedAt === null || $cAt > $maxClosedAt) $maxClosedAt = $cAt;
+                if (!empty($r->warehouse_id)) {
+                    $regWhIds[(int)$r->warehouse_id] = true;
+                }
                 if (!empty($r->warehouse_name)) {
                     $regWhNames[(string)$r->warehouse_name] = true;
                 }
                 $regMeta[$rid] = ['opened_at' => $oAt, 'closed_at' => $cAt];
             }
+            $regWhIdList = array_keys($regWhIds);
             $regWhNameList = array_keys($regWhNames);
 
-            // Batch fetch shift sales (linked by cash_register_id OR legacy unlinked within envelope, excluding late-offline audit sales)
+            // Batch fetch shift sales cleanly: linked query + separate unlinked window query (index-friendly!)
             $hasLateOfflineColReg = $accounting->schemaHasColumn('sales', 'late_offline_reconciliation');
             $shiftSalesByReg = [];
             $allShiftSaleIds = [];
             if (!empty($realRegIds)) {
                 $seenShiftSaleIds = [];
-                foreach (array_chunk($realRegIds, 400) as $chunkIdx => $idChunk) {
-                    $sq = DB::table('sales');
+                $collectShiftSale = function ($ss) use (&$seenShiftSaleIds, &$shiftSalesByReg, &$accountedSaleIds, &$allShiftSaleIds, $realRegs, $regMeta) {
+                    $sid = (int)$ss->id;
+                    if (isset($seenShiftSaleIds[$sid])) return;
+                    $seenShiftSaleIds[$sid] = true;
+                    if (!empty($ss->cash_register_id)) {
+                        $rid = (int)$ss->cash_register_id;
+                        $shiftSalesByReg[$rid][] = $ss;
+                        $accountedSaleIds[$sid] = true;
+                        $allShiftSaleIds[$sid] = true;
+                    } else {
+                        // Attribute unlinked sale to at most ONE matching register shift to prevent double-counting overlapping shifts
+                        $matchedRid = null;
+                        foreach ($realRegs as $r) {
+                            $rid = (int)$r->id;
+                            if ($r->warehouse_id && $ss->warehouse_id) {
+                                if ((int)$ss->warehouse_id !== (int)$r->warehouse_id) continue;
+                            } elseif ((string)$ss->warehouse_name !== (string)$r->warehouse_name) {
+                                continue;
+                            }
+                            if ($r->user_id && (int)$ss->user_id !== (int)$r->user_id) continue;
+                            $sCreated = (string)($ss->created_at ?? '');
+                            if ($sCreated < $regMeta[$rid]['opened_at'] || $sCreated > $regMeta[$rid]['closed_at']) continue;
+                            $matchedRid = $rid;
+                            break;
+                        }
+                        if ($matchedRid !== null) {
+                            $shiftSalesByReg[$matchedRid][] = $ss;
+                            $accountedSaleIds[$sid] = true;
+                            $allShiftSaleIds[$sid] = true;
+                        }
+                    }
+                };
+                $saleCols = ['id', 'cash_register_id', 'warehouse_id', 'warehouse_name', 'user_id', 'grand_total', 'paid_amount', 'payment_type', 'created_at'];
+                foreach (array_chunk($realRegIds, 400) as $idChunk) {
+                    $sq = DB::table('sales')->whereIn('cash_register_id', $idChunk);
                     $this->applyActiveDocumentFilter($sq, 'status');
                     if ($hasLateOfflineColReg) {
                         $sq->where(function ($sub) {
                             $sub->whereNull('late_offline_reconciliation')->orWhere('late_offline_reconciliation', false);
                         });
                     }
-                    $sq->where(function ($q) use ($idChunk, $chunkIdx, $regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                        $q->whereIn('cash_register_id', $idChunk);
-                        if ($chunkIdx === 0 && !empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
-                            $q->orWhere(function ($sub) use ($regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                                $sub->whereNull('cash_register_id')
-                                    ->whereIn('warehouse_name', $regWhNameList)
-                                    ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
-                                if (!empty($allowedOutlets)) {
-                                    $sub->whereIn('warehouse_id', $allowedOutlets);
-                                }
-                            });
-                        }
-                    });
-                    $chunkSales = $sq->get(['id', 'cash_register_id', 'warehouse_name', 'user_id', 'grand_total', 'paid_amount', 'payment_type', 'created_at']);
-                    foreach ($chunkSales as $ss) {
-                        $sid = (int)$ss->id;
-                        if (isset($seenShiftSaleIds[$sid])) {
-                            continue;
-                        }
-                        $seenShiftSaleIds[$sid] = true;
-                        if (!empty($ss->cash_register_id)) {
-                            $rid = (int)$ss->cash_register_id;
-                            $shiftSalesByReg[$rid][] = $ss;
-                            $accountedSaleIds[$sid] = true;
-                            $allShiftSaleIds[$sid] = true;
-                        } else {
-                            $matchedAny = false;
-                            foreach ($realRegs as $r) {
-                                $rid = (int)$r->id;
-                                if ((string)$ss->warehouse_name !== (string)$r->warehouse_name) continue;
-                                if ($r->user_id && (int)$ss->user_id !== (int)$r->user_id) continue;
-                                $sCreated = (string)($ss->created_at ?? '');
-                                if ($sCreated < $regMeta[$rid]['opened_at'] || $sCreated > $regMeta[$rid]['closed_at']) continue;
-                                $shiftSalesByReg[$rid][] = $ss;
-                                $matchedAny = true;
-                            }
-                            if ($matchedAny) {
-                                $accountedSaleIds[$sid] = true;
-                                $allShiftSaleIds[$sid] = true;
-                            }
-                        }
+                    foreach ($sq->get($saleCols) as $ss) {
+                        $collectShiftSale($ss);
+                    }
+                }
+                if (!empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
+                    $unlinkedSq = DB::table('sales')
+                        ->whereNull('cash_register_id')
+                        ->whereIn('warehouse_name', $regWhNameList)
+                        ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
+                    $this->applyActiveDocumentFilter($unlinkedSq, 'status');
+                    if ($hasLateOfflineColReg) {
+                        $unlinkedSq->where(function ($sub) {
+                            $sub->whereNull('late_offline_reconciliation')->orWhere('late_offline_reconciliation', false);
+                        });
+                    }
+                    if (!empty($allowedOutlets)) {
+                        $unlinkedSq->whereIn('warehouse_id', $allowedOutlets);
+                    }
+                    foreach ($unlinkedSq->get($saleCols) as $ss) {
+                        $collectShiftSale($ss);
                     }
                 }
             }
@@ -7549,7 +9455,7 @@ class ReportController extends Controller
             $crossShiftPaymentsByReg = [];
             $allPaymentIdsSeen = [];
             $uniqueShiftSaleIds = array_keys($allShiftSaleIds);
-            if ($accounting->schemaHasTable('sale_payments')) {
+            if ($hasSpTable) {
                 $hasSpRegCol = $accounting->schemaHasColumn('sale_payments', 'cash_register_id');
                 if ($hasSpRegCol && !empty($realRegIds)) {
                     foreach (array_chunk($realRegIds, 400) as $idChunk) {
@@ -7585,16 +9491,19 @@ class ReportController extends Controller
                 }
             }
 
-            // Batch fetch shift expenses + expense_payments
+            // Batch fetch shift expenses + expense_payments (split linked vs unlinked for index speed)
             $shiftExpensesByReg = [];
             $allShiftExpIds = [];
             $hasExpensesTable = $accounting->schemaHasTable('expenses');
             $hasExpRegCol = $hasExpensesTable && $accounting->schemaHasColumn('expenses', 'cash_register_id');
             if ($hasExpensesTable && !empty($realRegIds)) {
                 $seenExpIds = [];
+                $expCols = ['id', 'warehouse_name', 'amount', 'paid_amount', 'due_amount', 'payment_status', 'payment_method', 'created_at'];
                 if ($hasExpRegCol) {
-                    foreach (array_chunk($realRegIds, 400) as $chunkIdx => $idChunk) {
+                    $expCols[] = 'cash_register_id';
+                    foreach (array_chunk($realRegIds, 400) as $idChunk) {
                         $eq = DB::table('expenses')
+                            ->whereIn('cash_register_id', $idChunk)
                             ->where(function ($q) {
                                 $q->whereNull('payment_status')
                                   ->orWhereNotIn('payment_status', [
@@ -7602,41 +9511,18 @@ class ReportController extends Controller
                                       'Draft', 'draft', 'DRAFT',
                                       'Voided', 'voided', 'VOIDED',
                                   ]);
-                            })
-                            ->where(function ($q) use ($idChunk, $chunkIdx, $regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                                $q->whereIn('cash_register_id', $idChunk);
-                                if ($chunkIdx === 0 && !empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
-                                    $q->orWhere(function ($sub) use ($regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                                        $sub->whereNull('cash_register_id')
-                                            ->whereIn('warehouse_name', $regWhNameList)
-                                            ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
-                                        if (!empty($allowedOutlets)) {
-                                            $sub->whereIn('warehouse_id', $allowedOutlets);
-                                        }
-                                    });
-                                }
                             });
-                        foreach ($eq->get(['id', 'cash_register_id', 'warehouse_name', 'amount', 'paid_amount', 'due_amount', 'payment_status', 'payment_method', 'created_at']) as $ex) {
+                        foreach ($eq->get($expCols) as $ex) {
                             $eid = (int)$ex->id;
                             if (isset($seenExpIds[$eid])) continue;
                             $seenExpIds[$eid] = true;
-                            if (!empty($ex->cash_register_id)) {
-                                $rid = (int)$ex->cash_register_id;
-                                $shiftExpensesByReg[$rid][] = $ex;
-                                $allShiftExpIds[$eid] = true;
-                            } else {
-                                foreach ($realRegs as $r) {
-                                    $rid = (int)$r->id;
-                                    if ((string)$ex->warehouse_name !== (string)$r->warehouse_name) continue;
-                                    $eCreated = (string)($ex->created_at ?? '');
-                                    if ($eCreated < $regMeta[$rid]['opened_at'] || $eCreated > $regMeta[$rid]['closed_at']) continue;
-                                    $shiftExpensesByReg[$rid][] = $ex;
-                                    $allShiftExpIds[$eid] = true;
-                                }
-                            }
+                            $shiftExpensesByReg[(int)$ex->cash_register_id][] = $ex;
+                            $allShiftExpIds[$eid] = true;
                         }
                     }
-                } elseif (!empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
+                }
+                if (!empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
+                    $expCols[] = 'warehouse_id';
                     $eq = DB::table('expenses')
                         ->where(function ($q) {
                             $q->whereNull('payment_status')
@@ -7648,17 +9534,28 @@ class ReportController extends Controller
                         })
                         ->whereIn('warehouse_name', $regWhNameList)
                         ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
+                    if ($hasExpRegCol) {
+                        $eq->whereNull('cash_register_id');
+                    }
                     if (!empty($allowedOutlets)) {
                         $eq->whereIn('warehouse_id', $allowedOutlets);
                     }
-                    foreach ($eq->get(['id', 'warehouse_name', 'amount', 'paid_amount', 'due_amount', 'payment_status', 'payment_method', 'created_at']) as $ex) {
+                    foreach ($eq->get($expCols) as $ex) {
+                        $eid = (int)$ex->id;
+                        if (isset($seenExpIds[$eid])) continue;
+                        $seenExpIds[$eid] = true;
                         foreach ($realRegs as $r) {
                             $rid = (int)$r->id;
-                            if ((string)$ex->warehouse_name !== (string)$r->warehouse_name) continue;
+                            if ($r->warehouse_id && isset($ex->warehouse_id) && $ex->warehouse_id) {
+                                if ((int)$ex->warehouse_id !== (int)$r->warehouse_id) continue;
+                            } elseif ((string)$ex->warehouse_name !== (string)$r->warehouse_name) {
+                                continue;
+                            }
                             $eCreated = (string)($ex->created_at ?? '');
                             if ($eCreated < $regMeta[$rid]['opened_at'] || $eCreated > $regMeta[$rid]['closed_at']) continue;
                             $shiftExpensesByReg[$rid][] = $ex;
-                            $allShiftExpIds[(int)$ex->id] = true;
+                            $allShiftExpIds[$eid] = true;
+                            break;
                         }
                     }
                 }
@@ -7674,61 +9571,53 @@ class ReportController extends Controller
                 }
             }
 
-            // Batch fetch shift sale_returns (strictly enforcing outlet scope on unlinked rows)
+            // Batch fetch shift sale_returns (split linked vs unlinked)
             $shiftReturnsByReg = [];
             $hasSaleReturnsTable = $accounting->schemaHasTable('sale_returns');
             $hasSrRegCol = $hasSaleReturnsTable && $accounting->schemaHasColumn('sale_returns', 'cash_register_id');
             if ($hasSaleReturnsTable && !empty($realRegIds)) {
                 $seenSrIds = [];
+                $srCols = ['id', 'warehouse_name', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload', 'created_at'];
                 if ($hasSrRegCol) {
-                    foreach (array_chunk($realRegIds, 400) as $chunkIdx => $idChunk) {
-                        $srQ = DB::table('sale_returns');
+                    $srCols[] = 'cash_register_id';
+                    foreach (array_chunk($realRegIds, 400) as $idChunk) {
+                        $srQ = DB::table('sale_returns')->whereIn('cash_register_id', $idChunk);
                         $this->applyActiveDocumentFilter($srQ, 'status');
-                        $srQ->where(function ($q) use ($idChunk, $chunkIdx, $regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                            $q->whereIn('cash_register_id', $idChunk);
-                            if ($chunkIdx === 0 && !empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
-                                $q->orWhere(function ($sub) use ($regWhNameList, $minOpenedAt, $maxClosedAt, $allowedOutlets) {
-                                    $sub->whereNull('cash_register_id')
-                                        ->whereIn('warehouse_name', $regWhNameList)
-                                        ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
-                                    if (!empty($allowedOutlets)) {
-                                        $sub->whereIn('warehouse_id', $allowedOutlets);
-                                    }
-                                });
-                            }
-                        });
-                        foreach ($srQ->get(['id', 'cash_register_id', 'warehouse_name', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload', 'created_at']) as $ret) {
+                        foreach ($srQ->get($srCols) as $ret) {
                             $retId = (int)$ret->id;
                             if (isset($seenSrIds[$retId])) continue;
                             $seenSrIds[$retId] = true;
-                            if (!empty($ret->cash_register_id)) {
-                                $shiftReturnsByReg[(int)$ret->cash_register_id][] = $ret;
-                            } else {
-                                foreach ($realRegs as $r) {
-                                    $rid = (int)$r->id;
-                                    if ((string)$ret->warehouse_name !== (string)$r->warehouse_name) continue;
-                                    $rCreated = (string)($ret->created_at ?? '');
-                                    if ($rCreated < $regMeta[$rid]['opened_at'] || $rCreated > $regMeta[$rid]['closed_at']) continue;
-                                    $shiftReturnsByReg[$rid][] = $ret;
-                                }
-                            }
+                            $shiftReturnsByReg[(int)$ret->cash_register_id][] = $ret;
                         }
                     }
-                } elseif (!empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
-                    $srQ = DB::table('sale_returns');
-                    $this->applyActiveDocumentFilter($srQ, 'status');
-                    $srQ->whereIn('warehouse_name', $regWhNameList)
+                }
+                if (!empty($regWhNameList) && $minOpenedAt !== null && $maxClosedAt !== null) {
+                    $srCols[] = 'warehouse_id';
+                    $srQ = DB::table('sale_returns')
+                        ->whereIn('warehouse_name', $regWhNameList)
                         ->whereBetween('created_at', [$minOpenedAt, $maxClosedAt]);
+                    if ($hasSrRegCol) {
+                        $srQ->whereNull('cash_register_id');
+                    }
+                    $this->applyActiveDocumentFilter($srQ, 'status');
                     if (!empty($allowedOutlets)) {
                         $srQ->whereIn('warehouse_id', $allowedOutlets);
                     }
-                    foreach ($srQ->get(['id', 'warehouse_name', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload', 'created_at']) as $ret) {
+                    foreach ($srQ->get($srCols) as $ret) {
+                        $retId = (int)$ret->id;
+                        if (isset($seenSrIds[$retId])) continue;
+                        $seenSrIds[$retId] = true;
                         foreach ($realRegs as $r) {
                             $rid = (int)$r->id;
-                            if ((string)$ret->warehouse_name !== (string)$r->warehouse_name) continue;
+                            if ($r->warehouse_id && isset($ret->warehouse_id) && $ret->warehouse_id) {
+                                if ((int)$ret->warehouse_id !== (int)$r->warehouse_id) continue;
+                            } elseif ((string)$ret->warehouse_name !== (string)$r->warehouse_name) {
+                                continue;
+                            }
                             $rCreated = (string)($ret->created_at ?? '');
                             if ($rCreated < $regMeta[$rid]['opened_at'] || $rCreated > $regMeta[$rid]['closed_at']) continue;
                             $shiftReturnsByReg[$rid][] = $ret;
+                            break;
                         }
                     }
                 }
@@ -7809,11 +9698,9 @@ class ReportController extends Controller
                     }
                 }
 
-                // Floats in & Cash Drops
                 $floatsIn = (float)($regTxAgg[$rid]['float_in'] ?? 0.0);
                 $cashDrops = (float)($regTxAgg[$rid]['drop'] ?? 0.0);
 
-                // Shift Expenses & Refunds
                 $shiftExpenses = $shiftExpensesByReg[$rid] ?? [];
                 $totalExpenses = 0.0;
                 $cashExpenses = 0.0;
@@ -7886,7 +9773,6 @@ class ReportController extends Controller
                     $variance = $r->cash_difference !== null ? (float)$r->cash_difference : round($closingCash - $expectedCash, 2);
                 }
 
-                // Primary payment type
                 $primaryPayment = 'Cash';
                 if ($digitalSales > $cashSales && $digitalSales > $cardSales) {
                     $maxTender = 'KBZPay';
@@ -7909,14 +9795,22 @@ class ReportController extends Controller
                 $refNo = $r->reference_no ?: ('REG-' . str_replace('-', '', $sessionDate) . '-' . str_pad($r->id, 4, '0', STR_PAD_LEFT));
                 $registerName = $r->register_name ?: 'Register 01';
 
-                // Filters
+                $availRegisters[$registerName] = true;
+                $availCashiers[$cashierName] = true;
+                foreach ($paymentBreakdown as $pb) {
+                    if (!empty($pb['method']) && ((float)($pb['amount'] ?? 0) > 0 || (int)($pb['count'] ?? 0) > 0)) {
+                        $availPayTypes[(string)$pb['method']] = true;
+                    }
+                }
+
                 if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($registerName, $registerFilter) !== 0) continue;
                 if ($statusFilter !== 'All' && !empty($statusFilter)) {
                     $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
                     $normStatus = strtolower($status) === 'active' ? 'open' : strtolower($status);
                     if ($normFilter !== $normStatus) continue;
                 }
-                if ($paymentTypeFilter !== 'All' && !empty($paymentTypeFilter) && strcasecmp($primaryPayment, $paymentTypeFilter) !== 0) continue;
+                if (!$matchesDiscrepancy($variance, (string)$discrepancyFilter)) continue;
+                if (!$matchesPaymentFilter($primaryPayment, $paymentBreakdown, (string)$paymentTypeFilter)) continue;
 
                 if (!empty($search)) {
                     $q = strtolower($search);
@@ -7965,127 +9859,221 @@ class ReportController extends Controller
             }
         }
 
-        // 2. Process Legacy Sales (Not linked to any real cash register, SQLite >999 safe)
-        $accountedIds = array_keys($accountedSaleIds);
-        $legacySalesQuery = DB::table('sales');
-        $this->applyActiveDocumentFilter($legacySalesQuery, 'status');
-        if (!empty($allowedOutlets)) {
-            $legacySalesQuery->where(function ($q) use ($allowedOutlets, $allowedOutletNames) {
-                $q->whereIn('warehouse_id', $allowedOutlets);
-                if (!empty($allowedOutletNames)) {
-                    $q->orWhere(function ($sub) use ($allowedOutletNames) {
-                        $sub->whereNull('warehouse_id')->whereIn('warehouse_name', $allowedOutletNames);
-                    });
-                }
-            });
-        }
-
-        if ($targetWarehouseId !== null || $targetWarehouseName !== null) {
-            $legacySalesQuery->where(function ($q) use ($targetWarehouseId, $targetWarehouseName) {
-                if ($targetWarehouseId !== null) $q->where('warehouse_id', $targetWarehouseId);
-                if ($targetWarehouseName !== null) $q->orWhereRaw('LOWER(warehouse_name) = ?', [strtolower($targetWarehouseName)]);
-            });
-        }
-        if ($cashier !== 'All' && !empty($cashier)) {
-            $legacySalesQuery->where('created_by', 'like', "%{$cashier}%");
-        }
-        $this->applyReportDateRange($legacySalesQuery, $startDate !== '' ? $startDate : null, $endDate !== '' ? $endDate : null, 'date');
-
-        if (count($accountedIds) <= 400) {
-            if (!empty($accountedIds)) {
-                $legacySalesQuery->whereNotIn('id', $accountedIds);
-            }
-            $legacyGroups = $legacySalesQuery
-                ->selectRaw("
-                    SUBSTRING(date, 1, 10) as session_date,
-                    MIN(date) as opened_at_raw,
-                    MAX(date) as closed_at_raw,
-                    COALESCE(warehouse_id, 1) as w_id,
-                    COALESCE(warehouse_name, 'Main Branch Outlet') as w_name,
-                    COALESCE(created_by, 'Super Admin') as cashier_name,
-                    COUNT(id) as tx_count,
-                    COALESCE(SUM(grand_total), 0) as total_sales,
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, 'Cash')) LIKE '%cash%' AND LOWER(COALESCE(payment_type, '')) NOT LIKE '%non%cash%' AND LOWER(COALESCE(payment_type, '')) NOT LIKE '%cashless%' THEN paid_amount ELSE 0 END), 0) as cash_sales,
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(payment_type, '')) IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as card_sales,
-                    COALESCE(SUM(CASE WHEN (LOWER(COALESCE(payment_type, 'Cash')) NOT LIKE '%cash%' OR LOWER(COALESCE(payment_type, '')) LIKE '%non%cash%' OR LOWER(COALESCE(payment_type, '')) LIKE '%cashless%') AND LOWER(COALESCE(payment_type, '')) NOT IN ('card', 'pos card', 'credit card', 'visa', 'mastercard') THEN paid_amount ELSE 0 END), 0) as digital_sales
-                ")
-                ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"), 'warehouse_id', 'warehouse_name', 'created_by')
-                ->orderByDesc(DB::raw("SUBSTRING(date, 1, 10)"))
-                ->get();
-        } else {
-            // Stream un-accounted legacy candidates safely without hitting SQLite 999 parameter limit
-            if (count($realRegIds) <= 400 && !empty($realRegIds)) {
-                $legacySalesQuery->where(function ($q) use ($realRegIds) {
-                    $q->whereNull('cash_register_id')->orWhereNotIn('cash_register_id', $realRegIds);
+        // 2. Process Legacy Sales (Single-pass streaming + selective sale_payments tender resolution — zero multi-pass GROUP BY temp tables!)
+        $applyLegacyScope = function ($q) use ($allowedOutlets, $allowedOutletNames, $targetWarehouseId, $targetWarehouseName, $cashier, $startDate, $endDate) {
+            $this->applyActiveDocumentFilter($q, 'status');
+            if (!empty($allowedOutlets)) {
+                $q->where(function ($sub) use ($allowedOutlets, $allowedOutletNames) {
+                    $sub->whereIn('warehouse_id', $allowedOutlets);
+                    if (!empty($allowedOutletNames)) {
+                        $sub->orWhere(function ($inner) use ($allowedOutletNames) {
+                            $inner->whereNull('warehouse_id')->whereIn('warehouse_name', $allowedOutletNames);
+                        });
+                    }
                 });
             }
-            $groupedMap = [];
-            foreach ($legacySalesQuery->select(['id', 'date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total', 'paid_amount', 'payment_type'])->cursor() as $lsRow) {
-                if (isset($accountedSaleIds[(int)$lsRow->id])) {
-                    continue;
-                }
-                $sDate = substr((string)$lsRow->date, 0, 10);
-                $wId = (int)($lsRow->warehouse_id ?? 1);
-                $wName = (string)($lsRow->warehouse_name ?: 'Main Branch Outlet');
-                $cName = (string)($lsRow->created_by ?: 'Super Admin');
-                $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
-                if (!isset($groupedMap[$gKey])) {
-                    $groupedMap[$gKey] = (object)[
-                        'session_date' => $sDate,
-                        'opened_at_raw' => (string)$lsRow->date,
-                        'closed_at_raw' => (string)$lsRow->date,
-                        'w_id' => $wId,
-                        'w_name' => $wName,
-                        'cashier_name' => $cName,
-                        'tx_count' => 0,
-                        'total_sales' => 0.0,
-                        'cash_sales' => 0.0,
-                        'card_sales' => 0.0,
-                        'digital_sales' => 0.0,
-                    ];
-                }
-                $grp = $groupedMap[$gKey];
-                $grp->tx_count++;
-                $grp->total_sales += (float)$lsRow->grand_total;
-                if ((string)$lsRow->date < $grp->opened_at_raw) $grp->opened_at_raw = (string)$lsRow->date;
-                if ((string)$lsRow->date > $grp->closed_at_raw) $grp->closed_at_raw = (string)$lsRow->date;
-                $paid = (float)$lsRow->paid_amount;
-                $pt = strtolower(trim((string)($lsRow->payment_type ?: 'cash')));
-                if (str_contains($pt, 'cash') && !str_contains($pt, 'non cash') && !str_contains($pt, 'non-cash') && !str_contains($pt, 'cashless')) {
-                    $grp->cash_sales += $paid;
-                } elseif (in_array($pt, ['card', 'pos card', 'credit card', 'visa', 'mastercard'], true)) {
-                    $grp->card_sales += $paid;
-                } else {
-                    $grp->digital_sales += $paid;
-                }
+            if ($targetWarehouseId !== null && $targetWarehouseName !== null) {
+                $q->where(function ($sub) use ($targetWarehouseId, $targetWarehouseName) {
+                    $sub->where('warehouse_id', $targetWarehouseId)
+                        ->orWhere(function ($inner) use ($targetWarehouseName) {
+                            $inner->whereNull('warehouse_id')->where('warehouse_name', $targetWarehouseName);
+                        });
+                });
+            } elseif ($targetWarehouseId !== null) {
+                $q->where('warehouse_id', $targetWarehouseId);
+            } elseif ($targetWarehouseName !== null) {
+                $q->where('warehouse_name', $targetWarehouseName);
             }
-            $legacyGroups = collect(array_values($groupedMap))->sortByDesc('session_date')->values();
+            if ($cashier !== 'All' && !empty($cashier)) {
+                $q->where('created_by', 'like', "%{$cashier}%");
+            }
+            $this->applyReportDateRange($q, $startDate !== '' ? $startDate : null, $endDate !== '' ? $endDate : null, 'date');
+        };
+
+        $canSliceLegacyBeforeTenders = $skipSummary
+            && $knownTotal !== null
+            && $registerFilter === 'All'
+            && $paymentTypeFilter === 'All'
+            && strtolower(trim((string)$discrepancyFilter)) === 'all'
+            && $search === ''
+            && !in_array(strtolower($statusFilter), ['open', 'active'], true);
+
+        $legacySalesQuery = DB::table('sales');
+        $applyLegacyScope($legacySalesQuery);
+
+        $groupedMap = [];
+        $legacySalesMeta = [];
+        foreach ($legacySalesQuery->select(['id', 'date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total', 'paid_amount', 'payment_type'])->cursor() as $lsRow) {
+            $sid = (int)$lsRow->id;
+            if (isset($accountedSaleIds[$sid])) {
+                continue;
+            }
+            $sDate = substr((string)$lsRow->date, 0, 10);
+            $wId = (int)($lsRow->warehouse_id ?? 1);
+            $wName = (string)($lsRow->warehouse_name ?: 'Main Branch Outlet');
+            $cName = (string)($lsRow->created_by ?: 'Super Admin');
+            $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
+            if (!isset($groupedMap[$gKey])) {
+                $groupedMap[$gKey] = (object)[
+                    'session_date' => $sDate,
+                    'opened_at_raw' => (string)$lsRow->date,
+                    'closed_at_raw' => (string)$lsRow->date,
+                    'w_id' => $wId,
+                    'w_name' => $wName,
+                    'cashier_name' => $cName,
+                    'tx_count' => 0,
+                    'total_sales' => 0.0,
+                    'cash_sales' => 0.0,
+                    'card_sales' => 0.0,
+                    'digital_sales' => 0.0,
+                    'tender_totals' => [],
+                    'tender_counts' => [],
+                ];
+            }
+            $grp = $groupedMap[$gKey];
+            $grp->tx_count++;
+            $grp->total_sales += (float)$lsRow->grand_total;
+            if ((string)$lsRow->date < $grp->opened_at_raw) $grp->opened_at_raw = (string)$lsRow->date;
+            if ((string)$lsRow->date > $grp->closed_at_raw) $grp->closed_at_raw = (string)$lsRow->date;
+
+            $legacySalesMeta[$sid] = [
+                'gKey' => $gKey,
+                'paid' => (float)$lsRow->paid_amount,
+                'pt' => trim((string)($lsRow->payment_type ?: 'Cash')) ?: 'Cash',
+            ];
         }
 
-        $seq = count($items) + 1;
-        foreach ($legacyGroups as $lg) {
+        // Sort legacy groups newest date first before optional skip_summary slice
+        $legacyGroupsList = array_values($groupedMap);
+        usort($legacyGroupsList, fn ($a, $b) => strcmp((string)$b->session_date, (string)$a->session_date));
+
+        $legacySliceOffset = 0;
+        if ($canSliceLegacyBeforeTenders && !empty($legacyGroupsList)) {
+            $neededStart = max(0, (($page - 1) * $perPage) - (count($items) + $skippedRealRegsCount));
+            $neededLen = $perPage + 10;
+            $legacySliceOffset = $neededStart;
+            $legacyGroupsList = array_slice($legacyGroupsList, $neededStart, $neededLen);
+        }
+
+        // Map kept group keys so we ONLY resolve sale_payments for groups we will actually process
+        $keptGroupKeys = [];
+        foreach ($legacyGroupsList as $lg) {
+            $keptKey = $lg->session_date . '|' . $lg->w_id . '|' . $lg->w_name . '|' . $lg->cashier_name;
+            $keptGroupKeys[$keptKey] = $lg;
+        }
+        $keptSaleMeta = [];
+        foreach ($legacySalesMeta as $sid => $meta) {
+            if (isset($keptGroupKeys[$meta['gKey']])) {
+                $keptSaleMeta[$sid] = $meta;
+            }
+        }
+        unset($legacySalesMeta);
+
+        $accumulateLegacyTenderRow = function (object $grp, string $rawType, int $cnt, float $amt) use ($accounting): void {
+            if ($amt <= 0.0001 && $cnt <= 0) {
+                return;
+            }
+            $mName = $this->normalizePaymentMethodName($rawType !== '' ? $rawType : 'Cash');
+            $grp->tender_totals[$mName] = ($grp->tender_totals[$mName] ?? 0.0) + $amt;
+            $grp->tender_counts[$mName] = ($grp->tender_counts[$mName] ?? 0) + $cnt;
+            $mLower = strtolower($mName);
+            if ($accounting->isCashPaymentType($mName)) {
+                $grp->cash_sales = (float)$grp->cash_sales + $amt;
+            } elseif (str_contains($mLower, 'card') || in_array($mLower, ['visa', 'mastercard'], true)) {
+                $grp->card_sales = (float)$grp->card_sales + $amt;
+            } else {
+                $grp->digital_sales = (float)$grp->digital_sales + $amt;
+            }
+        };
+
+        $salesWithSpRows = [];
+        if ($hasSpTable && !empty($keptSaleMeta)) {
+            $keptIds = array_keys($keptSaleMeta);
+            if (count($keptIds) <= 2000) {
+                foreach (array_chunk($keptIds, 500) as $idChunk) {
+                    foreach (DB::table('sale_payments')->whereIn('sale_id', $idChunk)->select(['sale_id', 'payment_type', 'amount'])->get() as $sp) {
+                        $sid = (int)$sp->sale_id;
+                        $salesWithSpRows[$sid] = true;
+                        $grp = $keptGroupKeys[$keptSaleMeta[$sid]['gKey']];
+                        $accumulateLegacyTenderRow($grp, trim((string)($sp->payment_type ?? '')) ?: 'Cash', 1, max(0.0, (float)$sp->amount));
+                    }
+                }
+            } else {
+                foreach (DB::table('sale_payments')->select(['sale_id', 'payment_type', 'amount'])->cursor() as $sp) {
+                    $sid = (int)$sp->sale_id;
+                    if (!isset($keptSaleMeta[$sid])) {
+                        continue;
+                    }
+                    $salesWithSpRows[$sid] = true;
+                    $grp = $keptGroupKeys[$keptSaleMeta[$sid]['gKey']];
+                    $accumulateLegacyTenderRow($grp, trim((string)($sp->payment_type ?? '')) ?: 'Cash', 1, max(0.0, (float)$sp->amount));
+                }
+            }
+        }
+        foreach ($keptSaleMeta as $sid => $meta) {
+            if (isset($salesWithSpRows[$sid])) {
+                continue;
+            }
+            if ($meta['paid'] > 0.0001) {
+                $accumulateLegacyTenderRow($keptGroupKeys[$meta['gKey']], $meta['pt'], 1, $meta['paid']);
+            }
+        }
+        unset($keptSaleMeta, $salesWithSpRows);
+
+        $realItemsCount = count($items) + $skippedRealRegsCount;
+        $seq = $realItemsCount + 1 + $legacySliceOffset;
+        foreach ($legacyGroupsList as $lg) {
             $sDate = $lg->session_date;
             $cName = trim(explode('(', (string)($lg->cashier_name ?: 'Super Admin'))[0]) ?: 'Super Admin';
             $refNo = 'REG-' . str_replace('-', '', $sDate) . '-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
             $regName = 'Register ' . str_pad(($seq % 3) + 1, 2, '0', STR_PAD_LEFT);
+            $curSeq = $seq++;
+
+            $availRegisters[$regName] = true;
+            $availCashiers[$cName] = true;
+
+            $cSales = (float)$lg->cash_sales;
+            $cdSales = (float)$lg->card_sales;
+            $dgSales = (float)$lg->digital_sales;
+            $totSales = (float)$lg->total_sales;
+            $tTotals = is_array($lg->tender_totals ?? null) ? $lg->tender_totals : [];
+            $tCounts = is_array($lg->tender_counts ?? null) ? $lg->tender_counts : [];
+
+            $paymentBreakdown = [];
+            $topMethod = 'Cash';
+            $topAmt = -1.0;
+            $nonZeroMethods = 0;
+            foreach ($tTotals as $m => $amt) {
+                $fAmt = round((float)$amt, 2);
+                $cnt = (int)($tCounts[$m] ?? 0);
+                if ($fAmt > 0.009 || $cnt > 0) {
+                    $paymentBreakdown[] = [
+                        'method' => (string)$m,
+                        'amount' => $fAmt,
+                        'count' => $cnt,
+                    ];
+                    $availPayTypes[(string)$m] = true;
+                    if ($fAmt > 0.009) {
+                        $nonZeroMethods++;
+                        if ($fAmt > $topAmt) {
+                            $topAmt = $fAmt;
+                            $topMethod = (string)$m;
+                        }
+                    }
+                }
+            }
+            if (empty($paymentBreakdown)) {
+                $paymentBreakdown[] = ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count];
+            }
+            $prim = $nonZeroMethods > 1 ? 'Split Payment' : ($topAmt > 0 ? $topMethod : 'Cash');
 
             if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($regName, $registerFilter) !== 0) continue;
             if ($statusFilter !== 'All' && !empty($statusFilter)) {
                 $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
                 if ($normFilter !== 'closed') continue;
             }
-
-            $cSales = (float)$lg->cash_sales;
-            $cdSales = (float)$lg->card_sales;
-            $dgSales = (float)$lg->digital_sales;
-            $totSales = (float)$lg->total_sales;
-
-            $prim = 'Cash';
-            if ($dgSales > $cSales && $dgSales > $cdSales) $prim = 'KBZPay';
-            elseif ($cdSales > $cSales) $prim = 'Card';
-            elseif ($cSales > 0 && ($dgSales > 0 || $cdSales > 0)) $prim = 'Split Payment';
-
-            if ($paymentTypeFilter !== 'All' && !empty($paymentTypeFilter) && strcasecmp($prim, $paymentTypeFilter) !== 0) continue;
+            if (!$matchesDiscrepancy(0.0, (string)$discrepancyFilter)) continue;
+            if (!$matchesPaymentFilter($prim, $paymentBreakdown, (string)$paymentTypeFilter)) continue;
 
             if (!empty($search)) {
                 $q = strtolower($search);
@@ -8099,7 +10087,7 @@ class ReportController extends Controller
             $var = 0.00;
 
             $items[] = [
-                'id' => $seq++,
+                'id' => $curSeq,
                 'reference_no' => $refNo,
                 'register_id' => $regName,
                 'warehouse_id' => (int)$lg->w_id,
@@ -8132,11 +10120,7 @@ class ReportController extends Controller
                 'cashier_name' => $cName,
                 'user_name' => $cName,
                 'user_role' => 'Lead Cashier',
-                'payment_breakdown' => array_values(array_filter([
-                    ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count],
-                    $cdSales > 0 ? ['method' => 'Card', 'amount' => round($cdSales, 2), 'count' => 1] : null,
-                    $dgSales > 0 ? ['method' => ($prim !== 'Cash' && $prim !== 'Card' && $prim !== 'Split Payment' ? $prim : 'KPay'), 'amount' => round($dgSales, 2), 'count' => 1] : null,
-                ])),
+                'payment_breakdown' => $paymentBreakdown,
             ];
         }
 
@@ -8151,7 +10135,7 @@ class ReportController extends Controller
             return $cmp;
         });
 
-        // Calculate summary and drawer flow aggregates
+        // Calculate summary and drawer flow aggregates (skippable when skip_summary=1 & known_total given)
         $totalShiftSales = 0.0;
         $totalOpeningCash = 0.0;
         $totalCashSales = 0.0;
@@ -8171,92 +10155,90 @@ class ReportController extends Controller
         $openSessionsCount = 0;
         $closedSessionsCount = 0;
         $discrepancySessionsCount = 0;
-
-        $tenderAgg = [];
-
-        foreach ($items as $item) {
-            $totalShiftSales += (float)$item['total_sales'];
-            $totalOpeningCash += (float)$item['opening_cash'];
-            $totalCashSales += (float)$item['cash_sales'];
-            $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
-            $totalRefundsSum += (float)$item['total_refunds'];
-            $totalCashRefundsSum += (float)($item['cash_refunds'] ?? 0.0);
-            $totalExpensesSum += (float)$item['total_expenses'];
-            $totalCashExpensesSum += (float)($item['cash_expenses'] ?? 0.0);
-            $totalFloatsInSum += (float)($item['floats_in'] ?? 0.0);
-            $totalCashDropsSum += (float)($item['cash_drops'] ?? 0.0);
-            $totalCashPurchasesPaidSum += (float)($item['cash_purchases_paid'] ?? 0.0);
-            $totalCashPurchaseRefundsSum += (float)($item['cash_purchase_refunds'] ?? 0.0);
-            $totalExpectedCash += (float)$item['expected_cash'];
-            $totalClosingCash += (float)$item['closing_cash'];
-            $totalVariance += (float)$item['difference'];
-            $totalTxSum += (int)$item['total_transactions'];
-
-            if (strtolower($item['status']) === 'open' || strtolower($item['status']) === 'active') {
-                $openSessionsCount++;
-            } else {
-                $closedSessionsCount++;
-            }
-            if (abs((float)$item['difference']) > 0.009) {
-                $discrepancySessionsCount++;
-            }
-
-            // Aggregate payment tenders
-            if (!empty($item['payment_breakdown']) && is_array($item['payment_breakdown'])) {
-                foreach ($item['payment_breakdown'] as $pb) {
-                    $m = trim((string)($pb['method'] ?? 'Other'));
-                    if (empty($m)) $m = 'Other';
-                    if (!isset($tenderAgg[$m])) {
-                        $tenderAgg[$m] = ['count' => 0, 'total_amount' => 0.0];
-                    }
-                    $tenderAgg[$m]['count'] += (int)($pb['count'] ?? 0);
-                    $tenderAgg[$m]['total_amount'] += (float)($pb['amount'] ?? 0.0);
-                }
-            } else {
-                if ((float)$item['cash_sales'] > 0) {
-                    $tenderAgg['Cash'] = [
-                        'count' => ($tenderAgg['Cash']['count'] ?? 0) + (int)$item['total_transactions'],
-                        'total_amount' => ($tenderAgg['Cash']['total_amount'] ?? 0.0) + (float)$item['cash_sales'],
-                    ];
-                }
-                if ((float)$item['card_sales'] > 0) {
-                    $tenderAgg['Card'] = [
-                        'count' => ($tenderAgg['Card']['count'] ?? 0) + 1,
-                        'total_amount' => ($tenderAgg['Card']['total_amount'] ?? 0.0) + (float)$item['card_sales'],
-                    ];
-                }
-                if ((float)$item['digital_sales'] > 0) {
-                    $tenderAgg['Digital'] = [
-                        'count' => ($tenderAgg['Digital']['count'] ?? 0) + 1,
-                        'total_amount' => ($tenderAgg['Digital']['total_amount'] ?? 0.0) + (float)$item['digital_sales'],
-                    ];
-                }
-            }
-        }
-
-        $totalTenderCollected = array_sum(array_column($tenderAgg, 'total_amount'));
         $byPaymentTender = [];
-        foreach ($tenderAgg as $method => $tData) {
-            if ($tData['total_amount'] > 0 || $tData['count'] > 0) {
+
+        if (!$skipSummary) {
+            $tenderAgg = [];
+            foreach ($items as $item) {
+                $totalShiftSales += (float)$item['total_sales'];
+                $totalOpeningCash += (float)$item['opening_cash'];
+                $totalCashSales += (float)$item['cash_sales'];
+                $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
+                $totalRefundsSum += (float)$item['total_refunds'];
+                $totalCashRefundsSum += (float)($item['cash_refunds'] ?? 0.0);
+                $totalExpensesSum += (float)$item['total_expenses'];
+                $totalCashExpensesSum += (float)($item['cash_expenses'] ?? 0.0);
+                $totalFloatsInSum += (float)($item['floats_in'] ?? 0.0);
+                $totalCashDropsSum += (float)($item['cash_drops'] ?? 0.0);
+                $totalCashPurchasesPaidSum += (float)($item['cash_purchases_paid'] ?? 0.0);
+                $totalCashPurchaseRefundsSum += (float)($item['cash_purchase_refunds'] ?? 0.0);
+                $totalExpectedCash += (float)$item['expected_cash'];
+                $totalClosingCash += (float)$item['closing_cash'];
+                $totalVariance += (float)$item['difference'];
+                $totalTxSum += (int)$item['total_transactions'];
+
+                if (strtolower($item['status']) === 'open' || strtolower($item['status']) === 'active') {
+                    $openSessionsCount++;
+                } else {
+                    $closedSessionsCount++;
+                }
+                if (abs((float)$item['difference']) > 0.009) {
+                    $discrepancySessionsCount++;
+                }
+
+                if (!empty($item['payment_breakdown']) && is_array($item['payment_breakdown'])) {
+                    foreach ($item['payment_breakdown'] as $pb) {
+                        $m = trim((string)($pb['method'] ?? 'Other'));
+                        if (empty($m)) $m = 'Other';
+                        if (!isset($tenderAgg[$m])) {
+                            $tenderAgg[$m] = ['count' => 0, 'total_amount' => 0.0];
+                        }
+                        $tenderAgg[$m]['count'] += (int)($pb['count'] ?? 0);
+                        $tenderAgg[$m]['total_amount'] += (float)($pb['amount'] ?? 0.0);
+                    }
+                } else {
+                    if ((float)$item['cash_sales'] > 0) {
+                        $tenderAgg['Cash'] = [
+                            'count' => ($tenderAgg['Cash']['count'] ?? 0) + (int)$item['total_transactions'],
+                            'total_amount' => ($tenderAgg['Cash']['total_amount'] ?? 0.0) + (float)$item['cash_sales'],
+                        ];
+                    }
+                    if ((float)$item['card_sales'] > 0) {
+                        $tenderAgg['Card'] = [
+                            'count' => ($tenderAgg['Card']['count'] ?? 0) + 1,
+                            'total_amount' => ($tenderAgg['Card']['total_amount'] ?? 0.0) + (float)$item['card_sales'],
+                        ];
+                    }
+                    if ((float)$item['digital_sales'] > 0) {
+                        $tenderAgg['Digital'] = [
+                            'count' => ($tenderAgg['Digital']['count'] ?? 0) + 1,
+                            'total_amount' => ($tenderAgg['Digital']['total_amount'] ?? 0.0) + (float)$item['digital_sales'],
+                        ];
+                    }
+                }
+            }
+
+            $totalTenderCollected = array_sum(array_column($tenderAgg, 'total_amount'));
+            foreach ($tenderAgg as $method => $tData) {
+                if ($tData['total_amount'] > 0 || $tData['count'] > 0) {
+                    $byPaymentTender[] = [
+                        'payment_type' => $method,
+                        'count' => (int)$tData['count'],
+                        'total_amount' => round((float)$tData['total_amount'], 2),
+                        'percentage' => $totalTenderCollected > 0 ? round(($tData['total_amount'] / $totalTenderCollected) * 100, 1) : 0.0,
+                    ];
+                }
+            }
+            if (empty($byPaymentTender)) {
                 $byPaymentTender[] = [
-                    'payment_type' => $method,
-                    'count' => (int)$tData['count'],
-                    'total_amount' => round((float)$tData['total_amount'], 2),
-                    'percentage' => $totalTenderCollected > 0 ? round(($tData['total_amount'] / $totalTenderCollected) * 100, 1) : 0.0,
+                    'payment_type' => 'Cash',
+                    'count' => 0,
+                    'total_amount' => 0.0,
+                    'percentage' => 0.0,
                 ];
             }
+            usort($byPaymentTender, fn ($a, $b) => $b['total_amount'] <=> $a['total_amount']);
         }
-        if (empty($byPaymentTender)) {
-            $byPaymentTender[] = [
-                'payment_type' => 'Cash',
-                'count' => 0,
-                'total_amount' => 0.0,
-                'percentage' => 0.0,
-            ];
-        }
-        usort($byPaymentTender, function ($a, $b) {
-            return $b['total_amount'] <=> $a['total_amount'];
-        });
 
         $drawerFlowSummary = [
             'cost_masked' => !$canViewCost,
@@ -8276,9 +10258,15 @@ class ReportController extends Controller
             'total_variance' => $canViewCost ? round($totalVariance, 2) : 0.0,
         ];
 
-        $maskedItems = $items;
-        if (!$canViewCost) {
-            $maskedItems = array_map(function ($row) {
+        $totalSessions = ($skipSummary && $knownTotal !== null) ? $knownTotal : count($items);
+        $offset = ($page - 1) * $perPage;
+        $sliceOffset = $canSliceLegacyBeforeTenders ? max(0, $offset - $skippedRealRegsCount - $legacySliceOffset) : $offset;
+        $pagedRaw = array_slice($items, $sliceOffset, $perPage);
+        $hasMore = ($offset + count($pagedRaw)) < $totalSessions;
+
+        // Only mask the 50 paged items (not all 3,200!)
+        $pagedSessions = !$canViewCost
+            ? array_map(function ($row) {
                 $masked = $this->maskAssocNumericKeys(
                     $row,
                     ['opening_cash', 'cash_purchases_paid', 'cash_purchase_refunds', 'expected_cash', 'closing_cash', 'difference'],
@@ -8286,22 +10274,65 @@ class ReportController extends Controller
                 );
                 $masked['cost_masked'] = true;
                 return $masked;
-            }, $items);
-        } else {
-            $maskedItems = array_map(function ($row) {
+            }, $pagedRaw)
+            : array_map(function ($row) {
                 $row['cost_masked'] = false;
                 return $row;
-            }, $items);
-        }
+            }, $pagedRaw);
 
-        $totalSessions = count($maskedItems);
-        $offset = ($page - 1) * $perPage;
-        $pagedSessions = array_slice($maskedItems, $offset, $perPage);
-        $hasMore = ($offset + count($pagedSessions)) < $totalSessions;
+        $availableRegisters = [];
+        $availableCashiers = [];
+        $availablePaymentTypes = [];
+        if (!$skipSummary && $page === 1) {
+            $availableRegisters = array_keys($availRegisters);
+            if ($accounting->schemaHasTable('cash_registers')) {
+                foreach (DB::table('cash_registers')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                    ->whereNotNull('register_name')->where('register_name', '!=', '')
+                    ->distinct()->pluck('register_name') as $rn) {
+                    $availRegisters[(string)$rn] = true;
+                }
+            }
+            $availableRegisters = array_keys($availRegisters);
+            sort($availableRegisters, SORT_NATURAL | SORT_FLAG_CASE);
+
+            $cashierList = $availCashiers;
+            $hasCashierNarrowingFilter = ($targetWarehouseId !== null || $targetWarehouseName !== null || ($cashier !== 'All' && !empty($cashier)) || $startDate !== '' || $endDate !== '');
+            if ($hasCashierNarrowingFilter || empty($cashierList)) {
+                foreach (DB::table('sales')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
+                    ->whereNotNull('created_by')->where('created_by', '!=', '')
+                    ->distinct()->pluck('created_by') as $cb) {
+                    $cleanName = trim(explode('(', (string)$cb)[0]);
+                    if ($cleanName !== '') {
+                        $cashierList[$cleanName] = true;
+                    }
+                }
+            }
+            $availableCashiers = array_keys($cashierList);
+            sort($availableCashiers, SORT_NATURAL | SORT_FLAG_CASE);
+
+            $ptMap = $availPayTypes;
+            if (!empty($byPaymentTender)) {
+                foreach ($byPaymentTender as $bt) {
+                    if (!empty($bt['payment_type'])) {
+                        $ptMap[(string)$bt['payment_type']] = true;
+                    }
+                }
+            }
+            if (count($ptMap) > 1) {
+                $ptMap['Split Payment'] = true;
+            }
+            $availablePaymentTypes = array_keys($ptMap);
+            sort($availablePaymentTypes, SORT_NATURAL | SORT_FLAG_CASE);
+        }
 
         return $this->noStoreJson([
             'status' => 'success',
             'cost_masked' => !$canViewCost,
+            'available_registers' => $availableRegisters,
+            'available_cashiers' => $availableCashiers,
+            'available_payment_types' => $availablePaymentTypes,
             'summary' => [
                 'cost_masked' => !$canViewCost,
                 'total_sessions' => $totalSessions,
@@ -8345,21 +10376,66 @@ class ReportController extends Controller
         $asOfEnd        = $accounting->normalizeFilterBoundaryDate($rawAsOfDate, true);
         $asOfDate       = substr($asOfEnd, 0, 10);
         $search         = trim((string)$request->input('search', ''));
+        $rawRisk        = strtolower(trim((string)($request->input('risk_filter') ?? $request->input('bucket', 'All'))));
+        $riskFilter     = match ($rawRisk) {
+            'healthy', 'current'                         => 'healthy',
+            'moderate', 'watchlist', 'days_31_60', '31-60' => 'moderate',
+            'urgent', 'days_61_90', '61-90'              => 'urgent',
+            'critical', 'days_90_plus', '90+'            => 'critical',
+            default                                      => 'All',
+        };
+        $skipSummary    = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $page           = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage        = $this->resolveReportPerPage($request, 50, 10000);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
+        $warehouseId    = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && !empty($warehouse)) {
+            if ($warehouseId === null || !in_array($warehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
 
-        // Reconstruct As-Of Receivables <= $asOfEnd across active non-voided sales
+        $applyWh = static function ($q, string $idCol, string $nameCol) use ($warehouse, $warehouseId): void {
+            if ($warehouse === 'All' || empty($warehouse)) {
+                return;
+            }
+            if ($warehouseId !== null) {
+                $q->where(function ($sub) use ($idCol, $nameCol, $warehouse, $warehouseId) {
+                    $sub->where($idCol, $warehouseId);
+                    if (!is_numeric($warehouse)) {
+                        $sub->orWhere(function ($legacy) use ($idCol, $nameCol, $warehouse) {
+                            $legacy->whereNull($idCol)->where($nameCol, $warehouse);
+                        });
+                    }
+                });
+            } else {
+                $q->where($nameCol, $warehouse);
+            }
+        };
+
+        $hasSpTable = $accounting->schemaHasTable('sale_payments');
+
+        // Reconstruct As-Of Receivables <= $asOfEnd: only inspect sales that are open today,
+        // had return credits applied, or received payments after $asOfEnd.
         $query = DB::table('sales')
             ->where('sales.date', '<=', $asOfEnd);
         $this->applyActiveDocumentFilter($query, 'sales.status');
         if (!empty($allowedOutlets)) {
             $query->whereIn('sales.warehouse_id', $allowedOutlets);
         }
-
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where('sales.warehouse_name', $warehouse);
-        }
+        $applyWh($query, 'sales.warehouse_id', 'sales.warehouse_name');
+        $query->where(function ($q) use ($hasSpTable, $asOfEnd) {
+            $q->where('sales.due_amount', '>', 0.001)
+                ->orWhere('sales.returned_credit_amount', '>', 0.001);
+            if ($hasSpTable) {
+                $q->orWhereExists(function ($sub) use ($asOfEnd) {
+                    $sub->select(DB::raw(1))
+                        ->from('sale_payments')
+                        ->whereColumn('sale_payments.sale_id', 'sales.id')
+                        ->where('sale_payments.payment_date', '>', $asOfEnd);
+                });
+            }
+        });
 
         $sales = $query->select(
             'sales.id',
@@ -8374,32 +10450,37 @@ class ReportController extends Controller
             'sales.warehouse_name'
         )->get();
 
-        $saleIds        = $sales->pluck('id')->all();
-        $salePayBySale  = [];
-        if (!empty($saleIds) && $accounting->schemaHasTable('sale_payments')) {
+        // Fetch payments strictly for candidate open sales (SQLite-safe chunking)
+        $salePayBySale = [];
+        if ($sales->isNotEmpty() && $hasSpTable) {
+            $saleIds = $sales->pluck('id')->all();
             foreach (array_chunk($saleIds, 400) as $idChunk) {
-                $spChunk = DB::table('sale_payments')
+                foreach (DB::table('sale_payments')
                     ->whereIn('sale_id', $idChunk)
                     ->select(['sale_id', 'amount', 'payment_date'])
-                    ->get();
-                foreach ($spChunk as $sp) {
+                    ->cursor() as $sp) {
                     $salePayBySale[(int)$sp->sale_id][] = $sp;
                 }
             }
         }
 
-        $activeReturnsQ = DB::table('sale_returns')
-            ->where('sale_returns.date', '<=', $asOfEnd);
-        $this->applyActiveDocumentFilter($activeReturnsQ, 'sale_returns.status');
-        if (!empty($allowedOutlets)) {
-            $activeReturnsQ->whereIn('sale_returns.warehouse_id', $allowedOutlets);
-        }
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $activeReturnsQ->where('sale_returns.warehouse_name', $warehouse);
-        }
+        $applyReturnScope = function ($q) use ($allowedOutlets, $applyWh): void {
+            $this->applyActiveDocumentFilter($q, 'sale_returns.status');
+            if (!empty($allowedOutlets)) {
+                $q->whereIn('sale_returns.warehouse_id', $allowedOutlets);
+            }
+            $applyWh($q, 'sale_returns.warehouse_id', 'sale_returns.warehouse_name');
+            $q->where(function ($sub) {
+                $sub->where('sale_returns.due_amount', '>', 0.001)
+                    ->orWhere('sale_returns.applied_credit_amount', '>', 0.001);
+            });
+        };
+
+        $activeReturnsQ = DB::table('sale_returns')->where('sale_returns.date', '<=', $asOfEnd);
+        $applyReturnScope($activeReturnsQ);
         $activeReturnsAsOf = $activeReturnsQ->select([
             'id', 'sale_id', 'customer_id', 'customer_name', 'date',
-            'grand_total', 'paid_amount', 'due_amount', 'applied_credit_amount',
+            'due_amount', 'applied_credit_amount',
         ])->get();
 
         $creditsAppliedBySale = [];
@@ -8410,17 +10491,33 @@ class ReportController extends Controller
             }
         }
 
-        $customerMap     = [];
-        $totalReceivable = 0.0;
-        $totalCurrent    = 0.0;
-        $totalDays31_60  = 0.0;
-        $totalDays61_90  = 0.0;
-        $totalDays90Plus = 0.0;
+        // Track returns with credit applied AFTER $asOfEnd so historical As-Of queries don't prematurely deduct them
+        $futureCreditsBySale = [];
+        $futureReturnsQ = DB::table('sale_returns')
+            ->where('sale_returns.date', '>', $asOfEnd)
+            ->whereNotNull('sale_returns.sale_id')
+            ->where('sale_returns.applied_credit_amount', '>', 0.001);
+        $applyReturnScope($futureReturnsQ);
+        foreach ($futureReturnsQ->select(['sale_id', 'applied_credit_amount'])->cursor() as $fr) {
+            $sid = (int)$fr->sale_id;
+            $futureCreditsBySale[$sid] = ($futureCreditsBySale[$sid] ?? 0.0) + (float)$fr->applied_credit_amount;
+        }
 
-        $asOfCarbon = Carbon::parse($asOfDate);
+        $customerMap     = [];
+        $asOfEpoch = strtotime($asOfDate) ?: time();
+        $dayDiffCache = [];
+        $calcDaysOverdue = static function (string $docDate) use ($asOfEpoch, &$dayDiffCache): int {
+            $day = substr($docDate, 0, 10);
+            if (!isset($dayDiffCache[$day])) {
+                $ts = strtotime($day);
+                $dayDiffCache[$day] = $ts !== false ? max(0, (int)floor(($asOfEpoch - $ts) / 86400)) : 0;
+            }
+            return $dayDiffCache[$day];
+        };
 
         foreach ($sales as $s) {
-            $payments = $salePayBySale[(int)$s->id] ?? [];
+            $sid = (int)$s->id;
+            $payments = $salePayBySale[$sid] ?? [];
             if (!empty($payments)) {
                 $paidAsOf     = 0.0;
                 $totalRecorded = 0.0;
@@ -8430,7 +10527,10 @@ class ReportController extends Controller
                         continue;
                     }
                     $totalRecorded += $amt;
-                    $pDateStr = $accounting->normalizeTransactionDate((string)($p->payment_date ?? $s->date), (string)$s->date);
+                    $rawPayDt = (string)($p->payment_date ?? $s->date);
+                    $pDateStr = (strlen($rawPayDt) === 19 && $rawPayDt[4] === '-' && $rawPayDt[10] === ' ')
+                        ? $rawPayDt
+                        : $accounting->normalizeTransactionDate($rawPayDt, (string)$s->date);
                     if ($pDateStr <= $asOfEnd) {
                         $paidAsOf += $amt;
                     }
@@ -8444,9 +10544,13 @@ class ReportController extends Controller
                 $paidAsOf = (float)$s->paid_amount;
             }
 
-            $creditAsOf = array_key_exists((int)$s->id, $creditsAppliedBySale)
-                ? (float)$creditsAppliedBySale[(int)$s->id]
-                : (float)($s->returned_credit_amount ?? 0.0);
+            if (array_key_exists($sid, $creditsAppliedBySale)) {
+                $creditAsOf = (float)$creditsAppliedBySale[$sid];
+            } elseif (isset($futureCreditsBySale[$sid])) {
+                $creditAsOf = max(0.0, (float)($s->returned_credit_amount ?? 0.0) - (float)$futureCreditsBySale[$sid]);
+            } else {
+                $creditAsOf = (float)($s->returned_credit_amount ?? 0.0);
+            }
 
             $due = round(max(0.0, (float)$s->grand_total - $paidAsOf - $creditAsOf), 2);
             if ($due <= 0.001) {
@@ -8457,11 +10561,7 @@ class ReportController extends Controller
             $cName = $s->customer_name ?: 'Walk-in Customer';
             $key   = $cId > 0 ? (string)$cId : 'name_' . $cName;
 
-            $saleDate = Carbon::parse(substr($s->date, 0, 10));
-            $days     = $saleDate->diffInDays($asOfCarbon, false);
-            if ($days < 0) {
-                $days = 0;
-            }
+            $days = $calcDaysOverdue((string)$s->date);
 
             if (!isset($customerMap[$key])) {
                 $customerMap[$key] = [
@@ -8473,6 +10573,7 @@ class ReportController extends Controller
                     'credit_limit'        => 0.0,
                     'gross_due'           => 0.0,
                     'open_credit_notes'   => 0.0,
+                    'applied_credit_notes' => 0.0,
                     'total_due'           => 0.0,
                     'current'             => 0.0,
                     'days_31_60'          => 0.0,
@@ -8532,6 +10633,7 @@ class ReportController extends Controller
             $custRow = &$customerMap[$key];
             $custRow['open_credit_notes'] += $cnDue;
             $remCredit = min($cnDue, (float)$custRow['total_due']);
+            $custRow['applied_credit_notes'] += $remCredit;
             $appliedCreditToDebtors += $remCredit;
             $custRow['total_due'] = max(0.0, round($custRow['total_due'] - $remCredit, 2));
 
@@ -8548,12 +10650,12 @@ class ReportController extends Controller
         }
 
         // Filter out settled accounts whose open invoices were completely offset by credit notes
-        $customerMap = array_filter($customerMap, static fn($row) => $row['total_due'] > 0.001);
+        $customerMap = array_filter($customerMap, static fn ($row) => $row['total_due'] > 0.001);
 
-        // Enrich with customer details (chunked SQLite-safe)
+        // Compute normalized risk status & Enrich with customer details (chunked SQLite-safe)
         $customerIds = array_values(array_unique(array_filter(array_column($customerMap, 'customer_id'))));
+        $customerDetails = collect();
         if (!empty($customerIds)) {
-            $customerDetails = collect();
             foreach (array_chunk($customerIds, 400) as $idChunk) {
                 $chunkRows = Customer::whereIn('id', $idChunk)
                     ->select(['id', 'phone', 'email', 'tier', 'credit_limit'])
@@ -8562,19 +10664,32 @@ class ReportController extends Controller
                     $customerDetails->put($cd->id, $cd);
                 }
             }
-            foreach ($customerMap as $k => &$cust) {
-                if (!empty($cust['customer_id']) && isset($customerDetails[$cust['customer_id']])) {
-                    $cd = $customerDetails[$cust['customer_id']];
-                    $cust['phone'] = $cd->phone ?? '';
-                    $cust['email'] = $cd->email ?? '';
-                    $cust['tier'] = $cd->tier ?? 'Regular';
-                    $cust['credit_limit'] = (float)($cd->credit_limit ?? 0);
-                }
-            }
-            unset($cust);
         }
+        foreach ($customerMap as $k => &$cust) {
+            if (!empty($cust['customer_id']) && isset($customerDetails[$cust['customer_id']])) {
+                $cd = $customerDetails[$cust['customer_id']];
+                $cust['phone'] = $cd->phone ?? '';
+                $cust['email'] = $cd->email ?? '';
+                $cust['tier'] = $cd->tier ?? 'Regular';
+                $cust['credit_limit'] = (float)($cd->credit_limit ?? 0);
+            }
+            if ((float)$cust['days_90_plus'] > 0.001) {
+                $cust['risk_status'] = 'critical';
+            } elseif ((float)$cust['days_61_90'] > 0.001) {
+                $cust['risk_status'] = 'urgent';
+            } elseif ((float)$cust['days_31_60'] > 0.001) {
+                $cust['risk_status'] = 'moderate';
+            } else {
+                $cust['risk_status'] = 'healthy';
+            }
+        }
+        unset($cust);
 
         $items = array_values($customerMap);
+
+        if ($riskFilter !== 'All') {
+            $items = array_values(array_filter($items, static fn ($it) => ($it['risk_status'] ?? 'healthy') === $riskFilter));
+        }
 
         if (!empty($search)) {
             $q = strtolower($search);
@@ -8593,6 +10708,7 @@ class ReportController extends Controller
         $totalDays61_90  = 0.0;
         $totalDays90Plus = 0.0;
         $filteredOpenCreditNotes = 0.0;
+        $filteredAppliedCreditNotes = 0.0;
         foreach ($items as $row) {
             $totalReceivable += $row['total_due'];
             $totalCurrent    += $row['current'];
@@ -8600,8 +10716,13 @@ class ReportController extends Controller
             $totalDays61_90  += $row['days_61_90'];
             $totalDays90Plus += $row['days_90_plus'];
             $filteredOpenCreditNotes += (float)($row['open_credit_notes'] ?? 0);
+            $filteredAppliedCreditNotes += (float)($row['applied_credit_notes'] ?? 0);
         }
-        $totalOpenCreditNotes = !empty($search) ? $filteredOpenCreditNotes : $totalOpenCreditNotes;
+        $hasSubFilter = !empty($search) || $riskFilter !== 'All';
+        $effectiveTotalOpenCn = $hasSubFilter ? $filteredOpenCreditNotes : $totalOpenCreditNotes;
+        $effectiveAppliedCredit = $hasSubFilter
+            ? $filteredAppliedCreditNotes
+            : $appliedCreditToDebtors;
 
         usort($items, function ($a, $b) {
             return $b['total_due'] <=> $a['total_due'];
@@ -8610,6 +10731,7 @@ class ReportController extends Controller
         foreach ($items as &$it) {
             $it['gross_due'] = round((float)($it['gross_due'] ?? $it['total_due']), 2);
             $it['open_credit_notes'] = round((float)($it['open_credit_notes'] ?? 0), 2);
+            $it['applied_credit_notes'] = round((float)($it['applied_credit_notes'] ?? 0), 2);
             $it['total_due'] = round($it['total_due'], 2);
             $it['current'] = round($it['current'], 2);
             $it['days_31_60'] = round($it['days_31_60'], 2);
@@ -8625,13 +10747,13 @@ class ReportController extends Controller
         $pagedItems = array_slice($items, $offset, $perPage);
         $hasMore = ($offset + count($pagedItems)) < $totalCustomers;
 
-        $unappliedCreditNotes = round(max(0.0, $totalOpenCreditNotes - $appliedCreditToDebtors), 2);
-        return $this->noStoreJson([
+        $unappliedCreditNotes = round(max(0.0, $effectiveTotalOpenCn - $effectiveAppliedCredit), 2);
+        $payload = [
             'status' => 'success',
             'summary' => [
                 'total_receivable' => round($totalReceivable, 2),
                 'total_receivables' => round($totalReceivable, 2),
-                'total_open_credit_notes' => round($totalOpenCreditNotes, 2),
+                'total_open_credit_notes' => round($effectiveTotalOpenCn, 2),
                 'unapplied_open_credit_notes' => $unappliedCreditNotes,
                 'net_receivable_after_all_credits' => round($totalReceivable - $unappliedCreditNotes, 2),
                 'current' => round($totalCurrent, 2),
@@ -8641,6 +10763,8 @@ class ReportController extends Controller
                 'total_overdue' => round($totalOverdue, 2),
                 'total_customers' => $totalCustomers,
                 'as_of_date' => $asOfDate,
+                'warehouse' => $warehouse,
+                'risk_filter' => $riskFilter,
             ],
             'data' => $pagedItems,
             'pagination' => [
@@ -8650,7 +10774,23 @@ class ReportController extends Controller
                 'last_page' => $lastPage,
                 'has_more' => $hasMore,
             ],
-        ]);
+        ];
+        if (!$skipSummary) {
+            $whList = $accounting->schemaHasTable('outlets')
+                ? DB::table('outlets')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                    ->orderBy('name')
+                    ->pluck('name')
+                    ->filter(fn ($v) => trim((string)$v) !== '')
+                    ->values()
+                    ->all()
+                : [];
+            $payload['available_filters'] = [
+                'warehouses' => array_values(array_unique($whList)),
+                'risk_levels' => ['healthy', 'moderate', 'urgent', 'critical'],
+            ];
+        }
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -8664,11 +10804,45 @@ class ReportController extends Controller
         $rawAsOfDate = (string)$request->input('as_of_date', Carbon::today()->toDateString());
         $asOfEnd = $accounting->normalizeFilterBoundaryDate($rawAsOfDate, true);
         $asOfDate = substr($asOfEnd, 0, 10);
+        $isHistoricalAsOf = $asOfDate < Carbon::today()->toDateString();
         $search = trim((string)$request->input('search', ''));
+        $rawRisk = strtolower(trim((string)($request->input('risk_filter') ?? $request->input('bucket', 'All'))));
+        $riskFilter = match ($rawRisk) {
+            'healthy', 'current'                         => 'healthy',
+            'moderate', 'watchlist', 'days_31_60', '31-60' => 'moderate',
+            'urgent', 'days_61_90', '61-90'              => 'urgent',
+            'critical', 'days_90_plus', '90+'            => 'critical',
+            default                                      => 'All',
+        };
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
+        $warehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && !empty($warehouse)) {
+            if ($warehouseId === null || !in_array($warehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
+
+        $applyWh = static function ($q, string $idCol, string $nameCol) use ($warehouse, $warehouseId): void {
+            if ($warehouse === 'All' || empty($warehouse)) {
+                return;
+            }
+            if ($warehouseId !== null) {
+                $q->where(function ($sub) use ($idCol, $nameCol, $warehouse, $warehouseId) {
+                    $sub->where($idCol, $warehouseId);
+                    if (!is_numeric($warehouse)) {
+                        $sub->orWhere(function ($legacy) use ($idCol, $nameCol, $warehouse) {
+                            $legacy->whereNull($idCol)->where($nameCol, $warehouse);
+                        });
+                    }
+                });
+            } else {
+                $q->where($nameCol, $warehouse);
+            }
+        };
 
         $query = DB::table('purchases')
             ->whereIn('purchases.status', ['Received', 'Completed'])
@@ -8677,10 +10851,23 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $query->whereIn('purchases.warehouse_id', $allowedOutlets);
         }
+        $applyWh($query, 'purchases.warehouse_id', 'purchases.warehouse_name');
 
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where('purchases.warehouse_name', $warehouse);
-        }
+        // On today/current view, skip fully settled single-payment POs cleanly using index;
+        // on historical As-Of queries, scan payload POs as well for exact point-in-time reconstruction.
+        $query->where(function ($q) use ($isHistoricalAsOf) {
+            $q->where('purchases.due_amount', '>', 0.001)
+                ->orWhere('purchases.returned_credit_amount', '>', 0.001)
+                ->orWhereColumn('purchases.updated_at', '>', 'purchases.created_at');
+            if ($isHistoricalAsOf) {
+                $q->orWhere('purchases.payments_payload', 'LIKE', '%},%')
+                    ->orWhere(function ($sub) {
+                        $sub->whereNotNull('purchases.payments_payload')
+                            ->where('purchases.payments_payload', '!=', '')
+                            ->where('purchases.payments_payload', '!=', '[]');
+                    });
+            }
+        });
 
         $purchases = $query->select(
             'purchases.id',
@@ -8708,10 +10895,46 @@ class ReportController extends Controller
         $totalDays61_90 = 0.0;
         $totalDays90Plus = 0.0;
 
-        $asOfCarbon = Carbon::parse($asOfDate);
+        $asOfEpoch = strtotime($asOfDate) ?: time();
+        $dayDiffCache = [];
+        $calcDaysOverdue = static function (string $docDate) use ($asOfEpoch, &$dayDiffCache): int {
+            $day = substr($docDate, 0, 10);
+            if (!isset($dayDiffCache[$day])) {
+                $ts = strtotime($day);
+                $dayDiffCache[$day] = $ts !== false ? max(0, (int)floor(($asOfEpoch - $ts) / 86400)) : 0;
+            }
+            return $dayDiffCache[$day];
+        };
+        $fastPayloadPaidAsOf = static function (?string $payload, float $fallbackPaid, string $docDate) use ($accounting, $asOfEnd): float {
+            if ($fallbackPaid <= 0.0001 && (empty($payload) || $payload === '[]')) {
+                return 0.0;
+            }
+            if (empty($payload) || $payload === '[]') {
+                return round(max(0.0, $fallbackPaid), 2);
+            }
+            $decoded = json_decode($payload, true);
+            if (!is_array($decoded) || empty($decoded)) {
+                return round(max(0.0, $fallbackPaid), 2);
+            }
+            $sum = 0.0;
+            foreach ($decoded as $leg) {
+                if (!is_array($leg)) continue;
+                $amt = (float)($leg['amount'] ?? 0);
+                if ($amt <= 0) continue;
+                $rawDate = trim((string)($leg['payment_date'] ?? $docDate));
+                if ($rawDate === '') {
+                    $sum += $amt;
+                } elseif (strlen($rawDate) === 19 && $rawDate[4] === '-' && $rawDate[10] === ' ') {
+                    if ($rawDate <= $asOfEnd) $sum += $amt;
+                } else {
+                    if ($accounting->normalizeTransactionDate($rawDate, $docDate) <= $asOfEnd) $sum += $amt;
+                }
+            }
+            return round($sum, 2);
+        };
 
         foreach ($purchases as $p) {
-            $paidAsOf = $accounting->sumPayloadPaymentsAsOf($p->payments_payload ?? null, (float)$p->paid_amount, (string)$p->date, $asOfEnd);
+            $paidAsOf = $fastPayloadPaidAsOf($p->payments_payload ?? null, (float)$p->paid_amount, (string)$p->date);
             $creditAsOf = isset($poHasAnyAlloc[$p->id])
                 ? (float)($poAllocAsOf[$p->id] ?? 0.0)
                 : (float)($p->returned_credit_amount ?? 0.0);
@@ -8724,9 +10947,7 @@ class ReportController extends Controller
             $sName = $p->supplier_name ?: 'General Supplier';
             $key = $sId > 0 ? (string)$sId : 'name_' . $sName;
 
-            $purchDate = Carbon::parse(substr($p->date, 0, 10));
-            $days = $purchDate->diffInDays($asOfCarbon, false);
-            if ($days < 0) $days = 0;
+            $days = $calcDaysOverdue((string)$p->date);
 
             if (!isset($supplierMap[$key])) {
                 $supplierMap[$key] = [
@@ -8738,6 +10959,8 @@ class ReportController extends Controller
                     'category' => 'General',
                     'payment_terms' => 'Net 30',
                     'total_due' => 0.0,
+                    'unallocated_credit' => 0.0,
+                    'credit_balance' => 0.0,
                     'current' => 0.0,
                     'days_31_60' => 0.0,
                     'days_61_90' => 0.0,
@@ -8795,8 +11018,7 @@ class ReportController extends Controller
                 $key = (string)$supId;
                 $openDateRaw = ($supRow && !empty($supRow->created_at)) ? (string)$supRow->created_at : $asOfDate;
                 $openDateStr = substr($accounting->normalizeTransactionDate($openDateRaw, $asOfDate), 0, 10);
-                $openDays = Carbon::parse($openDateStr)->diffInDays($asOfCarbon, false);
-                if ($openDays < 0) $openDays = 0;
+                $openDays = $calcDaysOverdue($openDateStr);
 
                 if (!isset($supplierMap[$key])) {
                     $supplierMap[$key] = [
@@ -8808,6 +11030,8 @@ class ReportController extends Controller
                         'category' => $supRow->category ?? 'General',
                         'payment_terms' => $supRow->payment_terms ?? 'Net 30',
                         'total_due' => 0.0,
+                        'unallocated_credit' => 0.0,
+                        'credit_balance' => 0.0,
                         'current' => 0.0,
                         'days_31_60' => 0.0,
                         'days_61_90' => 0.0,
@@ -8854,18 +11078,21 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $unallocPrQuery->whereIn('warehouse_id', $allowedOutlets);
         }
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $unallocPrQuery->where('warehouse_name', $warehouse);
+        $applyWh($unallocPrQuery, 'warehouse_id', 'warehouse_name');
+        if (!$isHistoricalAsOf) {
+            $unallocPrQuery->where(function ($q) {
+                $q->where('due_amount', '>', 0.001)
+                    ->orWhereColumn('updated_at', '>', 'created_at');
+            });
         }
         $openCredits = $unallocPrQuery->select('id', 'supplier_id', 'supplier_name', 'date', 'grand_total', 'paid_amount', 'due_amount', 'payments_payload')->get();
         if ($openCredits->isNotEmpty()) {
-            $openCreditIds = $openCredits->pluck('id')->all();
+            $openCreditSet = array_flip($openCredits->pluck('id')->map(fn ($v) => (int)$v)->all());
             $allocByPr = [];
-            $hasReleasedAt = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
-            foreach (array_chunk($openCreditIds, 400) as $idChunk) {
+            if ($accounting->schemaHasTable('purchase_return_allocations') && DB::table('purchase_return_allocations')->exists()) {
+                $hasReleasedAt = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
                 $allocQuery = DB::table('purchase_return_allocations')
                     ->join('purchases', 'purchase_return_allocations.purchase_id', '=', 'purchases.id')
-                    ->whereIn('purchase_return_allocations.purchase_return_id', $idChunk)
                     ->whereIn('purchases.status', ['Received', 'Completed'])
                     ->where('purchases.date', '<=', $asOfEnd);
                 if (!empty($allowedOutlets)) {
@@ -8877,19 +11104,19 @@ class ReportController extends Controller
                             ->orWhere('purchase_return_allocations.released_at', '>', $asOfEnd);
                     });
                 }
-                if ($warehouse !== 'All' && !empty($warehouse)) {
-                    $allocQuery->where('purchases.warehouse_name', $warehouse);
-                }
+                $applyWh($allocQuery, 'purchases.warehouse_id', 'purchases.warehouse_name');
                 foreach ($allocQuery
                     ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as allocated'))
                     ->groupBy('purchase_return_allocations.purchase_return_id')
                     ->pluck('allocated', 'purchase_return_id') as $prId => $allocVal) {
-                    $allocByPr[$prId] = ($allocByPr[$prId] ?? 0.0) + (float)$allocVal;
+                    if (isset($openCreditSet[(int)$prId])) {
+                        $allocByPr[(int)$prId] = (float)$allocVal;
+                    }
                 }
             }
 
             foreach ($openCredits as $cr) {
-                $refundedAsOf = $accounting->sumPayloadPaymentsAsOf($cr->payments_payload ?? null, (float)$cr->paid_amount, (string)$cr->date, $asOfEnd);
+                $refundedAsOf = $fastPayloadPaidAsOf($cr->payments_payload ?? null, (float)$cr->paid_amount, (string)$cr->date);
                 $crDueAsOf = round(max(0.0, (float)$cr->grand_total - $refundedAsOf), 2);
                 $unalloc = round(max(0.0, $crDueAsOf - (float)($allocByPr[$cr->id] ?? 0.0)), 2);
                 if ($unalloc <= 0.001) {
@@ -8928,11 +11155,11 @@ class ReportController extends Controller
                     $avail = (float)$supplierMap[$cKey][$bucket];
                     if ($avail > 0) {
                         $deduct = min($avail, $rem);
-                        $supplierMap[$cKey][$bucket] -= $deduct;
-                        $rem -= $deduct;
+                        $supplierMap[$cKey][$bucket] = max(0.0, round($avail - $deduct, 2));
+                        $rem = round($rem - $deduct, 2);
                     }
                 }
-                $netRemaining = (float)$supplierMap[$cKey]['total_due'] - $unalloc;
+                $netRemaining = round((float)$supplierMap[$cKey]['total_due'] - $unalloc, 2);
                 if ($netRemaining >= 0) {
                     $supplierMap[$cKey]['total_due'] = $netRemaining;
                 } else {
@@ -8977,11 +11204,37 @@ class ReportController extends Controller
                     $supp['category'] = $sd->category ?? 'General';
                     $supp['payment_terms'] = $sd->payment_terms ?? 'Net 30';
                 }
+                if ((float)$supp['days_90_plus'] > 0.001) {
+                    $supp['risk_status'] = 'critical';
+                } elseif ((float)$supp['days_61_90'] > 0.001) {
+                    $supp['risk_status'] = 'urgent';
+                } elseif ((float)$supp['days_31_60'] > 0.001) {
+                    $supp['risk_status'] = 'moderate';
+                } else {
+                    $supp['risk_status'] = 'healthy';
+                }
+            }
+            unset($supp);
+        } else {
+            foreach ($supplierMap as $k => &$supp) {
+                if ((float)$supp['days_90_plus'] > 0.001) {
+                    $supp['risk_status'] = 'critical';
+                } elseif ((float)$supp['days_61_90'] > 0.001) {
+                    $supp['risk_status'] = 'urgent';
+                } elseif ((float)$supp['days_31_60'] > 0.001) {
+                    $supp['risk_status'] = 'moderate';
+                } else {
+                    $supp['risk_status'] = 'healthy';
+                }
             }
             unset($supp);
         }
 
         $items = array_values($supplierMap);
+
+        if ($riskFilter !== 'All') {
+            $items = array_values(array_filter($items, static fn ($it) => ($it['risk_status'] ?? 'healthy') === $riskFilter));
+        }
 
         if (!empty($search)) {
             $q = strtolower($search);
@@ -9008,7 +11261,7 @@ class ReportController extends Controller
         }
         unset($it);
 
-        if (!empty($search)) {
+        if (!empty($search) || $riskFilter !== 'All') {
             $totalPayable = 0.0;
             $totalCurrent = 0.0;
             $totalDays31_60 = 0.0;
@@ -9030,7 +11283,7 @@ class ReportController extends Controller
         $pagedItems = array_slice($items, $offset, $perPage);
         $hasMore = ($offset + count($pagedItems)) < $totalSuppliers;
 
-        return $this->noStoreJson([
+        $payload = [
             'status' => 'success',
             'cost_masked' => !$canViewCost,
             'summary' => [
@@ -9043,6 +11296,8 @@ class ReportController extends Controller
                 'total_overdue' => $canViewCost ? round($totalOverdue, 2) : 0.0,
                 'total_suppliers' => $totalSuppliers,
                 'as_of_date' => $asOfDate,
+                'warehouse' => $warehouse,
+                'risk_filter' => $riskFilter,
             ],
             'data' => $canViewCost ? $pagedItems : array_map(function ($it) {
                 $masked = $this->maskAssocNumericKeys(
@@ -9061,7 +11316,23 @@ class ReportController extends Controller
                 'last_page' => $lastPage,
                 'has_more' => $hasMore,
             ],
-        ]);
+        ];
+        if (!$skipSummary) {
+            $whList = $accounting->schemaHasTable('outlets')
+                ? DB::table('outlets')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                    ->orderBy('name')
+                    ->pluck('name')
+                    ->filter(fn ($v) => trim((string)$v) !== '')
+                    ->values()
+                    ->all()
+                : [];
+            $payload['available_filters'] = [
+                'warehouses' => array_values(array_unique($whList)),
+                'risk_levels' => ['healthy', 'moderate', 'urgent', 'critical'],
+            ];
+        }
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -9073,645 +11344,1119 @@ class ReportController extends Controller
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
         $startDate = $request->input('start_date') ?? $request->input('from_date');
         $endDate = $request->input('end_date') ?? $request->input('to_date');
+        $activityFilter = trim((string)($request->input('activity') ?? $request->input('flow_type', 'All')));
+        $paymentFilter = trim((string)($request->input('payment_method') ?? $request->input('payment_type', 'All')));
+        $userFilter = trim((string)($request->input('user_name') ?? $request->input('created_by', 'All')));
+        $search = trim((string)$request->input('search', ''));
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
+        $knownClosingBalance = ($request->has('known_closing_balance') && is_numeric($request->query('known_closing_balance')))
+            ? (float)$request->query('known_closing_balance')
+            : null;
+        $fastPageOnly = ($skipSummary && $knownTotal !== null && $knownClosingBalance !== null);
 
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
-        $accounting    = $this->accounting();
-        $canViewCost   = $accounting->canViewCost($request);
+        $accounting = $this->accounting();
+        $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
+        $warehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && !empty($warehouse)) {
+            if ($warehouseId === null || !in_array($warehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
 
         $startDt = !empty($startDate) ? $accounting->normalizeFilterBoundaryDate((string)$startDate, false) : null;
         $endDt = !empty($endDate) ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
         $priorStartDateTime = $startDt;
 
-        // 1. Cash Inflows: Sales Cash Received strictly by sale_payments.payment_date (fallback to sales.date when legacy unsplit)
-        $hasSpTable = $accounting->schemaHasTable('sale_payments');
-        $salesQuery = DB::table('sales');
-        $this->applyActiveDocumentFilter($salesQuery, 'status');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $salesQuery->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $salesQuery->whereIn('warehouse_id', $allowedOutlets);
+        // Normalize activity / flow_type filter into exact source flags
+        $actLow = strtolower($activityFilter);
+        $includeSales = true;
+        $includePurchases = true;
+        $includeExpenses = true;
+        $includePurchaseReturns = true;
+        $includeSaleReturns = true;
+        if ($actLow === 'operating inflow' || $actLow === 'inflow') {
+            $includePurchases = false;
+            $includeExpenses = false;
+            $includeSaleReturns = false;
+        } elseif ($actLow === 'operating outflow' || $actLow === 'outflow') {
+            $includeSales = false;
+            $includePurchaseReturns = false;
+        } elseif ($actLow === 'sales' || $actLow === 'sale') {
+            $includePurchases = false;
+            $includeExpenses = false;
+            $includePurchaseReturns = false;
+            $includeSaleReturns = false;
+        } elseif ($actLow === 'purchases' || $actLow === 'purchase') {
+            $includeSales = false;
+            $includeExpenses = false;
+            $includePurchaseReturns = false;
+            $includeSaleReturns = false;
+        } elseif ($actLow === 'expenses' || $actLow === 'expense') {
+            $includeSales = false;
+            $includePurchases = false;
+            $includePurchaseReturns = false;
+            $includeSaleReturns = false;
+        } elseif ($actLow === 'refunds' || $actLow === 'refund' || $actLow === 'operating flow refund') {
+            $includeSales = false;
+            $includePurchases = false;
+            $includeExpenses = false;
+        } elseif (in_array($actLow, ['financing', 'financing capital', 'financing & capital', 'capital', 'investing'], true)) {
+            $includeSales = false;
+            $includePurchases = false;
+            $includeExpenses = false;
+            $includePurchaseReturns = false;
+            $includeSaleReturns = false;
         }
 
-        $legacyNoPaySalesQ = (clone $salesQuery)
-            ->where('paid_amount', '>', 0)
-            ->when($hasSpTable, fn ($q) => $q->whereNotExists(function ($sub) {
-                $sub->select(DB::raw(1))->from('sale_payments')->whereColumn('sale_payments.sale_id', 'sales.id');
-            }));
-        if ($startDt !== null) {
-            $legacyNoPaySalesQ->where('date', '>=', $startDt);
-        }
-        if ($endDt !== null) {
-            $legacyNoPaySalesQ->where('date', '<=', $endDt);
-        }
+        $pmLower = ($paymentFilter !== '' && strtolower($paymentFilter) !== 'all') ? strtolower($paymentFilter) : null;
+        $userLower = ($userFilter !== '' && strtolower($userFilter) !== 'all') ? strtolower($userFilter) : null;
+        $searchLower = ($search !== '') ? strtolower($search) : null;
 
-        $salesCashReceived = (float)(clone $legacyNoPaySalesQ)->sum('paid_amount');
-        $tenderTotalsMap = [];
-        $tenderCountsMap = [];
-        foreach ((clone $legacyNoPaySalesQ)
-            ->select('payment_type', DB::raw('SUM(paid_amount) as amount'), DB::raw('COUNT(*) as count'))
-            ->groupBy('payment_type')
-            ->get() as $lt) {
-            $pt = $lt->payment_type ?: 'Cash';
-            $tenderTotalsMap[$pt] = ($tenderTotalsMap[$pt] ?? 0.0) + (float)$lt->amount;
-            $tenderCountsMap[$pt] = ($tenderCountsMap[$pt] ?? 0) + (int)$lt->count;
-        }
-
-        $spPeriodQ = null;
-        if ($hasSpTable) {
-            $spPeriodQ = DB::table('sale_payments')
-                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
-                ->where('sale_payments.amount', '>', 0);
-            $this->applyActiveDocumentFilter($spPeriodQ, 'sales.status');
+        $nonCashTypes = [
+            'credit note',
+            'store credit',
+            'credit',
+            'unpaid',
+            'points',
+            'loyalty points',
+            'opening stock',
+            'none',
+            'n/a',
+            'void',
+            'voided',
+        ];
+        $applyCashSettlementFilter = static function ($q, string $col) use ($nonCashTypes): void {
+            $q->where(function ($sub) use ($col, $nonCashTypes) {
+                $sub->whereNull($col)
+                    ->orWhereRaw("LOWER(TRIM({$col})) NOT IN (" . implode(',', array_fill(0, count($nonCashTypes), '?')) . ")", $nonCashTypes);
+            });
+        };
+        $applyWh = static function ($q, string $whNameCol = 'warehouse_name', string $whIdCol = 'warehouse_id') use ($warehouse, $warehouseId, $allowedOutlets): void {
             if ($warehouse !== 'All' && !empty($warehouse)) {
-                $spPeriodQ->where('sales.warehouse_name', $warehouse);
+                if (is_numeric($warehouse) && $warehouseId !== null) {
+                    if ($warehouseId === 1) {
+                        $q->where(fn ($sub) => $sub->where($whIdCol, 1)->orWhereNull($whIdCol));
+                    } else {
+                        $q->where($whIdCol, $warehouseId);
+                    }
+                } elseif ($warehouseId !== null) {
+                    $q->where(function ($sub) use ($whIdCol, $warehouseId, $whNameCol, $warehouse) {
+                        $sub->where($whIdCol, $warehouseId)
+                            ->orWhere(fn ($inner) => $inner->whereNull($whIdCol)->where($whNameCol, $warehouse));
+                    });
+                } else {
+                    $q->where($whNameCol, $warehouse);
+                }
             }
             if (!empty($allowedOutlets)) {
-                $spPeriodQ->whereIn('sales.warehouse_id', $allowedOutlets);
+                $q->whereIn($whIdCol, $allowedOutlets);
             }
-            $spPayDateExpr = 'COALESCE(sale_payments.payment_date, sales.date)';
-            if ($startDt !== null) {
-                $spPeriodQ->whereRaw("{$spPayDateExpr} >= ?", [$startDt]);
+        };
+        $applyPaymentSql = static function ($q, string $col, ?string $fallbackCol = null) use ($pmLower): void {
+            if ($pmLower === null) {
+                return;
             }
-            if ($endDt !== null) {
-                $spPeriodQ->whereRaw("{$spPayDateExpr} <= ?", [$endDt]);
+            $expr = $fallbackCol !== null
+                ? "COALESCE(NULLIF(TRIM({$col}), ''), NULLIF(TRIM({$fallbackCol}), ''), 'Cash')"
+                : "COALESCE(NULLIF(TRIM({$col}), ''), 'Cash')";
+            $q->whereRaw("LOWER(TRIM({$expr})) = ?", [$pmLower]);
+        };
+        $applyUserSql = static function ($q, array $cols, bool $defaultSuperAdmin = true) use ($userLower): void {
+            if ($userLower === null) {
+                return;
             }
-            $salesCashReceived += (float)(clone $spPeriodQ)->sum('sale_payments.amount');
-            foreach ((clone $spPeriodQ)
-                ->select('sale_payments.payment_type', DB::raw('SUM(sale_payments.amount) as amount'), DB::raw('COUNT(*) as count'))
-                ->groupBy('sale_payments.payment_type')
-                ->get() as $spt) {
-                $pt = $spt->payment_type ?: 'Cash';
-                $tenderTotalsMap[$pt] = ($tenderTotalsMap[$pt] ?? 0.0) + (float)$spt->amount;
-                $tenderCountsMap[$pt] = ($tenderCountsMap[$pt] ?? 0) + (int)$spt->count;
+            $like = '%' . $userLower . '%';
+            $includeSuperFallback = $defaultSuperAdmin && str_contains('super admin', $userLower);
+            $q->where(function ($sub) use ($cols, $like, $includeSuperFallback) {
+                foreach ($cols as $idx => $c) {
+                    if ($idx === 0) {
+                        $sub->whereRaw("LOWER(COALESCE({$c}, '')) LIKE ?", [$like]);
+                    } else {
+                        $sub->orWhereRaw("LOWER(COALESCE({$c}, '')) LIKE ?", [$like]);
+                    }
+                }
+                if ($includeSuperFallback && count($cols) >= 2) {
+                    $primaryCheck = implode(' AND ', array_map(fn ($c) => "({$c} IS NULL OR TRIM({$c}) = '')", array_slice($cols, 0, 2)));
+                    $sub->orWhereRaw("({$primaryCheck})");
+                }
+            });
+        };
+        $applySearchSql = static function ($q, array $cols) use ($searchLower): void {
+            if ($searchLower === null) {
+                return;
             }
-        }
-        arsort($tenderTotalsMap);
-        $tenderInflows = collect($tenderTotalsMap)->map(fn ($amt, $pt) => [
-            'payment_type' => $pt,
-            'amount' => round((float)$amt, 2),
-            'count' => (int)($tenderCountsMap[$pt] ?? 0),
-        ])->values();
+            $like = '%' . $searchLower . '%';
+            $q->where(function ($sub) use ($cols, $like) {
+                foreach ($cols as $idx => $c) {
+                    if ($idx === 0) {
+                        $sub->whereRaw("LOWER(COALESCE({$c}, '')) LIKE ?", [$like]);
+                    } else {
+                        $sub->orWhereRaw("LOWER(COALESCE({$c}, '')) LIKE ?", [$like]);
+                    }
+                }
+            });
+        };
 
-        $supplierRefundsReceived = 0.0;
-        $purchCashPaid = 0.0;
-        $dailySupplierRefunds = collect();
-        $dailyPurch = collect();
-        $purchRetTxns = collect();
-        $purchTxns = collect();
+        $hasSpTable = $accounting->schemaHasTable('sale_payments');
+        $hasEpTable = $accounting->schemaHasTable('expense_payments');
 
-        // Calculate Opening Cash Balance (prior to startDate under IAS 7, payment-date aware)
+        $salesCashReceived = 0.0;
+        $tenderTotalsMap = [];
+        $tenderCountsMap = [];
         $openingBalance = 0.0;
-        if ($priorStartDateTime !== null) {
-            $priorLegacySalesQ = (clone $salesQuery)
-                ->where('date', '<', $priorStartDateTime)
+        $totalExpenses = 0.0;
+        $dailyInflowsArr = [];
+        $dailyExpArr = [];
+        $expCatAgg = [];
+        $purchCashPaid = 0.0;
+        $supplierRefundsReceived = 0.0;
+        $refundsPaid = 0.0;
+        $dailyPurchArr = [];
+        $dailySupplierRefundsArr = [];
+        $dailyRefundsArr = [];
+        $sqlBranches = [];
+        $precomputedSqlCount = 0;
+
+        // 1. Sales Cash Inflows (pure SQL, SARGable date branches — zero COALESCE filesort)
+        if ($includeSales) {
+            $legacyNoPaySalesQ = DB::table('sales')
                 ->where('paid_amount', '>', 0)
                 ->when($hasSpTable, fn ($q) => $q->whereNotExists(function ($sub) {
                     $sub->select(DB::raw(1))->from('sale_payments')->whereColumn('sale_payments.sale_id', 'sales.id');
                 }));
-            $priorIn = (float)$priorLegacySalesQ->sum('paid_amount');
-            if ($hasSpTable) {
-                $priorSpQ = DB::table('sale_payments')
+            $this->applyActiveDocumentFilter($legacyNoPaySalesQ, 'status');
+            $applyCashSettlementFilter($legacyNoPaySalesQ, 'payment_type');
+            $applyWh($legacyNoPaySalesQ, 'warehouse_name', 'warehouse_id');
+            $applyPaymentSql($legacyNoPaySalesQ, 'payment_type');
+            $applyUserSql($legacyNoPaySalesQ, ['created_by', 'user_name', 'user_role']);
+            $applySearchSql($legacyNoPaySalesQ, ['reference_no', 'customer_name', 'warehouse_name', 'payment_type', 'created_by', 'user_name', 'notes']);
+
+            $legacySalesPeriodQ = (clone $legacyNoPaySalesQ);
+            if ($startDt !== null) {
+                $legacySalesPeriodQ->where('date', '>=', $startDt);
+            }
+            if ($endDt !== null) {
+                $legacySalesPeriodQ->where('date', '<=', $endDt);
+            }
+
+            $spPeriodBranch = function (bool $isPrior, bool $datedOnly) use (
+                $warehouse,
+                $warehouseId,
+                $allowedOutlets,
+                $startDt,
+                $endDt,
+                $priorStartDateTime,
+                $applyCashSettlementFilter,
+                $applyPaymentSql,
+                $applyUserSql,
+                $applySearchSql
+            ) {
+                $q = DB::table('sale_payments')
                     ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
-                    ->whereRaw('COALESCE(sale_payments.payment_date, sales.date) < ?', [$priorStartDateTime]);
-                $this->applyActiveDocumentFilter($priorSpQ, 'sales.status');
+                    ->where('sale_payments.amount', '>', 0);
+                $this->applyActiveDocumentFilter($q, 'sales.status');
+                $applyCashSettlementFilter($q, 'sale_payments.payment_type');
                 if ($warehouse !== 'All' && !empty($warehouse)) {
-                    $priorSpQ->where('sales.warehouse_name', $warehouse);
+                    if (is_numeric($warehouse) && $warehouseId !== null) {
+                        if ($warehouseId === 1) {
+                            $q->where(fn ($sub) => $sub->where('sales.warehouse_id', 1)->orWhereNull('sales.warehouse_id'));
+                        } else {
+                            $q->where('sales.warehouse_id', $warehouseId);
+                        }
+                    } elseif ($warehouseId !== null) {
+                        $q->where(function ($sub) use ($warehouseId, $warehouse) {
+                            $sub->where('sales.warehouse_id', $warehouseId)
+                                ->orWhere(fn ($inner) => $inner->whereNull('sales.warehouse_id')->where('sales.warehouse_name', $warehouse));
+                        });
+                    } else {
+                        $q->where('sales.warehouse_name', $warehouse);
+                    }
                 }
                 if (!empty($allowedOutlets)) {
-                    $priorSpQ->whereIn('sales.warehouse_id', $allowedOutlets);
+                    $q->whereIn('sales.warehouse_id', $allowedOutlets);
                 }
-                $priorIn += (float)$priorSpQ->sum('sale_payments.amount');
-            }
+                $applyPaymentSql($q, 'sale_payments.payment_type');
+                $applyUserSql($q, ['sale_payments.created_by', 'sale_payments.user_name', 'sales.created_by', 'sale_payments.user_role', 'sales.user_role']);
+                $applySearchSql($q, ['sales.reference_no', 'sales.customer_name', 'sales.warehouse_name', 'sale_payments.payment_type', 'sale_payments.created_by', 'sale_payments.user_name', 'sales.created_by', 'sale_payments.notes', 'sales.notes']);
 
-            $priorRetQ = DB::table('sale_returns')->where('date', '<', $priorStartDateTime);
-            $this->applyActiveDocumentFilter($priorRetQ, 'status');
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $priorRetQ->where('warehouse_name', $warehouse);
-            }
-            if (!empty($allowedOutlets)) {
-                $priorRetQ->whereIn('warehouse_id', $allowedOutlets);
-            }
-            $priorOut = (float)$priorRetQ->sum('paid_amount');
-
-            $openingBalance = $priorIn - $priorOut;
-        }
-
-        // Extract exact payment-dated supplier cash outflows (Received/Completed Purchases, excl Opening Stock)
-        $purchBaseQ = DB::table('purchases')
-            ->whereIn('status', ['Received', 'Completed'])
-            ->where('paid_amount', '>', 0);
-        $this->excludeOpeningStockPurchases($purchBaseQ, 'payment_type');
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $purchBaseQ->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $purchBaseQ->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $dailyPurchArr = [];
-        foreach ($purchBaseQ->select([
-            'id', 'reference_no', 'date', 'supplier_name', 'warehouse_name',
-            'payment_type', 'paid_amount', 'payments_payload', 'created_by',
-            'user_name', 'user_role', 'status', 'notes'
-        ])->cursor() as $po) {
-            $legs = !empty($po->payments_payload) ? json_decode((string)$po->payments_payload, true) : null;
-            if (is_array($legs) && !empty($legs)) {
-                foreach ($legs as $leg) {
-                    $amt = (float)($leg['amount'] ?? 0);
-                    if ($amt <= 0) {
-                        continue;
-                    }
-                    $rawDt = $accounting->normalizeTransactionDate(
-                        (string)($leg['payment_date'] ?? $po->date),
-                        (string)$po->date
-                    );
-                    if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                        $openingBalance -= $amt;
-                        continue;
-                    }
-                    if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                        continue;
-                    }
-                    $purchCashPaid += $amt;
-                    $dayKey = substr($rawDt, 0, 10);
-                    $dailyPurchArr[$dayKey] = ($dailyPurchArr[$dayKey] ?? 0.0) + $amt;
-                    $purchTxns->push((object)[
-                        'id'             => $po->id,
-                        'reference_no'   => $leg['reference_no'] ?? $po->reference_no,
-                        'date'           => $rawDt,
-                        'type'           => 'purchase',
-                        'type_label'     => 'Operating Outflow (Purchase)',
-                        'activity'       => 'Operating',
-                        'party_name'     => $po->supplier_name ?: 'Supplier',
-                        'warehouse_name' => $po->warehouse_name,
-                        'payment_method' => $leg['payment_type'] ?? ($po->payment_type ?: 'Cash'),
-                        'amount_in'      => 0.0,
-                        'amount_out'     => $amt,
-                        'created_by'     => $leg['user_name'] ?? $po->created_by ?? $po->user_name ?? 'Super Admin',
-                        'user_role'      => $leg['user_role'] ?? $po->user_role ?? 'Super Admin',
-                        'status'         => $po->status ?: 'Received',
-                        'notes'          => $leg['notes'] ?? $po->notes ?? '',
-                    ]);
-                }
-            } else {
-                $rawDt = $accounting->normalizeTransactionDate((string)$po->date, (string)$po->date);
-                $amt = (float)$po->paid_amount;
-                if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                    $openingBalance -= $amt;
-                    continue;
-                }
-                if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                    continue;
-                }
-                $purchCashPaid += $amt;
-                $dayKey = substr($rawDt, 0, 10);
-                $dailyPurchArr[$dayKey] = ($dailyPurchArr[$dayKey] ?? 0.0) + $amt;
-                $purchTxns->push((object)[
-                    'id'             => $po->id,
-                    'reference_no'   => $po->reference_no,
-                    'date'           => (string)$po->date,
-                    'type'           => 'purchase',
-                    'type_label'     => 'Operating Outflow (Purchase)',
-                    'activity'       => 'Operating',
-                    'party_name'     => $po->supplier_name ?: 'Supplier',
-                    'warehouse_name' => $po->warehouse_name,
-                    'payment_method' => $po->payment_type ?: 'Cash',
-                    'amount_in'      => 0.0,
-                    'amount_out'     => $amt,
-                    'created_by'     => $po->created_by ?? $po->user_name ?? 'Super Admin',
-                    'user_role'      => $po->user_role ?? 'Super Admin',
-                    'status'         => $po->status ?: 'Received',
-                    'notes'          => $po->notes ?? '',
-                ]);
-            }
-        }
-        $dailyPurch = collect($dailyPurchArr);
-
-        // Extract exact payment-dated supplier refund inflows (Completed/Received Purchase Returns)
-        $prBaseQ = DB::table('purchase_returns')
-            ->whereIn('status', ['Completed', 'Received'])
-            ->where('paid_amount', '>', 0);
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $prBaseQ->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $prBaseQ->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $dailySupplierRefundsArr = [];
-        foreach ($prBaseQ->select([
-            'id', 'reference_no', 'date', 'supplier_name', 'warehouse_name',
-            'payment_type', 'paid_amount', 'payments_payload', 'created_by',
-            'user_name', 'user_role', 'status', 'notes'
-        ])->cursor() as $pr) {
-            $legs = !empty($pr->payments_payload) ? json_decode((string)$pr->payments_payload, true) : null;
-            if (is_array($legs) && !empty($legs)) {
-                foreach ($legs as $leg) {
-                    $amt = (float)($leg['amount'] ?? 0);
-                    if ($amt <= 0) {
-                        continue;
-                    }
-                    $rawDt = $accounting->normalizeTransactionDate(
-                        (string)($leg['payment_date'] ?? $pr->date),
-                        (string)$pr->date
-                    );
-                    if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                        $openingBalance += $amt;
-                        continue;
-                    }
-                    if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                        continue;
-                    }
-                    $supplierRefundsReceived += $amt;
-                    $dayKey = substr($rawDt, 0, 10);
-                    $dailySupplierRefundsArr[$dayKey] = ($dailySupplierRefundsArr[$dayKey] ?? 0.0) + $amt;
-                    $purchRetTxns->push((object)[
-                        'id'             => $pr->id,
-                        'reference_no'   => $leg['reference_no'] ?? $pr->reference_no,
-                        'date'           => $rawDt,
-                        'type'           => 'purchase_return',
-                        'type_label'     => 'Operating Inflow (Supplier Refund)',
-                        'activity'       => 'Operating',
-                        'party_name'     => $pr->supplier_name ?: 'Supplier',
-                        'warehouse_name' => $pr->warehouse_name,
-                        'payment_method' => $leg['payment_type'] ?? ($pr->payment_type ?: 'Cash'),
-                        'amount_in'      => $amt,
-                        'amount_out'     => 0.0,
-                        'created_by'     => $leg['user_name'] ?? $pr->created_by ?? $pr->user_name ?? 'Super Admin',
-                        'user_role'      => $leg['user_role'] ?? $pr->user_role ?? 'Super Admin',
-                        'status'         => $pr->status ?: 'Completed',
-                        'notes'          => $leg['notes'] ?? $pr->notes ?? '',
-                    ]);
-                }
-            } else {
-                $rawDt = $accounting->normalizeTransactionDate((string)$pr->date, (string)$pr->date);
-                $amt = (float)$pr->paid_amount;
-                if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                    $openingBalance += $amt;
-                    continue;
-                }
-                if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                    continue;
-                }
-                $supplierRefundsReceived += $amt;
-                $dayKey = substr($rawDt, 0, 10);
-                $dailySupplierRefundsArr[$dayKey] = ($dailySupplierRefundsArr[$dayKey] ?? 0.0) + $amt;
-                $purchRetTxns->push((object)[
-                    'id'             => $pr->id,
-                    'reference_no'   => $pr->reference_no,
-                    'date'           => (string)$pr->date,
-                    'type'           => 'purchase_return',
-                    'type_label'     => 'Operating Inflow (Supplier Refund)',
-                    'activity'       => 'Operating',
-                    'party_name'     => $pr->supplier_name ?: 'Supplier',
-                    'warehouse_name' => $pr->warehouse_name,
-                    'payment_method' => $pr->payment_type ?: 'Cash',
-                    'amount_in'      => $amt,
-                    'amount_out'     => 0.0,
-                    'created_by'     => $pr->created_by ?? $pr->user_name ?? 'Super Admin',
-                    'user_role'      => $pr->user_role ?? 'Super Admin',
-                    'status'         => $pr->status ?: 'Completed',
-                    'notes'          => $pr->notes ?? '',
-                ]);
-            }
-        }
-        $dailySupplierRefunds = collect($dailySupplierRefundsArr);
-
-        $totalInflows = $salesCashReceived + $supplierRefundsReceived;
-
-        // 2. Remaining Cash Outflows: Expenses Actually Paid (chunked 400 to stay SQLite-safe & low RAM) + Sale Return Refunds
-        $expBaseQ = DB::table('expenses')
-            ->where(function ($q) {
-                $q->whereNull('payment_status')
-                  ->orWhereNotIn('payment_status', [
-                      'Pending', 'pending', 'PENDING',
-                      'Draft', 'draft', 'DRAFT',
-                      'Voided', 'voided', 'VOIDED',
-                  ]);
-            });
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $expBaseQ->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $expBaseQ->whereIn('warehouse_id', $allowedOutlets);
-        }
-
-        $totalExpenses = 0.0;
-        $dailyExpArr   = [];
-        $expCatAgg     = [];
-        $expTxns       = collect();
-
-        $expBaseQ->select([
-            'id', 'reference_no', 'warehouse_name', 'expense_category_name', 'title',
-            'amount', 'paid_amount', 'due_amount', 'payment_status', 'payment_method',
-            'date', 'details', 'created_by', 'user_name', 'user_role',
-        ])->orderBy('id')->chunkById(400, function ($expChunk) use (
-            &$totalExpenses, &$dailyExpArr, &$expCatAgg, &$openingBalance, $expTxns, $accounting, $priorStartDateTime, $startDt, $endDt
-        ) {
-            $expPaymentMap = DB::table('expense_payments')
-                ->whereIn('expense_id', $expChunk->pluck('id')->all())
-                ->orderBy('id')
-                ->get()
-                ->groupBy('expense_id');
-
-            foreach ($expChunk as $exp) {
-                $catName = $exp->expense_category_name ?: 'General Expenses';
-                $legs    = $expPaymentMap->get($exp->id);
-
-                if ($legs && $legs->isNotEmpty()) {
-                    foreach ($legs as $ep) {
-                        $amt = (float)($ep->amount ?? 0);
-                        if ($amt <= 0.0001) {
-                            continue;
-                        }
-                        $rawDt = $accounting->normalizeTransactionDate(
-                            (string)($ep->payment_date ?: $exp->date),
-                            (string)$exp->date
-                        );
-                        if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                            $openingBalance -= $amt;
-                            continue;
-                        }
-                        if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                            continue;
-                        }
-                        $totalExpenses += $amt;
-                        $dayKey = substr($rawDt, 0, 10);
-                        $dailyExpArr[$dayKey] = ($dailyExpArr[$dayKey] ?? 0.0) + $amt;
-                        if (!isset($expCatAgg[$catName])) {
-                            $expCatAgg[$catName] = ['amount' => 0.0, 'count' => 0];
-                        }
-                        $expCatAgg[$catName]['amount'] += $amt;
-                        $expCatAgg[$catName]['count']++;
-
-                        $expTxns->push((object)[
-                            'id'             => $exp->id,
-                            'reference_no'   => $ep->reference_no ?: $exp->reference_no,
-                            'date'           => $rawDt,
-                            'type'           => 'expense',
-                            'type_label'     => 'Operating Outflow (Expense)',
-                            'activity'       => 'Operating',
-                            'party_name'     => $exp->title ?: ($catName ?: 'General Expense'),
-                            'warehouse_name' => $exp->warehouse_name,
-                            'payment_method' => $ep->payment_type ?: ($exp->payment_method ?: 'Cash'),
-                            'amount_in'      => 0.0,
-                            'amount_out'     => $amt,
-                            'created_by'     => $ep->user_name ?: ($ep->created_by ?: ($exp->created_by ?: ($exp->user_name ?: 'Super Admin'))),
-                            'user_role'      => $ep->user_role ?: ($exp->user_role ?: 'Super Admin'),
-                            'status'         => $exp->payment_status ?: 'Paid',
-                            'notes'          => $ep->notes ?: ($exp->details ?: ''),
-                        ]);
+                if ($datedOnly) {
+                    $q->whereNotNull('sale_payments.payment_date');
+                    if ($isPrior) {
+                        $q->where('sale_payments.payment_date', '<', $priorStartDateTime);
+                    } else {
+                        if ($startDt !== null) $q->where('sale_payments.payment_date', '>=', $startDt);
+                        if ($endDt !== null) $q->where('sale_payments.payment_date', '<=', $endDt);
                     }
                 } else {
-                    // Single-record fallback when no payment leg exists (never count Unpaid bills!)
-                    $pStat = strtolower(trim((string)($exp->payment_status ?? '')));
-                    if ($pStat === 'unpaid') {
-                        continue;
-                    }
-                    $paid = (float)($exp->paid_amount ?? 0);
-                    $due  = (float)($exp->due_amount ?? 0);
-                    if ($paid > 0.0001) {
-                        $effPaid = $paid;
-                    } elseif ($due <= 0.0001 && in_array($pStat, ['', 'paid'], true)) {
-                        $effPaid = (float)$exp->amount;
+                    $q->whereNull('sale_payments.payment_date');
+                    if ($isPrior) {
+                        $q->where('sales.date', '<', $priorStartDateTime);
                     } else {
-                        continue;
+                        if ($startDt !== null) $q->where('sales.date', '>=', $startDt);
+                        if ($endDt !== null) $q->where('sales.date', '<=', $endDt);
                     }
-                    if ($effPaid <= 0.0001) {
-                        continue;
-                    }
+                }
+                return $q;
+            };
 
-                    $rawDt = $accounting->normalizeTransactionDate((string)$exp->date, (string)$exp->date);
-                    if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
-                        $openingBalance -= $effPaid;
-                        continue;
+            $salesSqlCount = 0;
+            if (!$fastPageOnly) {
+                if (!$skipSummary) {
+                    foreach ((clone $legacySalesPeriodQ)
+                        ->selectRaw("payment_type, SUBSTRING(date, 1, 10) as day_date, SUM(paid_amount) as amount, COUNT(*) as count")
+                        ->groupBy('payment_type', DB::raw("SUBSTRING(date, 1, 10)"))
+                        ->get() as $lt) {
+                        $amt = (float)$lt->amount;
+                        $cnt = (int)$lt->count;
+                        $salesCashReceived += $amt;
+                        $salesSqlCount += $cnt;
+                        $precomputedSqlCount += $cnt;
+                        $pt = $lt->payment_type ?: 'Cash';
+                        $tenderTotalsMap[$pt] = ($tenderTotalsMap[$pt] ?? 0.0) + $amt;
+                        $tenderCountsMap[$pt] = ($tenderCountsMap[$pt] ?? 0) + $cnt;
+                        $dKey = (string)$lt->day_date;
+                        $dailyInflowsArr[$dKey] = ($dailyInflowsArr[$dKey] ?? 0.0) + $amt;
                     }
-                    if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
-                        continue;
+                } else {
+                    $salesCashReceived += (float)(clone $legacySalesPeriodQ)->sum('paid_amount');
+                }
+                if ($hasSpTable) {
+                    foreach ([true, false] as $datedOnly) {
+                        $spBranchQ = $spPeriodBranch(false, $datedOnly);
+                        if (!$skipSummary) {
+                            $dateExpr = $datedOnly ? 'sale_payments.payment_date' : 'sales.date';
+                            foreach ((clone $spBranchQ)
+                                ->selectRaw("sale_payments.payment_type, SUBSTRING({$dateExpr}, 1, 10) as day_date, SUM(sale_payments.amount) as amount, COUNT(*) as count")
+                                ->groupBy('sale_payments.payment_type', DB::raw("SUBSTRING({$dateExpr}, 1, 10)"))
+                                ->get() as $spt) {
+                                $amt = (float)$spt->amount;
+                                $cnt = (int)$spt->count;
+                                $salesCashReceived += $amt;
+                                $salesSqlCount += $cnt;
+                                $precomputedSqlCount += $cnt;
+                                $pt = $spt->payment_type ?: 'Cash';
+                                $tenderTotalsMap[$pt] = ($tenderTotalsMap[$pt] ?? 0.0) + $amt;
+                                $tenderCountsMap[$pt] = ($tenderCountsMap[$pt] ?? 0) + $cnt;
+                                $dKey = (string)$spt->day_date;
+                                $dailyInflowsArr[$dKey] = ($dailyInflowsArr[$dKey] ?? 0.0) + $amt;
+                            }
+                        } else {
+                            $salesCashReceived += (float)(clone $spBranchQ)->sum('sale_payments.amount');
+                        }
                     }
-
-                    $totalExpenses += $effPaid;
-                    $dayKey = substr($rawDt, 0, 10);
-                    $dailyExpArr[$dayKey] = ($dailyExpArr[$dayKey] ?? 0.0) + $effPaid;
-                    if (!isset($expCatAgg[$catName])) {
-                        $expCatAgg[$catName] = ['amount' => 0.0, 'count' => 0];
+                }
+                if ($priorStartDateTime !== null) {
+                    $priorIn = (float)(clone $legacyNoPaySalesQ)->where('date', '<', $priorStartDateTime)->sum('paid_amount');
+                    if ($hasSpTable) {
+                        $priorIn += (float)$spPeriodBranch(true, true)->sum('sale_payments.amount');
+                        $priorIn += (float)$spPeriodBranch(true, false)->sum('sale_payments.amount');
                     }
-                    $expCatAgg[$catName]['amount'] += $effPaid;
-                    $expCatAgg[$catName]['count']++;
-
-                    $expTxns->push((object)[
-                        'id'             => $exp->id,
-                        'reference_no'   => $exp->reference_no,
-                        'date'           => (string)$exp->date,
-                        'type'           => 'expense',
-                        'type_label'     => 'Operating Outflow (Expense)',
-                        'activity'       => 'Operating',
-                        'party_name'     => $exp->title ?: ($catName ?: 'General Expense'),
-                        'warehouse_name' => $exp->warehouse_name,
-                        'payment_method' => $exp->payment_method ?: 'Cash',
-                        'amount_in'      => 0.0,
-                        'amount_out'     => $effPaid,
-                        'created_by'     => $exp->created_by ?: ($exp->user_name ?: 'Super Admin'),
-                        'user_role'      => $exp->user_role ?: 'Super Admin',
-                        'status'         => $exp->payment_status ?: 'Paid',
-                        'notes'          => $exp->details ?: '',
-                    ]);
+                    $openingBalance += $priorIn;
                 }
             }
-        }, 'id');
-        $dailyExp = collect($dailyExpArr);
 
-        uasort($expCatAgg, static fn($a, $b) => $b['amount'] <=> $a['amount']);
-        $expenseCategories = collect($expCatAgg)->map(function ($row, $cat) {
-            return [
+            $sqlBranches[] = [
+                'q' => (clone $legacySalesPeriodQ)->select([
+                    'id',
+                    'reference_no',
+                    'date',
+                    DB::raw("'sale' as type"),
+                    DB::raw("'Operating Inflow (Sale)' as type_label"),
+                    DB::raw("'Operating' as activity"),
+                    DB::raw("COALESCE(customer_name, 'Walk-in Customer') as party_name"),
+                    'warehouse_name',
+                    DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
+                    'paid_amount as amount_in',
+                    DB::raw('0 as amount_out'),
+                    DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
+                    DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
+                    DB::raw("COALESCE(status, 'Completed') as status"),
+                    DB::raw("COALESCE(notes, '') as notes"),
+                ]),
+                'dateCol' => 'date',
+                'idCol' => 'id',
+                'groupKey' => 'sales',
+            ];
+            if ($hasSpTable) {
+                $sqlBranches[] = [
+                    'q' => $spPeriodBranch(false, true)->select([
+                        'sales.id',
+                        'sales.reference_no',
+                        'sale_payments.payment_date as date',
+                        DB::raw("'sale' as type"),
+                        DB::raw("'Operating Inflow (Sale)' as type_label"),
+                        DB::raw("'Operating' as activity"),
+                        DB::raw("COALESCE(sales.customer_name, 'Walk-in Customer') as party_name"),
+                        'sales.warehouse_name',
+                        DB::raw("COALESCE(sale_payments.payment_type, 'Cash') as payment_method"),
+                        'sale_payments.amount as amount_in',
+                        DB::raw('0 as amount_out'),
+                        DB::raw("COALESCE(sale_payments.created_by, sale_payments.user_name, sales.created_by, 'Super Admin') as created_by"),
+                        DB::raw("COALESCE(sale_payments.user_role, sales.user_role, 'Super Admin') as user_role"),
+                        DB::raw("COALESCE(sales.status, 'Completed') as status"),
+                        DB::raw("COALESCE(sale_payments.notes, sales.notes, '') as notes"),
+                    ]),
+                    'dateCol' => 'sale_payments.payment_date',
+                    'idCol' => null,
+                    'groupKey' => 'sales',
+                ];
+                $sqlBranches[] = [
+                    'q' => $spPeriodBranch(false, false)->select([
+                        'sales.id',
+                        'sales.reference_no',
+                        'sales.date as date',
+                        DB::raw("'sale' as type"),
+                        DB::raw("'Operating Inflow (Sale)' as type_label"),
+                        DB::raw("'Operating' as activity"),
+                        DB::raw("COALESCE(sales.customer_name, 'Walk-in Customer') as party_name"),
+                        'sales.warehouse_name',
+                        DB::raw("COALESCE(sale_payments.payment_type, 'Cash') as payment_method"),
+                        'sale_payments.amount as amount_in',
+                        DB::raw('0 as amount_out'),
+                        DB::raw("COALESCE(sale_payments.created_by, sale_payments.user_name, sales.created_by, 'Super Admin') as created_by"),
+                        DB::raw("COALESCE(sale_payments.user_role, sales.user_role, 'Super Admin') as user_role"),
+                        DB::raw("COALESCE(sales.status, 'Completed') as status"),
+                        DB::raw("COALESCE(sale_payments.notes, sales.notes, '') as notes"),
+                    ]),
+                    'dateCol' => 'sales.date',
+                    'idCol' => 'sales.id',
+                    'groupKey' => 'sales',
+                ];
+            }
+        }
+
+        // 2. Expenses Paid (pure SQL via SARGable JOIN expense_payments + legacy fallback)
+        if ($includeExpenses) {
+            $expFilter = static function ($q, string $alias = '') {
+                $p = $alias !== '' ? $alias . '.' : '';
+                $q->where(function ($sub) use ($p) {
+                    $sub->whereNull("{$p}payment_status")
+                        ->orWhereNotIn("{$p}payment_status", [
+                            'Pending', 'pending', 'PENDING',
+                            'Draft', 'draft', 'DRAFT',
+                            'Voided', 'voided', 'VOIDED',
+                        ]);
+                });
+            };
+
+            if ($hasEpTable) {
+                $epBranch = function (bool $isPrior, bool $datedOnly) use (
+                    $expFilter,
+                    $applyCashSettlementFilter,
+                    $applyWh,
+                    $applyPaymentSql,
+                    $applyUserSql,
+                    $applySearchSql,
+                    $priorStartDateTime,
+                    $startDt,
+                    $endDt
+                ) {
+                    $q = DB::table('expense_payments')
+                        ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                        ->where('expense_payments.amount', '>', 0.0001);
+                    $expFilter($q, 'expenses');
+                    $applyCashSettlementFilter($q, 'expense_payments.payment_type');
+                    $applyWh($q, 'expenses.warehouse_name', 'expenses.warehouse_id');
+                    $applyPaymentSql($q, 'expense_payments.payment_type', 'expenses.payment_method');
+                    $applyUserSql($q, ['expense_payments.user_name', 'expense_payments.created_by', 'expenses.created_by', 'expenses.user_name', 'expense_payments.user_role', 'expenses.user_role']);
+                    $applySearchSql($q, ['expense_payments.reference_no', 'expenses.reference_no', 'expenses.title', 'expenses.expense_category_name', 'expenses.warehouse_name', 'expense_payments.payment_type', 'expense_payments.user_name', 'expense_payments.created_by', 'expenses.created_by', 'expense_payments.notes', 'expenses.details']);
+
+                    if ($datedOnly) {
+                        $q->whereNotNull('expense_payments.payment_date');
+                        if ($isPrior) {
+                            $q->where('expense_payments.payment_date', '<', $priorStartDateTime);
+                        } else {
+                            if ($startDt !== null) $q->where('expense_payments.payment_date', '>=', $startDt);
+                            if ($endDt !== null) $q->where('expense_payments.payment_date', '<=', $endDt);
+                        }
+                    } else {
+                        $q->whereNull('expense_payments.payment_date');
+                        if ($isPrior) {
+                            $q->where('expenses.date', '<', $priorStartDateTime);
+                        } else {
+                            if ($startDt !== null) $q->where('expenses.date', '>=', $startDt);
+                            if ($endDt !== null) $q->where('expenses.date', '<=', $endDt);
+                        }
+                    }
+                    return $q;
+                };
+
+                if (!$fastPageOnly) {
+                    if ($priorStartDateTime !== null) {
+                        $openingBalance -= (float)$epBranch(true, true)->sum('expense_payments.amount');
+                        $openingBalance -= (float)$epBranch(true, false)->sum('expense_payments.amount');
+                    }
+                    foreach ([true, false] as $datedOnly) {
+                        $epQ = $epBranch(false, $datedOnly);
+                        if (!$skipSummary) {
+                            $dateExpr = $datedOnly ? 'expense_payments.payment_date' : 'expenses.date';
+                            foreach ((clone $epQ)
+                                ->selectRaw("COALESCE(expenses.expense_category_name, 'General Expenses') as cat_name, SUBSTRING({$dateExpr}, 1, 10) as day_date, SUM(expense_payments.amount) as amt, COUNT(*) as cnt")
+                                ->groupBy(DB::raw("COALESCE(expenses.expense_category_name, 'General Expenses')"), DB::raw("SUBSTRING({$dateExpr}, 1, 10)"))
+                                ->get() as $epRow) {
+                                $amt = (float)$epRow->amt;
+                                $cnt = (int)$epRow->cnt;
+                                $totalExpenses += $amt;
+                                $precomputedSqlCount += $cnt;
+                                $dKey = (string)$epRow->day_date;
+                                $dailyExpArr[$dKey] = ($dailyExpArr[$dKey] ?? 0.0) + $amt;
+                                $cat = (string)$epRow->cat_name;
+                                if (!isset($expCatAgg[$cat])) $expCatAgg[$cat] = ['amount' => 0.0, 'count' => 0];
+                                $expCatAgg[$cat]['amount'] += $amt;
+                                $expCatAgg[$cat]['count'] += $cnt;
+                            }
+                        } else {
+                            $totalExpenses += (float)(clone $epQ)->sum('expense_payments.amount');
+                        }
+                    }
+                }
+
+                $sqlBranches[] = [
+                    'q' => $epBranch(false, true)->select([
+                        'expenses.id',
+                        DB::raw('COALESCE(expense_payments.reference_no, expenses.reference_no) as reference_no'),
+                        'expense_payments.payment_date as date',
+                        DB::raw("'expense' as type"),
+                        DB::raw("'Operating Outflow (Expense)' as type_label"),
+                        DB::raw("'Operating' as activity"),
+                        DB::raw("COALESCE(expenses.title, expenses.expense_category_name, 'General Expense') as party_name"),
+                        'expenses.warehouse_name',
+                        DB::raw("COALESCE(expense_payments.payment_type, expenses.payment_method, 'Cash') as payment_method"),
+                        DB::raw('0 as amount_in'),
+                        'expense_payments.amount as amount_out',
+                        DB::raw("COALESCE(expense_payments.user_name, expense_payments.created_by, expenses.created_by, expenses.user_name, 'Super Admin') as created_by"),
+                        DB::raw("COALESCE(expense_payments.user_role, expenses.user_role, 'Super Admin') as user_role"),
+                        DB::raw("COALESCE(expenses.payment_status, 'Paid') as status"),
+                        DB::raw("COALESCE(expense_payments.notes, expenses.details, '') as notes"),
+                    ]),
+                    'dateCol' => 'expense_payments.payment_date',
+                    'idCol' => null,
+                ];
+                $sqlBranches[] = [
+                    'q' => $epBranch(false, false)->select([
+                        'expenses.id',
+                        DB::raw('COALESCE(expense_payments.reference_no, expenses.reference_no) as reference_no'),
+                        'expenses.date as date',
+                        DB::raw("'expense' as type"),
+                        DB::raw("'Operating Outflow (Expense)' as type_label"),
+                        DB::raw("'Operating' as activity"),
+                        DB::raw("COALESCE(expenses.title, expenses.expense_category_name, 'General Expense') as party_name"),
+                        'expenses.warehouse_name',
+                        DB::raw("COALESCE(expense_payments.payment_type, expenses.payment_method, 'Cash') as payment_method"),
+                        DB::raw('0 as amount_in'),
+                        'expense_payments.amount as amount_out',
+                        DB::raw("COALESCE(expense_payments.user_name, expense_payments.created_by, expenses.created_by, expenses.user_name, 'Super Admin') as created_by"),
+                        DB::raw("COALESCE(expense_payments.user_role, expenses.user_role, 'Super Admin') as user_role"),
+                        DB::raw("COALESCE(expenses.payment_status, 'Paid') as status"),
+                        DB::raw("COALESCE(expense_payments.notes, expenses.details, '') as notes"),
+                    ]),
+                    'dateCol' => 'expenses.date',
+                    'idCol' => 'expenses.id',
+                ];
+            }
+
+            $expEffPaidExpr = "CASE WHEN COALESCE(paid_amount, 0) > 0.0001 THEN paid_amount WHEN COALESCE(due_amount, 0) <= 0.0001 AND LOWER(TRIM(COALESCE(payment_status, ''))) IN ('', 'paid') THEN amount ELSE 0 END";
+            $expLegacyQ = DB::table('expenses')
+                ->when($hasEpTable, fn ($q) => $q->whereNotExists(function ($sub) {
+                    $sub->select(DB::raw(1))->from('expense_payments')->whereColumn('expense_payments.expense_id', 'expenses.id');
+                }))
+                ->whereRaw("LOWER(TRIM(COALESCE(payment_status, ''))) != 'unpaid'");
+            $expFilter($expLegacyQ, '');
+            $applyCashSettlementFilter($expLegacyQ, 'payment_method');
+            $applyWh($expLegacyQ, 'warehouse_name', 'warehouse_id');
+            $applyPaymentSql($expLegacyQ, 'payment_method');
+            $applyUserSql($expLegacyQ, ['created_by', 'user_name', 'user_role']);
+            $applySearchSql($expLegacyQ, ['reference_no', 'title', 'expense_category_name', 'warehouse_name', 'payment_method', 'created_by', 'user_name', 'details']);
+
+            $expLegacyPeriodQ = (clone $expLegacyQ);
+            if ($startDt !== null) $expLegacyPeriodQ->where('date', '>=', $startDt);
+            if ($endDt !== null) $expLegacyPeriodQ->where('date', '<=', $endDt);
+            $expLegacyPeriodQ->whereRaw("({$expEffPaidExpr}) > 0.0001");
+
+            if (!$fastPageOnly) {
+                if ($priorStartDateTime !== null) {
+                    $priorLegacyExpOut = (float)(clone $expLegacyQ)
+                        ->where('date', '<', $priorStartDateTime)
+                        ->selectRaw("COALESCE(SUM({$expEffPaidExpr}), 0) as s")
+                        ->value('s');
+                    $openingBalance -= $priorLegacyExpOut;
+                }
+                if (!$skipSummary) {
+                    foreach ((clone $expLegacyPeriodQ)
+                        ->selectRaw("COALESCE(expense_category_name, 'General Expenses') as cat_name, SUBSTRING(date, 1, 10) as day_date, SUM({$expEffPaidExpr}) as amt, COUNT(*) as cnt")
+                        ->groupBy(DB::raw("COALESCE(expense_category_name, 'General Expenses')"), DB::raw("SUBSTRING(date, 1, 10)"))
+                        ->get() as $elRow) {
+                        $amt = (float)$elRow->amt;
+                        $cnt = (int)$elRow->cnt;
+                        $totalExpenses += $amt;
+                        $precomputedSqlCount += $cnt;
+                        $dKey = (string)$elRow->day_date;
+                        $dailyExpArr[$dKey] = ($dailyExpArr[$dKey] ?? 0.0) + $amt;
+                        $cat = (string)$elRow->cat_name;
+                        if (!isset($expCatAgg[$cat])) $expCatAgg[$cat] = ['amount' => 0.0, 'count' => 0];
+                        $expCatAgg[$cat]['amount'] += $amt;
+                        $expCatAgg[$cat]['count'] += $cnt;
+                    }
+                } else {
+                    $totalExpenses += (float)(clone $expLegacyPeriodQ)->selectRaw("COALESCE(SUM({$expEffPaidExpr}), 0) as s")->value('s');
+                }
+            }
+
+            $sqlBranches[] = [
+                'q' => (clone $expLegacyPeriodQ)->select([
+                    'id',
+                    'reference_no',
+                    'date',
+                    DB::raw("'expense' as type"),
+                    DB::raw("'Operating Outflow (Expense)' as type_label"),
+                    DB::raw("'Operating' as activity"),
+                    DB::raw("COALESCE(title, expense_category_name, 'General Expense') as party_name"),
+                    'warehouse_name',
+                    DB::raw("COALESCE(payment_method, 'Cash') as payment_method"),
+                    DB::raw('0 as amount_in'),
+                    DB::raw("({$expEffPaidExpr}) as amount_out"),
+                    DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
+                    DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
+                    DB::raw("COALESCE(payment_status, 'Paid') as status"),
+                    DB::raw("COALESCE(details, '') as notes"),
+                ]),
+                'dateCol' => 'date',
+                'idCol' => 'id',
+            ];
+        }
+
+        // 3. Payment-dated Purchase Outflows, Purchase Return Refunds, and Sale Return Refunds
+        $offset = ($page - 1) * $perPage;
+        $needTopN = $offset + $perPage + 1;
+        $payloadTxnIndex = []; // compact tuples: [date, id, srcType, amountIn, amountOut, legIdx]
+        $payloadNeedMetaFilter = ($pmLower !== null || $userLower !== null || $searchLower !== null);
+
+        $scanPayloadDocs = function (
+            $baseQ,
+            string $srcType,
+            bool $isInflow,
+            ?string $defaultTenderCol = null,
+            bool $excludeCreditDefault = true
+        ) use (
+            $accounting,
+            $priorStartDateTime,
+            $startDt,
+            $endDt,
+            &$openingBalance,
+            &$purchCashPaid,
+            &$supplierRefundsReceived,
+            &$refundsPaid,
+            &$dailyPurchArr,
+            &$dailySupplierRefundsArr,
+            &$dailyRefundsArr,
+            &$payloadTxnIndex,
+            $skipSummary,
+            $fastPageOnly,
+            $needTopN,
+            $pmLower,
+            $userLower,
+            $searchLower,
+            $payloadNeedMetaFilter
+        ): void {
+            $cols = ['id', 'date', 'payment_type', 'paid_amount', 'payments_payload'];
+            if ($defaultTenderCol !== null) {
+                $cols[] = $defaultTenderCol;
+            }
+            if ($payloadNeedMetaFilter) {
+                $partyCol = ($srcType === 'sale_return') ? 'customer_name' : 'supplier_name';
+                $cols = array_merge($cols, ['reference_no', $partyCol, 'warehouse_name', 'created_by', 'user_name', 'user_role', 'notes']);
+            }
+            if ($pmLower !== null && $pmLower !== 'cash') {
+                $pmLike = '%' . $pmLower . '%';
+                $baseQ->where(function ($sub) use ($pmLike, $pmLower, $defaultTenderCol) {
+                    $sub->whereRaw("LOWER(COALESCE(payments_payload, '')) LIKE ?", [$pmLike])
+                        ->orWhereRaw("LOWER(TRIM(COALESCE(payment_type, ''))) = ?", [$pmLower]);
+                    if ($defaultTenderCol !== null) {
+                        $sub->orWhereRaw("LOWER(TRIM(COALESCE({$defaultTenderCol}, ''))) = ?", [$pmLower]);
+                    }
+                });
+            }
+
+            // Fast slice when skip_summary=1 with known_total + known_closing_balance: top N by date + any multi-leg/later-paid docs
+            if ($fastPageOnly) {
+                $topIds = (clone $baseQ)
+                    ->orderByDesc('date')
+                    ->orderByDesc('id')
+                    ->limit($needTopN)
+                    ->pluck('id')
+                    ->all();
+                $laterIds = (clone $baseQ)
+                    ->where(function ($sub) {
+                        $sub->where('payments_payload', 'LIKE', '%},%')
+                            ->orWhereColumn('updated_at', '>', 'created_at');
+                    })
+                    ->pluck('id')
+                    ->all();
+                $targetIds = array_values(array_unique(array_merge($topIds, $laterIds)));
+                if (empty($targetIds)) {
+                    return;
+                }
+                $cursor = (clone $baseQ)->whereIn('id', $targetIds)->select($cols)->cursor();
+            } else {
+                $cursor = $baseQ->select($cols)->cursor();
+            }
+
+            $srcPartyCol = ($srcType === 'sale_return') ? 'customer_name' : 'supplier_name';
+            $recordLeg = function (string $rawDt, int $docId, float $amt, int $legIdx, string $ptRaw, ?array $leg = null, ?object $doc = null) use (
+                $srcType,
+                $isInflow,
+                $priorStartDateTime,
+                $startDt,
+                $endDt,
+                $fastPageOnly,
+                $skipSummary,
+                $pmLower,
+                $userLower,
+                $searchLower,
+                $srcPartyCol,
+                &$openingBalance,
+                &$purchCashPaid,
+                &$supplierRefundsReceived,
+                &$refundsPaid,
+                &$dailyPurchArr,
+                &$dailySupplierRefundsArr,
+                &$dailyRefundsArr,
+                &$payloadTxnIndex
+            ): void {
+                $pmEff = $ptRaw !== '' ? $ptRaw : 'Cash';
+                if ($pmLower !== null && strtolower(trim($pmEff)) !== $pmLower) {
+                    return;
+                }
+                if ($userLower !== null && $doc !== null) {
+                    $by = (string)(($leg['user_name'] ?? null) ?: (($doc->created_by ?? null) ?: ($doc->user_name ?? 'Super Admin')));
+                    $role = (string)(($leg['user_role'] ?? null) ?: ($doc->user_role ?? 'Super Admin'));
+                    if (!str_contains(strtolower($by), $userLower) && !str_contains(strtolower($role), $userLower)) {
+                        return;
+                    }
+                }
+                if ($searchLower !== null && $doc !== null) {
+                    $ref = (string)(($leg['reference_no'] ?? null) ?: ($doc->reference_no ?? ''));
+                    $party = (string)($doc->$srcPartyCol ?? '');
+                    $wh = (string)($doc->warehouse_name ?? '');
+                    $by = (string)(($leg['user_name'] ?? null) ?: (($doc->created_by ?? null) ?: ($doc->user_name ?? 'Super Admin')));
+                    $notes = (string)(($leg['notes'] ?? null) ?: ($doc->notes ?? ''));
+                    if (
+                        !str_contains(strtolower($ref), $searchLower) &&
+                        !str_contains(strtolower($party), $searchLower) &&
+                        !str_contains(strtolower($wh), $searchLower) &&
+                        !str_contains(strtolower($pmEff), $searchLower) &&
+                        !str_contains(strtolower($by), $searchLower) &&
+                        !str_contains(strtolower($notes), $searchLower)
+                    ) {
+                        return;
+                    }
+                }
+                if ($priorStartDateTime !== null && $rawDt < $priorStartDateTime) {
+                    if (!$fastPageOnly) {
+                        $openingBalance += ($isInflow ? $amt : -$amt);
+                    }
+                    return;
+                }
+                if (($startDt !== null && $rawDt < $startDt) || ($endDt !== null && $rawDt > $endDt)) {
+                    return;
+                }
+                if (!$fastPageOnly) {
+                    $dayKey = substr($rawDt, 0, 10);
+                    if ($srcType === 'purchase') {
+                        $purchCashPaid += $amt;
+                        if (!$skipSummary) $dailyPurchArr[$dayKey] = ($dailyPurchArr[$dayKey] ?? 0.0) + $amt;
+                    } elseif ($srcType === 'purchase_return') {
+                        $supplierRefundsReceived += $amt;
+                        if (!$skipSummary) $dailySupplierRefundsArr[$dayKey] = ($dailySupplierRefundsArr[$dayKey] ?? 0.0) + $amt;
+                    } else {
+                        $refundsPaid += $amt;
+                        if (!$skipSummary) $dailyRefundsArr[$dayKey] = ($dailyRefundsArr[$dayKey] ?? 0.0) + $amt;
+                    }
+                }
+                $payloadTxnIndex[] = [
+                    $rawDt,
+                    $docId,
+                    $srcType,
+                    $isInflow ? $amt : 0.0,
+                    $isInflow ? 0.0 : $amt,
+                    $legIdx,
+                ];
+            };
+
+            foreach ($cursor as $doc) {
+                $rawPayload = (string)($doc->payments_payload ?? '');
+                $legs = ($rawPayload !== '' && $rawPayload !== '[]') ? json_decode($rawPayload, true) : null;
+                if (is_array($legs) && !empty($legs)) {
+                    foreach ($legs as $legIdx => $leg) {
+                        if (!is_array($leg)) continue;
+                        $amt = (float)($leg['amount'] ?? 0);
+                        if ($amt <= 0.0001) continue;
+                        $ptRaw = (string)($leg['payment_type'] ?? ($defaultTenderCol ? ($doc->$defaultTenderCol ?? '') : '') ?: ($doc->payment_type ?? ''));
+                        if ($excludeCreditDefault && $accounting->isNonCashSettlementType($ptRaw)) {
+                            continue;
+                        }
+                        $rawCand = (string)($leg['payment_date'] ?? $doc->date);
+                        $rawDt = (strlen($rawCand) === 19 && $rawCand[4] === '-' && $rawCand[10] === ' ')
+                            ? $rawCand
+                            : $accounting->normalizeTransactionDate($rawCand, (string)$doc->date);
+                        $recordLeg($rawDt, (int)$doc->id, $amt, (int)$legIdx, $ptRaw, $leg, $doc);
+                    }
+                } else {
+                    $ptRaw = (string)(($defaultTenderCol ? ($doc->$defaultTenderCol ?? '') : '') ?: ($doc->payment_type ?? ''));
+                    if ($excludeCreditDefault && $accounting->isNonCashSettlementType($ptRaw)) {
+                        continue;
+                    }
+                    $amt = (float)$doc->paid_amount;
+                    if ($amt <= 0.0001) continue;
+                    $docDateStr = (string)$doc->date;
+                    $rawDt = (strlen($docDateStr) === 19 && $docDateStr[4] === '-' && $docDateStr[10] === ' ')
+                        ? $docDateStr
+                        : $accounting->normalizeTransactionDate($docDateStr, $docDateStr);
+                    $recordLeg($rawDt, (int)$doc->id, $amt, -1, $ptRaw, null, $doc);
+                }
+            }
+        };
+
+        $skipSingleNonCashSql = static function ($q, string $nonCashLower, ?string $tenderCol = null): void {
+            $tenderExpr = $tenderCol !== null
+                ? "LOWER(TRIM(COALESCE(NULLIF({$tenderCol}, ''), payment_type, '')))"
+                : "LOWER(TRIM(COALESCE(payment_type, '')))";
+            $q->whereRaw("NOT (
+                {$tenderExpr} = ?
+                AND (
+                    payments_payload IS NULL
+                    OR payments_payload = ''
+                    OR payments_payload = '[]'
+                    OR (payments_payload NOT LIKE '%},%' AND LOWER(payments_payload) LIKE ?)
+                )
+            )", [$nonCashLower, '%"payment_type":"' . $nonCashLower . '"%']);
+        };
+
+        if ($includePurchases) {
+            $purchBaseQ = DB::table('purchases')
+                ->whereIn('status', ['Received', 'Completed'])
+                ->where('paid_amount', '>', 0);
+            $this->excludeOpeningStockPurchases($purchBaseQ, 'payment_type');
+            $applyWh($purchBaseQ, 'warehouse_name', 'warehouse_id');
+            $scanPayloadDocs($purchBaseQ, 'purchase', false, null, true);
+        }
+
+        if ($includePurchaseReturns) {
+            $prBaseQ = DB::table('purchase_returns')
+                ->whereIn('status', ['Completed', 'Received'])
+                ->where('paid_amount', '>', 0);
+            $skipSingleNonCashSql($prBaseQ, 'credit note');
+            $applyWh($prBaseQ, 'warehouse_name', 'warehouse_id');
+            $scanPayloadDocs($prBaseQ, 'purchase_return', true, null, true);
+        }
+
+        if ($includeSaleReturns) {
+            $retQuery = DB::table('sale_returns')->where('paid_amount', '>', 0);
+            $this->applyActiveDocumentFilter($retQuery, 'status');
+            $skipSingleNonCashSql($retQuery, 'store credit', 'refund_tender');
+            $applyWh($retQuery, 'warehouse_name', 'warehouse_id');
+            $scanPayloadDocs($retQuery, 'sale_return', false, 'refund_tender', true);
+        }
+
+        $totalInflows = $salesCashReceived + $supplierRefundsReceived;
+        $totalOutflows = $purchCashPaid + $totalExpenses + $refundsPaid;
+        $netCashFlow = $totalInflows - $totalOutflows;
+        $closingBalance = $fastPageOnly ? $knownClosingBalance : ($openingBalance + $netCashFlow);
+
+        // 4. Tender Breakdown, Expense Categories, Daily Timeline & Filter Metadata (Page 1 only)
+        $tenderInflows = collect();
+        $expenseCategories = collect();
+        $timeline = [];
+        $availableFilters = null;
+        if (!$skipSummary) {
+            arsort($tenderTotalsMap);
+            $tenderInflows = collect($tenderTotalsMap)->map(fn ($amt, $pt) => [
+                'payment_type' => $pt,
+                'amount' => round((float)$amt, 2),
+                'count' => (int)($tenderCountsMap[$pt] ?? 0),
+            ])->values();
+
+            uasort($expCatAgg, static fn ($a, $b) => $b['amount'] <=> $a['amount']);
+            $expenseCategories = collect($expCatAgg)->map(fn ($row, $cat) => [
                 'category' => $cat,
                 'amount'   => round((float)$row['amount'], 2),
                 'count'    => (int)$row['count'],
+            ])->values();
+
+            $allDates = array_unique(array_merge(
+                array_keys($dailyInflowsArr),
+                array_keys($dailySupplierRefundsArr),
+                array_keys($dailyPurchArr),
+                array_keys($dailyExpArr),
+                array_keys($dailyRefundsArr)
+            ));
+            sort($allDates);
+
+            $runningBalance = $openingBalance;
+            foreach ($allDates as $d) {
+                $in = (float)($dailyInflowsArr[$d] ?? 0.0) + (float)($dailySupplierRefundsArr[$d] ?? 0.0);
+                $out = (float)($dailyPurchArr[$d] ?? 0.0) + (float)($dailyExpArr[$d] ?? 0.0) + (float)($dailyRefundsArr[$d] ?? 0.0);
+                $net = $in - $out;
+                $runningBalance += $net;
+                $timeline[] = [
+                    'date' => $d,
+                    'inflow' => round($in, 2),
+                    'outflow' => round($out, 2),
+                    'net_cash' => round($net, 2),
+                    'cumulative_cash' => round($runningBalance, 2),
+                ];
+            }
+
+            // Collect filter options so dropdowns stay complete regardless of active filters
+            $whList = $accounting->schemaHasTable('outlets')
+                ? DB::table('outlets')
+                    ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                    ->orderBy('name')
+                    ->pluck('name')
+                    ->filter(fn ($v) => trim((string)$v) !== '')
+                    ->values()
+                    ->all()
+                : [];
+            $pmSet = ['cash' => 'Cash'];
+            foreach (array_keys($tenderTotalsMap) as $tp) {
+                $clean = trim((string)$tp);
+                if ($clean !== '') $pmSet[strtolower($clean)] = $clean;
+            }
+            if ($hasSpTable) {
+                foreach (DB::table('sale_payments')->distinct()->limit(30)->pluck('payment_type') as $spPm) {
+                    $clean = trim((string)$spPm);
+                    if ($clean !== '' && !$accounting->isNonCashSettlementType($clean)) {
+                        $pmSet[strtolower($clean)] = $pmSet[strtolower($clean)] ?? $clean;
+                    }
+                }
+            }
+            if ($hasEpTable) {
+                foreach (DB::table('expense_payments')->distinct()->limit(30)->pluck('payment_type') as $epPm) {
+                    $clean = trim((string)$epPm);
+                    if ($clean !== '' && !$accounting->isNonCashSettlementType($clean)) {
+                        $pmSet[strtolower($clean)] = $pmSet[strtolower($clean)] ?? $clean;
+                    }
+                }
+            }
+            $userSet = [];
+            foreach (DB::table('sales')->distinct()->limit(50)->pluck('created_by') as $uName) {
+                $clean = trim((string)$uName);
+                if ($clean !== '') $userSet[strtolower($clean)] = $clean;
+            }
+            if ($accounting->schemaHasTable('expenses')) {
+                foreach (DB::table('expenses')->distinct()->limit(50)->pluck('created_by') as $uName) {
+                    $clean = trim((string)$uName);
+                    if ($clean !== '') $userSet[strtolower($clean)] = $userSet[strtolower($clean)] ?? $clean;
+                }
+            }
+            if ($accounting->schemaHasTable('users')) {
+                foreach (DB::table('users')->where('status', 'active')->orderBy('name')->limit(50)->pluck('name') as $uName) {
+                    $clean = trim((string)$uName);
+                    if ($clean !== '') $userSet[strtolower($clean)] = $userSet[strtolower($clean)] ?? $clean;
+                }
+            }
+            $availableFilters = [
+                'warehouses' => array_values(array_unique($whList)),
+                'payment_methods' => array_values($pmSet),
+                'users' => array_values($userSet),
+                'activities' => ['Operating Inflow', 'Operating Outflow', 'Purchases', 'Expenses', 'Refunds', 'Financing'],
             ];
-        })->values();
+        }
 
-        $retQuery = DB::table('sale_returns');
-        $this->applyActiveDocumentFilter($retQuery, 'status');
-        if ($startDt !== null) {
-            $retQuery->where('date', '>=', $startDt);
-        }
-        if ($endDt !== null) {
-            $retQuery->where('date', '<=', $endDt);
-        }
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $retQuery->where('warehouse_name', $warehouse);
-        }
-        if (!empty($allowedOutlets)) {
-            $retQuery->whereIn('warehouse_id', $allowedOutlets);
-        }
-        $refundsPaid = (float)$retQuery->sum('paid_amount');
-
-        $totalOutflows = $purchCashPaid + $totalExpenses + $refundsPaid;
-        $netCashFlow = $totalInflows - $totalOutflows;
-
-        // 3. Daily Timeline (payment-date accurate across Sales, Supplier Refunds, Purchases, Expenses & Sale Returns)
-        $dailyInflowsArr = [];
-        foreach ((clone $legacyNoPaySalesQ)
-            ->selectRaw("SUBSTRING(date, 1, 10) as day_date, SUM(paid_amount) as inflow")
-            ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"))
-            ->get() as $diRow) {
-            $dKey = (string)$diRow->day_date;
-            $dailyInflowsArr[$dKey] = ($dailyInflowsArr[$dKey] ?? 0.0) + (float)$diRow->inflow;
-        }
-        if ($hasSpTable && $spPeriodQ !== null) {
-            foreach ((clone $spPeriodQ)
-                ->selectRaw("SUBSTRING(COALESCE(sale_payments.payment_date, sales.date), 1, 10) as day_date, SUM(sale_payments.amount) as inflow")
-                ->groupBy(DB::raw("SUBSTRING(COALESCE(sale_payments.payment_date, sales.date), 1, 10)"))
-                ->get() as $spDayRow) {
-                $dKey = (string)$spDayRow->day_date;
-                $dailyInflowsArr[$dKey] = ($dailyInflowsArr[$dKey] ?? 0.0) + (float)$spDayRow->inflow;
+        // 5. SQL-Paginated Journal Slice merged cleanly with payload tuples
+        $sqlCount = 0;
+        if ($skipSummary && $knownTotal !== null) {
+            $sqlCount = max(0, $knownTotal - count($payloadTxnIndex));
+        } elseif (!$skipSummary) {
+            $sqlCount = $precomputedSqlCount;
+        } else {
+            foreach ($sqlBranches as $b) {
+                $sqlCount += (int)(clone $b['q'])->count();
             }
         }
-        $dailyInflows = collect($dailyInflowsArr);
-
-        $dailyRefunds = (clone $retQuery)
-            ->selectRaw("SUBSTRING(date, 1, 10) as day_date, SUM(paid_amount) as outflow")
-            ->groupBy(DB::raw("SUBSTRING(date, 1, 10)"))
-            ->pluck('outflow', 'day_date');
-
-        $allDates = array_unique(array_merge(
-            $dailyInflows->keys()->all(),
-            $dailySupplierRefunds->keys()->all(),
-            $dailyPurch->keys()->all(),
-            $dailyExp->keys()->all(),
-            $dailyRefunds->keys()->all()
-        ));
-        sort($allDates);
-
-        $timeline = [];
-        $runningBalance = $openingBalance;
-        foreach ($allDates as $d) {
-            $in = (float)($dailyInflows[$d] ?? 0.0) + (float)($dailySupplierRefunds[$d] ?? 0.0);
-            $out = (float)($dailyPurch[$d] ?? 0.0) + (float)($dailyExp[$d] ?? 0.0) + (float)($dailyRefunds[$d] ?? 0.0);
-            $net = $in - $out;
-            $runningBalance += $net;
-            $timeline[] = [
-                'date' => $d,
-                'inflow' => round($in, 2),
-                'outflow' => round($out, 2),
-                'net_cash' => round($net, 2),
-                'cumulative_cash' => round($runningBalance, 2),
-            ];
-        }
-
-        // 4. Unified Granular Cash Flow Transactions Journal (IAS 7 Standard Direct Method)
-        $legacySalesTxns = (clone $legacyNoPaySalesQ)
-            ->select([
-                'id',
-                'reference_no',
-                'date',
-                DB::raw("'sale' as type"),
-                DB::raw("'Operating Inflow (Sale)' as type_label"),
-                DB::raw("'Operating' as activity"),
-                DB::raw("COALESCE(customer_name, 'Walk-in Customer') as party_name"),
-                'warehouse_name',
-                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
-                'paid_amount as amount_in',
-                DB::raw('0 as amount_out'),
-                DB::raw("COALESCE(created_by, user_name, 'Super Admin') as created_by"),
-                DB::raw("COALESCE(user_role, 'Super Admin') as user_role"),
-                DB::raw("COALESCE(status, 'Completed') as status"),
-                DB::raw("COALESCE(notes, '') as notes"),
-            ])
-            ->get();
-        $spSalesTxns = ($hasSpTable && $spPeriodQ !== null)
-            ? (clone $spPeriodQ)->select([
-                'sales.id',
-                'sales.reference_no',
-                DB::raw('COALESCE(sale_payments.payment_date, sales.date) as date'),
-                DB::raw("'sale' as type"),
-                DB::raw("'Operating Inflow (Sale)' as type_label"),
-                DB::raw("'Operating' as activity"),
-                DB::raw("COALESCE(sales.customer_name, 'Walk-in Customer') as party_name"),
-                'sales.warehouse_name',
-                DB::raw("COALESCE(sale_payments.payment_type, 'Cash') as payment_method"),
-                'sale_payments.amount as amount_in',
-                DB::raw('0 as amount_out'),
-                DB::raw("COALESCE(sale_payments.created_by, sale_payments.user_name, sales.created_by, 'Super Admin') as created_by"),
-                DB::raw("COALESCE(sale_payments.user_role, sales.user_role, 'Super Admin') as user_role"),
-                DB::raw("COALESCE(sales.status, 'Completed') as status"),
-                DB::raw("COALESCE(sale_payments.notes, sales.notes, '') as notes"),
-            ])->get()
-            : collect();
-        $salesTxns = $legacySalesTxns->concat($spSalesTxns);
-
-        $retTxns = (clone $retQuery)
-            ->where('paid_amount', '>', 0)
-            ->select([
-                'id',
-                'reference_no',
-                'date',
-                DB::raw("'sale_return' as type"),
-                DB::raw("'Operating Outflow (Refund)' as type_label"),
-                DB::raw("'Operating' as activity"),
-                DB::raw("COALESCE(customer_name, 'Walk-in Customer') as party_name"),
-                'warehouse_name',
-                DB::raw("COALESCE(payment_type, 'Cash') as payment_method"),
-                DB::raw('0 as amount_in'),
-                'paid_amount as amount_out',
-                DB::raw("COALESCE(created_by, 'Super Admin') as created_by"),
-                DB::raw("'Super Admin' as user_role"),
-                DB::raw("COALESCE(status, 'Completed') as status"),
-                DB::raw("COALESCE(notes, '') as notes"),
-            ])
-            ->get();
-
-        $mergedTxns = collect([])
-            ->concat($salesTxns)
-            ->concat($purchRetTxns)
-            ->concat($purchTxns)
-            ->concat($expTxns)
-            ->concat($retTxns)
-            ->sort(function ($a, $b) {
-                $dComp = strcmp((string)$a->date, (string)$b->date);
-                if ($dComp !== 0) return $dComp;
-                return ((int)$a->id) <=> ((int)$b->id);
-            })
-            ->values();
-
-        $runningTxnBal = $openingBalance;
-        $transactions = [];
-        foreach ($mergedTxns as $t) {
-            $in = (float)($t->amount_in ?? 0);
-            $out = (float)($t->amount_out ?? 0);
-            $runningTxnBal += ($in - $out);
-
-            $transactions[] = [
-                'id' => (int)$t->id,
-                'reference_no' => (string)$t->reference_no,
-                'date' => (string)$t->date,
-                'type' => (string)$t->type,
-                'type_label' => (string)$t->type_label,
-                'activity' => (string)$t->activity,
-                'party_name' => (string)$t->party_name,
-                'warehouse_name' => (string)($t->warehouse_name ?: 'Main Branch Outlet'),
-                'payment_method' => (string)($t->payment_method ?: 'Cash'),
-                'amount_in' => round($in, 2),
-                'amount_out' => round($out, 2),
-                'running_balance' => round($runningTxnBal, 2),
-                'created_by' => (string)($t->created_by ?: 'Super Admin'),
-                'user_role' => (string)($t->user_role ?: 'Super Admin'),
-                'status' => (string)($t->status ?: 'Completed'),
-                'notes' => (string)($t->notes ?: ''),
-            ];
-        }
-
-        // Reverse for newest first in table
-        $transactions = array_reverse($transactions);
-
-        $totalRecords = count($transactions);
+        $totalRecords = ($skipSummary && $knownTotal !== null)
+            ? $knownTotal
+            : ($sqlCount + count($payloadTxnIndex));
         $lastPage = max(1, (int)ceil($totalRecords / max(1, $perPage)));
-        $offset = ($page - 1) * $perPage;
-        $pagedTransactions = array_values(array_slice($transactions, $offset, $perPage));
-        $hasMore = ($offset + count($pagedTransactions)) < $totalRecords;
 
-        $closingBalance = $openingBalance + $netCashFlow;
+        // Sort compact payload tuples newest-first: [0]=d, [1]=id, [2]=src, [3]=in, [4]=out, [5]=legIdx
+        usort($payloadTxnIndex, static function ($a, $b) {
+            $dComp = strcmp((string)$b[0], (string)$a[0]);
+            return $dComp !== 0 ? $dComp : ((int)$b[1] <=> (int)$a[1]);
+        });
+        $topPayload = array_slice($payloadTxnIndex, 0, $needTopN);
+        unset($payloadTxnIndex);
+
+        $topSqlRows = [];
+        foreach ($sqlBranches as $b) {
+            $qOrdered = (clone $b['q'])->orderByDesc($b['dateCol']);
+            if (!empty($b['idCol'])) {
+                $qOrdered->orderByDesc($b['idCol']);
+            }
+            $branchLimit = $needTopN + ($b['idCol'] === null ? 16 : 0);
+            foreach ($qOrdered->limit($branchLimit)->get() as $sr) {
+                $topSqlRows[] = $sr;
+            }
+        }
+        usort($topSqlRows, static function ($a, $b) {
+            $dComp = strcmp((string)$b->date, (string)$a->date);
+            return $dComp !== 0 ? $dComp : ((int)$b->id <=> (int)$a->id);
+        });
+        $topSqlRows = array_slice($topSqlRows, 0, $needTopN);
+
+        // K=2 descending merge of top $needTopN sorted arrays
+        $mergedTop = [];
+        $si = 0;
+        $pi = 0;
+        $sLen = count($topSqlRows);
+        $pLen = count($topPayload);
+        while (count($mergedTop) < $needTopN && ($si < $sLen || $pi < $pLen)) {
+            $takeSql = false;
+            if ($si < $sLen && $pi < $pLen) {
+                $cmp = strcmp((string)$topSqlRows[$si]->date, (string)$topPayload[$pi][0]);
+                if ($cmp > 0) {
+                    $takeSql = true;
+                } elseif ($cmp === 0 && (int)$topSqlRows[$si]->id >= (int)$topPayload[$pi][1]) {
+                    $takeSql = true;
+                }
+            } elseif ($si < $sLen) {
+                $takeSql = true;
+            }
+            if ($takeSql) {
+                $mergedTop[] = ['kind' => 'sql', 'row' => $topSqlRows[$si++]];
+            } else {
+                $mergedTop[] = ['kind' => 'pay', 'row' => $topPayload[$pi++]];
+            }
+        }
+
+        $hasMore = count($mergedTop) > ($offset + $perPage) || ($offset + $perPage) < $totalRecords;
+        $pageEntries = array_slice($mergedTop, $offset, $perPage);
+
+        // Compute exact running_balance working backwards from closingBalance using the preceding $offset newer entries
+        $runningTxnBal = $closingBalance;
+        for ($k = 0; $k < $offset && $k < count($mergedTop); $k++) {
+            $e = $mergedTop[$k];
+            if ($e['kind'] === 'sql') {
+                $runningTxnBal -= ((float)$e['row']->amount_in - (float)$e['row']->amount_out);
+            } else {
+                $runningTxnBal -= ((float)$e['row'][3] - (float)$e['row'][4]);
+            }
+        }
+
+        // Hydrate full display metadata strictly for <= 50 payload rows landing on this page
+        $needPoIds = [];
+        $needPrIds = [];
+        $needSrIds = [];
+        foreach ($pageEntries as $e) {
+            if ($e['kind'] !== 'pay') continue;
+            $r = $e['row'];
+            if ($r[2] === 'purchase') $needPoIds[$r[1]] = true;
+            elseif ($r[2] === 'purchase_return') $needPrIds[$r[1]] = true;
+            else $needSrIds[$r[1]] = true;
+        }
+        $poMeta = !empty($needPoIds)
+            ? DB::table('purchases')->whereIn('id', array_keys($needPoIds))->get(['id', 'reference_no', 'supplier_name', 'warehouse_name', 'payment_type', 'payments_payload', 'created_by', 'user_name', 'user_role', 'status', 'notes'])->keyBy('id')
+            : collect();
+        $prMeta = !empty($needPrIds)
+            ? DB::table('purchase_returns')->whereIn('id', array_keys($needPrIds))->get(['id', 'reference_no', 'supplier_name', 'warehouse_name', 'payment_type', 'payments_payload', 'created_by', 'user_name', 'user_role', 'status', 'notes'])->keyBy('id')
+            : collect();
+        $srMeta = !empty($needSrIds)
+            ? DB::table('sale_returns')->whereIn('id', array_keys($needSrIds))->get(['id', 'reference_no', 'customer_name', 'warehouse_name', 'payment_type', 'refund_tender', 'payments_payload', 'created_by', 'user_name', 'user_role', 'status', 'notes'])->keyBy('id')
+            : collect();
+
+        $pagedTransactions = [];
+        foreach ($pageEntries as $e) {
+            if ($e['kind'] === 'sql') {
+                $t = $e['row'];
+                $in = (float)($t->amount_in ?? 0);
+                $out = (float)($t->amount_out ?? 0);
+                $balAfter = $runningTxnBal;
+                $runningTxnBal -= ($in - $out);
+                $pagedTransactions[] = [
+                    'id' => (int)$t->id,
+                    'reference_no' => (string)$t->reference_no,
+                    'date' => (string)$t->date,
+                    'type' => (string)$t->type,
+                    'type_label' => (string)$t->type_label,
+                    'activity' => (string)$t->activity,
+                    'party_name' => (string)$t->party_name,
+                    'warehouse_name' => (string)($t->warehouse_name ?: 'Main Branch Outlet'),
+                    'payment_method' => (string)($t->payment_method ?: 'Cash'),
+                    'amount_in' => round($in, 2),
+                    'amount_out' => round($out, 2),
+                    'running_balance' => round($balAfter, 2),
+                    'created_by' => (string)($t->created_by ?: 'Super Admin'),
+                    'user_role' => (string)($t->user_role ?: 'Super Admin'),
+                    'status' => (string)($t->status ?: 'Completed'),
+                    'notes' => (string)($t->notes ?: ''),
+                ];
+            } else {
+                $r = $e['row'];
+                $docDate = (string)$r[0];
+                $docId = (int)$r[1];
+                $srcType = (string)$r[2];
+                $in = (float)$r[3];
+                $out = (float)$r[4];
+                $legIdx = (int)$r[5];
+                $balAfter = $runningTxnBal;
+                $runningTxnBal -= ($in - $out);
+                $defaultTender = 'Cash';
+                if ($srcType === 'purchase') {
+                    $m = $poMeta->get($docId);
+                    $typeLabel = 'Operating Outflow (Purchase)';
+                    $party = $m ? ($m->supplier_name ?: 'Supplier') : 'Supplier';
+                    $defStatus = 'Received';
+                    $defaultTender = (string)($m->payment_type ?? '');
+                } elseif ($srcType === 'purchase_return') {
+                    $m = $prMeta->get($docId);
+                    $typeLabel = 'Operating Inflow (Supplier Refund)';
+                    $party = $m ? ($m->supplier_name ?: 'Supplier') : 'Supplier';
+                    $defStatus = 'Completed';
+                    $defaultTender = (string)($m->payment_type ?? '');
+                } else {
+                    $m = $srMeta->get($docId);
+                    $typeLabel = 'Operating Outflow (Refund)';
+                    $party = $m ? ($m->customer_name ?: 'Walk-in Customer') : 'Walk-in Customer';
+                    $defStatus = 'Completed';
+                    $defaultTender = (string)(($m->refund_tender ?? '') ?: ($m->payment_type ?? ''));
+                }
+                $leg = null;
+                if ($legIdx >= 0 && $m && !empty($m->payments_payload)) {
+                    $decodedLegs = json_decode((string)$m->payments_payload, true);
+                    if (is_array($decodedLegs) && isset($decodedLegs[$legIdx]) && is_array($decodedLegs[$legIdx])) {
+                        $leg = $decodedLegs[$legIdx];
+                    }
+                }
+                $pmVal = (string)(($leg['payment_type'] ?? '') ?: $defaultTender ?: 'Cash');
+                $refVal = (string)(($leg['reference_no'] ?? '') ?: ($m->reference_no ?? ''));
+                $byVal = (string)(($leg['user_name'] ?? '') ?: (($m->created_by ?? null) ?: (($m->user_name ?? null) ?: 'Super Admin')));
+                $roleVal = (string)(($leg['user_role'] ?? '') ?: (($m->user_role ?? null) ?: 'Super Admin'));
+                $notesVal = (string)(($leg['notes'] ?? '') ?: ($m->notes ?? ''));
+
+                $pagedTransactions[] = [
+                    'id' => $docId,
+                    'reference_no' => $refVal,
+                    'date' => $docDate,
+                    'type' => $srcType,
+                    'type_label' => $typeLabel,
+                    'activity' => 'Operating',
+                    'party_name' => (string)$party,
+                    'warehouse_name' => (string)(($m->warehouse_name ?? '') ?: 'Main Branch Outlet'),
+                    'payment_method' => $pmVal !== '' ? $pmVal : 'Cash',
+                    'amount_in' => round($in, 2),
+                    'amount_out' => round($out, 2),
+                    'running_balance' => round($balAfter, 2),
+                    'created_by' => $byVal,
+                    'user_role' => $roleVal,
+                    'status' => (string)(($m->status ?? null) ?: $defStatus),
+                    'notes' => $notesVal,
+                ];
+            }
+        }
 
         $maskedTransactions = $canViewCost
             ? $pagedTransactions
@@ -9726,7 +12471,7 @@ class ReportController extends Controller
                 return $masked;
             }, $pagedTransactions));
 
-        return $this->noStoreJson([
+        $payload = [
             'status' => 'success',
             'cost_masked' => !$canViewCost,
             'summary' => [
@@ -9745,6 +12490,9 @@ class ReportController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
+                'activity' => $activityFilter,
+                'payment_method' => $paymentFilter,
+                'user_name' => $userFilter,
             ],
             'tender_inflows' => $tenderInflows,
             'expense_outflows' => $expenseCategories,
@@ -9761,7 +12509,11 @@ class ReportController extends Controller
                 'total'        => $totalRecords,
                 'has_more'     => $hasMore,
             ],
-        ]);
+        ];
+        if ($availableFilters !== null) {
+            $payload['available_filters'] = $availableFilters;
+        }
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -9773,22 +12525,29 @@ class ReportController extends Controller
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
         $startDate = $request->input('start_date') ?? $request->input('from_date', Carbon::now()->startOfMonth()->toDateString());
         $endDate = $request->input('end_date') ?? $request->input('to_date', Carbon::now()->toDateString());
-        $movementType = (string)$request->input('movement_type', 'All');
+        $movementTypeRaw = trim((string)$request->input('movement_type', 'All'));
+        $movementTypeLower = strtolower($movementTypeRaw);
+        $movementType = ($movementTypeLower === '' || $movementTypeLower === 'all') ? 'All' : $movementTypeLower;
         $category = $request->input('category', 'All');
         $search = trim((string)$request->input('search', ''));
-        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
-        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
-
+        $section = strtolower(trim((string)$request->input('section', 'all')));
+        if (!in_array($section, ['all', 'journal', 'bin_card'], true)) {
+            $section = 'all';
+        }
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
+        $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
         $binPage = max(1, (int)($request->input('bin_page') ?? $request->query('bin_page', $page)));
 
         $accounting = $this->accounting();
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $warehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
-        if (!empty($allowedOutlets) && $warehouseId !== null && !in_array($warehouseId, $allowedOutlets, true)) {
-            return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && $warehouse !== '') {
+            if ($warehouseId === null || !in_array($warehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
         }
 
         $fromDateTime = $accounting->normalizeFilterBoundaryDate((string)$startDate, false);
@@ -9800,558 +12559,856 @@ class ReportController extends Controller
         $adjBaseQtySql = 'COALESCE(NULLIF(stock_adjustment_items.base_quantity, 0), stock_adjustment_items.quantity * COALESCE(NULLIF(stock_adjustment_items.conversion_rate, 0), 1))';
         $trfBaseQtySql = 'COALESCE(NULLIF(stock_transfer_items.base_quantity, 0), stock_transfer_items.quantity * COALESCE(NULLIF(stock_transfer_items.conversion_rate, 0), 1))';
 
-        // Prune UNION ALL branches upfront based on movement_type filter
-        $wantAll = ($movementType === '' || $movementType === 'All');
-        $wantSale = $wantAll || in_array($movementType, ['sale', 'sales'], true);
-        $wantPurchase = $wantAll || in_array($movementType, ['purchase', 'purchases', 'opening_stock'], true);
-        $wantAdjust = $wantAll || in_array($movementType, ['adjustment', 'adjustments', 'adjustment_in', 'adjustment_out'], true);
-        $wantTransfer = $wantAll || in_array($movementType, ['transfer', 'transfers', 'transfer_in', 'transfer_out'], true);
-        $wantSaleReturn = $wantAll || in_array($movementType, ['return', 'returns', 'sale_return', 'sale_returns', 'sale_return_void'], true);
-        $wantPurchReturn = $wantAll || in_array($movementType, ['return', 'returns', 'purchase_return', 'purchase_returns', 'purchase_return_void'], true);
-        $wantProc = $wantAll || in_array($movementType, ['processing', 'production', 'processing_in', 'processing_out'], true);
-        $recognizedType = $wantSale || $wantPurchase || $wantAdjust || $wantTransfer || $wantSaleReturn || $wantPurchReturn || $wantProc;
+        // Prune UNION branches upfront based on normalized movement_type filter
+        $wantAll = ($movementType === 'All');
+        $wantInOnly = ($movementType === 'in');
+        $wantOutOnly = ($movementType === 'out');
+        $wantSale = $wantAll || $wantOutOnly || in_array($movementType, ['sale', 'sales'], true);
+        $wantPurchase = $wantAll || $wantInOnly || in_array($movementType, ['purchase', 'purchases', 'opening_stock'], true);
+        $wantAdjust = $wantAll || $wantInOnly || $wantOutOnly || in_array($movementType, ['adjustment', 'adjustments', 'adjustment_in', 'adjustment_out'], true);
+        $wantTransferOut = $wantAll || $wantOutOnly || in_array($movementType, ['transfer', 'transfers', 'transfer_out'], true);
+        $wantTransferIn = $wantAll || $wantInOnly || in_array($movementType, ['transfer', 'transfers', 'transfer_in'], true);
+        $wantSaleReturn = $wantAll || $wantInOnly || $wantOutOnly || in_array($movementType, ['return', 'returns', 'sale_return', 'sale_returns', 'sale_return_void'], true);
+        $wantPurchReturn = $wantAll || $wantInOnly || $wantOutOnly || in_array($movementType, ['return', 'returns', 'purchase_return', 'purchase_returns', 'purchase_return_void'], true);
+        $wantProcIn = $wantAll || $wantInOnly || in_array($movementType, ['processing', 'production', 'processing_in'], true);
+        $wantProcOut = $wantAll || $wantOutOnly || in_array($movementType, ['processing', 'production', 'processing_out'], true);
+        $recognizedType = $wantSale || $wantPurchase || $wantAdjust || $wantTransferOut || $wantTransferIn || $wantSaleReturn || $wantPurchReturn || $wantProcIn || $wantProcOut;
         if (!$recognizedType) {
-            $wantSale = $wantPurchase = $wantAdjust = $wantTransfer = $wantSaleReturn = $wantPurchReturn = $wantProc = true;
+            $wantSale = $wantPurchase = $wantAdjust = $wantTransferOut = $wantTransferIn = $wantSaleReturn = $wantPurchReturn = $wantProcIn = $wantProcOut = true;
         }
 
-        $isSqlite = DB::connection()->getDriverName() === 'sqlite';
-        $refIntCast = $isSqlite ? 'CAST(stock_movements.reference_id AS INTEGER)' : 'CAST(stock_movements.reference_id AS UNSIGNED)';
-        $prRefFallback = $isSqlite ? "('PR-' || stock_movements.reference_id)" : "CONCAT('PR-', stock_movements.reference_id)";
-        $srRefFallback = $isSqlite ? "('SR-' || stock_movements.reference_id)" : "CONCAT('SR-', stock_movements.reference_id)";
-        $hasMovementUnitCost = $accounting->schemaHasColumn('stock_movements', 'unit_cost');
-        $smUnitCostPrefix = $hasMovementUnitCost ? 'NULLIF(stock_movements.unit_cost, 0), ' : '';
+        $hasCategory = !empty($category) && $category !== 'All';
+        $hasSearch = !empty($search);
 
-        $branches = [];
-
-        if ($wantSale) {
-            $salesMvQuery = DB::table('sale_items')
-                ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-                ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
-                ->where('sales.date', '>=', $fromDateTime)
-                ->where('sales.date', '<=', $toDateTime);
-            $this->applyActiveDocumentFilter($salesMvQuery, 'sales.status');
+        $applyWhScope = static function ($q, string $whNameCol, string $whIdCol) use ($warehouse, $warehouseId, $allowedOutlets): void {
             if (!empty($allowedOutlets)) {
-                $salesMvQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+                $q->whereIn($whIdCol, $allowedOutlets);
             }
             if ($warehouse !== 'All' && !empty($warehouse)) {
-                $salesMvQuery->where('sales.warehouse_name', $warehouse);
+                if ($warehouseId !== null) {
+                    $q->where($whIdCol, $warehouseId);
+                } else {
+                    $q->where($whNameCol, $warehouse);
+                }
             }
-            $branches[] = $salesMvQuery->select([
-                'sales.id as source_id',
-                'sales.reference_no as reference_no',
-                DB::raw("'sale' as movement_type"),
-                DB::raw("'Sale Out' as type_label"),
-                'sale_items.product_id',
-                'sale_items.product_name',
-                'sale_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'sales.warehouse_name',
-                'sales.warehouse_id',
-                DB::raw('0 as quantity_in'),
-                DB::raw("{$saleBaseQtySql} as quantity_out"),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw("CASE WHEN {$saleBaseQtySql} > 0 AND COALESCE(sale_items.total_cogs, 0) > 0 THEN sale_items.total_cogs / {$saleBaseQtySql} ELSE COALESCE(products.cost_price, products.purchase_price, 0) END as unit_cost"),
-                'sales.created_by',
-                'sales.user_name',
-                'sales.user_role',
-                'sales.date as date',
-            ]);
-        }
+        };
 
-        if ($wantPurchase) {
-            $purchUnitCostSql = "COALESCE("
-                . "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.purchase_item_id = purchase_items.id), 0), "
-                . "NULLIF(purchase_items.base_unit_cost, 0), "
-                . "CASE WHEN COALESCE(purchase_items.conversion_rate, 1) > 0 THEN purchase_items.unit_cost / purchase_items.conversion_rate ELSE purchase_items.unit_cost END, "
-                . "products.cost_price, 0) as unit_cost";
+        $applyBranchCatSearch = static function (
+            $q,
+            string $prodNameCol,
+            string $prodCodeCol,
+            string $refCol,
+            string $whNameCol,
+            ?string $createdByCol,
+            ?string $userNameCol
+        ) use ($hasCategory, $category, $hasSearch, $search): void {
+            if ($hasCategory) {
+                $q->where('products.category_name', $category);
+            }
+            if ($hasSearch) {
+                $like = "%{$search}%";
+                $q->where(function ($sub) use ($like, $prodNameCol, $prodCodeCol, $refCol, $whNameCol, $createdByCol, $userNameCol) {
+                    $sub->where($refCol, 'like', $like)
+                        ->orWhere($prodNameCol, 'like', $like)
+                        ->orWhere($prodCodeCol, 'like', $like)
+                        ->orWhere('products.alternative_name', 'like', $like)
+                        ->orWhere($whNameCol, 'like', $like);
+                    if ($createdByCol !== null) {
+                        $sub->orWhere($createdByCol, 'like', $like);
+                    }
+                    if ($userNameCol !== null) {
+                        $sub->orWhere($userNameCol, 'like', $like);
+                    }
+                });
+            }
+        };
 
-            $purchMvQuery = DB::table('purchase_items')
-                ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
-                ->leftJoin('products', 'purchase_items.product_id', '=', 'products.id')
-                ->whereIn('purchases.status', ['Received', 'Completed'])
-                ->where('purchases.date', '>=', $fromDateTime)
-                ->where('purchases.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $purchMvQuery->whereIn('purchases.warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $purchMvQuery->where('purchases.warehouse_name', $warehouse);
-            }
-            $branches[] = $purchMvQuery->select([
-                'purchases.id as source_id',
-                'purchases.reference_no as reference_no',
-                DB::raw("'purchase' as movement_type"),
-                DB::raw("CASE WHEN COALESCE(LOWER(TRIM(purchases.payment_type)), '') = 'opening stock' THEN 'Opening Stock In' ELSE 'Purchase In' END as type_label"),
-                'purchase_items.product_id',
-                'purchase_items.product_name',
-                'purchase_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'purchases.warehouse_name',
-                'purchases.warehouse_id',
-                DB::raw("{$purchBaseQtySql} as quantity_in"),
-                DB::raw('0 as quantity_out'),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw($purchUnitCostSql),
-                'purchases.created_by',
-                'purchases.user_name',
-                'purchases.user_role',
-                'purchases.date as date',
-            ]);
-        }
-
-        if ($wantAdjust) {
-            $adjMvQuery = DB::table('stock_adjustment_items')
-                ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-                ->leftJoin('products', 'stock_adjustment_items.product_id', '=', 'products.id')
-                ->where('stock_adjustments.date', '>=', $fromDateTime)
-                ->where('stock_adjustments.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $adjMvQuery->whereIn('stock_adjustments.warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $adjMvQuery->where('stock_adjustments.warehouse_name', $warehouse);
-            }
-            $branches[] = $adjMvQuery->select([
-                'stock_adjustments.id as source_id',
-                'stock_adjustments.reference_no as reference_no',
-                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'adjustment_in' ELSE 'adjustment_out' END as movement_type"),
-                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'Adjust In' ELSE 'Adjust Out' END as type_label"),
-                'stock_adjustment_items.product_id',
-                'stock_adjustment_items.product_name',
-                'stock_adjustment_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'stock_adjustments.warehouse_name',
-                'stock_adjustments.warehouse_id',
-                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN {$adjBaseQtySql} ELSE 0 END as quantity_in"),
-                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 0 ELSE {$adjBaseQtySql} END as quantity_out"),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw('COALESCE(NULLIF(stock_adjustment_items.base_unit_cost, 0), CASE WHEN COALESCE(stock_adjustment_items.conversion_rate, 1) > 0 THEN stock_adjustment_items.unit_cost / stock_adjustment_items.conversion_rate ELSE stock_adjustment_items.unit_cost END, products.cost_price, 0) as unit_cost'),
-                'stock_adjustments.created_by',
-                'stock_adjustments.user_name',
-                'stock_adjustments.user_role',
-                'stock_adjustments.date as date',
-            ]);
-        }
-
-        if ($wantTransfer) {
-            $transOutQuery = DB::table('stock_transfer_items')
-                ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                ->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id')
-                ->whereIn('stock_transfers.status', ['Sent', 'Completed'])
-                ->where('stock_transfers.date', '>=', $fromDateTime)
-                ->where('stock_transfers.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $transOutQuery->whereIn('stock_transfers.from_warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $transOutQuery->where('stock_transfers.from_warehouse', $warehouse);
-            }
-            $branches[] = $transOutQuery->select([
-                'stock_transfers.id as source_id',
-                'stock_transfers.reference_no as reference_no',
-                DB::raw("'transfer' as movement_type"),
-                DB::raw("'Transfer Out' as type_label"),
-                'stock_transfer_items.product_id',
-                'stock_transfer_items.product_name',
-                'stock_transfer_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'stock_transfers.from_warehouse as warehouse_name',
-                DB::raw('COALESCE(stock_transfers.from_warehouse_id, 0) as warehouse_id'),
-                DB::raw('0 as quantity_in'),
-                DB::raw("{$trfBaseQtySql} as quantity_out"),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw('COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0) as unit_cost'),
-                'stock_transfers.created_by',
-                'stock_transfers.user_name',
-                DB::raw("'' as user_role"),
-                'stock_transfers.date as date',
-            ]);
-
-            $transInQuery = DB::table('stock_transfer_items')
-                ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                ->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id')
-                ->where('stock_transfers.status', 'Completed')
-                ->where('stock_transfers.date', '>=', $fromDateTime)
-                ->where('stock_transfers.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $transInQuery->whereIn('stock_transfers.to_warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $transInQuery->where('stock_transfers.to_warehouse', $warehouse);
-            }
-            $branches[] = $transInQuery->select([
-                'stock_transfers.id as source_id',
-                'stock_transfers.reference_no as reference_no',
-                DB::raw("'transfer' as movement_type"),
-                DB::raw("'Transfer In' as type_label"),
-                'stock_transfer_items.product_id',
-                'stock_transfer_items.product_name',
-                'stock_transfer_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'stock_transfers.to_warehouse as warehouse_name',
-                DB::raw('COALESCE(stock_transfers.to_warehouse_id, 0) as warehouse_id'),
-                DB::raw("{$trfBaseQtySql} as quantity_in"),
-                DB::raw('0 as quantity_out'),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw('COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0) as unit_cost'),
-                'stock_transfers.created_by',
-                'stock_transfers.user_name',
-                DB::raw("'' as user_role"),
-                'stock_transfers.date as date',
-            ]);
-        }
-
-        if ($wantSaleReturn) {
-            $srHistUnitCostSql = "COALESCE({$smUnitCostPrefix}"
-                . "NULLIF((SELECT SUM(srcl.total_cost) / NULLIF(SUM(srcl.base_quantity), 0) FROM sale_return_cost_layers srcl WHERE srcl.sale_return_id = sale_returns.id AND srcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR srcl.product_variant_id = stock_movements.product_variant_id)), 0), "
-                . "NULLIF((SELECT SUM(srcl2.total_cost) / NULLIF(SUM(srcl2.base_quantity), 0) FROM sale_return_cost_layers srcl2 WHERE srcl2.sale_return_id = sale_returns.id AND srcl2.product_id = stock_movements.product_id), 0), "
-                . "products.cost_price, products.purchase_price, 0) as unit_cost";
-
-            $saleRetMvQuery = DB::table('stock_movements')
-                ->leftJoin('sale_returns', function ($join) {
-                    $join->on('stock_movements.reference_id', '=', 'sale_returns.id')
-                         ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(sale_returns.id AS CHAR)'));
-                })
-                ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
-                ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                ->where('stock_movements.movement_type', 'sale_return')
-                ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
-                ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
-            if (!empty($allowedOutlets)) {
-                $saleRetMvQuery->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $saleRetMvQuery->whereRaw('COALESCE(sale_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
-            }
-            $branches[] = $saleRetMvQuery->select([
-                DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
-                DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
-                DB::raw("'sale_return' as movement_type"),
-                DB::raw("'Return In' as type_label"),
-                'stock_movements.product_id',
-                'products.name as product_name',
-                'products.code as product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                'stock_movements.quantity_in as quantity_in',
-                DB::raw('0 as quantity_out'),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw($srHistUnitCostSql),
-                DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
-                DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
-                DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
-                DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
-            ]);
-
-            $saleRetVoidMvQuery = DB::table('stock_movements')
-                ->leftJoin('sale_returns', function ($join) {
-                    $join->on('stock_movements.reference_id', '=', 'sale_returns.id')
-                         ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(sale_returns.id AS CHAR)'));
-                })
-                ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
-                ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                ->whereIn('stock_movements.movement_type', ['sale_return_void', 'sale_return_edit_reverse'])
-                ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
-                ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
-            if (!empty($allowedOutlets)) {
-                $saleRetVoidMvQuery->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $saleRetVoidMvQuery->whereRaw('COALESCE(sale_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
-            }
-            $branches[] = $saleRetVoidMvQuery->select([
-                DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
-                DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
-                DB::raw("'sale_return_void' as movement_type"),
-                DB::raw("'Return Voided Out' as type_label"),
-                'stock_movements.product_id',
-                'products.name as product_name',
-                'products.code as product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                DB::raw('0 as quantity_in'),
-                'stock_movements.quantity_out as quantity_out',
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw($srHistUnitCostSql),
-                DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
-                DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
-                DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
-                DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
-            ]);
-        }
-
-        if ($wantPurchReturn) {
-            $prHistUnitCostSql = "COALESCE({$smUnitCostPrefix}"
-                . "NULLIF((SELECT SUM(prcl.total_cost) / NULLIF(SUM(prcl.base_quantity), 0) FROM purchase_return_cost_layers prcl WHERE prcl.purchase_return_id = purchase_returns.id AND prcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR prcl.product_variant_id = stock_movements.product_variant_id)), 0), "
-                . "NULLIF((SELECT SUM(prcl2.total_cost) / NULLIF(SUM(prcl2.base_quantity), 0) FROM purchase_return_cost_layers prcl2 WHERE prcl2.purchase_return_id = purchase_returns.id AND prcl2.product_id = stock_movements.product_id), 0), "
-                . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_out), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_out) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
-                . "products.cost_price, products.purchase_price, 0) as unit_cost";
-
-            $prVoidHistUnitCostSql = "COALESCE({$smUnitCostPrefix}"
-                . "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.source_type = 'purchase_return_void' AND ib.source_reference = purchase_returns.reference_no AND ib.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR ib.product_variant_id = stock_movements.product_variant_id)), 0), "
-                . ($hasMovementUnitCost ? "NULLIF((SELECT smOrig.unit_cost FROM stock_movements smOrig WHERE smOrig.movement_type = 'purchase_return' AND smOrig.reference_id = stock_movements.reference_id AND smOrig.product_id = stock_movements.product_id ORDER BY smOrig.id DESC LIMIT 1), 0), " : "")
-                . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_in), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_in) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
-                . "products.cost_price, products.purchase_price, 0) as unit_cost";
-
-            $purchRetMvQuery = DB::table('stock_movements')
-                ->leftJoin('purchase_returns', function ($join) {
-                    $join->on('stock_movements.reference_id', '=', 'purchase_returns.id')
-                         ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(purchase_returns.id AS CHAR)'));
-                })
-                ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
-                ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                ->where('stock_movements.movement_type', 'purchase_return')
-                ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
-                ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
-            if (!empty($allowedOutlets)) {
-                $purchRetMvQuery->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $purchRetMvQuery->whereRaw('COALESCE(purchase_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
-            }
-            $branches[] = $purchRetMvQuery->select([
-                DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
-                DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
-                DB::raw("'purchase_return' as movement_type"),
-                DB::raw("'Return Out' as type_label"),
-                'stock_movements.product_id',
-                'products.name as product_name',
-                'products.code as product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                DB::raw('0 as quantity_in'),
-                'stock_movements.quantity_out as quantity_out',
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw($prHistUnitCostSql),
-                DB::raw("COALESCE(purchase_returns.created_by, '') as created_by"),
-                DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, '') as user_name"),
-                DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
-                DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
-            ]);
-
-            $purchRetVoidMvQuery = DB::table('stock_movements')
-                ->leftJoin('purchase_returns', function ($join) {
-                    $join->on('stock_movements.reference_id', '=', 'purchase_returns.id')
-                         ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(purchase_returns.id AS CHAR)'));
-                })
-                ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
-                ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                ->where('stock_movements.movement_type', 'purchase_return_void')
-                ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
-                ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
-            if (!empty($allowedOutlets)) {
-                $purchRetVoidMvQuery->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $purchRetVoidMvQuery->whereRaw('COALESCE(purchase_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
-            }
-            $branches[] = $purchRetVoidMvQuery->select([
-                DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
-                DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
-                DB::raw("'purchase_return_void' as movement_type"),
-                DB::raw("'Return Voided In' as type_label"),
-                'stock_movements.product_id',
-                'products.name as product_name',
-                'products.code as product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                'stock_movements.quantity_in as quantity_in',
-                DB::raw('0 as quantity_out'),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw($prVoidHistUnitCostSql),
-                DB::raw("COALESCE(purchase_returns.created_by, 'System') as created_by"),
-                DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, 'System') as user_name"),
-                DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
-                DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
-            ]);
-        }
-
-        if ($wantProc && $accounting->schemaHasTable('processings') && $accounting->schemaHasTable('processing_items')) {
-            $procInQuery = DB::table('processings')
-                ->leftJoin('products', 'processings.output_product_id', '=', 'products.id')
-                ->where('processings.status', 'completed')
-                ->where('processings.date', '>=', $fromDateTime)
-                ->where('processings.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $procInQuery->whereIn('processings.warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $procInQuery->where('processings.warehouse_name', $warehouse);
-            }
-            $branches[] = $procInQuery->select([
-                'processings.id as source_id',
-                'processings.reference_no as reference_no',
-                DB::raw("'processing_in' as movement_type"),
-                DB::raw("'Production In' as type_label"),
-                'processings.output_product_id as product_id',
-                'processings.output_product_name as product_name',
-                'processings.output_product_code as product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'processings.warehouse_name',
-                DB::raw('COALESCE(processings.warehouse_id, 1) as warehouse_id'),
-                'processings.output_base_quantity as quantity_in',
-                DB::raw('0 as quantity_out'),
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw('COALESCE(processings.output_unit_cost, products.cost_price, 0) as unit_cost'),
-                'processings.created_by',
-                'processings.user_name',
-                'processings.user_role',
-                'processings.date as date',
-            ]);
-
-            $procOutQuery = DB::table('processing_items')
-                ->join('processings', 'processing_items.processing_id', '=', 'processings.id')
-                ->leftJoin('products', 'processing_items.product_id', '=', 'products.id')
-                ->where('processings.status', 'completed')
-                ->where('processings.date', '>=', $fromDateTime)
-                ->where('processings.date', '<=', $toDateTime);
-            if (!empty($allowedOutlets)) {
-                $procOutQuery->whereIn('processings.warehouse_id', $allowedOutlets);
-            }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $procOutQuery->where('processings.warehouse_name', $warehouse);
-            }
-            $branches[] = $procOutQuery->select([
-                'processings.id as source_id',
-                'processings.reference_no as reference_no',
-                DB::raw("'processing_out' as movement_type"),
-                DB::raw("'Production Out' as type_label"),
-                'processing_items.product_id',
-                'processing_items.product_name',
-                'processing_items.product_code',
-                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                'products.category_name',
-                'processings.warehouse_name',
-                DB::raw('COALESCE(processings.warehouse_id, 1) as warehouse_id'),
-                DB::raw('0 as quantity_in'),
-                'processing_items.base_quantity as quantity_out',
-                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                DB::raw('COALESCE(NULLIF(processing_items.base_unit_cost, 0), processing_items.unit_cost, products.cost_price, 0) as unit_cost'),
-                'processings.created_by',
-                'processings.user_name',
-                'processings.user_role',
-                'processings.date as date',
-            ]);
-        }
-
-        $unionQuery = array_shift($branches);
-        foreach ($branches as $branchQ) {
-            $unionQuery = $unionQuery->unionAll($branchQ);
-        }
-
-        $movementsSub = DB::query()->fromSub($unionQuery, 'mv');
-
-        if (!empty($category) && $category !== 'All') {
-            $movementsSub->where('category_name', $category);
-        }
-
-        if (!empty($movementType) && $movementType !== 'All') {
-            if ($movementType === 'sale' || $movementType === 'sales') {
-                $movementsSub->where('movement_type', 'sale');
-            } elseif ($movementType === 'purchase' || $movementType === 'purchases') {
-                $movementsSub->where('movement_type', 'purchase');
-            } elseif ($movementType === 'opening_stock') {
-                $movementsSub->where('movement_type', 'purchase')->where('type_label', 'Opening Stock In');
-            } elseif ($movementType === 'adjustment' || $movementType === 'adjustments') {
-                $movementsSub->whereIn('movement_type', ['adjustment_in', 'adjustment_out']);
-            } elseif ($movementType === 'transfer' || $movementType === 'transfers') {
-                $movementsSub->whereIn('movement_type', ['transfer', 'transfer_in', 'transfer_out']);
-            } elseif ($movementType === 'processing' || $movementType === 'production') {
-                $movementsSub->whereIn('movement_type', ['processing_in', 'processing_out']);
-            } elseif ($movementType === 'return' || $movementType === 'returns') {
-                $movementsSub->whereIn('movement_type', ['sale_return', 'sale_return_void', 'purchase_return', 'purchase_return_void']);
-            } elseif ($movementType === 'sale_return' || $movementType === 'sale_returns') {
-                $movementsSub->whereIn('movement_type', ['sale_return', 'sale_return_void']);
-            } elseif ($movementType === 'purchase_return' || $movementType === 'purchase_returns') {
-                $movementsSub->whereIn('movement_type', ['purchase_return', 'purchase_return_void']);
-            } else {
-                $movementsSub->where('movement_type', $movementType);
-            }
-        }
-
-        if (!empty($search)) {
-            $movementsSub->where(function ($q) use ($search) {
-                $q->where('reference_no', 'like', "%{$search}%")
-                  ->orWhere('product_name', 'like', "%{$search}%")
-                  ->orWhere('product_code', 'like', "%{$search}%")
-                  ->orWhere('alternative_name', 'like', "%{$search}%")
-                  ->orWhere('warehouse_name', 'like', "%{$search}%")
-                  ->orWhere('created_by', 'like', "%{$search}%")
-                  ->orWhere('user_name', 'like', "%{$search}%");
-            });
-        }
-
-        // Single-query KPI aggregation instead of 4 separate scans of 11-way UNION
         $totalMovements = 0;
         $totalInflowQty = 0.0;
         $totalOutflowQty = 0.0;
         $totalMovementValue = 0.0;
-        if (!$skipSummary) {
-            $mvSummary = (clone $movementsSub)->selectRaw('
-                COUNT(*) as total_movements,
-                COALESCE(SUM(quantity_in), 0) as total_inflow_qty,
-                COALESCE(SUM(quantity_out), 0) as total_outflow_qty,
-                COALESCE(SUM((quantity_in + quantity_out) * unit_cost), 0) as total_movement_value
-            ')->first();
-            $totalMovements = (int)($mvSummary->total_movements ?? 0);
-            $totalInflowQty = (float)($mvSummary->total_inflow_qty ?? 0);
-            $totalOutflowQty = (float)($mvSummary->total_outflow_qty ?? 0);
-            $totalMovementValue = (float)($mvSummary->total_movement_value ?? 0);
-        } elseif ($knownTotal !== null) {
-            $totalMovements = $knownTotal;
-        } else {
-            $totalMovements = (int)(clone $movementsSub)->count();
+        $offset = ($page - 1) * $perPage;
+        $hasMoreMovements = false;
+        $pageMvRows = collect();
+
+        if ($section !== 'bin_card') {
+            $smTypesPresent = [];
+            if (($wantSaleReturn || $wantPurchReturn) && $accounting->schemaHasTable('stock_movements')) {
+                foreach (DB::table('stock_movements')->distinct()->pluck('movement_type') as $mt) {
+                    $smTypesPresent[(string)$mt] = true;
+                }
+            }
+            $hasSmSaleRet = ($wantAll || $wantInOnly || !in_array($movementType, ['sale_return_void'], true)) && isset($smTypesPresent['sale_return']);
+            $hasSmSaleRetVoid = ($wantAll || $wantOutOnly || in_array($movementType, ['return', 'returns', 'sale_return', 'sale_returns', 'sale_return_void'], true))
+                && (isset($smTypesPresent['sale_return_void']) || isset($smTypesPresent['sale_return_edit_reverse']));
+            $hasSmPurchRet = ($wantAll || $wantOutOnly || !in_array($movementType, ['purchase_return_void'], true)) && isset($smTypesPresent['purchase_return']);
+            $hasSmPurchRetVoid = ($wantAll || $wantInOnly || in_array($movementType, ['return', 'returns', 'purchase_return', 'purchase_returns', 'purchase_return_void'], true))
+                && isset($smTypesPresent['purchase_return_void']);
+
+            $isSqlite = DB::connection()->getDriverName() === 'sqlite';
+            $refIntCast = $isSqlite ? 'CAST(stock_movements.reference_id AS INTEGER)' : 'CAST(stock_movements.reference_id AS UNSIGNED)';
+            $prRefFallback = $isSqlite ? "('PR-' || stock_movements.reference_id)" : "CONCAT('PR-', stock_movements.reference_id)";
+            $srRefFallback = $isSqlite ? "('SR-' || stock_movements.reference_id)" : "CONCAT('SR-', stock_movements.reference_id)";
+            $hasMovementUnitCost = $accounting->schemaHasColumn('stock_movements', 'unit_cost');
+            $smUnitCostPrefix = $hasMovementUnitCost ? 'NULLIF(stock_movements.unit_cost, 0), ' : '';
+            $hasAdjVariantCol = $accounting->schemaHasColumn('stock_adjustment_items', 'product_variant_id');
+            $hasTrfVariantCol = $accounting->schemaHasColumn('stock_transfer_items', 'product_variant_id');
+            $adjVariantExpr = $hasAdjVariantCol ? 'stock_adjustment_items.product_variant_id as variant_id' : 'NULL as variant_id';
+            $trfVariantExpr = $hasTrfVariantCol ? 'stock_transfer_items.product_variant_id as variant_id' : 'NULL as variant_id';
+
+            $branches = [];
+
+            if ($wantSale) {
+                $saleUnitCostExpr = "CASE WHEN {$saleBaseQtySql} > 0 AND COALESCE(sale_items.total_cogs, 0) > 0 THEN sale_items.total_cogs / {$saleBaseQtySql} ELSE COALESCE(NULLIF(product_variants.cost_price, 0), products.cost_price, products.purchase_price, 0) END";
+                $buildSalesQ = function (bool $forSummary) use (
+                    $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                    $saleBaseQtySql, $saleUnitCostExpr, $canViewCost, $hasCategory, $hasSearch
+                ) {
+                    $q = DB::table('sale_items')
+                        ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                        ->where('sales.date', '>=', $fromDateTime)
+                        ->where('sales.date', '<=', $toDateTime);
+                    $this->applyActiveDocumentFilter($q, 'sales.status');
+                    $applyWhScope($q, 'sales.warehouse_name', 'sales.warehouse_id');
+                    if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                        $q->leftJoin('products', 'sale_items.product_id', '=', 'products.id');
+                    }
+                    if (!$forSummary || $canViewCost) {
+                        $q->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id');
+                    }
+                    $applyBranchCatSearch($q, 'sale_items.product_name', 'sale_items.product_code', 'sales.reference_no', 'sales.warehouse_name', 'sales.created_by', 'sales.user_name');
+                    return $q;
+                };
+
+                $branches[] = [
+                    'sumQuery' => $buildSalesQ(true),
+                    'qtyInExpr' => '0',
+                    'qtyOutExpr' => $saleBaseQtySql,
+                    'unitCostExpr' => $saleUnitCostExpr,
+                    'rowQuery' => $buildSalesQ(false)->select([
+                        'sales.id as source_id',
+                        DB::raw('sale_items.id as item_row_id'),
+                        DB::raw('sale_items.product_variant_id as variant_id'),
+                        'sales.reference_no as reference_no',
+                        DB::raw("'sale' as movement_type"),
+                        DB::raw("'Sale Out' as type_label"),
+                        'sale_items.product_id',
+                        'sale_items.product_name',
+                        'sale_items.product_code',
+                        DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                        'products.category_name',
+                        'sales.warehouse_name',
+                        'sales.warehouse_id',
+                        DB::raw('0 as quantity_in'),
+                        DB::raw("{$saleBaseQtySql} as quantity_out"),
+                        DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                        DB::raw("{$saleUnitCostExpr} as unit_cost"),
+                        'sales.created_by',
+                        'sales.user_name',
+                        'sales.user_role',
+                        'sales.date as date',
+                    ]),
+                    'dateCol' => 'sales.date',
+                    'statusSplit' => null,
+                    'statusCol' => null,
+                ];
+            }
+
+            if ($wantPurchase) {
+                $purchUnitCostExpr = "COALESCE("
+                    . "NULLIF(purchase_items.base_unit_cost, 0), "
+                    . "CASE WHEN COALESCE(purchase_items.conversion_rate, 1) > 0 THEN purchase_items.unit_cost / purchase_items.conversion_rate ELSE purchase_items.unit_cost END, "
+                    . "products.cost_price, 0)";
+                $buildPurchQ = function (bool $forSummary, ?string $exactStatus = null) use (
+                    $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                    $movementType, $canViewCost, $hasCategory, $hasSearch
+                ) {
+                    $q = DB::table('purchase_items')
+                        ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
+                        ->where('purchases.date', '>=', $fromDateTime)
+                        ->where('purchases.date', '<=', $toDateTime);
+                    if ($exactStatus !== null) {
+                        $q->where('purchases.status', $exactStatus);
+                    } else {
+                        $q->whereIn('purchases.status', ['Received', 'Completed']);
+                    }
+                    if ($movementType === 'opening_stock') {
+                        $q->whereRaw("COALESCE(LOWER(TRIM(purchases.payment_type)), '') = 'opening stock'");
+                    }
+                    $applyWhScope($q, 'purchases.warehouse_name', 'purchases.warehouse_id');
+                    if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                        $q->leftJoin('products', 'purchase_items.product_id', '=', 'products.id');
+                    }
+                    $applyBranchCatSearch($q, 'purchase_items.product_name', 'purchase_items.product_code', 'purchases.reference_no', 'purchases.warehouse_name', 'purchases.created_by', 'purchases.user_name');
+                    return $q;
+                };
+
+                $purchSelect = [
+                    'purchases.id as source_id',
+                    DB::raw('purchase_items.id as item_row_id'),
+                    DB::raw('purchase_items.product_variant_id as variant_id'),
+                    'purchases.reference_no as reference_no',
+                    DB::raw("'purchase' as movement_type"),
+                    DB::raw("CASE WHEN COALESCE(LOWER(TRIM(purchases.payment_type)), '') = 'opening stock' THEN 'Opening Stock In' ELSE 'Purchase In' END as type_label"),
+                    'purchase_items.product_id',
+                    'purchase_items.product_name',
+                    'purchase_items.product_code',
+                    DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                    'products.category_name',
+                    'purchases.warehouse_name',
+                    'purchases.warehouse_id',
+                    DB::raw("{$purchBaseQtySql} as quantity_in"),
+                    DB::raw('0 as quantity_out'),
+                    DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                    DB::raw("{$purchUnitCostExpr} as unit_cost"),
+                    'purchases.created_by',
+                    'purchases.user_name',
+                    'purchases.user_role',
+                    'purchases.date as date',
+                ];
+
+                $branches[] = [
+                    'sumQuery' => $buildPurchQ(true),
+                    'qtyInExpr' => $purchBaseQtySql,
+                    'qtyOutExpr' => '0',
+                    'unitCostExpr' => $purchUnitCostExpr,
+                    'rowQuery' => $buildPurchQ(false)->select($purchSelect),
+                    'rowBuilder' => (!$hasCategory && !$hasSearch)
+                        ? static fn (string $st) => $buildPurchQ(false, $st)->select($purchSelect)
+                        : null,
+                    'dateCol' => 'purchases.date',
+                    'statusSplit' => (!$hasCategory && !$hasSearch) ? ['Received', 'Completed'] : null,
+                    'statusCol' => 'purchases.status',
+                ];
+            }
+
+            if ($wantAdjust) {
+                $adjUnitCostExpr = 'COALESCE(NULLIF(stock_adjustment_items.base_unit_cost, 0), CASE WHEN COALESCE(stock_adjustment_items.conversion_rate, 1) > 0 THEN stock_adjustment_items.unit_cost / stock_adjustment_items.conversion_rate ELSE stock_adjustment_items.unit_cost END, products.cost_price, 0)';
+                $adjInFilter = ($wantInOnly || $movementType === 'adjustment_in');
+                $adjOutFilter = ($wantOutOnly || $movementType === 'adjustment_out');
+                $adjQtyInExpr = "CASE WHEN {$effAdjTypeSql} = 'addition' THEN {$adjBaseQtySql} ELSE 0 END";
+                $adjQtyOutExpr = "CASE WHEN {$effAdjTypeSql} = 'addition' THEN 0 ELSE {$adjBaseQtySql} END";
+
+                $buildAdjQ = function (bool $forSummary) use (
+                    $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                    $effAdjTypeSql, $adjInFilter, $adjOutFilter, $canViewCost, $hasCategory, $hasSearch
+                ) {
+                    $q = DB::table('stock_adjustment_items')
+                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+                        ->where('stock_adjustments.date', '>=', $fromDateTime)
+                        ->where('stock_adjustments.date', '<=', $toDateTime);
+                    if ($adjInFilter && !$adjOutFilter) {
+                        $q->whereRaw("{$effAdjTypeSql} = 'addition'");
+                    } elseif ($adjOutFilter && !$adjInFilter) {
+                        $q->whereRaw("{$effAdjTypeSql} <> 'addition'");
+                    }
+                    $applyWhScope($q, 'stock_adjustments.warehouse_name', 'stock_adjustments.warehouse_id');
+                    if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                        $q->leftJoin('products', 'stock_adjustment_items.product_id', '=', 'products.id');
+                    }
+                    $applyBranchCatSearch($q, 'stock_adjustment_items.product_name', 'stock_adjustment_items.product_code', 'stock_adjustments.reference_no', 'stock_adjustments.warehouse_name', 'stock_adjustments.created_by', 'stock_adjustments.user_name');
+                    return $q;
+                };
+
+                $branches[] = [
+                    'sumQuery' => $buildAdjQ(true),
+                    'qtyInExpr' => $adjQtyInExpr,
+                    'qtyOutExpr' => $adjQtyOutExpr,
+                    'unitCostExpr' => $adjUnitCostExpr,
+                    'rowQuery' => $buildAdjQ(false)->select([
+                        'stock_adjustments.id as source_id',
+                        DB::raw('0 as item_row_id'),
+                        DB::raw($adjVariantExpr),
+                        'stock_adjustments.reference_no as reference_no',
+                        DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'adjustment_in' ELSE 'adjustment_out' END as movement_type"),
+                        DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'Adjust In' ELSE 'Adjust Out' END as type_label"),
+                        'stock_adjustment_items.product_id',
+                        'stock_adjustment_items.product_name',
+                        'stock_adjustment_items.product_code',
+                        DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                        'products.category_name',
+                        'stock_adjustments.warehouse_name',
+                        'stock_adjustments.warehouse_id',
+                        DB::raw("{$adjQtyInExpr} as quantity_in"),
+                        DB::raw("{$adjQtyOutExpr} as quantity_out"),
+                        DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                        DB::raw("{$adjUnitCostExpr} as unit_cost"),
+                        'stock_adjustments.created_by',
+                        'stock_adjustments.user_name',
+                        'stock_adjustments.user_role',
+                        'stock_adjustments.date as date',
+                    ]),
+                    'dateCol' => 'stock_adjustments.date',
+                    'statusSplit' => null,
+                    'statusCol' => null,
+                ];
+            }
+
+            if ($wantTransferOut) {
+                $trfUnitCostExpr = 'COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0)';
+                $buildTrfOutQ = function (bool $forSummary, ?string $exactStatus = null) use (
+                    $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                    $canViewCost, $hasCategory, $hasSearch
+                ) {
+                    $q = DB::table('stock_transfer_items')
+                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
+                        ->where('stock_transfers.date', '>=', $fromDateTime)
+                        ->where('stock_transfers.date', '<=', $toDateTime);
+                    if ($exactStatus !== null) {
+                        $q->where('stock_transfers.status', $exactStatus);
+                    } else {
+                        $q->whereIn('stock_transfers.status', ['Sent', 'Completed']);
+                    }
+                    $applyWhScope($q, 'stock_transfers.from_warehouse', 'stock_transfers.from_warehouse_id');
+                    if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                        $q->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id');
+                    }
+                    $applyBranchCatSearch($q, 'stock_transfer_items.product_name', 'stock_transfer_items.product_code', 'stock_transfers.reference_no', 'stock_transfers.from_warehouse', 'stock_transfers.created_by', 'stock_transfers.user_name');
+                    return $q;
+                };
+
+                $trfOutSelect = [
+                    'stock_transfers.id as source_id',
+                    DB::raw('0 as item_row_id'),
+                    DB::raw($trfVariantExpr),
+                    'stock_transfers.reference_no as reference_no',
+                    DB::raw("'transfer' as movement_type"),
+                    DB::raw("'Transfer Out' as type_label"),
+                    'stock_transfer_items.product_id',
+                    'stock_transfer_items.product_name',
+                    'stock_transfer_items.product_code',
+                    DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                    'products.category_name',
+                    'stock_transfers.from_warehouse as warehouse_name',
+                    DB::raw('COALESCE(stock_transfers.from_warehouse_id, 0) as warehouse_id'),
+                    DB::raw('0 as quantity_in'),
+                    DB::raw("{$trfBaseQtySql} as quantity_out"),
+                    DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                    DB::raw("{$trfUnitCostExpr} as unit_cost"),
+                    'stock_transfers.created_by',
+                    'stock_transfers.user_name',
+                    DB::raw("'' as user_role"),
+                    'stock_transfers.date as date',
+                ];
+
+                $branches[] = [
+                    'sumQuery' => $buildTrfOutQ(true),
+                    'qtyInExpr' => '0',
+                    'qtyOutExpr' => $trfBaseQtySql,
+                    'unitCostExpr' => $trfUnitCostExpr,
+                    'rowQuery' => $buildTrfOutQ(false)->select($trfOutSelect),
+                    'rowBuilder' => (!$hasCategory && !$hasSearch)
+                        ? static fn (string $st) => $buildTrfOutQ(false, $st)->select($trfOutSelect)
+                        : null,
+                    'dateCol' => 'stock_transfers.date',
+                    'statusSplit' => (!$hasCategory && !$hasSearch) ? ['Sent', 'Completed'] : null,
+                    'statusCol' => 'stock_transfers.status',
+                ];
+            }
+
+            if ($wantTransferIn) {
+                $trfUnitCostExpr = 'COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0)';
+                $buildTrfInQ = function (bool $forSummary) use (
+                    $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                    $canViewCost, $hasCategory, $hasSearch
+                ) {
+                    $q = DB::table('stock_transfer_items')
+                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
+                        ->where('stock_transfers.status', 'Completed')
+                        ->where('stock_transfers.date', '>=', $fromDateTime)
+                        ->where('stock_transfers.date', '<=', $toDateTime);
+                    $applyWhScope($q, 'stock_transfers.to_warehouse', 'stock_transfers.to_warehouse_id');
+                    if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                        $q->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id');
+                    }
+                    $applyBranchCatSearch($q, 'stock_transfer_items.product_name', 'stock_transfer_items.product_code', 'stock_transfers.reference_no', 'stock_transfers.to_warehouse', 'stock_transfers.created_by', 'stock_transfers.user_name');
+                    return $q;
+                };
+
+                $branches[] = [
+                    'sumQuery' => $buildTrfInQ(true),
+                    'qtyInExpr' => $trfBaseQtySql,
+                    'qtyOutExpr' => '0',
+                    'unitCostExpr' => $trfUnitCostExpr,
+                    'rowQuery' => $buildTrfInQ(false)->select([
+                        'stock_transfers.id as source_id',
+                        DB::raw('0 as item_row_id'),
+                        DB::raw($trfVariantExpr),
+                        'stock_transfers.reference_no as reference_no',
+                        DB::raw("'transfer' as movement_type"),
+                        DB::raw("'Transfer In' as type_label"),
+                        'stock_transfer_items.product_id',
+                        'stock_transfer_items.product_name',
+                        'stock_transfer_items.product_code',
+                        DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                        'products.category_name',
+                        'stock_transfers.to_warehouse as warehouse_name',
+                        DB::raw('COALESCE(stock_transfers.to_warehouse_id, 0) as warehouse_id'),
+                        DB::raw("{$trfBaseQtySql} as quantity_in"),
+                        DB::raw('0 as quantity_out'),
+                        DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                        DB::raw("{$trfUnitCostExpr} as unit_cost"),
+                        'stock_transfers.created_by',
+                        'stock_transfers.user_name',
+                        DB::raw("'' as user_role"),
+                        'stock_transfers.date as date',
+                    ]),
+                    'dateCol' => 'stock_transfers.date',
+                    'statusSplit' => null,
+                    'statusCol' => null,
+                ];
+            }
+
+            if ($wantSaleReturn && ($hasSmSaleRet || $hasSmSaleRetVoid)) {
+                $srHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
+                    . "NULLIF((SELECT SUM(srcl.total_cost) / NULLIF(SUM(srcl.base_quantity), 0) FROM sale_return_cost_layers srcl WHERE srcl.sale_return_id = sale_returns.id AND srcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR srcl.product_variant_id = stock_movements.product_variant_id)), 0), "
+                    . "NULLIF((SELECT SUM(srcl2.total_cost) / NULLIF(SUM(srcl2.base_quantity), 0) FROM sale_return_cost_layers srcl2 WHERE srcl2.sale_return_id = sale_returns.id AND srcl2.product_id = stock_movements.product_id), 0), "
+                    . "products.cost_price, products.purchase_price, 0)";
+
+                $applySmSrFilters = function ($q, array $types) use (
+                    $refIntCast, $srRefFallback, $fromDateTime, $toDateTime,
+                    $allowedOutlets, $warehouse, $warehouseId, $hasCategory, $category, $hasSearch, $search
+                ) {
+                    $q->leftJoin('sale_returns', DB::raw($refIntCast), '=', 'sale_returns.id')
+                        ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
+                        ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
+                        ->whereIn('stock_movements.movement_type', $types)
+                        ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
+                        ->whereRaw('COALESCE(sale_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
+                    if (!empty($allowedOutlets)) {
+                        $q->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
+                    }
+                    if ($warehouse !== 'All' && !empty($warehouse)) {
+                        if ($warehouseId !== null) {
+                            $q->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) = ?', [$warehouseId]);
+                        } else {
+                            $q->whereRaw('COALESCE(sale_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
+                        }
+                    }
+                    if ($hasCategory) {
+                        $q->where('products.category_name', $category);
+                    }
+                    if ($hasSearch) {
+                        $like = "%{$search}%";
+                        $q->where(function ($sub) use ($like, $srRefFallback) {
+                            $sub->whereRaw("COALESCE(sale_returns.reference_no, {$srRefFallback}) like ?", [$like])
+                                ->orWhere('products.name', 'like', $like)
+                                ->orWhere('products.code', 'like', $like)
+                                ->orWhere('products.alternative_name', 'like', $like)
+                                ->orWhereRaw("COALESCE(sale_returns.warehouse_name, outlets.name, '') like ?", [$like])
+                                ->orWhereRaw("COALESCE(sale_returns.created_by, 'System') like ?", [$like])
+                                ->orWhereRaw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') like ?", [$like]);
+                        });
+                    }
+                    return $q;
+                };
+
+                if ($hasSmSaleRet) {
+                    $srQ = $applySmSrFilters(DB::table('stock_movements'), ['sale_return']);
+                    $branches[] = [
+                        'sumQuery' => clone $srQ,
+                        'qtyInExpr' => 'stock_movements.quantity_in',
+                        'qtyOutExpr' => '0',
+                        'unitCostExpr' => $srHistUnitCostExpr,
+                        'rowQuery' => (clone $srQ)->select([
+                            DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
+                            DB::raw('0 as item_row_id'),
+                            'stock_movements.product_variant_id as variant_id',
+                            DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
+                            DB::raw("'sale_return' as movement_type"),
+                            DB::raw("'Return In' as type_label"),
+                            'stock_movements.product_id',
+                            'products.name as product_name',
+                            'products.code as product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                            DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                            'stock_movements.quantity_in as quantity_in',
+                            DB::raw('0 as quantity_out'),
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$srHistUnitCostExpr} as unit_cost"),
+                            DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
+                            DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
+                            DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
+                            DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
+                        ]),
+                        'dateCol' => DB::raw('COALESCE(sale_returns.date, stock_movements.created_at)'),
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+
+                if ($hasSmSaleRetVoid) {
+                    $srvQ = $applySmSrFilters(DB::table('stock_movements'), ['sale_return_void', 'sale_return_edit_reverse']);
+                    $branches[] = [
+                        'sumQuery' => clone $srvQ,
+                        'qtyInExpr' => '0',
+                        'qtyOutExpr' => 'stock_movements.quantity_out',
+                        'unitCostExpr' => $srHistUnitCostExpr,
+                        'rowQuery' => (clone $srvQ)->select([
+                            DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
+                            DB::raw('0 as item_row_id'),
+                            'stock_movements.product_variant_id as variant_id',
+                            DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
+                            DB::raw("'sale_return_void' as movement_type"),
+                            DB::raw("'Return Voided Out' as type_label"),
+                            'stock_movements.product_id',
+                            'products.name as product_name',
+                            'products.code as product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                            DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                            DB::raw('0 as quantity_in'),
+                            'stock_movements.quantity_out as quantity_out',
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$srHistUnitCostExpr} as unit_cost"),
+                            DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
+                            DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
+                            DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
+                            DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
+                        ]),
+                        'dateCol' => DB::raw('COALESCE(sale_returns.date, stock_movements.created_at)'),
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+            }
+
+            if ($wantPurchReturn && ($hasSmPurchRet || $hasSmPurchRetVoid)) {
+                $prHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
+                    . "NULLIF((SELECT SUM(prcl.total_cost) / NULLIF(SUM(prcl.base_quantity), 0) FROM purchase_return_cost_layers prcl WHERE prcl.purchase_return_id = purchase_returns.id AND prcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR prcl.product_variant_id = stock_movements.product_variant_id)), 0), "
+                    . "NULLIF((SELECT SUM(prcl2.total_cost) / NULLIF(SUM(prcl2.base_quantity), 0) FROM purchase_return_cost_layers prcl2 WHERE prcl2.purchase_return_id = purchase_returns.id AND prcl2.product_id = stock_movements.product_id), 0), "
+                    . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_out), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_out) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
+                    . "products.cost_price, products.purchase_price, 0)";
+
+                $prVoidHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
+                    . "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.source_type = 'purchase_return_void' AND ib.source_reference = purchase_returns.reference_no AND ib.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR ib.product_variant_id = stock_movements.product_variant_id)), 0), "
+                    . ($hasMovementUnitCost ? "NULLIF((SELECT smOrig.unit_cost FROM stock_movements smOrig WHERE smOrig.movement_type = 'purchase_return' AND smOrig.reference_id = stock_movements.reference_id AND smOrig.product_id = stock_movements.product_id ORDER BY smOrig.id DESC LIMIT 1), 0), " : "")
+                    . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_in), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_in) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
+                    . "products.cost_price, products.purchase_price, 0)";
+
+                $applySmPrFilters = function ($q, string $type) use (
+                    $refIntCast, $prRefFallback, $fromDateTime, $toDateTime,
+                    $allowedOutlets, $warehouse, $warehouseId, $hasCategory, $category, $hasSearch, $search
+                ) {
+                    $q->leftJoin('purchase_returns', DB::raw($refIntCast), '=', 'purchase_returns.id')
+                        ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
+                        ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
+                        ->where('stock_movements.movement_type', $type)
+                        ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) >= ?', [$fromDateTime])
+                        ->whereRaw('COALESCE(purchase_returns.date, stock_movements.created_at) <= ?', [$toDateTime]);
+                    if (!empty($allowedOutlets)) {
+                        $q->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
+                    }
+                    if ($warehouse !== 'All' && !empty($warehouse)) {
+                        if ($warehouseId !== null) {
+                            $q->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) = ?', [$warehouseId]);
+                        } else {
+                            $q->whereRaw('COALESCE(purchase_returns.warehouse_name, outlets.name) = ?', [$warehouse]);
+                        }
+                    }
+                    if ($hasCategory) {
+                        $q->where('products.category_name', $category);
+                    }
+                    if ($hasSearch) {
+                        $like = "%{$search}%";
+                        $q->where(function ($sub) use ($like, $prRefFallback) {
+                            $sub->whereRaw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) like ?", [$like])
+                                ->orWhere('products.name', 'like', $like)
+                                ->orWhere('products.code', 'like', $like)
+                                ->orWhere('products.alternative_name', 'like', $like)
+                                ->orWhereRaw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') like ?", [$like])
+                                ->orWhereRaw("COALESCE(purchase_returns.created_by, '') like ?", [$like])
+                                ->orWhereRaw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, '') like ?", [$like]);
+                        });
+                    }
+                    return $q;
+                };
+
+                if ($hasSmPurchRet) {
+                    $prQ = $applySmPrFilters(DB::table('stock_movements'), 'purchase_return');
+                    $branches[] = [
+                        'sumQuery' => clone $prQ,
+                        'qtyInExpr' => '0',
+                        'qtyOutExpr' => 'stock_movements.quantity_out',
+                        'unitCostExpr' => $prHistUnitCostExpr,
+                        'rowQuery' => (clone $prQ)->select([
+                            DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
+                            DB::raw('0 as item_row_id'),
+                            'stock_movements.product_variant_id as variant_id',
+                            DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
+                            DB::raw("'purchase_return' as movement_type"),
+                            DB::raw("'Return Out' as type_label"),
+                            'stock_movements.product_id',
+                            'products.name as product_name',
+                            'products.code as product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                            DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                            DB::raw('0 as quantity_in'),
+                            'stock_movements.quantity_out as quantity_out',
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$prHistUnitCostExpr} as unit_cost"),
+                            DB::raw("COALESCE(purchase_returns.created_by, '') as created_by"),
+                            DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, '') as user_name"),
+                            DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
+                            DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
+                        ]),
+                        'dateCol' => DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at)'),
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+
+                if ($hasSmPurchRetVoid) {
+                    $prvQ = $applySmPrFilters(DB::table('stock_movements'), 'purchase_return_void');
+                    $branches[] = [
+                        'sumQuery' => clone $prvQ,
+                        'qtyInExpr' => 'stock_movements.quantity_in',
+                        'qtyOutExpr' => '0',
+                        'unitCostExpr' => $prVoidHistUnitCostExpr,
+                        'rowQuery' => (clone $prvQ)->select([
+                            DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
+                            DB::raw('0 as item_row_id'),
+                            'stock_movements.product_variant_id as variant_id',
+                            DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
+                            DB::raw("'purchase_return_void' as movement_type"),
+                            DB::raw("'Return Voided In' as type_label"),
+                            'stock_movements.product_id',
+                            'products.name as product_name',
+                            'products.code as product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                            DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                            'stock_movements.quantity_in as quantity_in',
+                            DB::raw('0 as quantity_out'),
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$prVoidHistUnitCostExpr} as unit_cost"),
+                            DB::raw("COALESCE(purchase_returns.created_by, 'System') as created_by"),
+                            DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, 'System') as user_name"),
+                            DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
+                            DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
+                        ]),
+                        'dateCol' => DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at)'),
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+            }
+
+            if (($wantProcIn || $wantProcOut) && $accounting->schemaHasTable('processings') && $accounting->schemaHasTable('processing_items')) {
+                if ($wantProcIn) {
+                    $procInUnitCostExpr = 'COALESCE(processings.output_unit_cost, products.cost_price, 0)';
+                    $buildProcInQ = function (bool $forSummary) use (
+                        $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                        $canViewCost, $hasCategory, $hasSearch
+                    ) {
+                        $q = DB::table('processings')
+                            ->where('processings.status', 'completed')
+                            ->where('processings.date', '>=', $fromDateTime)
+                            ->where('processings.date', '<=', $toDateTime);
+                        $applyWhScope($q, 'processings.warehouse_name', 'processings.warehouse_id');
+                        if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                            $q->leftJoin('products', 'processings.output_product_id', '=', 'products.id');
+                        }
+                        $applyBranchCatSearch($q, 'processings.output_product_name', 'processings.output_product_code', 'processings.reference_no', 'processings.warehouse_name', 'processings.created_by', 'processings.user_name');
+                        return $q;
+                    };
+
+                    $branches[] = [
+                        'sumQuery' => $buildProcInQ(true),
+                        'qtyInExpr' => 'processings.output_base_quantity',
+                        'qtyOutExpr' => '0',
+                        'unitCostExpr' => $procInUnitCostExpr,
+                        'rowQuery' => $buildProcInQ(false)->select([
+                            'processings.id as source_id',
+                            DB::raw('0 as item_row_id'),
+                            DB::raw('NULL as variant_id'),
+                            'processings.reference_no as reference_no',
+                            DB::raw("'processing_in' as movement_type"),
+                            DB::raw("'Production In' as type_label"),
+                            'processings.output_product_id as product_id',
+                            'processings.output_product_name as product_name',
+                            'processings.output_product_code as product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            'processings.warehouse_name',
+                            DB::raw('COALESCE(processings.warehouse_id, 1) as warehouse_id'),
+                            'processings.output_base_quantity as quantity_in',
+                            DB::raw('0 as quantity_out'),
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$procInUnitCostExpr} as unit_cost"),
+                            'processings.created_by',
+                            'processings.user_name',
+                            'processings.user_role',
+                            'processings.date as date',
+                        ]),
+                        'dateCol' => 'processings.date',
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+
+                if ($wantProcOut) {
+                    $procOutUnitCostExpr = 'COALESCE(NULLIF(processing_items.base_unit_cost, 0), processing_items.unit_cost, products.cost_price, 0)';
+                    $buildProcOutQ = function (bool $forSummary) use (
+                        $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
+                        $canViewCost, $hasCategory, $hasSearch
+                    ) {
+                        $q = DB::table('processing_items')
+                            ->join('processings', 'processing_items.processing_id', '=', 'processings.id')
+                            ->where('processings.status', 'completed')
+                            ->where('processings.date', '>=', $fromDateTime)
+                            ->where('processings.date', '<=', $toDateTime);
+                        $applyWhScope($q, 'processings.warehouse_name', 'processings.warehouse_id');
+                        if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
+                            $q->leftJoin('products', 'processing_items.product_id', '=', 'products.id');
+                        }
+                        $applyBranchCatSearch($q, 'processing_items.product_name', 'processing_items.product_code', 'processings.reference_no', 'processings.warehouse_name', 'processings.created_by', 'processings.user_name');
+                        return $q;
+                    };
+
+                    $branches[] = [
+                        'sumQuery' => $buildProcOutQ(true),
+                        'qtyInExpr' => '0',
+                        'qtyOutExpr' => 'processing_items.base_quantity',
+                        'unitCostExpr' => $procOutUnitCostExpr,
+                        'rowQuery' => $buildProcOutQ(false)->select([
+                            'processings.id as source_id',
+                            DB::raw('0 as item_row_id'),
+                            DB::raw('NULL as variant_id'),
+                            'processings.reference_no as reference_no',
+                            DB::raw("'processing_out' as movement_type"),
+                            DB::raw("'Production Out' as type_label"),
+                            'processing_items.product_id',
+                            'processing_items.product_name',
+                            'processing_items.product_code',
+                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                            'products.category_name',
+                            'processings.warehouse_name',
+                            DB::raw('COALESCE(processings.warehouse_id, 1) as warehouse_id'),
+                            DB::raw('0 as quantity_in'),
+                            'processing_items.base_quantity as quantity_out',
+                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                            DB::raw("{$procOutUnitCostExpr} as unit_cost"),
+                            'processings.created_by',
+                            'processings.user_name',
+                            'processings.user_role',
+                            'processings.date as date',
+                        ]),
+                        'dateCol' => 'processings.date',
+                        'statusSplit' => null,
+                        'statusCol' => null,
+                    ];
+                }
+            }
+
+            if (!empty($branches)) {
+                $needTopN = $offset + $perPage + 1;
+                $allCandidates = [];
+
+                foreach ($branches as $br) {
+                    $sq = $br['sumQuery'];
+                    if (!$skipSummary) {
+                        $valExpr = $canViewCost
+                            ? "COALESCE(SUM((({$br['qtyInExpr']}) + ({$br['qtyOutExpr']})) * ({$br['unitCostExpr']})), 0)"
+                            : '0';
+                        $bs = (clone $sq)->selectRaw("
+                            COUNT(*) as total_movements,
+                            COALESCE(SUM({$br['qtyInExpr']}), 0) as total_inflow_qty,
+                            COALESCE(SUM({$br['qtyOutExpr']}), 0) as total_outflow_qty,
+                            {$valExpr} as total_movement_value
+                        ")->first();
+                        $totalMovements += (int)($bs->total_movements ?? 0);
+                        $totalInflowQty += (float)($bs->total_inflow_qty ?? 0);
+                        $totalOutflowQty += (float)($bs->total_outflow_qty ?? 0);
+                        $totalMovementValue += (float)($bs->total_movement_value ?? 0);
+                    } elseif ($knownTotal === null || $page <= 1) {
+                        $totalMovements += (int)(clone $sq)->count();
+                    }
+
+                    $dateCol = $br['dateCol'];
+                    if (!empty($br['statusSplit']) && !empty($br['rowBuilder'])) {
+                        $builder = $br['rowBuilder'];
+                        foreach ($br['statusSplit'] as $st) {
+                            foreach ($builder($st)->orderByDesc($dateCol)->limit($needTopN)->get() as $r) {
+                                $allCandidates[] = $r;
+                            }
+                        }
+                    } else {
+                        foreach ((clone $br['rowQuery'])->orderByDesc($dateCol)->limit($needTopN)->get() as $r) {
+                            $allCandidates[] = $r;
+                        }
+                    }
+                }
+                if ($skipSummary && $knownTotal !== null && $page > 1) {
+                    $totalMovements = $knownTotal;
+                }
+
+                usort($allCandidates, static fn ($a, $b) => strcmp((string)$b->date, (string)$a->date));
+                $hasMoreMovements = count($allCandidates) > ($offset + $perPage) || ($offset + $perPage) < $totalMovements;
+                $pageMvRows = collect(array_slice($allCandidates, $offset, $perPage));
+
+                // Refine exact FIFO/landed batch unit_cost strictly on the <=50 paged purchase rows
+                if ($canViewCost && $pageMvRows->isNotEmpty()) {
+                    $piIds = $pageMvRows
+                        ->filter(fn ($r) => $r->movement_type === 'purchase' && (int)($r->item_row_id ?? 0) > 0)
+                        ->pluck('item_row_id')
+                        ->map(fn ($v) => (int)$v)
+                        ->all();
+                    if (!empty($piIds) && $accounting->schemaHasTable('inventory_batches')) {
+                        $batchCostByPi = DB::table('inventory_batches')
+                            ->whereIn('purchase_item_id', $piIds)
+                            ->selectRaw('purchase_item_id, CASE WHEN SUM(initial_quantity) > 0 THEN SUM(initial_quantity * unit_cost) / SUM(initial_quantity) ELSE MAX(unit_cost) END as b_cost')
+                            ->groupBy('purchase_item_id')
+                            ->pluck('b_cost', 'purchase_item_id');
+                        foreach ($pageMvRows as $r) {
+                            $piId = (int)($r->item_row_id ?? 0);
+                            if ($r->movement_type === 'purchase' && $piId > 0 && isset($batchCostByPi[$piId]) && (float)$batchCostByPi[$piId] > 0) {
+                                $r->unit_cost = (float)$batchCostByPi[$piId];
+                            }
+                        }
+                    }
+                }
+            }
         }
         $netMovementQty = round($totalInflowQty - $totalOutflowQty, 2);
-
         $lastPage = max(1, (int)ceil($totalMovements / max(1, $perPage)));
-        $offset = ($page - 1) * $perPage;
-
-        $rawMvRows = (clone $movementsSub)
-            ->orderByDesc('date')
-            ->offset($offset)
-            ->limit($perPage + 1)
-            ->get();
-        $hasMoreMovements = $rawMvRows->count() > $perPage;
-        $pageMvRows = $hasMoreMovements ? $rawMvRows->slice(0, $perPage)->values() : $rawMvRows->values();
 
         // Paginated Section 2: Product-Level Bin Card Summary (50-ID scoped, single movement pass)
-        $prodQuery = DB::table('products')->whereNull('deleted_at')->select([
-            'id', 'code', 'name', 'alternative_name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity'
-        ]);
-        if ($category !== 'All' && !empty($category)) {
-            $prodQuery->where('category_name', $category);
-        }
-        if (!empty($search)) {
-            $prodQuery->where(function ($q) use ($search) {
-                $q->where('code', 'like', "%{$search}%")
-                  ->orWhere('name', 'like', "%{$search}%")
-                  ->orWhere('alternative_name', 'like', "%{$search}%");
-            });
-        }
+        $totalProductsCount = 0;
+        $hasMoreProducts = false;
+        $products = collect();
+        $pageProductIds = [];
 
-        $totalProductsCount = !$skipSummary
-            ? (int)(clone $prodQuery)->count()
-            : 0;
-        $binOffset = ($binPage - 1) * $perPage;
-        $rawProducts = $prodQuery->orderBy('id')->offset($binOffset)->limit($perPage + 1)->get();
-        $hasMoreProducts = $rawProducts->count() > $perPage;
-        $products = $hasMoreProducts ? $rawProducts->slice(0, $perPage)->values() : $rawProducts->values();
-        $pageProductIds = $products->pluck('id')->map(fn($v) => (int)$v)->all();
+        if ($section !== 'journal') {
+            $prodQuery = DB::table('products')->whereNull('deleted_at')->select([
+                'id', 'code', 'name', 'alternative_name', 'category_name', 'unit_name', 'cost_price', 'selling_price', 'stock_quantity'
+            ]);
+            if ($hasCategory) {
+                $prodQuery->where('category_name', $category);
+            }
+            if ($hasSearch) {
+                $prodQuery->where(function ($q) use ($search) {
+                    $q->where('code', 'like', "%{$search}%")
+                      ->orWhere('name', 'like', "%{$search}%")
+                      ->orWhere('alternative_name', 'like', "%{$search}%");
+                });
+            }
+
+            $totalProductsCount = (!$skipSummary || $binPage <= 1 || $knownTotal === null)
+                ? (int)(clone $prodQuery)->count()
+                : $knownTotal;
+            $binOffset = ($binPage - 1) * $perPage;
+            $rawProducts = $prodQuery->orderBy('id')->offset($binOffset)->limit($perPage + 1)->get();
+            $hasMoreProducts = $rawProducts->count() > $perPage;
+            $products = $hasMoreProducts ? $rawProducts->slice(0, $perPage)->values() : $rawProducts->values();
+            $pageProductIds = $products->pluck('id')->map(fn($v) => (int)$v)->all();
+        }
 
         // Scope warehouse stock balances strictly to product IDs present on this page (movements + bin cards)
         $neededProdIds = array_values(array_unique(array_merge(
@@ -10416,7 +13473,7 @@ class ReportController extends Controller
         $totalPurchasesIn = 0.0;
         $totalSalesOut = 0.0;
 
-        if (!empty($pageProductIds)) {
+        if ($section !== 'journal' && !empty($pageProductIds)) {
             $fifoByProduct = collect();
             foreach (array_chunk($pageProductIds, 400) as $idChunk) {
                 $fifoBatchQuery = DB::table('inventory_batches')
@@ -10593,11 +13650,308 @@ class ReportController extends Controller
                     'closing_retail_value' => round($closingStock * $selling, 2),
                 ];
             }
+
+            // Compute catalog-wide Bin Card summary totals across all filtered products when paginated (> perPage items)
+            if (!$skipSummary && $totalProductsCount > count($items)) {
+                $applyCatProdFilter = static function ($q) use ($hasCategory, $category, $hasSearch, $search): void {
+                    $q->whereNull('products.deleted_at');
+                    if ($hasCategory) {
+                        $q->where('products.category_name', $category);
+                    }
+                    if ($hasSearch) {
+                        $like = "%{$search}%";
+                        $q->where(function ($sub) use ($like) {
+                            $sub->where('products.code', 'like', $like)
+                                ->orWhere('products.name', 'like', $like)
+                                ->orWhere('products.alternative_name', 'like', $like);
+                        });
+                    }
+                };
+
+                if ($warehouseId !== null || !empty($allowedOutlets)) {
+                    $liveQ = DB::table('stock_balances')
+                        ->join('products', 'stock_balances.product_id', '=', 'products.id');
+                    $applyCatProdFilter($liveQ);
+                    if ($warehouseId !== null) {
+                        $liveQ->where('stock_balances.warehouse_id', $warehouseId);
+                    } else {
+                        $liveQ->whereIn('stock_balances.warehouse_id', $allowedOutlets);
+                    }
+                    $liveCostVal = (float)$liveQ->selectRaw('COALESCE(SUM(stock_balances.quantity * COALESCE(products.cost_price, 0)), 0) as v')->value('v');
+                } else {
+                    $liveQ = DB::table('products');
+                    $applyCatProdFilter($liveQ);
+                    $liveCostVal = (float)$liveQ->selectRaw('COALESCE(SUM(stock_quantity * COALESCE(cost_price, 0)), 0) as v')->value('v');
+                }
+
+                $fifoDelta = 0.0;
+                if ($canViewCost && $accounting->schemaHasTable('inventory_batches')) {
+                    $fdQ = DB::table('inventory_batches')
+                        ->join('products', 'inventory_batches.product_id', '=', 'products.id')
+                        ->where('inventory_batches.status', 'active')
+                        ->where('inventory_batches.remaining_quantity', '>', 0);
+                    $applyCatProdFilter($fdQ);
+                    if ($warehouseId !== null) {
+                        $fdQ->where('inventory_batches.warehouse_id', $warehouseId);
+                    } elseif (!empty($allowedOutlets)) {
+                        $fdQ->whereIn('inventory_batches.warehouse_id', $allowedOutlets);
+                    }
+                    $fifoDelta = (float)$fdQ->selectRaw('COALESCE(SUM(inventory_batches.remaining_quantity * (inventory_batches.unit_cost - COALESCE(products.cost_price, 0))), 0) as d')->value('d');
+                }
+
+                $filterByProductSubset = $hasCategory || $hasSearch;
+
+                // Aggregate qty per product_id first before joining products when unfiltered by category/search,
+                // avoiding tens of thousands of per-line PK lookups while keeping exact cost valuation.
+                $sumGroupedCostDelta = function ($groupedSubQ) use ($applyCatProdFilter, $filterByProductSubset): array {
+                    $q = DB::query()
+                        ->fromSub($groupedSubQ, 'agg')
+                        ->join('products', 'agg.product_id', '=', 'products.id');
+                    $applyCatProdFilter($q);
+                    $row = $q->selectRaw(
+                        'COALESCE(SUM(agg.period_qty), 0) as period_qty, '
+                        . 'COALESCE(SUM(agg.period_qty * COALESCE(products.cost_price, 0)), 0) as period_cost, '
+                        . 'COALESCE(SUM(agg.post_qty * COALESCE(products.cost_price, 0)), 0) as post_cost'
+                    )->first();
+                    return [
+                        'period_qty' => (float)($row->period_qty ?? 0),
+                        'period_cost' => (float)($row->period_cost ?? 0),
+                        'post_cost' => (float)($row->post_cost ?? 0),
+                    ];
+                };
+
+                $purchCatalogQ = DB::table('purchase_items')
+                    ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
+                    ->whereIn('purchases.status', ['Received', 'Completed'])
+                    ->where('purchases.date', '>=', $fromDateTime);
+                $applyWhScope($purchCatalogQ, 'purchases.warehouse_name', 'purchases.warehouse_id');
+                if ($filterByProductSubset) {
+                    $purchCatalogQ->join('products', 'purchase_items.product_id', '=', 'products.id');
+                    $applyCatProdFilter($purchCatalogQ);
+                    $purchRow = $purchCatalogQ->selectRaw(
+                        "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END), 0) as period_qty, "
+                        . "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN ({$purchBaseQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as period_cost, "
+                        . "COALESCE(SUM(CASE WHEN purchases.date > ? THEN ({$purchBaseQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as post_cost",
+                        [$toDateTime, $toDateTime, $toDateTime]
+                    )->first();
+                    $purchStats = [
+                        'period_qty' => (float)($purchRow->period_qty ?? 0),
+                        'period_cost' => (float)($purchRow->period_cost ?? 0),
+                        'post_cost' => (float)($purchRow->post_cost ?? 0),
+                    ];
+                } else {
+                    $purchCatalogQ->selectRaw(
+                        "purchase_items.product_id, "
+                        . "SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END) as period_qty, "
+                        . "SUM(CASE WHEN purchases.date > ? THEN {$purchBaseQtySql} ELSE 0 END) as post_qty",
+                        [$toDateTime, $toDateTime]
+                    )->groupBy('purchase_items.product_id');
+                    $purchStats = $sumGroupedCostDelta($purchCatalogQ);
+                }
+                $totalPurchasesIn = $purchStats['period_qty'];
+
+                $salesCatalogQ = DB::table('sale_items')
+                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                    ->where('sales.date', '>=', $fromDateTime);
+                $this->applyActiveDocumentFilter($salesCatalogQ, 'sales.status');
+                $applyWhScope($salesCatalogQ, 'sales.warehouse_name', 'sales.warehouse_id');
+                if ($filterByProductSubset) {
+                    $salesCatalogQ->join('products', 'sale_items.product_id', '=', 'products.id');
+                    $applyCatProdFilter($salesCatalogQ);
+                    $salesRow = $salesCatalogQ->selectRaw(
+                        "COALESCE(SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END), 0) as period_qty, "
+                        . "COALESCE(SUM(CASE WHEN sales.date <= ? THEN ({$saleBaseQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as period_cost, "
+                        . "COALESCE(SUM(CASE WHEN sales.date > ? THEN ({$saleBaseQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as post_cost",
+                        [$toDateTime, $toDateTime, $toDateTime]
+                    )->first();
+                    $salesStats = [
+                        'period_qty' => (float)($salesRow->period_qty ?? 0),
+                        'period_cost' => (float)($salesRow->period_cost ?? 0),
+                        'post_cost' => (float)($salesRow->post_cost ?? 0),
+                    ];
+                } else {
+                    $salesCatalogQ->selectRaw(
+                        "sale_items.product_id, "
+                        . "SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END) as period_qty, "
+                        . "SUM(CASE WHEN sales.date > ? THEN {$saleBaseQtySql} ELSE 0 END) as post_qty",
+                        [$toDateTime, $toDateTime]
+                    )->groupBy('sale_items.product_id');
+                    $salesStats = $sumGroupedCostDelta($salesCatalogQ);
+                }
+                $totalSalesOut = $salesStats['period_qty'];
+
+                if ($canViewCost) {
+                    $periodNetCost = $purchStats['period_cost'] - $salesStats['period_cost'];
+                    $postNetCost = $purchStats['post_cost'] - $salesStats['post_cost'];
+
+                    $evalCatalogDelta = function ($q, string $dateExpr, string $signedQtySql) use ($toDateTime, $filterByProductSubset, $applyCatProdFilter, $sumGroupedCostDelta): array {
+                        if ($filterByProductSubset) {
+                            $q->join('products', $q->from . '.product_id', '=', 'products.id');
+                            $applyCatProdFilter($q);
+                            $r = $q->selectRaw(
+                                "COALESCE(SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as period_cost, "
+                                . "COALESCE(SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as post_cost",
+                                [$toDateTime, $toDateTime]
+                            )->first();
+                            return [(float)($r->period_cost ?? 0), (float)($r->post_cost ?? 0)];
+                        }
+                        $itemTbl = $q->from;
+                        $q->selectRaw(
+                            "{$itemTbl}.product_id, "
+                            . "SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) ELSE 0 END) as period_qty, "
+                            . "SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) ELSE 0 END) as post_qty",
+                            [$toDateTime, $toDateTime]
+                        )->groupBy("{$itemTbl}.product_id");
+                        $s = $sumGroupedCostDelta($q);
+                        return [$s['period_cost'], $s['post_cost']];
+                    };
+
+                    // Adjustments
+                    $adjCatalogQ = DB::table('stock_adjustment_items')
+                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
+                        ->where('stock_adjustments.date', '>=', $fromDateTime);
+                    $applyWhScope($adjCatalogQ, 'stock_adjustments.warehouse_name', 'stock_adjustments.warehouse_id');
+                    $adjSignSql = "CASE WHEN {$effAdjTypeSql} = 'addition' THEN ({$adjBaseQtySql}) ELSE -({$adjBaseQtySql}) END";
+                    [$adjPer, $adjPost] = $evalCatalogDelta($adjCatalogQ, 'stock_adjustments.date', $adjSignSql);
+                    $periodNetCost += $adjPer;
+                    $postNetCost += $adjPost;
+
+                    // Transfers Out & In
+                    $trfOutCatalogQ = DB::table('stock_transfer_items')
+                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
+                        ->whereIn('stock_transfers.status', ['Sent', 'Completed'])
+                        ->where('stock_transfers.date', '>=', $fromDateTime);
+                    $applyWhScope($trfOutCatalogQ, 'stock_transfers.from_warehouse', 'stock_transfers.from_warehouse_id');
+                    [$trfOutPer, $trfOutPost] = $evalCatalogDelta($trfOutCatalogQ, 'stock_transfers.date', $trfBaseQtySql);
+                    $periodNetCost -= $trfOutPer;
+                    $postNetCost -= $trfOutPost;
+
+                    $trfInCatalogQ = DB::table('stock_transfer_items')
+                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
+                        ->where('stock_transfers.status', 'Completed')
+                        ->where('stock_transfers.date', '>=', $fromDateTime);
+                    $applyWhScope($trfInCatalogQ, 'stock_transfers.to_warehouse', 'stock_transfers.to_warehouse_id');
+                    [$trfInPer, $trfInPost] = $evalCatalogDelta($trfInCatalogQ, 'stock_transfers.date', $trfBaseQtySql);
+                    $periodNetCost += $trfInPer;
+                    $postNetCost += $trfInPost;
+
+                    // Sale Returns & Purchase Returns (indexed via idx_sm_type_created_wh; group by product_id before joining products)
+                    if ($accounting->schemaHasTable('stock_movements')) {
+                        $smNetQ = DB::table('stock_movements')
+                            ->whereIn('stock_movements.movement_type', ['sale_return', 'sale_return_void', 'sale_return_edit_reverse', 'purchase_return', 'purchase_return_void'])
+                            ->where('stock_movements.created_at', '>=', $fromDateTime);
+                        if (!empty($allowedOutlets)) {
+                            $smNetQ->whereIn('stock_movements.warehouse_id', $allowedOutlets);
+                        }
+                        if ($warehouseId !== null) {
+                            $smNetQ->where('stock_movements.warehouse_id', $warehouseId);
+                        }
+                        if ($filterByProductSubset) {
+                            $smNetQ->join('products', 'stock_movements.product_id', '=', 'products.id');
+                            $applyCatProdFilter($smNetQ);
+                            $smNetRow = $smNetQ->selectRaw(
+                                'COALESCE(SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as period_cost, '
+                                . 'COALESCE(SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as post_cost',
+                                [$toDateTime, $toDateTime]
+                            )->first();
+                            $periodNetCost += (float)($smNetRow->period_cost ?? 0);
+                            $postNetCost += (float)($smNetRow->post_cost ?? 0);
+                        } else {
+                            $smNetQ->selectRaw(
+                                'stock_movements.product_id, '
+                                . 'SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as period_qty, '
+                                . 'SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as post_qty',
+                                [$toDateTime, $toDateTime]
+                            )->groupBy('stock_movements.product_id');
+                            $smStats = $sumGroupedCostDelta($smNetQ);
+                            $periodNetCost += $smStats['period_cost'];
+                            $postNetCost += $smStats['post_cost'];
+                        }
+                    }
+
+                    // Completed Processing Output (+) & Raw Material Consumption (-)
+                    if ($accounting->schemaHasTable('processings') && $accounting->schemaHasTable('processing_items')) {
+                        $pInCatQ = DB::table('processings')
+                            ->where('status', 'completed')
+                            ->where('date', '>=', $fromDateTime);
+                        $applyWhScope($pInCatQ, 'processings.warehouse_name', 'processings.warehouse_id');
+                        if ($filterByProductSubset) {
+                            $pInCatQ->join('products', 'processings.output_product_id', '=', 'products.id');
+                            $applyCatProdFilter($pInCatQ);
+                            $pInRow = $pInCatQ->selectRaw(
+                                'COALESCE(SUM(CASE WHEN processings.date <= ? THEN processings.output_base_quantity * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as period_cost, '
+                                . 'COALESCE(SUM(CASE WHEN processings.date > ? THEN processings.output_base_quantity * COALESCE(products.cost_price, 0) ELSE 0 END), 0) as post_cost',
+                                [$toDateTime, $toDateTime]
+                            )->first();
+                            $periodNetCost += (float)($pInRow->period_cost ?? 0);
+                            $postNetCost += (float)($pInRow->post_cost ?? 0);
+                        } else {
+                            $pInCatQ->selectRaw(
+                                'output_product_id as product_id, '
+                                . 'SUM(CASE WHEN date <= ? THEN output_base_quantity ELSE 0 END) as period_qty, '
+                                . 'SUM(CASE WHEN date > ? THEN output_base_quantity ELSE 0 END) as post_qty',
+                                [$toDateTime, $toDateTime]
+                            )->groupBy('output_product_id');
+                            $pInStats = $sumGroupedCostDelta($pInCatQ);
+                            $periodNetCost += $pInStats['period_cost'];
+                            $postNetCost += $pInStats['post_cost'];
+                        }
+
+                        $pOutCatQ = DB::table('processing_items')
+                            ->join('processings', 'processing_items.processing_id', '=', 'processings.id')
+                            ->where('processings.status', 'completed')
+                            ->where('processings.date', '>=', $fromDateTime);
+                        $applyWhScope($pOutCatQ, 'processings.warehouse_name', 'processings.warehouse_id');
+                        [$pOutPer, $pOutPost] = $evalCatalogDelta($pOutCatQ, 'processings.date', 'processing_items.base_quantity');
+                        $periodNetCost -= $pOutPer;
+                        $postNetCost -= $pOutPost;
+                    }
+
+                    $totalClosingCost = max(0.0, $liveCostVal - $postNetCost + $fifoDelta);
+                    $totalOpeningCost = max(0.0, $totalClosingCost - $periodNetCost);
+                }
+            }
         }
 
         $binLastPage = max(1, (int)ceil(($totalProductsCount ?: count($items)) / max(1, $perPage)));
 
-        return $this->noStoreJson([
+        $availableFilters = null;
+        if (!$skipSummary) {
+            $whListQuery = DB::table('outlets')->orderBy('name');
+            if (!empty($allowedOutlets)) {
+                $whListQuery->whereIn('id', $allowedOutlets);
+            }
+            $availWarehouses = $whListQuery->pluck('name')->filter(fn ($v) => !empty($v))->values()->all();
+            $availCategories = DB::table('products')
+                ->whereNull('deleted_at')
+                ->whereNotNull('category_name')
+                ->where('category_name', '!=', '')
+                ->distinct()
+                ->orderBy('category_name')
+                ->pluck('category_name')
+                ->values()
+                ->all();
+            $availableFilters = [
+                'warehouses' => $availWarehouses,
+                'categories' => $availCategories,
+                'movement_types' => [
+                    'All',
+                    'sale',
+                    'purchase',
+                    'opening_stock',
+                    'adjustment_in',
+                    'adjustment_out',
+                    'transfer',
+                    'sale_return',
+                    'purchase_return',
+                    'processing',
+                    'in',
+                    'out',
+                ],
+            ];
+        }
+
+        $payload = [
             'status' => 'success',
             'cost_masked' => !$canViewCost,
             'summary' => [
@@ -10633,7 +13987,12 @@ class ReportController extends Controller
                 'total'        => $totalProductsCount ?: count($items),
                 'has_more'     => $hasMoreProducts,
             ],
-        ]);
+        ];
+        if ($availableFilters !== null) {
+            $payload['available_filters'] = $availableFilters;
+        }
+
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -10648,27 +14007,41 @@ class ReportController extends Controller
         $endDate = $request->input('end_date');
         $category = $request->input('category', 'All');
         $search = trim((string)$request->input('search', ''));
-
+        $marginHealthRaw = strtolower(trim((string)$request->input('margin_health', 'All')));
+        $marginHealth = match ($marginHealthRaw) {
+            '', 'all' => 'All',
+            'high', 'healthy', 'high_margin' => 'high',
+            'moderate', 'medium' => 'moderate',
+            'low', 'low_margin' => 'low',
+            'negative', 'loss', 'loss_margin' => 'negative',
+            default => 'All',
+        };
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
 
-        $cogsExpr = 'COALESCE(
-            NULLIF(sale_items.total_cogs, 0),
-            NULLIF(sale_items.base_unit_cost, 0) * COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1),
-            COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity, 1) * COALESCE(NULLIF(product_variants.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)
-        )';
+        $warehouseId = $this->resolveWarehouseIdParam(is_scalar($warehouse) ? (string)$warehouse : null);
+        if (!empty($allowedOutlets) && $warehouse !== 'All' && $warehouse !== '') {
+            if ($warehouseId === null || !in_array($warehouseId, $allowedOutlets, true)) {
+                return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
+            }
+        }
+
+        $saleBaseQtyExpr = 'COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity * COALESCE(NULLIF(sale_items.conversion_rate, 0), 1), 1)';
+        $explicitCogsExpr = "COALESCE(NULLIF(sale_items.total_cogs, 0), NULLIF(sale_items.base_unit_cost, 0) * {$saleBaseQtyExpr}, 0)";
+        $uncostedQtyExpr = "CASE WHEN COALESCE(sale_items.total_cogs, 0) = 0 AND COALESCE(sale_items.base_unit_cost, 0) = 0 THEN {$saleBaseQtyExpr} ELSE 0 END";
         $hasPointsDiscountCol = $accounting->schemaHasColumn('sales', 'points_discount');
         $orderDiscSql = $hasPointsDiscountCol
             ? '(COALESCE(sales.discount, 0) + COALESCE(sales.points_discount, 0))'
             : 'COALESCE(sales.discount, 0)';
         $netLineRevExpr = "(COALESCE(sale_items.subtotal, 0) - COALESCE(sale_items.tax, 0) - (CASE WHEN COALESCE(sales.subtotal, 0) > 0 THEN {$orderDiscSql} * (COALESCE(sale_items.subtotal, 0) / sales.subtotal) ELSE 0 END))";
 
+        // Keep sales aggregation strictly 2-table (sale_items + sales) so MariaDB uses idx_si_pm_cover;
+        // category & search filters are applied against resolved product metadata & fallback names below.
         $query = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
-            ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id');
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
         $this->applyActiveDocumentFilter($query, 'sales.status');
         if (!empty($allowedOutlets)) {
             $query->whereIn('sales.warehouse_id', $allowedOutlets);
@@ -10677,52 +14050,99 @@ class ReportController extends Controller
         $this->applyReportDateRange($query, $startDate, $endDate, 'sales.date');
 
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where(function ($q) use ($warehouse) {
-                if (is_numeric($warehouse)) {
-                    $q->where('sales.warehouse_id', (int)$warehouse);
-                } else {
-                    $q->where('sales.warehouse_name', $warehouse);
-                }
-            });
+            if ($warehouseId !== null) {
+                $query->where('sales.warehouse_id', $warehouseId);
+            } else {
+                $query->where('sales.warehouse_name', $warehouse);
+            }
         }
 
-        if ($category !== 'All' && !empty($category)) {
-            $query->where('products.category_name', $category);
-        }
-
-        if (!empty($search)) {
-            $query->where(function ($q) use ($search) {
-                $q->where('sale_items.product_name', 'like', "%{$search}%")
-                  ->orWhere('sale_items.product_code', 'like', "%{$search}%")
-                  ->orWhere('products.name', 'like', "%{$search}%")
-                  ->orWhere('products.code', 'like', "%{$search}%")
-                  ->orWhere('products.alternative_name', 'like', "%{$search}%");
-            });
-        }
-
-        $rawItems = $query->selectRaw("
-            sale_items.product_id,
-            COALESCE(products.code, sale_items.product_code, 'N/A') as code,
-            COALESCE(products.name, sale_items.product_name, 'Unnamed Product') as name,
-            COALESCE(products.alternative_name, '') as alternative_name,
-            COALESCE(products.category_name, 'General') as category_name,
+        // Pure numeric GROUP BY sale_items.product_id without joining product_variants/products across all rows
+        $aggItems = $query->selectRaw("
+            sale_items.product_id as product_id,
             SUM(sale_items.quantity) as units_sold,
             SUM({$netLineRevExpr}) as gross_revenue,
-            SUM({$cogsExpr}) as total_cogs
+            SUM({$explicitCogsExpr}) as total_cogs,
+            SUM({$uncostedQtyExpr}) as uncosted_qty
         ")
-        ->groupBy(
-            'sale_items.product_id',
-            DB::raw("COALESCE(products.code, sale_items.product_code, 'N/A')"),
-            DB::raw("COALESCE(products.name, sale_items.product_name, 'Unnamed Product')"),
-            DB::raw("COALESCE(products.alternative_name, '')"),
-            DB::raw("COALESCE(products.category_name, 'General')")
-        )
+        ->groupBy('sale_items.product_id')
         ->get();
+
+        // Only look up product_variant fallback costs for products that actually have uncosted lines
+        $uncostedProdIds = [];
+        foreach ($aggItems as $ar) {
+            if ((float)($ar->uncosted_qty ?? 0) > 0.0001 && (int)$ar->product_id > 0) {
+                $uncostedProdIds[] = (int)$ar->product_id;
+            }
+        }
+        $uncostedVarCogsByProd = [];
+        $uncostedCatalogQtyByProd = [];
+        if (!empty($uncostedProdIds)) {
+            $uq = DB::table('sale_items')
+                ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+                ->leftJoin('product_variants', 'sale_items.product_variant_id', '=', 'product_variants.id')
+                ->whereIn('sale_items.product_id', $uncostedProdIds)
+                ->whereRaw('COALESCE(sale_items.total_cogs, 0) = 0 AND COALESCE(sale_items.base_unit_cost, 0) = 0');
+            $this->applyActiveDocumentFilter($uq, 'sales.status');
+            if (!empty($allowedOutlets)) {
+                $uq->whereIn('sales.warehouse_id', $allowedOutlets);
+            }
+            $this->applyReportDateRange($uq, $startDate, $endDate, 'sales.date');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                if ($warehouseId !== null) {
+                    $uq->where('sales.warehouse_id', $warehouseId);
+                } else {
+                    $uq->where('sales.warehouse_name', $warehouse);
+                }
+            }
+            foreach ($uq->selectRaw("
+                sale_items.product_id,
+                SUM(CASE WHEN COALESCE(product_variants.cost_price, 0) > 0 THEN ({$saleBaseQtyExpr}) * product_variants.cost_price ELSE 0 END) as var_cost,
+                SUM(CASE WHEN COALESCE(product_variants.cost_price, 0) = 0 THEN ({$saleBaseQtyExpr}) ELSE 0 END) as catalog_qty
+            ")->groupBy('sale_items.product_id')->get() as $ur) {
+                $upid = (int)$ur->product_id;
+                $uncostedVarCogsByProd[$upid] = (float)($ur->var_cost ?? 0);
+                if ((float)($ur->catalog_qty ?? 0) > 0.0001) {
+                    $uncostedCatalogQtyByProd[$upid] = (float)$ur->catalog_qty;
+                }
+            }
+        }
 
         // Deduct active completed Sale Returns (returned qty, net revenue, and restored COGS) per product
         $retByProd = [];
         $retCogsByProd = [];
-        $retIds = [];
+        $srclByRetAndProd = [];
+        $hasSrcl = $accounting->schemaHasTable('sale_return_cost_layers') && DB::table('sale_return_cost_layers')->exists();
+        if ($hasSrcl) {
+            $srclQ = DB::table('sale_return_cost_layers')
+                ->join('sale_returns', 'sale_return_cost_layers.sale_return_id', '=', 'sale_returns.id');
+            $this->applyActiveDocumentFilter($srclQ, 'sale_returns.status');
+            if (!empty($allowedOutlets)) {
+                $srclQ->whereIn('sale_returns.warehouse_id', $allowedOutlets);
+            }
+            $this->applyReportDateRange($srclQ, $startDate, $endDate, 'sale_returns.date');
+            if ($warehouse !== 'All' && !empty($warehouse)) {
+                if ($warehouseId !== null) {
+                    $srclQ->where('sale_returns.warehouse_id', $warehouseId);
+                } else {
+                    $srclQ->where('sale_returns.warehouse_name', $warehouse);
+                }
+            }
+            foreach ($srclQ->select(
+                'sale_return_cost_layers.sale_return_id',
+                'sale_return_cost_layers.product_id',
+                DB::raw('SUM(sale_return_cost_layers.total_cost) as ret_cogs')
+            )
+                ->groupBy('sale_return_cost_layers.sale_return_id', 'sale_return_cost_layers.product_id')
+                ->get() as $srcl) {
+                $rid = (int)$srcl->sale_return_id;
+                $pid = (int)$srcl->product_id;
+                $rc = (float)$srcl->ret_cogs;
+                $srclByRetAndProd[$rid][$pid] = ($srclByRetAndProd[$rid][$pid] ?? 0.0) + $rc;
+                $retCogsByProd[$pid] = ($retCogsByProd[$pid] ?? 0.0) + $rc;
+            }
+        }
+
         $retQ = DB::table('sale_returns');
         $this->applyActiveDocumentFilter($retQ, 'status');
         if (!empty($allowedOutlets)) {
@@ -10730,22 +14150,30 @@ class ReportController extends Controller
         }
         $this->applyReportDateRange($retQ, $startDate, $endDate, 'date');
         if ($warehouse !== 'All' && !empty($warehouse)) {
-            $retQ->where(function ($q) use ($warehouse) {
-                if (is_numeric($warehouse)) {
-                    $q->where('warehouse_id', (int)$warehouse);
-                } else {
-                    $q->where('warehouse_name', $warehouse);
-                }
-            });
+            if ($warehouseId !== null) {
+                $retQ->where('warehouse_id', $warehouseId);
+            } else {
+                $retQ->where('warehouse_name', $warehouse);
+            }
         }
-        foreach ($retQ->select(['id', 'subtotal', 'discount', 'items_payload'])->cursor() as $rRow) {
-            $retIds[] = (int)$rRow->id;
+        $srSelectCols = ['id', 'subtotal', 'discount', 'items_payload'];
+        if ($accounting->schemaHasColumn('sale_returns', 'return_cost_total')) {
+            $srSelectCols[] = 'return_cost_total';
+        }
+        if ($accounting->schemaHasColumn('sale_returns', 'points_discount')) {
+            $srSelectCols[] = 'points_discount';
+        }
+        $unlayeredRetQtyByProd = [];
+        $unlayeredExplicitCogsByProd = [];
+        foreach ($retQ->select($srSelectCols)->cursor() as $rRow) {
             $itemsArr = !empty($rRow->items_payload) ? json_decode((string)$rRow->items_payload, true) : null;
             if (!is_array($itemsArr)) {
                 continue;
             }
+            $rId = (int)$rRow->id;
             $rSub  = (float)($rRow->subtotal ?? 0);
-            $rDisc = (float)($rRow->discount ?? 0);
+            $rDisc = (float)($rRow->discount ?? 0) + (float)($rRow->points_discount ?? 0);
+            $rCostTotal = (float)($rRow->return_cost_total ?? 0);
             foreach ($itemsArr as $ri) {
                 $pid = isset($ri['product_id']) ? (int)$ri['product_id'] : 0;
                 if ($pid <= 0) {
@@ -10761,25 +14189,107 @@ class ReportController extends Controller
                 }
                 $retByProd[$pid]['qty'] += $qty;
                 $retByProd[$pid]['rev'] += $netRetRev;
-            }
-        }
-        if (!empty($retIds) && $accounting->schemaHasTable('sale_return_cost_layers')) {
-            foreach (array_chunk($retIds, 400) as $idChunk) {
-                $srclRows = DB::table('sale_return_cost_layers')
-                    ->whereIn('sale_return_id', $idChunk)
-                    ->select('product_id', DB::raw('SUM(total_cost) as ret_cogs'))
-                    ->groupBy('product_id')
-                    ->get();
-                foreach ($srclRows as $srcl) {
-                    $retCogsByProd[(int)$srcl->product_id] = ($retCogsByProd[(int)$srcl->product_id] ?? 0.0) + (float)$srcl->ret_cogs;
+
+                if (!isset($srclByRetAndProd[$rId][$pid])) {
+                    $itemTotalCost = (float)($ri['total_cost'] ?? 0);
+                    $itemBaseUnitCost = (float)($ri['base_unit_cost'] ?? 0);
+                    $itemUnitCost = (float)($ri['unit_cost'] ?? $ri['cost_price'] ?? 0);
+                    $convRate = (float)($ri['conversion_rate'] ?? 1);
+                    if ($convRate <= 0) {
+                        $convRate = 1.0;
+                    }
+                    $baseQty = (float)($ri['base_quantity'] ?? 0);
+                    if ($baseQty <= 0) {
+                        $baseQty = $qty * $convRate;
+                    }
+                    if ($itemTotalCost > 0) {
+                        $unlayeredExplicitCogsByProd[$pid] = ($unlayeredExplicitCogsByProd[$pid] ?? 0.0) + $itemTotalCost;
+                    } elseif ($itemBaseUnitCost > 0) {
+                        $unlayeredExplicitCogsByProd[$pid] = ($unlayeredExplicitCogsByProd[$pid] ?? 0.0) + ($baseQty * $itemBaseUnitCost);
+                    } elseif ($itemUnitCost > 0) {
+                        $unlayeredExplicitCogsByProd[$pid] = ($unlayeredExplicitCogsByProd[$pid] ?? 0.0) + ($qty * $itemUnitCost);
+                    } elseif ($rCostTotal > 0 && $rSub > 0.0001) {
+                        $unlayeredExplicitCogsByProd[$pid] = ($unlayeredExplicitCogsByProd[$pid] ?? 0.0) + ($rCostTotal * ($sub / $rSub));
+                    } elseif ($baseQty > 0) {
+                        $unlayeredRetQtyByProd[$pid] = ($unlayeredRetQtyByProd[$pid] ?? 0.0) + $baseQty;
+                    }
                 }
             }
         }
 
-        $totalRevenue = 0.0;
-        $totalCogs = 0.0;
-        $totalProfit = 0.0;
-        $totalUnits = 0.0;
+        // Batch-fetch product display metadata + cost fallback in 1 slim query
+        $allProdIds = array_values(array_unique(array_merge(
+            $aggItems->pluck('product_id')->map(fn ($v) => (int)$v)->filter(fn ($v) => $v > 0)->all(),
+            array_keys($retByProd),
+            array_keys($retCogsByProd)
+        )));
+        $prodMetaMap = [];
+        if (!empty($allProdIds)) {
+            $metaCols = ['id', 'code', 'name', 'alternative_name', 'category_name', 'cost_price', 'purchase_price'];
+            if (count($allProdIds) <= 400) {
+                foreach (DB::table('products')->whereIn('id', $allProdIds)->get($metaCols) as $pm) {
+                    $prodMetaMap[(int)$pm->id] = $pm;
+                }
+            } else {
+                foreach (DB::table('products')->get($metaCols) as $pm) {
+                    $prodMetaMap[(int)$pm->id] = $pm;
+                }
+            }
+        }
+
+        // Apply unlayered return COGS fallback using explicit payload/header cost or product catalog cost
+        foreach ($unlayeredExplicitCogsByProd as $pid => $exCost) {
+            $retCogsByProd[$pid] = ($retCogsByProd[$pid] ?? 0.0) + $exCost;
+        }
+        foreach ($unlayeredRetQtyByProd as $pid => $uQty) {
+            $pm = $prodMetaMap[$pid] ?? null;
+            $unitCostFallback = $pm
+                ? ((float)($pm->cost_price ?? 0) > 0 ? (float)$pm->cost_price : (float)($pm->purchase_price ?? 0))
+                : 0.0;
+            if ($unitCostFallback > 0) {
+                $retCogsByProd[$pid] = ($retCogsByProd[$pid] ?? 0.0) + ($uQty * $unitCostFallback);
+            }
+        }
+
+        // Fetch fallback display names ONLY for deleted/unlinked product IDs missing from products table
+        $missingMetaIds = [];
+        foreach ($aggItems as $row) {
+            $pid = (int)$row->product_id;
+            if ($pid <= 0 || !isset($prodMetaMap[$pid])) {
+                $missingMetaIds[] = $pid;
+            }
+        }
+        $fallbackMetaMap = [];
+        if (!empty($missingMetaIds)) {
+            foreach (DB::table('sale_items')
+                ->whereIn('product_id', array_values(array_unique($missingMetaIds)))
+                ->selectRaw("product_id, MAX(COALESCE(product_code, 'N/A')) as fallback_code, MAX(COALESCE(product_name, 'Unnamed Product')) as fallback_name")
+                ->groupBy('product_id')
+                ->get() as $fm) {
+                $fallbackMetaMap[(int)$fm->product_id] = $fm;
+            }
+        }
+
+        $rawItems = $aggItems->map(function ($row) use ($prodMetaMap, $fallbackMetaMap, $uncostedVarCogsByProd, $uncostedCatalogQtyByProd) {
+            $pid = (int)$row->product_id;
+            $pm = $pid > 0 ? ($prodMetaMap[$pid] ?? null) : null;
+            $fm = $fallbackMetaMap[$pid] ?? null;
+            $catalogUnitCost = $pm
+                ? ((float)($pm->cost_price ?? 0) > 0 ? (float)$pm->cost_price : (float)($pm->purchase_price ?? 0))
+                : 0.0;
+            $fallbackCost = ($uncostedVarCogsByProd[$pid] ?? 0.0)
+                + (($uncostedCatalogQtyByProd[$pid] ?? 0.0) * $catalogUnitCost);
+            return (object)[
+                'product_id'       => $pid,
+                'code'             => $pm ? ($pm->code ?: ($fm->fallback_code ?? 'N/A')) : ($fm->fallback_code ?? 'N/A'),
+                'name'             => $pm ? ($pm->name ?: ($fm->fallback_name ?? 'Unnamed Product')) : ($fm->fallback_name ?? 'Unnamed Product'),
+                'alternative_name' => $pm ? (string)($pm->alternative_name ?? '') : '',
+                'category_name'    => $pm ? ($pm->category_name ?: 'General') : 'General',
+                'units_sold'       => $row->units_sold,
+                'gross_revenue'    => $row->gross_revenue,
+                'total_cogs'       => (float)$row->total_cogs + $fallbackCost,
+            ];
+        });
 
         $adjustedRaw = [];
         $seenMarginProdIds = [];
@@ -10804,11 +14314,6 @@ class ReportController extends Controller
             $rev = round($rawGrossRev - $dedRev, 2);
             $cg = round($rawCogs - $dedCogs, 2);
 
-            $totalRevenue += $rev;
-            $totalCogs += $cg;
-            $totalProfit += ($rev - $cg);
-            $totalUnits += $uSold;
-
             $adjustedRaw[] = (object)[
                 'product_id'       => $it->product_id,
                 'code'             => $it->code,
@@ -10824,11 +14329,8 @@ class ReportController extends Controller
         // Surface products that experienced returns in this period despite zero gross sales
         $retOnlyIds = array_values(array_diff(array_keys($retByProd), array_keys($seenMarginProdIds)));
         if (!empty($retOnlyIds)) {
-            $retProducts = DB::table('products')->whereIn('id', $retOnlyIds)
-                ->get(['id', 'code', 'name', 'alternative_name', 'category_name'])
-                ->keyBy('id');
             foreach ($retOnlyIds as $rPid) {
-                $pObj = $retProducts->get($rPid);
+                $pObj = $prodMetaMap[$rPid] ?? null;
                 if (!empty($search) && $pObj) {
                     $sq = strtolower($search);
                     if (!str_contains(strtolower((string)$pObj->name), $sq)
@@ -10837,7 +14339,7 @@ class ReportController extends Controller
                         continue;
                     }
                 }
-                if ($category !== 'All' && !empty($category) && $pObj && (string)$pObj->category_name !== (string)$category) {
+                if ($category !== 'All' && !empty($category) && (!$pObj || (string)$pObj->category_name !== (string)$category)) {
                     continue;
                 }
                 $rInfo = $retByProd[$rPid];
@@ -10845,10 +14347,6 @@ class ReportController extends Controller
                 $uSold = -round((float)$rInfo['qty'], 4);
                 $rev = -round((float)$rInfo['rev'], 2);
                 $cg = -$rCg;
-                $totalRevenue += $rev;
-                $totalCogs += $cg;
-                $totalProfit += ($rev - $cg);
-                $totalUnits += $uSold;
                 $adjustedRaw[] = (object)[
                     'product_id'       => $rPid,
                     'code'             => $pObj->code ?? 'N/A',
@@ -10862,34 +14360,67 @@ class ReportController extends Controller
             }
         }
 
-        $items = [];
+        // Filter by margin_health if requested & accumulate filtered accounting totals
+        $totalRevenue = 0.0;
+        $totalCogs = 0.0;
+        $totalProfit = 0.0;
+        $totalUnits = 0.0;
+        $preItems = [];
         foreach ($adjustedRaw as $it) {
+            if ($category !== 'All' && !empty($category) && (string)$it->category_name !== (string)$category) {
+                continue;
+            }
+            if (!empty($search)) {
+                $sq = mb_strtolower($search);
+                $hay = mb_strtolower((string)$it->name . ' ' . (string)$it->code . ' ' . (string)$it->alternative_name);
+                if (!str_contains($hay, $sq)) {
+                    continue;
+                }
+            }
             $rev = (float)$it->gross_revenue;
             $cg = (float)$it->total_cogs;
             $uSold = (float)$it->units_sold;
             $gp = $rev - $cg;
             $marginPct = $rev > 0 ? round(($gp / $rev) * 100, 2) : 0.0;
             $markupPct = $cg > 0 ? round(($gp / $cg) * 100, 2) : 0.0;
-            $contribPct = $totalProfit > 0 ? round(($gp / $totalProfit) * 100, 2) : 0.0;
-            $avgPrice = $uSold > 0 ? round($rev / $uSold, 2) : 0.0;
-            $avgCost = $uSold > 0 ? round($cg / $uSold, 2) : 0.0;
+            $isLoss = $gp < -0.005 || $marginPct < 0.0;
 
-            $items[] = [
+            if ($marginHealth === 'high' && ($isLoss || $marginPct < 30.0)) {
+                continue;
+            } elseif ($marginHealth === 'moderate' && ($isLoss || $marginPct < 15.0 || $marginPct >= 30.0)) {
+                continue;
+            } elseif ($marginHealth === 'low' && ($isLoss || $marginPct >= 15.0)) {
+                continue;
+            } elseif ($marginHealth === 'negative' && !$isLoss) {
+                continue;
+            }
+
+            $totalRevenue += $rev;
+            $totalCogs += $cg;
+            $totalProfit += $gp;
+            $totalUnits += $uSold;
+
+            $preItems[] = [
                 'product_id' => $it->product_id,
                 'code' => $it->code,
                 'name' => $it->name,
                 'alternative_name' => (string)($it->alternative_name ?? ''),
                 'category_name' => $it->category_name,
                 'units_sold' => $uSold,
-                'avg_selling_price' => $avgPrice,
-                'avg_cost_price' => $avgCost,
+                'avg_selling_price' => $uSold > 0 ? round($rev / $uSold, 2) : 0.0,
+                'avg_cost_price' => $uSold > 0 ? round($cg / $uSold, 2) : 0.0,
                 'gross_revenue' => round($rev, 2),
                 'cogs' => round($cg, 2),
                 'gross_profit' => round($gp, 2),
                 'gross_margin_pct' => $marginPct,
                 'markup_pct' => $markupPct,
-                'contribution_pct' => $contribPct,
             ];
+        }
+
+        $items = [];
+        foreach ($preItems as $row) {
+            $row['contribution_pct'] = $totalProfit > 0 ? round(($row['gross_profit'] / $totalProfit) * 100, 2) : 0.0;
+            $items[] = $row;
         }
 
         usort($items, function ($a, $b) use ($canViewCost) {
@@ -10917,7 +14448,30 @@ class ReportController extends Controller
             }, $pagedItems);
         }
 
-        return $this->noStoreJson([
+        $availableFilters = null;
+        if (!$skipSummary) {
+            $whListQ = DB::table('outlets')->orderBy('name');
+            if (!empty($allowedOutlets)) {
+                $whListQ->whereIn('id', $allowedOutlets);
+            }
+            $availWarehouses = $whListQ->pluck('name')->filter(fn ($v) => !empty($v))->values()->all();
+            $availCategories = DB::table('products')
+                ->whereNull('deleted_at')
+                ->whereNotNull('category_name')
+                ->where('category_name', '!=', '')
+                ->distinct()
+                ->orderBy('category_name')
+                ->pluck('category_name')
+                ->values()
+                ->all();
+            $availableFilters = [
+                'warehouses' => $availWarehouses,
+                'categories' => $availCategories,
+                'health_levels' => ['All', 'high', 'moderate', 'low', 'negative'],
+            ];
+        }
+
+        $payload = [
             'status' => 'success',
             'cost_masked' => !$canViewCost,
             'summary' => [
@@ -10932,6 +14486,7 @@ class ReportController extends Controller
                 'end_date' => $endDate ?? '',
                 'warehouse' => $warehouse,
                 'category' => $category,
+                'margin_health' => $marginHealth,
             ],
             'data' => $pagedItems,
             'pagination' => [
@@ -10941,7 +14496,12 @@ class ReportController extends Controller
                 'total'        => $totalProducts,
                 'has_more'     => $hasMore,
             ],
-        ]);
+        ];
+        if ($availableFilters !== null) {
+            $payload['available_filters'] = $availableFilters;
+        }
+
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -10960,69 +14520,104 @@ class ReportController extends Controller
 
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
 
         // Resolve outlet/warehouse ID if specified
         $warehouseId = null;
+        $unmatchedExplicitWh = false;
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $matchedOutlet = DB::table('outlets')
                 ->where('name', $warehouse)
-                ->orWhere('id', $warehouse)
+                ->when(is_numeric($warehouse), fn($q) => $q->orWhere('id', (int)$warehouse))
                 ->first();
             if ($matchedOutlet) {
                 $warehouseId = $matchedOutlet->id;
                 $warehouse = $matchedOutlet->name;
+            } else {
+                $unmatchedExplicitWh = true;
             }
         }
-        if (!empty($allowedOutlets) && $warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)) {
+        if (!empty($allowedOutlets) && ($unmatchedExplicitWh || ($warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)))) {
             return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
         }
 
-        // Get last sale date per product (completed active sales only; Draft/Pending/Voided must NOT reset idle timer)
-        $saleQuery = DB::table('sale_items')
-            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->select('sale_items.product_id', DB::raw('MAX(sales.date) as last_sale_date'));
-        $this->applyActiveDocumentFilter($saleQuery, 'sales.status');
-        if (!empty($allowedOutlets)) {
-            $saleQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+        $buildAvailableFilters = function () use ($allowedOutlets) {
+            $whs = DB::table('outlets')
+                ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('id', $allowedOutlets))
+                ->orderBy('name')
+                ->pluck('name')
+                ->map(fn($n) => trim((string)$n))
+                ->filter(fn($n) => $n !== '')
+                ->unique()
+                ->values()
+                ->all();
+            $cats = DB::table('products')
+                ->whereNull('deleted_at')
+                ->whereNotNull('category_name')
+                ->where('category_name', '!=', '')
+                ->distinct()
+                ->orderBy('category_name')
+                ->pluck('category_name')
+                ->map(fn($n) => trim((string)$n))
+                ->filter(fn($n) => $n !== '')
+                ->unique()
+                ->values()
+                ->all();
+            return [
+                'warehouses' => $whs,
+                'categories' => $cats,
+                'velocity_statuses' => ['All', 'dead', 'slow', 'critical'],
+            ];
+        };
+
+        if ($unmatchedExplicitWh) {
+            $emptyPayload = [
+                'status' => 'success',
+                'cost_masked' => !$canViewCost,
+                'summary' => [
+                    'cost_masked' => !$canViewCost,
+                    'total_dead_products' => 0,
+                    'total_dead_units' => 0.0,
+                    'total_tied_up_capital' => 0.0,
+                    'slow_moving_capital' => 0.0,
+                    'dead_stock_capital' => 0.0,
+                    'total_potential_revenue' => 0.0,
+                    'threshold_days' => $daysInactive,
+                    'as_of_date' => Carbon::today()->toDateString(),
+                    'warehouse' => $warehouse,
+                ],
+                'data' => [],
+                'pagination' => [
+                    'current_page' => $page,
+                    'last_page'    => 1,
+                    'per_page'     => $perPage,
+                    'total'        => 0,
+                    'has_more'     => false,
+                ],
+            ];
+            if (!$skipSummary) {
+                $emptyPayload['available_filters'] = $buildAvailableFilters();
+            }
+            return $this->noStoreJson($emptyPayload);
         }
 
-        if ($warehouseId !== null) {
-            $saleQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                $q->where('sales.warehouse_id', $warehouseId)
-                  ->orWhere('sales.warehouse_name', $warehouse);
-            });
-        }
-
-        $lastSales = $saleQuery->groupBy('sale_items.product_id')
-            ->pluck('last_sale_date', 'product_id');
-
-        $variantAvgSub = DB::table('product_variants')
-            ->selectRaw('product_id, AVG(CASE WHEN cost_price > 0 THEN cost_price ELSE NULL END) as avg_cost, AVG(CASE WHEN selling_price > 0 THEN selling_price ELSE NULL END) as avg_sell')
-            ->groupBy('product_id');
-
+        // 1. Fetch ONLY compact numeric columns using covering index idx_prod_ds_cover (defer 8 VARCHAR columns to paged 50 rows!)
         $prodQuery = DB::table('products')
-            ->leftJoinSub($variantAvgSub, 'pv_avg', 'pv_avg.product_id', '=', 'products.id')
             ->whereNull('products.deleted_at');
 
         $selectFields = [
             'products.id',
-            'products.code',
-            'products.sku',
-            'products.barcode',
-            'products.name',
-            'products.alternative_name',
-            'products.category_name',
-            'products.brand_name',
-            'products.unit_name',
-            DB::raw('COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), pv_avg.avg_cost, 0) as cost_price'),
-            DB::raw('COALESCE(NULLIF(products.selling_price, 0), NULLIF(products.retail_price, 0), pv_avg.avg_sell, 0) as selling_price'),
+            'products.has_variants',
+            'products.cost_price',
+            'products.purchase_price',
+            'products.selling_price',
+            'products.retail_price',
             'products.created_at',
         ];
 
         if ($warehouseId !== null || !empty($allowedOutlets)) {
-            // Group stock_balances per product to aggregate all variants and avoid duplicate product rows
             $warehouseStockSub = DB::table('stock_balances')
                 ->when($warehouseId !== null, fn($q) => $q->where('warehouse_id', $warehouseId))
                 ->when($warehouseId === null && !empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
@@ -11057,48 +14652,212 @@ class ReportController extends Controller
 
         $products = $prodQuery->select($selectFields)->get();
 
+        if ($products->isEmpty()) {
+            $emptyPayload = [
+                'status' => 'success',
+                'cost_masked' => !$canViewCost,
+                'summary' => [
+                    'cost_masked' => !$canViewCost,
+                    'total_dead_products' => 0,
+                    'total_dead_units' => 0.0,
+                    'total_tied_up_capital' => 0.0,
+                    'slow_moving_capital' => 0.0,
+                    'dead_stock_capital' => 0.0,
+                    'total_potential_revenue' => 0.0,
+                    'threshold_days' => $daysInactive,
+                    'as_of_date' => Carbon::today()->toDateString(),
+                    'warehouse' => $warehouse,
+                ],
+                'data' => [],
+                'pagination' => [
+                    'current_page' => $page,
+                    'last_page'    => 1,
+                    'per_page'     => $perPage,
+                    'total'        => 0,
+                    'has_more'     => false,
+                ],
+            ];
+            if (!$skipSummary) {
+                $emptyPayload['available_filters'] = $buildAvailableFilters();
+            }
+            return $this->noStoreJson($emptyPayload);
+        }
+
+        $allProductIds = [];
+        $variantTargetIds = [];
+        foreach ($products as $p) {
+            $pid = (int)$p->id;
+            $allProductIds[] = $pid;
+            $needsVariantMeta = !empty($p->has_variants)
+                || ((float)($p->cost_price ?? 0) <= 0 && (float)($p->purchase_price ?? 0) <= 0)
+                || ((float)($p->selling_price ?? 0) <= 0 && (float)($p->retail_price ?? 0) <= 0);
+            if ($needsVariantMeta) {
+                $variantTargetIds[] = $pid;
+            }
+        }
+        $narrowIds = count($allProductIds) <= 500 ? $allProductIds : null;
+
+        // 2. Last sale date per product (completed active sales only; Draft/Pending/Voided must NOT reset idle timer)
+        $saleQuery = DB::table('sale_items')
+            ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->select('sale_items.product_id', DB::raw('MAX(sales.date) as last_sale_date'));
+        $this->applyActiveDocumentFilter($saleQuery, 'sales.status');
+        if ($narrowIds !== null) {
+            $saleQuery->whereIn('sale_items.product_id', $narrowIds);
+        }
+        if (!empty($allowedOutlets)) {
+            $saleQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+        }
+        if ($warehouseId !== null) {
+            $saleQuery->where(function ($q) use ($warehouseId, $warehouse) {
+                $q->where('sales.warehouse_id', $warehouseId)
+                  ->orWhere(function ($legacy) use ($warehouse) {
+                      $legacy->whereNull('sales.warehouse_id')->where('sales.warehouse_name', $warehouse);
+                  });
+            });
+        }
+        $lastSales = $saleQuery->groupBy('sale_items.product_id')->pluck('last_sale_date', 'product_id');
+
+        // 3. Active non-deleted variant cost/retail fallback & quantity-weighted variant stock valuation (ONLY if needed!)
+        $variantFallback = [];
+        if (!empty($variantTargetIds) && $accounting->schemaHasTable('product_variants')) {
+            $pvQ = DB::table('product_variants')->whereNull('deleted_at');
+            if (count($variantTargetIds) <= 500) {
+                $pvQ->whereIn('product_id', $variantTargetIds);
+            }
+            foreach ($pvQ
+                ->selectRaw('product_id, AVG(CASE WHEN cost_price > 0 THEN cost_price ELSE NULL END) as avg_cost, AVG(CASE WHEN selling_price > 0 THEN selling_price ELSE NULL END) as avg_sell')
+                ->groupBy('product_id')
+                ->get() as $pvRow) {
+                $variantFallback[(int)$pvRow->product_id] = [
+                    'avg_cost' => (float)($pvRow->avg_cost ?? 0.0),
+                    'avg_sell' => (float)($pvRow->avg_sell ?? 0.0),
+                ];
+            }
+
+            if ($accounting->schemaHasTable('stock_balances')) {
+                $wbVarQuery = DB::table('stock_balances as sb')
+                    ->join('product_variants as pv', 'pv.id', '=', 'sb.product_variant_id')
+                    ->whereNull('pv.deleted_at')
+                    ->where('sb.quantity', '>', 0);
+                if (count($variantTargetIds) <= 500) {
+                    $wbVarQuery->whereIn('sb.product_id', $variantTargetIds);
+                }
+                if ($warehouseId !== null) {
+                    $wbVarQuery->where('sb.warehouse_id', $warehouseId);
+                } elseif (!empty($allowedOutlets)) {
+                    $wbVarQuery->whereIn('sb.warehouse_id', $allowedOutlets);
+                }
+                foreach ($wbVarQuery
+                    ->selectRaw('sb.product_id, SUM(sb.quantity) as v_qty, SUM(sb.quantity * COALESCE(NULLIF(pv.cost_price, 0), 0)) as v_cost_val, SUM(sb.quantity * COALESCE(NULLIF(pv.selling_price, 0), 0)) as v_sell_val')
+                    ->groupBy('sb.product_id')
+                    ->get() as $wvr) {
+                    $vQty = (float)($wvr->v_qty ?? 0.0);
+                    if ($vQty > 0.0001) {
+                        $pid = (int)$wvr->product_id;
+                        $wCost = (float)($wvr->v_cost_val ?? 0.0) / $vQty;
+                        $wSell = (float)($wvr->v_sell_val ?? 0.0) / $vQty;
+                        if ($wCost > 0) $variantFallback[$pid]['avg_cost'] = $wCost;
+                        if ($wSell > 0) $variantFallback[$pid]['avg_sell'] = $wSell;
+                    }
+                }
+            }
+        }
+
+        // 4. Authoritative IAS 2 FIFO remaining batch subledger per product (reconciles Tied-Up Capital with Stock Valuation)
+        $fifoByProduct = [];
+        if ($accounting->schemaHasTable('inventory_batches')) {
+            $fifoQ = DB::table('inventory_batches')
+                ->where('status', 'active')
+                ->where('remaining_quantity', '>', 0.0001);
+            if ($narrowIds !== null) {
+                $fifoQ->whereIn('product_id', $narrowIds);
+            }
+            if ($warehouseId !== null) {
+                $fifoQ->where('warehouse_id', $warehouseId);
+            } elseif (!empty($allowedOutlets)) {
+                $fifoQ->whereIn('warehouse_id', $allowedOutlets);
+            }
+            foreach ($fifoQ
+                ->selectRaw('product_id, SUM(remaining_quantity) as fifo_qty, SUM(remaining_quantity * unit_cost) as fifo_val')
+                ->groupBy('product_id')
+                ->get() as $fb) {
+                $fifoByProduct[(int)$fb->product_id] = [
+                    'qty' => (float)$fb->fifo_qty,
+                    'val' => (float)$fb->fifo_val,
+                ];
+            }
+        }
+
         $items = [];
         $totalTiedUpCapital = 0.0;
         $totalDeadUnits = 0.0;
         $slowMovingCapital = 0.0;
         $deadStockCapital = 0.0;
         $totalPotentialRevenue = 0.0;
-        $nowTs = time();
-        $nowDate = date('Y-m-d');
+        $todayMidnight = Carbon::today();
+        $nowDate = $todayMidnight->toDateString();
+        $todayUtcEpoch = strtotime($nowDate . ' UTC');
 
         foreach ($products as $p) {
-            $pId = $p->id;
+            $pId = (int)$p->id;
             $lastSaleRaw = $lastSales[$pId] ?? null;
 
             $daysSince = 999;
             $lastSaleFormatted = 'Never Sold';
 
             if ($lastSaleRaw) {
-                $lastDateStr = substr($lastSaleRaw, 0, 10);
+                $lastDateStr = substr((string)$lastSaleRaw, 0, 10);
                 $lastSaleFormatted = $lastDateStr;
-                $lastTs = strtotime($lastDateStr);
-                $daysSince = $lastTs ? (int) max(0, floor(($nowTs - $lastTs) / 86400)) : 999;
+                $lastEpoch = strtotime($lastDateStr . ' UTC');
+                $daysSince = $lastEpoch !== false ? max(0, (int)(($todayUtcEpoch - $lastEpoch) / 86400)) : 999;
             } else {
-                $createDateStr = substr($p->created_at ?: $nowDate, 0, 10);
-                $createTs = strtotime($createDateStr);
-                $daysSince = $createTs ? (int) max(0, floor(($nowTs - $createTs) / 86400)) : 999;
+                $createDateStr = substr((string)($p->created_at ?: $nowDate), 0, 10);
+                $createEpoch = strtotime($createDateStr . ' UTC');
+                $daysSince = $createEpoch !== false ? max(0, (int)(($todayUtcEpoch - $createEpoch) / 86400)) : 999;
             }
 
             if ($daysSince >= $daysInactive) {
                 $qty = (float)($p->stock_quantity ?? 0);
-                $cost = (float)($p->cost_price ?? 0);
-                $retail = (float)($p->selling_price ?? 0);
-                $capital = $qty * $cost;
+                $pvMeta = $variantFallback[$pId] ?? ['avg_cost' => 0.0, 'avg_sell' => 0.0];
+                $pCost = (float)($p->cost_price ?? 0) > 0
+                    ? (float)$p->cost_price
+                    : ((float)($p->purchase_price ?? 0) > 0 ? (float)$p->purchase_price : $pvMeta['avg_cost']);
+                if (!empty($p->has_variants) && $pvMeta['avg_cost'] > 0) {
+                    $pCost = $pvMeta['avg_cost'];
+                }
+
+                $retail = (float)($p->selling_price ?? 0) > 0
+                    ? (float)$p->selling_price
+                    : ((float)($p->retail_price ?? 0) > 0 ? (float)$p->retail_price : $pvMeta['avg_sell']);
+                if (!empty($p->has_variants) && $pvMeta['avg_sell'] > 0) {
+                    $retail = $pvMeta['avg_sell'];
+                }
+
+                $fb = $fifoByProduct[$pId] ?? null;
+                if ($fb !== null && $fb['qty'] > 0.0001 && $qty > 0.0001) {
+                    $coveredQty = min($qty, $fb['qty']);
+                    $unbatchedQty = max(0.0, $qty - $fb['qty']);
+                    $avgFifoCost = $fb['val'] / $fb['qty'];
+                    $capital = ($coveredQty * $avgFifoCost) + ($unbatchedQty * $pCost);
+                    $cost = $capital / $qty;
+                } else {
+                    $cost = $pCost;
+                    $capital = $qty * $cost;
+                }
                 $revenue = $qty * $retail;
 
                 $isDead = ($daysSince >= 90);
+                $isCritical = ($daysSince >= 180 || ($lastSaleRaw === null && $daysSince >= 120));
                 $velocityStatus = $isDead ? 'dead' : 'slow';
 
-                // Check velocity status filter
                 if ($velocityStatusFilter === 'dead' && !$isDead) {
                     continue;
                 }
                 if ($velocityStatusFilter === 'slow' && $isDead) {
+                    continue;
+                }
+                if ($velocityStatusFilter === 'critical' && !$isCritical) {
                     continue;
                 }
 
@@ -11112,9 +14871,8 @@ class ReportController extends Controller
                     $slowMovingCapital += $capital;
                 }
 
-                // Dynamic strategic recommendations based on idle duration & sales velocity
                 $action = 'Promotional Discount (15% Off)';
-                if ($daysSince >= 180 || ($lastSaleRaw === null && $daysSince >= 120)) {
+                if ($isCritical) {
                     $action = 'Clearance / Liquidation (50% Off)';
                 } elseif ($daysSince >= 90) {
                     $action = 'Bundle Promo / Markdown (30% Off)';
@@ -11124,15 +14882,6 @@ class ReportController extends Controller
 
                 $items[] = [
                     'product_id' => $pId,
-                    'code' => $p->code ?? '',
-                    'sku' => $p->sku ?: ($p->code ?? ''),
-                    'barcode' => $p->barcode ?? '',
-                    'name' => $p->name ?? '',
-                    'alternative_name' => (string)($p->alternative_name ?? ''),
-                    'category_name' => $p->category_name ?? 'General',
-                    'brand_name' => $p->brand_name ?? '',
-                    'warehouse_name' => $warehouse !== 'All' ? $warehouse : 'All Outlets & Warehouses',
-                    'unit_name' => $p->unit_name ?? 'Pcs',
                     'stock_quantity' => round($qty, 2),
                     'cost_price' => round($cost, 2),
                     'selling_price' => round($retail, 2),
@@ -11155,17 +14904,52 @@ class ReportController extends Controller
         $totalDeadProducts = count($items);
         $lastPage = max(1, (int)ceil($totalDeadProducts / max(1, $perPage)));
         $offset = ($page - 1) * $perPage;
-        $pagedItems = array_slice($items, $offset, $perPage);
-        $hasMore = ($offset + count($pagedItems)) < $totalDeadProducts;
-        if (!$canViewCost) {
-            $pagedItems = array_map(function ($row) {
-                $masked = $this->maskAssocNumericKeys($row, ['cost_price', 'tied_up_capital'], null);
+        $slicedItems = array_slice($items, $offset, $perPage);
+        $hasMore = ($offset + count($slicedItems)) < $totalDeadProducts;
+
+        // Hydrate VARCHAR display metadata ONLY for the <= 50 sliced page products
+        $pagedIds = array_column($slicedItems, 'product_id');
+        $prodMetaMap = !empty($pagedIds)
+            ? DB::table('products')
+                ->whereIn('id', $pagedIds)
+                ->get(['id', 'code', 'sku', 'barcode', 'name', 'alternative_name', 'category_name', 'brand_name', 'unit_name'])
+                ->keyBy('id')
+            : collect();
+
+        $whLabel = $warehouse !== 'All' ? $warehouse : 'All Outlets & Warehouses';
+        $pagedItems = array_map(function ($row) use ($prodMetaMap, $whLabel, $canViewCost) {
+            $meta = $prodMetaMap->get($row['product_id']);
+            $code = (string)($meta->code ?? '');
+            $hydrated = [
+                'product_id' => $row['product_id'],
+                'code' => $code,
+                'sku' => !empty($meta->sku) ? (string)$meta->sku : $code,
+                'barcode' => (string)($meta->barcode ?? ''),
+                'name' => (string)($meta->name ?? ''),
+                'alternative_name' => (string)($meta->alternative_name ?? ''),
+                'category_name' => !empty($meta->category_name) ? (string)$meta->category_name : 'General',
+                'brand_name' => (string)($meta->brand_name ?? ''),
+                'warehouse_name' => $whLabel,
+                'unit_name' => !empty($meta->unit_name) ? (string)$meta->unit_name : 'Pcs',
+                'stock_quantity' => $row['stock_quantity'],
+                'cost_price' => $row['cost_price'],
+                'selling_price' => $row['selling_price'],
+                'tied_up_capital' => $row['tied_up_capital'],
+                'potential_revenue' => $row['potential_revenue'],
+                'days_inactive' => $row['days_inactive'],
+                'last_sale_date' => $row['last_sale_date'],
+                'velocity_status' => $row['velocity_status'],
+                'recommended_action' => $row['recommended_action'],
+            ];
+            if (!$canViewCost) {
+                $masked = $this->maskAssocNumericKeys($hydrated, ['cost_price', 'tied_up_capital'], null);
                 $masked['cost_masked'] = true;
                 return $masked;
-            }, $pagedItems);
-        }
+            }
+            return $hydrated;
+        }, $slicedItems);
 
-        return $this->noStoreJson([
+        $payload = [
             'status' => 'success',
             'cost_masked' => !$canViewCost,
             'summary' => [
@@ -11177,8 +14961,9 @@ class ReportController extends Controller
                 'dead_stock_capital' => $canViewCost ? round($deadStockCapital, 2) : 0.0,
                 'total_potential_revenue' => round($totalPotentialRevenue, 2),
                 'threshold_days' => $daysInactive,
-                'as_of_date' => Carbon::today()->toDateString(),
+                'as_of_date' => $nowDate,
                 'warehouse' => $warehouse,
+                'velocity_status' => $velocityStatusFilter,
             ],
             'data' => $pagedItems,
             'pagination' => [
@@ -11188,7 +14973,11 @@ class ReportController extends Controller
                 'total'        => $totalDeadProducts,
                 'has_more'     => $hasMore,
             ],
-        ]);
+        ];
+        if (!$skipSummary) {
+            $payload['available_filters'] = $buildAvailableFilters();
+        }
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -11206,23 +14995,45 @@ class ReportController extends Controller
 
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
+        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
 
         $allowedOutlets = $this->extractAllowedOutletIds($request);
 
         $warehouseId = null;
+        $unmatchedExplicitWh = false;
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $matchedOutlet = DB::table('outlets')
                 ->where('name', $warehouse)
-                ->orWhere('id', $warehouse)
+                ->when(is_numeric($warehouse), fn($q) => $q->orWhere('id', (int)$warehouse))
                 ->first();
             if ($matchedOutlet) {
                 $warehouseId = $matchedOutlet->id;
                 $warehouse = $matchedOutlet->name;
+            } else {
+                $unmatchedExplicitWh = true;
             }
         }
-        if (!empty($allowedOutlets) && $warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)) {
+        if (!empty($allowedOutlets) && ($unmatchedExplicitWh || ($warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)))) {
             return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
         }
+
+        $applyWhScope = function ($q, string $table = '') use ($warehouseId, $warehouse) {
+            if ($warehouse === 'All' || empty($warehouse)) {
+                return;
+            }
+            $idCol = $table !== '' ? "{$table}.warehouse_id" : 'warehouse_id';
+            $nameCol = $table !== '' ? "{$table}.warehouse_name" : 'warehouse_name';
+            $q->where(function ($sub) use ($idCol, $nameCol, $warehouseId, $warehouse) {
+                if ($warehouseId !== null) {
+                    $sub->where($idCol, $warehouseId)
+                        ->orWhere(function ($legacy) use ($idCol, $nameCol, $warehouse) {
+                            $legacy->whereNull($idCol)->where($nameCol, $warehouse);
+                        });
+                } else {
+                    $sub->where($nameCol, $warehouse);
+                }
+            });
+        };
 
         $query = DB::table('sales');
         $this->applyReportDateRange($query, $startDate, $endDate, 'date');
@@ -11230,17 +15041,7 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $query->whereIn('sales.warehouse_id', $allowedOutlets);
         }
-
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $query->where(function ($q) use ($warehouseId, $warehouse) {
-                if ($warehouseId !== null) {
-                    $q->where('sales.warehouse_id', $warehouseId)
-                      ->orWhere('sales.warehouse_name', $warehouse);
-                } else {
-                    $q->where('sales.warehouse_name', $warehouse);
-                }
-            });
-        }
+        $applyWhScope($query, 'sales');
 
         if (!empty($search)) {
             $query->where(function ($q) use ($search) {
@@ -11252,10 +15053,23 @@ class ReportController extends Controller
         }
 
         $saleCashCond = "(LOWER(TRIM(COALESCE(payment_type, ''))) LIKE '%cash%' AND LOWER(TRIM(COALESCE(payment_type, ''))) NOT LIKE '%non%cash%' AND LOWER(TRIM(COALESCE(payment_type, ''))) NOT LIKE '%cashless%')";
-        $cashiers = $query->selectRaw("
-            COALESCE(user_name, created_by, 'Unknown Staff') as cashier_name,
-            COALESCE(user_role, 'Cashier') as role,
-            COALESCE(warehouse_name, 'Main Branch Outlet') as warehouse_name,
+        $noPayRowsSql = "NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.sale_id = sales.id)";
+        $normNameWh = function (?string $userName, ?string $createdBy, ?string $warehouseName): array {
+            $u = trim((string)($userName ?? ''));
+            $c = trim((string)($createdBy ?? ''));
+            $w = trim((string)($warehouseName ?? ''));
+            return [
+                $u !== '' ? $u : ($c !== '' ? $c : 'Unknown Staff'),
+                $w !== '' ? $w : 'Main Branch Outlet',
+            ];
+        };
+
+        $cashiers = collect();
+        foreach ($query->selectRaw("
+            user_name,
+            created_by,
+            warehouse_name,
+            COALESCE(MAX(NULLIF(TRIM(user_role), '')), 'Cashier') as role,
             COUNT(id) as total_bills,
             SUM(grand_total) as net_revenue,
             SUM(paid_amount) as total_collected,
@@ -11263,67 +15077,222 @@ class ReportController extends Controller
             SUM(discount) as total_discount,
             SUM(tax_amount) as total_tax,
             SUM(subtotal) as total_subtotal,
-            SUM(CASE WHEN {$saleCashCond} THEN paid_amount ELSE 0 END) as fallback_cash,
-            SUM(CASE WHEN NOT {$saleCashCond} THEN paid_amount ELSE 0 END) as fallback_non_cash
+            SUM(CASE WHEN {$noPayRowsSql} AND {$saleCashCond} THEN paid_amount ELSE 0 END) as fallback_cash,
+            SUM(CASE WHEN {$noPayRowsSql} AND NOT {$saleCashCond} THEN paid_amount ELSE 0 END) as fallback_non_cash
         ")
-        ->groupBy(
-            DB::raw("COALESCE(user_name, created_by, 'Unknown Staff')"),
-            DB::raw("COALESCE(user_role, 'Cashier')"),
-            DB::raw("COALESCE(warehouse_name, 'Main Branch Outlet')")
-        )
-        ->get();
-
-        // Accurate multi-tender split from sale_payments filtered by payment_date with fallback to sales.payment_type
-        $tenderQuery = DB::table('sales')
-            ->leftJoin('sale_payments', 'sales.id', '=', 'sale_payments.sale_id');
-        if (!empty($startDate)) {
-            $tenderQuery->whereRaw('COALESCE(sale_payments.payment_date, sales.date) >= ?', [$accounting->normalizeFilterBoundaryDate((string)$startDate, false)]);
-        }
-        if (!empty($endDate)) {
-            $tenderQuery->whereRaw('COALESCE(sale_payments.payment_date, sales.date) <= ?', [$accounting->normalizeFilterBoundaryDate((string)$endDate, true)]);
-        }
-        $this->applyActiveDocumentFilter($tenderQuery, 'sales.status');
-        if (!empty($allowedOutlets)) {
-            $tenderQuery->whereIn('sales.warehouse_id', $allowedOutlets);
-        }
-
-        if ($warehouse !== 'All' && !empty($warehouse)) {
-            $tenderQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                if ($warehouseId !== null) {
-                    $q->where('sales.warehouse_id', $warehouseId)
-                      ->orWhere('sales.warehouse_name', $warehouse);
-                } else {
-                    $q->where('sales.warehouse_name', $warehouse);
+        ->groupBy('user_name', 'created_by', 'warehouse_name')
+        ->get() as $r) {
+            [$cName, $wName] = $normNameWh($r->user_name, $r->created_by, $r->warehouse_name);
+            $cKey = $cName . '|' . $wName;
+            if ($cashiers->has($cKey)) {
+                $existing = $cashiers->get($cKey);
+                if (($existing->role === 'Cashier' || empty($existing->role)) && !empty($r->role)) {
+                    $existing->role = $r->role;
                 }
+                $existing->total_bills = (int)$existing->total_bills + (int)$r->total_bills;
+                $existing->net_revenue = (float)$existing->net_revenue + (float)$r->net_revenue;
+                $existing->total_collected = (float)$existing->total_collected + (float)$r->total_collected;
+                $existing->total_due = (float)$existing->total_due + (float)$r->total_due;
+                $existing->total_discount = (float)$existing->total_discount + (float)$r->total_discount;
+                $existing->total_tax = (float)$existing->total_tax + (float)$r->total_tax;
+                $existing->total_subtotal = (float)$existing->total_subtotal + (float)$r->total_subtotal;
+                $existing->fallback_cash = (float)$existing->fallback_cash + (float)$r->fallback_cash;
+                $existing->fallback_non_cash = (float)$existing->fallback_non_cash + (float)$r->fallback_non_cash;
+            } else {
+                $r->cashier_name = $cName;
+                $r->warehouse_name = $wName;
+                $cashiers->put($cKey, $r);
+            }
+        }
+
+        // SARGable multi-tender split from sale_payments filtered by indexed payment_date (zero COALESCE full-join scan!)
+        $payFromDt = !empty($startDate) ? $accounting->normalizeFilterBoundaryDate((string)$startDate, false) : null;
+        $payToDt = !empty($endDate) ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
+        $payLegCashCond = "(LOWER(TRIM(COALESCE(sp.payment_type, ''))) LIKE '%cash%' AND LOWER(TRIM(COALESCE(sp.payment_type, ''))) NOT LIKE '%non%cash%' AND LOWER(TRIM(COALESCE(sp.payment_type, ''))) NOT LIKE '%cashless%')";
+
+        $spQuery = DB::table('sale_payments as sp')
+            ->join('sales', 'sales.id', '=', 'sp.sale_id');
+        if ($payFromDt !== null) {
+            $spQuery->where('sp.payment_date', '>=', $payFromDt);
+        }
+        if ($payToDt !== null) {
+            $spQuery->where('sp.payment_date', '<=', $payToDt);
+        }
+        $this->applyActiveDocumentFilter($spQuery, 'sales.status');
+        if (!empty($allowedOutlets)) {
+            $spQuery->whereIn('sales.warehouse_id', $allowedOutlets);
+        }
+        $applyWhScope($spQuery, 'sales');
+        if (!empty($search)) {
+            $spQuery->where(function ($q) use ($search) {
+                $q->where('sales.created_by', 'like', "%{$search}%")
+                  ->orWhere('sales.user_name', 'like', "%{$search}%")
+                  ->orWhere('sales.warehouse_name', 'like', "%{$search}%")
+                  ->orWhere('sales.user_role', 'like', "%{$search}%");
             });
         }
-
-        $payLegCashCond = "(LOWER(TRIM(COALESCE(sale_payments.payment_type, ''))) LIKE '%cash%' AND LOWER(TRIM(COALESCE(sale_payments.payment_type, ''))) NOT LIKE '%non%cash%' AND LOWER(TRIM(COALESCE(sale_payments.payment_type, ''))) NOT LIKE '%cashless%')";
-        $hdrCashCond = "(LOWER(TRIM(COALESCE(sales.payment_type, ''))) LIKE '%cash%' AND LOWER(TRIM(COALESCE(sales.payment_type, ''))) NOT LIKE '%non%cash%' AND LOWER(TRIM(COALESCE(sales.payment_type, ''))) NOT LIKE '%cashless%')";
-        $tenderMap = $tenderQuery->selectRaw("
-            COALESCE(sales.user_name, sales.created_by, 'Unknown Staff') as cashier_name,
-            COALESCE(sales.warehouse_name, 'Main Branch Outlet') as warehouse_name,
-            SUM(CASE 
-                WHEN sale_payments.id IS NOT NULL THEN (CASE WHEN {$payLegCashCond} THEN sale_payments.amount ELSE 0 END)
-                ELSE (CASE WHEN {$hdrCashCond} THEN sales.paid_amount ELSE 0 END)
-            END) as cash_collected,
-            SUM(CASE 
-                WHEN sale_payments.id IS NOT NULL THEN (CASE WHEN NOT {$payLegCashCond} THEN sale_payments.amount ELSE 0 END)
-                ELSE (CASE WHEN NOT {$hdrCashCond} THEN sales.paid_amount ELSE 0 END)
-            END) as non_cash_collected
+        $tenderMap = collect();
+        foreach ($spQuery->selectRaw("
+            sales.user_name,
+            sales.created_by,
+            sales.warehouse_name,
+            SUM(CASE WHEN {$payLegCashCond} THEN sp.amount ELSE 0 END) as cash_collected,
+            SUM(CASE WHEN NOT {$payLegCashCond} THEN sp.amount ELSE 0 END) as non_cash_collected
         ")
-        ->groupBy(
-            DB::raw("COALESCE(sales.user_name, sales.created_by, 'Unknown Staff')"),
-            DB::raw("COALESCE(sales.warehouse_name, 'Main Branch Outlet')")
-        )
-        ->get()
-        ->keyBy(function ($r) {
-            return $r->cashier_name . '|' . $r->warehouse_name;
-        });
+        ->groupBy('sales.user_name', 'sales.created_by', 'sales.warehouse_name')
+        ->get() as $sr) {
+            [$cName, $wName] = $normNameWh($sr->user_name, $sr->created_by, $sr->warehouse_name);
+            $nk = $cName . '|' . $wName;
+            if ($tenderMap->has($nk)) {
+                $existing = $tenderMap->get($nk);
+                $existing->cash_collected = (float)$existing->cash_collected + (float)$sr->cash_collected;
+                $existing->non_cash_collected = (float)$existing->non_cash_collected + (float)$sr->non_cash_collected;
+            } else {
+                $sr->cashier_name = $cName;
+                $sr->warehouse_name = $wName;
+                $tenderMap->put($nk, $sr);
+            }
+        }
 
-        // Batch completed Sale Returns & open-shift cash refunds per cashier & branch in single pass
+        if (DB::table('sale_payments')->whereNull('payment_date')->limit(1)->exists()) {
+            $nullSpQ = DB::table('sale_payments as sp')
+                ->join('sales', 'sales.id', '=', 'sp.sale_id')
+                ->whereNull('sp.payment_date');
+            $this->applyReportDateRange($nullSpQ, $startDate, $endDate, 'sales.date');
+            $this->applyActiveDocumentFilter($nullSpQ, 'sales.status');
+            if (!empty($allowedOutlets)) {
+                $nullSpQ->whereIn('sales.warehouse_id', $allowedOutlets);
+            }
+            $applyWhScope($nullSpQ, 'sales');
+            if (!empty($search)) {
+                $nullSpQ->where(function ($q) use ($search) {
+                    $q->where('sales.created_by', 'like', "%{$search}%")
+                      ->orWhere('sales.user_name', 'like', "%{$search}%")
+                      ->orWhere('sales.warehouse_name', 'like', "%{$search}%")
+                      ->orWhere('sales.user_role', 'like', "%{$search}%");
+                });
+            }
+            foreach ($nullSpQ->selectRaw("
+                sales.user_name,
+                sales.created_by,
+                sales.warehouse_name,
+                SUM(CASE WHEN {$payLegCashCond} THEN sp.amount ELSE 0 END) as cash_collected,
+                SUM(CASE WHEN NOT {$payLegCashCond} THEN sp.amount ELSE 0 END) as non_cash_collected
+            ")->groupBy('sales.user_name', 'sales.created_by', 'sales.warehouse_name')->get() as $nr) {
+                [$cName, $wName] = $normNameWh($nr->user_name, $nr->created_by, $nr->warehouse_name);
+                $nk = $cName . '|' . $wName;
+                if ($tenderMap->has($nk)) {
+                    $existing = $tenderMap->get($nk);
+                    $existing->cash_collected = (float)$existing->cash_collected + (float)$nr->cash_collected;
+                    $existing->non_cash_collected = (float)$existing->non_cash_collected + (float)$nr->non_cash_collected;
+                } else {
+                    $nr->cashier_name = $cName;
+                    $nr->warehouse_name = $wName;
+                    $tenderMap->put($nk, $nr);
+                }
+            }
+        }
+
+        // Aggregate register sessions across the period FIRST (plus open-shift metadata for return attribution)
+        $hasCashRegisters = $accounting->schemaHasTable('cash_registers');
+        $regAgg = collect();
+        $openRegIdsByKey = [];
+        $openRegMeta = [];
+        $allOpenRegIds = [];
+        $latestClosedAtByKey = [];
+        if ($hasCashRegisters) {
+            $regFromDt = !empty($startDate) ? $accounting->normalizeFilterBoundaryDate((string)$startDate, false) : null;
+            $regToDt = !empty($endDate) ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
+            $regBaseQ = DB::table('cash_registers')
+                ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets));
+            $applyWhScope($regBaseQ);
+            if (!empty($search)) {
+                $regBaseQ->where(function ($q) use ($search) {
+                    $q->where('user_name', 'like', "%{$search}%")
+                      ->orWhere('warehouse_name', 'like', "%{$search}%")
+                      ->orWhere('register_name', 'like', "%{$search}%");
+                });
+            }
+
+            $regDateFilteredQ = (clone $regBaseQ);
+            if ($regFromDt !== null && $regToDt !== null) {
+                $regDateFilteredQ->where(function ($q) use ($regFromDt, $regToDt) {
+                    $q->whereBetween('opened_at', [$regFromDt, $regToDt])
+                      ->orWhereBetween('closed_at', [$regFromDt, $regToDt]);
+                });
+            } elseif ($regFromDt !== null) {
+                $regDateFilteredQ->where(function ($q) use ($regFromDt) {
+                    $q->where('opened_at', '>=', $regFromDt)
+                      ->orWhere('closed_at', '>=', $regFromDt);
+                });
+            } elseif ($regToDt !== null) {
+                $regDateFilteredQ->where(function ($q) use ($regToDt) {
+                    $q->where('opened_at', '<=', $regToDt)
+                      ->orWhere('closed_at', '<=', $regToDt);
+                });
+            }
+
+            foreach ($regDateFilteredQ
+                ->selectRaw("
+                    user_name,
+                    warehouse_name,
+                    COUNT(id) as total_shifts,
+                    SUM(CASE WHEN LOWER(status) = 'closed' THEN 1 ELSE 0 END) as closed_shifts,
+                    SUM(CASE WHEN LOWER(status) IN ('open', 'opened') THEN 1 ELSE 0 END) as open_shifts,
+                    SUM(CASE WHEN LOWER(status) IN ('open', 'opened') THEN opening_cash ELSE 0 END) as open_opening_cash,
+                    SUM(opening_cash) as total_opening_cash,
+                    SUM(CASE WHEN LOWER(status) = 'closed' THEN expected_cash ELSE 0 END) as total_expected_cash,
+                    SUM(CASE WHEN LOWER(status) = 'closed' THEN closing_cash ELSE 0 END) as total_closing_cash,
+                    SUM(CASE WHEN LOWER(status) = 'closed' THEN COALESCE(cash_difference, closing_cash - expected_cash) ELSE 0 END) as total_cash_difference,
+                    MAX(CASE WHEN LOWER(status) = 'closed' THEN closed_at ELSE NULL END) as latest_closed_at,
+                    MAX(register_name) as last_register_name
+                ")
+                ->groupBy('user_name', 'warehouse_name')
+                ->get() as $rr) {
+                [$rUser, $rWh] = $normNameWh($rr->user_name, null, $rr->warehouse_name);
+                $rk = $rUser . '|' . $rWh;
+                if (!empty($rr->latest_closed_at)) {
+                    $prevClosed = $latestClosedAtByKey[$rk] ?? '';
+                    if ($prevClosed === '' || (string)$rr->latest_closed_at > $prevClosed) {
+                        $latestClosedAtByKey[$rk] = (string)$rr->latest_closed_at;
+                    }
+                }
+                if ($regAgg->has($rk)) {
+                    $existing = $regAgg->get($rk);
+                    $existing->total_shifts = (int)$existing->total_shifts + (int)$rr->total_shifts;
+                    $existing->closed_shifts = (int)$existing->closed_shifts + (int)$rr->closed_shifts;
+                    $existing->open_shifts = (int)$existing->open_shifts + (int)$rr->open_shifts;
+                    $existing->open_opening_cash = (float)$existing->open_opening_cash + (float)$rr->open_opening_cash;
+                    $existing->total_opening_cash = (float)$existing->total_opening_cash + (float)$rr->total_opening_cash;
+                    $existing->total_expected_cash = (float)$existing->total_expected_cash + (float)$rr->total_expected_cash;
+                    $existing->total_closing_cash = (float)$existing->total_closing_cash + (float)$rr->total_closing_cash;
+                    $existing->total_cash_difference = (float)$existing->total_cash_difference + (float)$rr->total_cash_difference;
+                    if (!empty($rr->last_register_name)) {
+                        $existing->last_register_name = $rr->last_register_name;
+                    }
+                } else {
+                    $rr->cashier_name = $rUser;
+                    $rr->warehouse_name = $rWh;
+                    $regAgg->put($rk, $rr);
+                }
+            }
+
+            foreach ((clone $regBaseQ)->whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])->select(['id', 'user_name', 'warehouse_name', 'opened_at'])->get() as $or) {
+                $rid = (int)$or->id;
+                $uName = trim((string)($or->user_name ?? '')) ?: 'Unknown Staff';
+                $wName = trim((string)($or->warehouse_name ?? '')) ?: 'Main Branch Outlet';
+                $oKey = $uName . '|' . $wName;
+                $openRegIdsByKey[$oKey][] = $rid;
+                $openRegMeta[$rid] = ['key' => $oKey, 'opened_at' => (string)($or->opened_at ?? '')];
+                $allOpenRegIds[] = $rid;
+            }
+        }
+
+        // Batch completed Sale Returns & open-shift cash refunds per cashier & branch
+        // Closed-shift refunds are already settled in closed expected_cash; only open-shift or post-close refunds affect open expected_cash.
         $retByCashier = [];
         $openCashRefundsByKey = [];
+        $openCashRefundsByReg = [];
         if ($accounting->schemaHasTable('sale_returns')) {
             $retAuditQ = DB::table('sale_returns');
             $this->applyReportDateRange($retAuditQ, $startDate, $endDate, 'date');
@@ -11331,115 +15300,156 @@ class ReportController extends Controller
             if (!empty($allowedOutlets)) {
                 $retAuditQ->whereIn('warehouse_id', $allowedOutlets);
             }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $retAuditQ->where(function ($q) use ($warehouseId, $warehouse) {
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId)->orWhere('warehouse_name', $warehouse);
-                    } else {
-                        $q->where('warehouse_name', $warehouse);
-                    }
+            $applyWhScope($retAuditQ);
+            if (!empty($search)) {
+                $retAuditQ->where(function ($q) use ($search) {
+                    $q->where('created_by', 'like', "%{$search}%")
+                      ->orWhere('user_name', 'like', "%{$search}%")
+                      ->orWhere('warehouse_name', 'like', "%{$search}%");
                 });
             }
-            foreach ($retAuditQ->select(['user_name', 'created_by', 'warehouse_name', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload'])->get() as $sr) {
-                $whLabel = $sr->warehouse_name ?: 'Main Branch Outlet';
-                $primaryName = $sr->user_name ?: ($sr->created_by ?: 'Unknown Staff');
+
+            $hasAnySplitRet = false;
+            $retCashCond = "(LOWER(TRIM(COALESCE(NULLIF(TRIM(refund_tender), ''), NULLIF(TRIM(payment_type), ''), 'cash'))) LIKE '%cash%' AND LOWER(TRIM(COALESCE(NULLIF(TRIM(refund_tender), ''), NULLIF(TRIM(payment_type), ''), 'cash'))) NOT LIKE '%non%cash%' AND LOWER(TRIM(COALESCE(NULLIF(TRIM(refund_tender), ''), NULLIF(TRIM(payment_type), ''), 'cash'))) NOT LIKE '%cashless%')";
+            foreach ((clone $retAuditQ)
+                ->selectRaw("
+                    user_name,
+                    created_by,
+                    warehouse_name,
+                    COALESCE(SUM(CASE WHEN payments_payload IS NULL OR payments_payload = '' THEN grand_total ELSE 0 END), 0) as ret_total,
+                    COALESCE(SUM(CASE WHEN payments_payload IS NULL OR payments_payload = '' THEN paid_amount ELSE 0 END), 0) as ret_refunded,
+                    COALESCE(SUM(CASE WHEN (payments_payload IS NULL OR payments_payload = '') AND paid_amount > 0 AND {$retCashCond} THEN paid_amount ELSE 0 END), 0) as ret_cash_refunded,
+                    COALESCE(SUM(CASE WHEN (payments_payload IS NULL OR payments_payload = '') AND paid_amount > 0 AND NOT {$retCashCond} THEN paid_amount ELSE 0 END), 0) as ret_non_cash_refunded,
+                    MAX(CASE WHEN payments_payload IS NOT NULL AND payments_payload != '' THEN 1 ELSE 0 END) as has_split
+                ")->groupBy('user_name', 'created_by', 'warehouse_name')->get() as $srAgg) {
+                [$primaryName, $whLabel] = $normNameWh($srAgg->user_name, $srAgg->created_by, $srAgg->warehouse_name);
                 $rKey = $primaryName . '|' . $whLabel;
                 if (!isset($retByCashier[$rKey])) {
-                    $retByCashier[$rKey] = ['total' => 0.0, 'refunded' => 0.0, 'cash_refunded' => 0.0, 'non_cash_refunded' => 0.0];
+                    $retByCashier[$rKey] = [
+                        'cashier_name' => $primaryName,
+                        'warehouse_name' => $whLabel,
+                        'total' => 0.0,
+                        'refunded' => 0.0,
+                        'cash_refunded' => 0.0,
+                        'non_cash_refunded' => 0.0,
+                    ];
                 }
-                $retByCashier[$rKey]['total'] += (float)$sr->grand_total;
-                $retByCashier[$rKey]['refunded'] += (float)$sr->paid_amount;
+                $retByCashier[$rKey]['total'] += (float)$srAgg->ret_total;
+                $retByCashier[$rKey]['refunded'] += (float)$srAgg->ret_refunded;
+                $retByCashier[$rKey]['cash_refunded'] += (float)$srAgg->ret_cash_refunded;
+                $retByCashier[$rKey]['non_cash_refunded'] += (float)$srAgg->ret_non_cash_refunded;
+                if ((int)($srAgg->has_split ?? 0) === 1) {
+                    $hasAnySplitRet = true;
+                }
+            }
 
-                $legs = !empty($sr->payments_payload) ? json_decode((string)$sr->payments_payload, true) : null;
-                $cashPart = 0.0;
-                $nonCashPart = 0.0;
-                if (is_array($legs) && !empty($legs)) {
-                    foreach ($legs as $leg) {
-                        $lAmt = max(0.0, (float)($leg['amount'] ?? 0));
-                        if ($lAmt <= 0.0001) continue;
-                        $ptRaw = (string)($leg['payment_type'] ?? ($sr->refund_tender ?: ($sr->payment_type ?: 'cash')));
-                        if ($accounting->isCashPaymentType($ptRaw)) {
-                            $cashPart += $lAmt;
+            // Single combined cursor for split payments_payload rows and open-shift cash refund attribution
+            $needOpenAttribution = !empty($allOpenRegIds);
+            if ($hasAnySplitRet || $needOpenAttribution) {
+                $openCashierNames = $needOpenAttribution
+                    ? array_values(array_unique(array_map(fn($m) => explode('|', $m['key'])[0], $openRegMeta)))
+                    : [];
+                $retHasRegCol = $needOpenAttribution && $accounting->schemaHasColumn('sale_returns', 'cash_register_id');
+                $extraRetCols = ['user_name', 'created_by', 'warehouse_name', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload', 'date', 'created_at'];
+                if ($retHasRegCol) {
+                    $extraRetCols[] = 'cash_register_id';
+                }
+
+                $combinedRetQ = (clone $retAuditQ)->where(function ($outer) use ($hasAnySplitRet, $needOpenAttribution, $openCashierNames) {
+                    $hasAny = false;
+                    if ($hasAnySplitRet) {
+                        $outer->where(function ($sp) {
+                            $sp->whereNotNull('payments_payload')->where('payments_payload', '!=', '');
+                        });
+                        $hasAny = true;
+                    }
+                    if ($needOpenAttribution) {
+                        $method = $hasAny ? 'orWhere' : 'where';
+                        $outer->$method(function ($oq) use ($openCashierNames) {
+                            $oq->where('paid_amount', '>', 0)
+                               ->when(!empty($openCashierNames) && !in_array('Unknown Staff', $openCashierNames, true), function ($q) use ($openCashierNames) {
+                                   $q->where(fn($w) => $w->whereIn('user_name', $openCashierNames)->orWhereIn('created_by', $openCashierNames));
+                               });
+                        });
+                    }
+                });
+
+                foreach ($combinedRetQ->select($extraRetCols)->cursor() as $sr) {
+                    [$primaryName, $whLabel] = $normNameWh($sr->user_name, $sr->created_by, $sr->warehouse_name);
+                    $uN = trim((string)($sr->user_name ?? ''));
+                    $cN = trim((string)($sr->created_by ?? ''));
+                    $rKey = $primaryName . '|' . $whLabel;
+                    $isSplitRow = !empty($sr->payments_payload) && trim((string)$sr->payments_payload) !== '';
+
+                    $cashPart = 0.0;
+                    $nonCashPart = 0.0;
+                    $legs = $isSplitRow ? json_decode((string)$sr->payments_payload, true) : null;
+                    if (is_array($legs) && !empty($legs)) {
+                        foreach ($legs as $leg) {
+                            $lAmt = max(0.0, (float)($leg['amount'] ?? 0));
+                            if ($lAmt <= 0.0001) continue;
+                            $ptRaw = (string)($leg['payment_type'] ?? ($sr->refund_tender ?: ($sr->payment_type ?: 'cash')));
+                            if ($accounting->isCashPaymentType($ptRaw)) {
+                                $cashPart += $lAmt;
+                            } else {
+                                $nonCashPart += $lAmt;
+                            }
+                        }
+                    } elseif ((float)$sr->paid_amount > 0) {
+                        $tenderRaw = (string)($sr->refund_tender ?: ($sr->payment_type ?: 'cash'));
+                        if ($accounting->isCashPaymentType($tenderRaw)) {
+                            $cashPart = (float)$sr->paid_amount;
                         } else {
-                            $nonCashPart += $lAmt;
+                            $nonCashPart = (float)$sr->paid_amount;
                         }
                     }
-                } elseif ((float)$sr->paid_amount > 0) {
-                    $tenderRaw = (string)($sr->refund_tender ?: ($sr->payment_type ?: 'cash'));
-                    if ($accounting->isCashPaymentType($tenderRaw)) {
-                        $cashPart += (float)$sr->paid_amount;
-                    } else {
-                        $nonCashPart += (float)$sr->paid_amount;
-                    }
-                }
-                $retByCashier[$rKey]['cash_refunded'] += $cashPart;
-                $retByCashier[$rKey]['non_cash_refunded'] += $nonCashPart;
 
-                if ($cashPart > 0) {
+                    if ($isSplitRow) {
+                        if (!isset($retByCashier[$rKey])) {
+                            $retByCashier[$rKey] = [
+                                'cashier_name' => $primaryName,
+                                'warehouse_name' => $whLabel,
+                                'total' => 0.0,
+                                'refunded' => 0.0,
+                                'cash_refunded' => 0.0,
+                                'non_cash_refunded' => 0.0,
+                            ];
+                        }
+                        $retByCashier[$rKey]['total'] += (float)$sr->grand_total;
+                        $retByCashier[$rKey]['refunded'] += (float)$sr->paid_amount;
+                        $retByCashier[$rKey]['cash_refunded'] += $cashPart;
+                        $retByCashier[$rKey]['non_cash_refunded'] += $nonCashPart;
+                    }
+
+                    if (!$needOpenAttribution || $cashPart <= 0.0001) {
+                        continue;
+                    }
+
+                    if ($retHasRegCol && !empty($sr->cash_register_id)) {
+                        $rrid = (int)$sr->cash_register_id;
+                        if (isset($openRegMeta[$rrid])) {
+                            $openCashRefundsByReg[$rrid] = ($openCashRefundsByReg[$rrid] ?? 0.0) + $cashPart;
+                        }
+                        continue;
+                    }
+
+                    $retTs = trim((string)($sr->created_at ?? $sr->date ?? ''));
+                    $closedCutoff = $latestClosedAtByKey[$rKey] ?? '';
+                    if ($closedCutoff !== '' && $retTs !== '' && $retTs <= $closedCutoff) {
+                        continue;
+                    }
                     $openCashRefundsByKey[$rKey] = ($openCashRefundsByKey[$rKey] ?? 0.0) + $cashPart;
-                    if (!empty($sr->user_name) && !empty($sr->created_by) && $sr->user_name !== $sr->created_by) {
-                        $altKey = $sr->created_by . '|' . $whLabel;
-                        $openCashRefundsByKey[$altKey] = ($openCashRefundsByKey[$altKey] ?? 0.0) + $cashPart;
+                    if ($uN !== '' && $cN !== '' && $uN !== $cN) {
+                        $altK = $cN . '|' . $whLabel;
+                        $openCashRefundsByKey[$altK] = ($openCashRefundsByKey[$altK] ?? 0.0) + $cashPart;
                     }
                 }
-            }
-        }
-
-        // Aggregate register sessions across the period (plus batch open-register drawers — zero N+1)
-        $hasCashRegisters = $accounting->schemaHasTable('cash_registers');
-        $regAgg = collect();
-        $openRegIdsByKey = [];
-        $allOpenRegIds = [];
-        if ($hasCashRegisters) {
-            $regFromDt = $accounting->normalizeFilterBoundaryDate((string)$startDate, false);
-            $regToDt = $accounting->normalizeFilterBoundaryDate((string)$endDate, true);
-            $regBaseQ = DB::table('cash_registers')
-                ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets));
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $regBaseQ->where(function ($q) use ($warehouseId, $warehouse) {
-                    if ($warehouseId !== null) {
-                        $q->where('warehouse_id', $warehouseId)->orWhere('warehouse_name', $warehouse);
-                    } else {
-                        $q->where('warehouse_name', $warehouse);
-                    }
-                });
-            }
-
-            $regAgg = (clone $regBaseQ)
-                ->where(function ($q) use ($startDate, $endDate, $regFromDt, $regToDt) {
-                    if (!empty($startDate) && !empty($endDate)) {
-                        $q->whereBetween('opened_at', [$regFromDt, $regToDt])
-                          ->orWhereBetween('closed_at', [$regFromDt, $regToDt]);
-                    }
-                })
-                ->selectRaw("
-                    COALESCE(user_name, 'Unknown Staff') as cashier_name,
-                    COALESCE(warehouse_name, 'Main Branch Outlet') as warehouse_name,
-                    COUNT(id) as total_shifts,
-                    SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_shifts,
-                    SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_shifts,
-                    SUM(opening_cash) as total_opening_cash,
-                    SUM(CASE WHEN status = 'closed' THEN expected_cash ELSE 0 END) as total_expected_cash,
-                    SUM(CASE WHEN status = 'closed' THEN closing_cash ELSE 0 END) as total_closing_cash,
-                    SUM(CASE WHEN status = 'closed' THEN cash_difference ELSE 0 END) as total_cash_difference,
-                    MAX(register_name) as last_register_name
-                ")
-                ->groupBy('user_name', 'warehouse_name')
-                ->get()
-                ->keyBy(function ($r) {
-                    return $r->cashier_name . '|' . $r->warehouse_name;
-                });
-
-            foreach ((clone $regBaseQ)->whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])->select(['id', 'user_name', 'warehouse_name'])->get() as $or) {
-                $rid = (int)$or->id;
-                $oKey = ($or->user_name ?: 'Unknown Staff') . '|' . ($or->warehouse_name ?: 'Main Branch Outlet');
-                $openRegIdsByKey[$oKey][] = $rid;
-                $allOpenRegIds[] = $rid;
             }
         }
 
         $openRegTxByReg = [];
         $openRegExpByReg = [];
+        $openRegCashSalesByReg = [];
         if (!empty($allOpenRegIds)) {
             if ($accounting->schemaHasTable('cash_register_transactions')) {
                 foreach (array_chunk($allOpenRegIds, 400) as $idChunk) {
@@ -11459,6 +15469,40 @@ class ReportController extends Controller
                     }
                 }
             }
+            if ($accounting->schemaHasColumn('sales', 'cash_register_id')) {
+                $spHasRegCol = $accounting->schemaHasColumn('sale_payments', 'cash_register_id');
+                if ($spHasRegCol) {
+                    foreach (array_chunk($allOpenRegIds, 400) as $idChunk) {
+                        foreach (DB::table('sale_payments as sp')
+                            ->join('sales', 'sales.id', '=', 'sp.sale_id')
+                            ->whereIn('sp.cash_register_id', $idChunk)
+                            ->when($payFromDt !== null, fn($q) => $q->where('sp.payment_date', '>=', $payFromDt))
+                            ->when($payToDt !== null, fn($q) => $q->where('sp.payment_date', '<=', $payToDt))
+                            ->where(fn($q) => $this->applyActiveDocumentFilter($q, 'sales.status'))
+                            ->selectRaw("sp.cash_register_id, COALESCE(SUM(CASE WHEN {$payLegCashCond} THEN sp.amount ELSE 0 END), 0) as cash_amt")
+                            ->groupBy('sp.cash_register_id')
+                            ->get() as $rCash) {
+                            $openRegCashSalesByReg[(int)$rCash->cash_register_id] = ($openRegCashSalesByReg[(int)$rCash->cash_register_id] ?? 0.0) + (float)$rCash->cash_amt;
+                        }
+                    }
+                }
+                foreach (array_chunk($allOpenRegIds, 400) as $idChunk) {
+                    $legacyOpenQ = DB::table('sales')
+                        ->whereIn('cash_register_id', $idChunk)
+                        ->whereRaw($saleCashCond)
+                        ->whereNotExists(function ($sub) {
+                            $sub->selectRaw('1')->from('sale_payments as sp')->whereColumn('sp.sale_id', 'sales.id');
+                        });
+                    $this->applyReportDateRange($legacyOpenQ, $startDate, $endDate, 'date');
+                    $this->applyActiveDocumentFilter($legacyOpenQ, 'status');
+                    foreach ($legacyOpenQ
+                        ->selectRaw('cash_register_id, COALESCE(SUM(paid_amount), 0) as cash_amt')
+                        ->groupBy('cash_register_id')
+                        ->get() as $rLegacy) {
+                        $openRegCashSalesByReg[(int)$rLegacy->cash_register_id] = ($openRegCashSalesByReg[(int)$rLegacy->cash_register_id] ?? 0.0) + (float)$rLegacy->cash_amt;
+                    }
+                }
+            }
             if ($accounting->schemaHasTable('expense_payments') && $accounting->schemaHasColumn('expense_payments', 'cash_register_id')) {
                 foreach (array_chunk($allOpenRegIds, 400) as $idChunk) {
                     foreach (DB::table('expense_payments')
@@ -11473,10 +15517,19 @@ class ReportController extends Controller
             }
         }
 
+        // Union all staff|warehouse keys across Sales, Sale Returns, and Register Shifts
+        // so cashiers with shift/refund activity and 0 sales are never invisible to fraud audit!
+        $allKeys = array_values(array_unique(array_merge(
+            $cashiers->keys()->all(),
+            array_keys($retByCashier),
+            $regAgg->keys()->all()
+        )));
+
         $items = [];
         $totalStoreSales = 0.0;
         $totalStoreBills = 0;
         $totalStoreDiscounts = 0.0;
+        $totalStoreNetRevenue = 0.0;
         $totalStoreCollected = 0.0;
         $totalStoreDue = 0.0;
         $totalStoreCash = 0.0;
@@ -11484,47 +15537,75 @@ class ReportController extends Controller
         $totalDiscrepancy = 0.0;
 
         $idx = 1;
-        foreach ($cashiers as $c) {
-            $bills = (int)$c->total_bills;
-            $key = $c->cashier_name . '|' . $c->warehouse_name;
+        foreach ($allKeys as $key) {
+            $c = $cashiers->get($key);
             $cRet = $retByCashier[$key] ?? ['total' => 0.0, 'refunded' => 0.0, 'cash_refunded' => 0.0, 'non_cash_refunded' => 0.0];
-            $grossBilled = (float)$c->net_revenue;
-            $netRevenue = round(max(0.0, $grossBilled - $cRet['total']), 2);
-            $discount = (float)$c->total_discount;
+            $reg = $regAgg->get($key);
+            $tender = $tenderMap->get($key);
+
+            $cashierName = $c ? $c->cashier_name : ($cRet['cashier_name'] ?? ($reg->cashier_name ?? 'Unknown Staff'));
+            $warehouseName = $c ? $c->warehouse_name : ($cRet['warehouse_name'] ?? ($reg->warehouse_name ?? 'Main Branch Outlet'));
+            $role = $c ? $c->role : 'Cashier';
+
+            $bills = $c ? (int)$c->total_bills : 0;
+            $grossBilled = $c ? (float)$c->net_revenue : 0.0;
+            $netRevenue = round($grossBilled - (float)$cRet['total'], 2);
+            $discount = $c ? (float)$c->total_discount : 0.0;
             $grossSales = $grossBilled + $discount;
-            $collected = round(max(0.0, (float)$c->total_collected - $cRet['refunded']), 2);
-            $due = (float)$c->total_due;
+            $due = $c ? (float)$c->total_due : 0.0;
             $avgTicket = $bills > 0 ? round($grossSales / $bills, 2) : 0.0;
             $discountRate = $grossSales > 0 ? round(($discount / $grossSales) * 100, 1) : 0.0;
 
-            $tender = $tenderMap->get($key);
-            $grossCash = $tender ? (float)$tender->cash_collected : (float)$c->fallback_cash;
-            $grossNonCash = $tender ? (float)$tender->non_cash_collected : (float)$c->fallback_non_cash;
-            $cash = round(max(0.0, $grossCash - (float)$cRet['cash_refunded']), 2);
-            $nonCash = round(max(0.0, $grossNonCash - (float)$cRet['non_cash_refunded']), 2);
+            // Tender reconciliation: signed net values ensure Cash + NonCash === Total Collected always
+            $grossCash = ($tender ? (float)$tender->cash_collected : 0.0) + ($c ? (float)$c->fallback_cash : 0.0);
+            $grossNonCash = ($tender ? (float)$tender->non_cash_collected : 0.0) + ($c ? (float)$c->fallback_non_cash : 0.0);
+            $cash = round($grossCash - (float)$cRet['cash_refunded'], 2);
+            $nonCash = round($grossNonCash - (float)$cRet['non_cash_refunded'], 2);
+            $collected = round($cash + $nonCash, 2);
 
-            $reg = $regAgg->get($key);
-            if ($reg && (int)$reg->closed_shifts > 0) {
-                $expectedCash = (float)$reg->total_expected_cash;
-                $closingCash = (float)$reg->total_closing_cash;
+            if ($reg) {
+                $closedCount = (int)$reg->closed_shifts;
+                $openCount = (int)$reg->open_shifts;
+                $closedExpected = (float)$reg->total_expected_cash;
+                $closedClosing = (float)$reg->total_closing_cash;
                 $diff = (float)$reg->total_cash_difference;
-                $shiftLabel = (int)$reg->closed_shifts === 1 ? '1 shift' : $reg->closed_shifts . ' shifts';
-                $regName = ($reg->last_register_name ?? 'Register 01') . ' (' . $shiftLabel . ')';
-            } elseif ($reg) {
-                $openRegIds = $openRegIdsByKey[$key] ?? [];
-                $floatsIn = 0.0;
-                $cashDrops = 0.0;
-                $openCashExpenses = 0.0;
-                foreach ($openRegIds as $orid) {
-                    $floatsIn += (float)($openRegTxByReg[$orid]['fi'] ?? 0.0);
-                    $cashDrops += (float)($openRegTxByReg[$orid]['dr'] ?? 0.0);
-                    $openCashExpenses += (float)($openRegExpByReg[$orid] ?? 0.0);
+
+                $openExpected = 0.0;
+                if ($openCount > 0) {
+                    $openRegIds = $openRegIdsByKey[$key] ?? [];
+                    $floatsIn = 0.0;
+                    $cashDrops = 0.0;
+                    $openCashExpenses = 0.0;
+                    $openRegCashDirect = 0.0;
+                    $openCashRefundsDirect = 0.0;
+                    foreach ($openRegIds as $orid) {
+                        $floatsIn += (float)($openRegTxByReg[$orid]['fi'] ?? 0.0);
+                        $cashDrops += (float)($openRegTxByReg[$orid]['dr'] ?? 0.0);
+                        $openCashExpenses += (float)($openRegExpByReg[$orid] ?? 0.0);
+                        $openRegCashDirect += (float)($openRegCashSalesByReg[$orid] ?? 0.0);
+                        $openCashRefundsDirect += (float)($openCashRefundsByReg[$orid] ?? 0.0);
+                    }
+                    $openCashRefunds = $openCashRefundsDirect + (float)($openCashRefundsByKey[$key] ?? 0.0);
+                    $openCashBase = $openRegCashDirect > 0.0001
+                        ? $openRegCashDirect
+                        : ($closedCount === 0 ? $grossCash : 0.0);
+                    $openExpected = round((float)$reg->open_opening_cash + $openCashBase + $floatsIn - $cashDrops - $openCashRefunds - $openCashExpenses, 2);
                 }
-                $openCashRefunds = (float)($openCashRefundsByKey[$key] ?? 0.0);
-                $expectedCash = round((float)$reg->total_opening_cash + $grossCash + $floatsIn - $cashDrops - $openCashRefunds - $openCashExpenses, 2);
-                $closingCash = $expectedCash;
-                $diff = 0.0;
-                $regName = ($reg->last_register_name ?? 'Register 01') . ' (Open)';
+
+                if ($closedCount > 0 && $openCount > 0) {
+                    $expectedCash = round($closedExpected + $openExpected, 2);
+                    $closingCash = round($closedClosing + $openExpected, 2);
+                    $regName = ($reg->last_register_name ?? 'Register 01') . " ({$closedCount} closed, {$openCount} open)";
+                } elseif ($closedCount > 0) {
+                    $expectedCash = $closedExpected;
+                    $closingCash = $closedClosing;
+                    $shiftLabel = $closedCount === 1 ? '1 shift' : $closedCount . ' shifts';
+                    $regName = ($reg->last_register_name ?? 'Register 01') . ' (' . $shiftLabel . ')';
+                } else {
+                    $expectedCash = $openExpected;
+                    $closingCash = $openExpected;
+                    $regName = ($reg->last_register_name ?? 'Register 01') . ' (Open)';
+                }
             } else {
                 $expectedCash = round($cash, 2);
                 $closingCash = round($cash, 2);
@@ -11547,6 +15628,7 @@ class ReportController extends Controller
             $totalStoreSales += $grossSales;
             $totalStoreBills += $bills;
             $totalStoreDiscounts += $discount;
+            $totalStoreNetRevenue += $netRevenue;
             $totalStoreCollected += $collected;
             $totalStoreDue += $due;
             $totalStoreCash += $cash;
@@ -11555,20 +15637,20 @@ class ReportController extends Controller
 
             $items[] = [
                 'staff_code' => 'STF-' . str_pad($idx++, 3, '0', STR_PAD_LEFT),
-                'cashier_name' => $c->cashier_name,
-                'role' => $c->role,
-                'warehouse_name' => $c->warehouse_name,
+                'cashier_name' => $cashierName,
+                'role' => $role,
+                'warehouse_name' => $warehouseName,
                 'register_name' => $regName,
                 'total_bills' => $bills,
                 'total_sales' => round($grossSales, 2),
-                'total_collected' => round($collected, 2),
+                'total_collected' => $collected,
                 'total_due' => round($due, 2),
                 'total_discount' => round($discount, 2),
-                'net_revenue' => round($netRevenue, 2),
+                'net_revenue' => $netRevenue,
                 'discount_rate' => $discountRate,
                 'average_bill_value' => $avgTicket,
-                'cash_collected' => round($cash, 2),
-                'non_cash_collected' => round($nonCash, 2),
+                'cash_collected' => $cash,
+                'non_cash_collected' => $nonCash,
                 'expected_cash' => round($expectedCash, 2),
                 'counted_cash' => round($closingCash, 2),
                 'cash_difference' => round($diff, 2),
@@ -11587,16 +15669,25 @@ class ReportController extends Controller
         $pagedItems = array_slice($items, $offset, $perPage);
         $hasMore = ($offset + count($pagedItems)) < $totalCashiers;
 
-        // Batched recent transactions (up to 15) strictly for the sliced page cashiers (single query, zero N+1)
-        if (!empty($pagedItems)) {
+        // Batched recent transactions (up to 15) strictly for sliced page cashiers with bills > 0
+        $pagedWithBills = array_filter($pagedItems, fn($it) => ($it['total_bills'] ?? 0) > 0);
+        if (!empty($pagedWithBills)) {
             $pagedKeyIdx = [];
             $pagedNames = [];
-            $pagedWhNames = [];
+            $bucketCaps = [];
+            $remainingBuckets = 0;
+            $includesUnknown = false;
             foreach ($pagedItems as $pIdx => $pItem) {
+                $tb = (int)($pItem['total_bills'] ?? 0);
+                if ($tb <= 0) continue;
                 $cKey = $pItem['cashier_name'] . '|' . $pItem['warehouse_name'];
                 $pagedKeyIdx[$cKey][] = $pIdx;
                 $pagedNames[$pItem['cashier_name']] = true;
-                $pagedWhNames[$pItem['warehouse_name']] = true;
+                if ($pItem['cashier_name'] === 'Unknown Staff') {
+                    $includesUnknown = true;
+                }
+                $bucketCaps[$pIdx] = min(15, $tb);
+                $remainingBuckets++;
             }
             $nameList = array_keys($pagedNames);
             $txsQuery = DB::table('sales');
@@ -11605,40 +15696,28 @@ class ReportController extends Controller
             if (!empty($allowedOutlets)) {
                 $txsQuery->whereIn('sales.warehouse_id', $allowedOutlets);
             }
-            if ($warehouse !== 'All' && !empty($warehouse)) {
-                $txsQuery->where(function ($q) use ($warehouseId, $warehouse) {
-                    if ($warehouseId !== null) {
-                        $q->where('sales.warehouse_id', $warehouseId)->orWhere('sales.warehouse_name', $warehouse);
-                    } else {
-                        $q->where('sales.warehouse_name', $warehouse);
-                    }
-                });
-            }
-            $txsQuery->where(function ($q) use ($nameList) {
+            $applyWhScope($txsQuery, 'sales');
+            $txsQuery->where(function ($q) use ($nameList, $includesUnknown) {
                 $q->whereIn('user_name', $nameList)->orWhereIn('created_by', $nameList);
-                foreach ($nameList as $cName) {
-                    $q->orWhere('created_by', 'like', $cName . ' (%');
+                if ($includesUnknown) {
+                    $q->orWhere(function ($u) {
+                        $u->where(function ($u1) {
+                            $u1->whereNull('user_name')->orWhereRaw("TRIM(user_name) = ''");
+                        })->where(function ($u2) {
+                            $u2->whereNull('created_by')->orWhereRaw("TRIM(created_by) = ''");
+                        });
+                    });
                 }
             });
 
-            $remainingBuckets = count($pagedKeyIdx);
             foreach ($txsQuery
                 ->orderBy('date', 'desc')
                 ->orderBy('id', 'desc')
                 ->select(['id', 'reference_no', 'date', 'customer_name', 'payment_type', 'grand_total', 'paid_amount', 'due_amount', 'discount', 'user_name', 'created_by', 'warehouse_name'])
                 ->cursor() as $t) {
-                $tWh = (string)($t->warehouse_name ?: 'Main Branch Outlet');
-                $tStaff = (string)($t->user_name ?: ($t->created_by ?: 'Unknown Staff'));
-                $matchedKeys = [];
-                if (isset($pagedKeyIdx[$tStaff . '|' . $tWh])) {
-                    $matchedKeys[] = $tStaff . '|' . $tWh;
-                } elseif (!empty($t->created_by)) {
-                    $cbPrefix = trim(explode('(', (string)$t->created_by)[0]);
-                    if (isset($pagedKeyIdx[$cbPrefix . '|' . $tWh])) {
-                        $matchedKeys[] = $cbPrefix . '|' . $tWh;
-                    }
-                }
-                if (empty($matchedKeys)) {
+                [$tStaff, $tWh] = $normNameWh($t->user_name, $t->created_by, $t->warehouse_name);
+                $mk = $tStaff . '|' . $tWh;
+                if (!isset($pagedKeyIdx[$mk])) {
                     continue;
                 }
                 $txRow = [
@@ -11652,13 +15731,12 @@ class ReportController extends Controller
                     'due_amount' => (float)($t->due_amount ?? 0.0),
                     'discount' => (float)($t->discount ?? 0.0),
                 ];
-                foreach ($matchedKeys as $mk) {
-                    foreach ($pagedKeyIdx[$mk] as $targetIdx) {
-                        if (count($pagedItems[$targetIdx]['transactions']) < 15) {
-                            $pagedItems[$targetIdx]['transactions'][] = $txRow;
-                            if (count($pagedItems[$targetIdx]['transactions']) === 15) {
-                                $remainingBuckets--;
-                            }
+                foreach ($pagedKeyIdx[$mk] as $targetIdx) {
+                    $cap = $bucketCaps[$targetIdx] ?? 15;
+                    if (count($pagedItems[$targetIdx]['transactions']) < $cap) {
+                        $pagedItems[$targetIdx]['transactions'][] = $txRow;
+                        if (count($pagedItems[$targetIdx]['transactions']) === $cap) {
+                            $remainingBuckets--;
                         }
                     }
                 }
@@ -11668,15 +15746,16 @@ class ReportController extends Controller
             }
         }
 
-        return $this->noStoreJson([
+        $payload = [
             'status' => 'success',
             'summary' => [
                 'total_cashiers' => $totalCashiers,
                 'total_store_bills' => $totalStoreBills,
                 'total_store_sales' => round($totalStoreSales, 2),
+                'total_store_discounts' => round($totalStoreDiscounts, 2),
+                'total_net_revenue' => round($totalStoreNetRevenue, 2),
                 'total_collected' => round($totalStoreCollected, 2),
                 'total_due' => round($totalStoreDue, 2),
-                'total_store_discounts' => round($totalStoreDiscounts, 2),
                 'total_cash_collected' => round($totalStoreCash, 2),
                 'total_non_cash_collected' => round($totalStoreNonCash, 2),
                 'average_store_bill' => $totalStoreBills > 0 ? round($totalStoreSales / $totalStoreBills, 2) : 0.0,
@@ -11684,6 +15763,7 @@ class ReportController extends Controller
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'warehouse' => $warehouse,
+                'audit_risk' => $riskFilter,
             ],
             'data' => $pagedItems,
             'pagination' => [
@@ -11693,7 +15773,25 @@ class ReportController extends Controller
                 'total'        => $totalCashiers,
                 'has_more'     => $hasMore,
             ],
-        ]);
+        ];
+
+        if (!$skipSummary) {
+            $availWarehouses = DB::table('outlets')
+                ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('id', $allowedOutlets))
+                ->orderBy('name')
+                ->pluck('name')
+                ->map(fn($n) => trim((string)$n))
+                ->filter(fn($n) => $n !== '')
+                ->unique()
+                ->values()
+                ->all();
+            $payload['available_filters'] = [
+                'warehouses' => $availWarehouses,
+                'audit_risks' => ['All', 'healthy', 'watch', 'critical'],
+            ];
+        }
+
+        return $this->noStoreJson($payload);
     }
 
     /**
@@ -11729,39 +15827,50 @@ class ReportController extends Controller
         }
 
         $warehouseId = null;
+        $unmatchedExplicitWh = false;
         if ($warehouse !== 'All' && !empty($warehouse)) {
             $matchedOutlet = DB::table('outlets')
                 ->where('name', $warehouse)
-                ->orWhere('id', $warehouse)
+                ->when(is_numeric($warehouse), fn ($q) => $q->orWhere('id', (int)$warehouse))
                 ->first();
             if ($matchedOutlet) {
-                $warehouseId = $matchedOutlet->id;
+                $warehouseId = (int)$matchedOutlet->id;
                 $warehouse = $matchedOutlet->name;
+            } else {
+                $unmatchedExplicitWh = true;
             }
         }
 
         $allowedOutlets = $this->extractAllowedOutletIds($request);
-        if (!empty($allowedOutlets) && $warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)) {
+        if (!empty($allowedOutlets) && ($unmatchedExplicitWh || ($warehouseId !== null && !in_array((int)$warehouseId, $allowedOutlets, true)))) {
             return $this->noStoreJson(['status' => 'error', 'message' => 'Unauthorized warehouse access.'], 403);
         }
         $canViewCost = $accounting->canViewCost($request);
 
-        $applyWhScope = function ($query, string $table = '') use ($warehouseId, $warehouse) {
+        $hasNullWhByTable = [];
+        $applyWhScope = function ($query, string $baseTable, string $table = '') use ($warehouseId, $warehouse, &$hasNullWhByTable) {
             if ($warehouse === 'All' || empty($warehouse)) {
                 return;
             }
             $idCol = $table !== '' ? "{$table}.warehouse_id" : 'warehouse_id';
             $nameCol = $table !== '' ? "{$table}.warehouse_name" : 'warehouse_name';
-            $query->where(function ($q) use ($idCol, $nameCol, $warehouseId, $warehouse) {
-                if ($warehouseId !== null) {
+            if ($warehouseId !== null) {
+                if (!array_key_exists($baseTable, $hasNullWhByTable)) {
+                    $hasNullWhByTable[$baseTable] = DB::table($baseTable)->whereNull('warehouse_id')->limit(1)->exists();
+                }
+                if (!$hasNullWhByTable[$baseTable]) {
+                    $query->where($idCol, $warehouseId);
+                    return;
+                }
+                $query->where(function ($q) use ($idCol, $nameCol, $warehouseId, $warehouse) {
                     $q->where($idCol, $warehouseId)
                       ->orWhere(function ($legacy) use ($idCol, $nameCol, $warehouse) {
                           $legacy->whereNull($idCol)->where($nameCol, $warehouse);
                       });
-                } else {
-                    $q->where($nameCol, $warehouse);
-                }
-            });
+                });
+            } else {
+                $query->where($nameCol, $warehouse);
+            }
         };
 
         // 1. Output Tax from Sales (collected from customers)
@@ -11770,7 +15879,7 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $salesQuery->whereIn('sales.warehouse_id', $allowedOutlets);
         }
-        $applyWhScope($salesQuery, 'sales');
+        $applyWhScope($salesQuery, 'sales', 'sales');
         $this->applyReportDateRange($salesQuery, $startDate, $endDate, 'sales.date');
         if (!empty($search)) {
             $salesQuery->where(function ($q) use ($search) {
@@ -11787,7 +15896,7 @@ class ReportController extends Controller
         if (!empty($allowedOutlets)) {
             $purchQuery->whereIn('purchases.warehouse_id', $allowedOutlets);
         }
-        $applyWhScope($purchQuery, 'purchases');
+        $applyWhScope($purchQuery, 'purchases', 'purchases');
         $this->applyReportDateRange($purchQuery, $startDate, $endDate, 'purchases.date');
         if (!empty($search)) {
             $purchQuery->where(function ($q) use ($search) {
@@ -11844,6 +15953,7 @@ class ReportController extends Controller
         $salesCount = 0;
         $taxableSales = 0.0;
         $grossOutputTax = 0.0;
+        $grossSalesGrandTotal = 0.0;
         $refundedOutputTax = 0.0;
         $srReturnedTaxable = 0.0;
         $netOutputTax = 0.0;
@@ -11851,6 +15961,7 @@ class ReportController extends Controller
         $purchCount = 0;
         $taxablePurchases = 0.0;
         $grossInputTax = 0.0;
+        $grossPurchasesGrandTotal = 0.0;
         $recoveredInputTax = 0.0;
         $prTaxableTotal = 0.0;
         $netInputTax = 0.0;
@@ -11872,7 +15983,8 @@ class ReportController extends Controller
                     COUNT(*) as cnt,
                     COALESCE(SUM(CASE WHEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - COALESCE(sales.tax_amount, 0)) > 0
                         THEN (COALESCE(sales.grand_total, 0) - COALESCE(sales.shipping, 0) - COALESCE(sales.tax_amount, 0)) ELSE 0 END), 0) as taxable_sales,
-                    COALESCE(SUM(COALESCE(sales.tax_amount, 0)), 0) as output_tax
+                    COALESCE(SUM(COALESCE(sales.tax_amount, 0)), 0) as output_tax,
+                    COALESCE(SUM(COALESCE(sales.grand_total, 0)), 0) as gross_grand_total
                 ")
                 ->first();
 
@@ -11892,23 +16004,28 @@ class ReportController extends Controller
                     ->selectRaw("
                         COUNT(sales.id) as cnt,
                         COALESCE(SUM(CASE WHEN {$netTaxableExpr} > 0 THEN {$netTaxableExpr} ELSE 0 END), 0) as taxable_sales,
-                        COALESCE(SUM({$totalSaleTaxExpr}), 0) as output_tax
+                        COALESCE(SUM({$totalSaleTaxExpr}), 0) as output_tax,
+                        COALESCE(SUM(COALESCE(sales.grand_total, 0)), 0) as gross_grand_total
                     ")
                     ->first();
                 $salesCount = (int)($fullAgg->cnt ?? 0);
                 $taxableSales = (float)($fullAgg->taxable_sales ?? 0);
                 $grossOutputTax = (float)($fullAgg->output_tax ?? 0);
+                $grossSalesGrandTotal = (float)($fullAgg->gross_grand_total ?? 0);
             } else {
                 $salesCount = (int)($hdrSalesAgg->cnt ?? 0);
                 $taxableSales = (float)($hdrSalesAgg->taxable_sales ?? 0);
                 $grossOutputTax = (float)($hdrSalesAgg->output_tax ?? 0);
+                $grossSalesGrandTotal = (float)($hdrSalesAgg->gross_grand_total ?? 0);
                 foreach ($saleLineRows as $lr) {
                     $rowTax = (float)($lr->tax_amount ?? 0) + (float)$lr->line_tax_sum;
                     if ($rowTax > 0) {
                         $salesCount++;
-                        $rowTaxable = max(0.0, (float)($lr->grand_total ?? 0) - (float)($lr->shipping ?? 0) - $rowTax);
+                        $rowGrandTotal = (float)($lr->grand_total ?? 0);
+                        $rowTaxable = max(0.0, $rowGrandTotal - (float)($lr->shipping ?? 0) - $rowTax);
                         $taxableSales += $rowTaxable;
                         $grossOutputTax += $rowTax;
+                        $grossSalesGrandTotal += $rowGrandTotal;
                     }
                 }
             }
@@ -11919,7 +16036,7 @@ class ReportController extends Controller
             if (!empty($allowedOutlets)) {
                 $srBaseQuery->whereIn('warehouse_id', $allowedOutlets);
             }
-            $applyWhScope($srBaseQuery);
+            $applyWhScope($srBaseQuery, 'sale_returns');
             $this->applyReportDateRange($srBaseQuery, $startDate, $endDate, 'date');
             if (!empty($search)) {
                 $srBaseQuery->where(function ($q) use ($search) {
@@ -11981,7 +16098,8 @@ class ReportController extends Controller
                     COUNT(*) as cnt,
                     COALESCE(SUM(CASE WHEN (COALESCE(purchases.grand_total, 0) - COALESCE(purchases.shipping, 0) - COALESCE(purchases.tax_amount, 0)) > 0
                         THEN (COALESCE(purchases.grand_total, 0) - COALESCE(purchases.shipping, 0) - COALESCE(purchases.tax_amount, 0)) ELSE 0 END), 0) as taxable_purchases,
-                    COALESCE(SUM(COALESCE(purchases.tax_amount, 0)), 0) as input_tax
+                    COALESCE(SUM(COALESCE(purchases.tax_amount, 0)), 0) as input_tax,
+                    COALESCE(SUM(COALESCE(purchases.grand_total, 0)), 0) as gross_grand_total
                 ")
                 ->first();
 
@@ -11999,23 +16117,28 @@ class ReportController extends Controller
                     ->selectRaw("
                         COUNT(purchases.id) as cnt,
                         COALESCE(SUM(CASE WHEN {$poTaxableExpr} > 0 THEN {$poTaxableExpr} ELSE 0 END), 0) as taxable_purchases,
-                        COALESCE(SUM({$poTaxExpr}), 0) as input_tax
+                        COALESCE(SUM({$poTaxExpr}), 0) as input_tax,
+                        COALESCE(SUM(COALESCE(purchases.grand_total, 0)), 0) as gross_grand_total
                     ")
                     ->first();
                 $purchCount = (int)($fullPurchAgg->cnt ?? 0);
                 $taxablePurchases = (float)($fullPurchAgg->taxable_purchases ?? 0);
                 $grossInputTax = (float)($fullPurchAgg->input_tax ?? 0);
+                $grossPurchasesGrandTotal = (float)($fullPurchAgg->gross_grand_total ?? 0);
             } else {
                 $purchCount = (int)($hdrPurchAgg->cnt ?? 0);
                 $taxablePurchases = (float)($hdrPurchAgg->taxable_purchases ?? 0);
                 $grossInputTax = (float)($hdrPurchAgg->input_tax ?? 0);
+                $grossPurchasesGrandTotal = (float)($hdrPurchAgg->gross_grand_total ?? 0);
                 foreach ($purchLineRows as $pr) {
                     $rowTax = (float)($pr->tax_amount ?? 0) + (float)$pr->line_tax_sum;
                     if ($rowTax > 0) {
                         $purchCount++;
-                        $rowTaxable = max(0.0, (float)($pr->grand_total ?? 0) - (float)($pr->shipping ?? 0) - $rowTax);
+                        $rowGrandTotal = (float)($pr->grand_total ?? 0);
+                        $rowTaxable = max(0.0, $rowGrandTotal - (float)($pr->shipping ?? 0) - $rowTax);
                         $taxablePurchases += $rowTaxable;
                         $grossInputTax += $rowTax;
+                        $grossPurchasesGrandTotal += $rowGrandTotal;
                     }
                 }
             }
@@ -12027,7 +16150,7 @@ class ReportController extends Controller
             if (!empty($allowedOutlets)) {
                 $prBaseQuery->whereIn('warehouse_id', $allowedOutlets);
             }
-            $applyWhScope($prBaseQuery);
+            $applyWhScope($prBaseQuery, 'purchase_returns');
             $this->applyReportDateRange($prBaseQuery, $startDate, $endDate, 'date');
             if (!empty($search)) {
                 $prBaseQuery->where(function ($q) use ($search) {
@@ -12267,9 +16390,22 @@ class ReportController extends Controller
                 return $masked;
             })->values();
 
+        $availableWarehouses = [];
+        if (!$skipSummary) {
+            $availableWarehouses = DB::table('outlets')
+                ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('id', $allowedOutlets))
+                ->orderBy('name')
+                ->pluck('name')
+                ->values()
+                ->all();
+        }
+
         return $this->noStoreJson([
             'status' => 'success',
             'cost_masked' => !$canViewCost,
+            'available_filters' => [
+                'warehouses' => $availableWarehouses,
+            ],
             'period' => [
                 'start_date' => $startDate,
                 'end_date'   => $endDate,
@@ -12277,6 +16413,8 @@ class ReportController extends Controller
             ],
             'output_tax' => [
                 'gross_sales_tax'      => round($grossOutputTax, 2),
+                'gross_taxable_sales'  => round($taxableSales, 2),
+                'gross_sales_total'    => round($grossSalesGrandTotal, 2),
                 'returns_tax_refund'   => round($refundedOutputTax, 2),
                 'net_output_tax'       => round($netOutputTax, 2),
                 'taxable_sales_amount' => round($taxableSales - $srReturnedTaxable, 2),
@@ -12285,6 +16423,8 @@ class ReportController extends Controller
             'input_tax' => [
                 'cost_masked'              => !$canViewCost,
                 'gross_purchases_tax'      => $canViewCost ? round($grossInputTax, 2) : 0.0,
+                'gross_taxable_purchases'  => $canViewCost ? round($taxablePurchases, 2) : 0.0,
+                'gross_purchases_total'    => $canViewCost ? round($grossPurchasesGrandTotal, 2) : 0.0,
                 'returns_tax_recovered'    => $canViewCost ? round($recoveredInputTax, 2) : 0.0,
                 'net_input_tax'            => $canViewCost ? round($netInputTax, 2) : 0.0,
                 'taxable_purchases_amount' => $canViewCost ? round($taxablePurchases - $prTaxableTotal, 2) : 0.0,
@@ -12347,5 +16487,108 @@ class ReportController extends Controller
             return 'Mobile Wallet';
         }
         return ucwords($trimmed);
+    }
+
+    /**
+     * Attribute a sale or purchase return voucher's paid and unallocated credit amounts
+     * into tender breakdown buckets, handling multi-leg Split Payment payloads accurately.
+     */
+    private function accumulateReturnTenderRow(
+        array &$tenderMap,
+        int $rowId,
+        float $rowGrand,
+        float $rowPaid,
+        string $fallbackMethod,
+        mixed $paymentsPayload,
+        string $unpaidFallbackTender = 'Credit Note'
+    ): void {
+        $allocatedFromLegs = false;
+        $hasPayload = is_array($paymentsPayload)
+            ? !empty($paymentsPayload)
+            : (is_string($paymentsPayload) && $paymentsPayload !== '' && $paymentsPayload !== '[]');
+
+        if ($hasPayload) {
+            $decodedPayments = is_string($paymentsPayload)
+                ? json_decode($paymentsPayload, true)
+                : $paymentsPayload;
+            if (is_array($decodedPayments) && !empty($decodedPayments)) {
+                $validLegs = [];
+                $legsSum = 0.0;
+                foreach ($decodedPayments as $leg) {
+                    if (!is_array($leg)) {
+                        continue;
+                    }
+                    $legAmt = (float)($leg['amount'] ?? 0);
+                    if ($legAmt <= 0) {
+                        continue;
+                    }
+                    $legType = trim((string)($leg['payment_type'] ?? $leg['method'] ?? ''));
+                    if ($legType === '' || $legType === 'Split Payment') {
+                        $legType = $fallbackMethod === 'Split Payment' ? 'Cash' : $fallbackMethod;
+                    }
+                    $validLegs[] = ['type' => $legType, 'amount' => $legAmt];
+                    $legsSum += $legAmt;
+                }
+
+                if ($legsSum > 0 && !empty($validLegs)) {
+                    $allocatedFromLegs = true;
+                    $paidScale = ($legsSum > $rowPaid + 0.01 && $legsSum > 0) ? ($rowPaid / $legsSum) : 1.0;
+                    foreach ($validLegs as $vLeg) {
+                        $m = $vLeg['type'];
+                        if (!isset($tenderMap[$m])) {
+                            $tenderMap[$m] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                        }
+                        $legPaidAmt = $vLeg['amount'] * $paidScale;
+                        $tenderMap[$m]['voucher_ids'][$rowId] = true;
+                        $tenderMap[$m]['total_refunded'] += $legPaidAmt;
+                        $tenderMap[$m]['total_returned'] += $legPaidAmt;
+                    }
+                    if ($rowPaid - $legsSum > 0.01) {
+                        $residualMethod = $fallbackMethod === 'Split Payment' ? 'Cash' : $fallbackMethod;
+                        if (!isset($tenderMap[$residualMethod])) {
+                            $tenderMap[$residualMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                        }
+                        $resAmt = $rowPaid - $legsSum;
+                        $tenderMap[$residualMethod]['voucher_ids'][$rowId] = true;
+                        $tenderMap[$residualMethod]['total_refunded'] += $resAmt;
+                        $tenderMap[$residualMethod]['total_returned'] += $resAmt;
+                    }
+                    $unpaidCreditAmt = $rowGrand - $rowPaid;
+                    if ($unpaidCreditAmt > 0.01) {
+                        if (!isset($tenderMap[$unpaidFallbackTender])) {
+                            $tenderMap[$unpaidFallbackTender] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                        }
+                        $tenderMap[$unpaidFallbackTender]['voucher_ids'][$rowId] = true;
+                        $tenderMap[$unpaidFallbackTender]['total_returned'] += $unpaidCreditAmt;
+                    }
+                }
+            }
+        }
+
+        if (!$allocatedFromLegs) {
+            $paidTargetMethod = ($rowPaid > 0.01 && $fallbackMethod === 'Split Payment') ? 'Cash' : $fallbackMethod;
+            if ($rowPaid > 0.01) {
+                if (!isset($tenderMap[$paidTargetMethod])) {
+                    $tenderMap[$paidTargetMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                }
+                $tenderMap[$paidTargetMethod]['voucher_ids'][$rowId] = true;
+                $tenderMap[$paidTargetMethod]['total_refunded'] += $rowPaid;
+                $tenderMap[$paidTargetMethod]['total_returned'] += $rowPaid;
+                $unpaidCreditAmt = $rowGrand - $rowPaid;
+                if ($unpaidCreditAmt > 0.01) {
+                    if (!isset($tenderMap[$unpaidFallbackTender])) {
+                        $tenderMap[$unpaidFallbackTender] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                    }
+                    $tenderMap[$unpaidFallbackTender]['voucher_ids'][$rowId] = true;
+                    $tenderMap[$unpaidFallbackTender]['total_returned'] += $unpaidCreditAmt;
+                }
+            } else {
+                if (!isset($tenderMap[$fallbackMethod])) {
+                    $tenderMap[$fallbackMethod] = ['voucher_ids' => [], 'total_refunded' => 0.0, 'total_returned' => 0.0];
+                }
+                $tenderMap[$fallbackMethod]['voucher_ids'][$rowId] = true;
+                $tenderMap[$fallbackMethod]['total_returned'] += $rowGrand;
+            }
+        }
     }
 }

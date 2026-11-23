@@ -14,11 +14,46 @@ use Illuminate\Support\Facades\Schema;
  */
 class InventoryReconciliationService
 {
+    /** @var array<string, bool> */
+    private static array $tableExistsCache = [];
+    /** @var array<string, array<string, int>> */
+    private static array $columnListingCache = [];
+
+    private function schemaKey(): string
+    {
+        $conn = DB::connection();
+        return $conn->getName() . ':' . spl_object_id($conn->getPdo());
+    }
+
+    private function cachedHasTable(string $table): bool
+    {
+        $key = $this->schemaKey() . ':' . $table;
+        if (!array_key_exists($key, self::$tableExistsCache)) {
+            self::$tableExistsCache[$key] = Schema::hasTable($table);
+        }
+        return self::$tableExistsCache[$key];
+    }
+
+    private function cachedColumnMap(string $table): array
+    {
+        $key = $this->schemaKey() . ':' . $table;
+        if (!array_key_exists($key, self::$columnListingCache)) {
+            self::$columnListingCache[$key] = array_flip(Schema::getColumnListing($table));
+        }
+        return self::$columnListingCache[$key];
+    }
+
     /**
      * Fast SQL-level portfolio valuation totals without loading all products/variants/batches into PHP.
      */
-    public function computeValuationSummary(?int $warehouseId = null, ?array $allowedWarehouseIds = null, ?array $productIds = null): array
-    {
+    public function computeValuationSummary(
+        ?int $warehouseId = null,
+        ?array $allowedWarehouseIds = null,
+        ?array $productIds = null,
+        ?int $knownActiveProductCount = null,
+        bool $includeInTransit = true,
+        $productIdsSubQuery = null
+    ): array {
         if ($productIds !== null) {
             $productIds = array_values(array_unique(array_map('intval', $productIds)));
             if (empty($productIds)) {
@@ -36,7 +71,8 @@ class InventoryReconciliationService
                     'valuation_variance' => 0.0,
                 ];
             }
-            if (count($productIds) > 400) {
+            $chunkLimit = DB::connection()->getDriverName() === 'sqlite' ? 400 : 2000;
+            if (count($productIds) > $chunkLimit) {
                 $acc = [
                     'total_book_qty' => 0.0,
                     'total_fifo_qty' => 0.0,
@@ -48,8 +84,8 @@ class InventoryReconciliationService
                     'effective_valuation' => 0.0,
                     'retail_valuation' => 0.0,
                 ];
-                foreach (array_chunk($productIds, 400) as $chunk) {
-                    $part = $this->computeValuationSummary($warehouseId, $allowedWarehouseIds, $chunk);
+                foreach (array_chunk($productIds, $chunkLimit) as $chunk) {
+                    $part = $this->computeValuationSummary($warehouseId, $allowedWarehouseIds, $chunk, null, $includeInTransit);
                     foreach ($acc as $k => $_) {
                         $acc[$k] += (float)$part[$k];
                     }
@@ -82,6 +118,8 @@ class InventoryReconciliationService
         }
         if ($productIds !== null) {
             $fifoBase->whereIn('ib.product_id', $productIds);
+        } elseif ($productIdsSubQuery !== null) {
+            $fifoBase->whereIn('ib.product_id', clone $productIdsSubQuery);
         }
 
         $fifoTotals = (clone $fifoBase)->selectRaw('
@@ -98,7 +136,7 @@ class InventoryReconciliationService
                 DB::raw('COALESCE(product_variant_id, 0) as variant_key'),
                 DB::raw('SUM(quantity) as book_qty'),
             ])
-            ->groupBy('product_id', DB::raw('COALESCE(product_variant_id, 0)'));
+            ->groupBy('product_id', 'product_variant_id');
         if ($warehouseId !== null) {
             $sbGrouped->where('warehouse_id', $warehouseId);
         } elseif (!empty($allowedWarehouseIds)) {
@@ -106,6 +144,8 @@ class InventoryReconciliationService
         }
         if ($productIds !== null) {
             $sbGrouped->whereIn('product_id', $productIds);
+        } elseif ($productIdsSubQuery !== null) {
+            $sbGrouped->whereIn('product_id', clone $productIdsSubQuery);
         }
 
         $fifoSkuSub = DB::table('inventory_batches')
@@ -116,7 +156,7 @@ class InventoryReconciliationService
                 DB::raw('COALESCE(product_variant_id, 0) as variant_key'),
                 DB::raw('SUM(remaining_quantity) as fifo_qty'),
             ])
-            ->groupBy('product_id', DB::raw('COALESCE(product_variant_id, 0)'));
+            ->groupBy('product_id', 'product_variant_id');
         if ($warehouseId !== null) {
             $fifoSkuSub->where('warehouse_id', $warehouseId);
         } elseif (!empty($allowedWarehouseIds)) {
@@ -124,23 +164,60 @@ class InventoryReconciliationService
         }
         if ($productIds !== null) {
             $fifoSkuSub->whereIn('product_id', $productIds);
+        } elseif ($productIdsSubQuery !== null) {
+            $fifoSkuSub->whereIn('product_id', clone $productIdsSubQuery);
         }
 
-        $hasVariantsTable = Schema::hasTable('product_variants');
-        $balJoin = DB::query()
-            ->fromSub($sbGrouped, 'sb')
-            ->join('products as p', 'p.id', '=', 'sb.product_id')
-            ->whereNull('p.deleted_at')
-            ->leftJoinSub($fifoSkuSub, 'fb', function ($join) {
-                $join->on('fb.product_id', '=', 'sb.product_id')
-                    ->on('fb.variant_key', '=', 'sb.variant_key');
-            });
+        $hasVariantsTable = $this->cachedHasTable('product_variants');
+
+        // When warehouseId is fixed, (warehouse_id, product_id, variant_key) is unique in stock_balances
+        // so direct table scan avoids derived-table grouping overhead completely.
+        if ($warehouseId !== null) {
+            $balJoin = DB::table('stock_balances as sb')
+                ->join('products as p', 'p.id', '=', 'sb.product_id')
+                ->where('sb.warehouse_id', $warehouseId)
+                ->whereNull('p.deleted_at');
+            if ($productIds !== null) {
+                $balJoin->whereIn('sb.product_id', $productIds);
+            } elseif ($productIdsSubQuery !== null) {
+                $balJoin->whereIn('sb.product_id', clone $productIdsSubQuery);
+            }
+            $bookCol = 'sb.quantity';
+            if ($totalFifoQty > 0.0001) {
+                $balJoin->leftJoinSub($fifoSkuSub, 'fb', function ($join) {
+                    $join->on('fb.product_id', '=', 'sb.product_id')
+                        ->whereRaw('fb.variant_key = COALESCE(sb.product_variant_id, 0)');
+                });
+                $unbatchedExpr = "CASE WHEN ({$bookCol} - COALESCE(fb.fifo_qty, 0)) > 0.0001 THEN ({$bookCol} - COALESCE(fb.fifo_qty, 0)) ELSE 0 END";
+            } else {
+                $unbatchedExpr = "CASE WHEN {$bookCol} > 0.0001 THEN {$bookCol} ELSE 0 END";
+            }
+        } else {
+            $balJoin = DB::query()
+                ->fromSub($sbGrouped, 'sb')
+                ->join('products as p', 'p.id', '=', 'sb.product_id')
+                ->whereNull('p.deleted_at');
+            $bookCol = 'sb.book_qty';
+            if ($totalFifoQty > 0.0001) {
+                $balJoin->leftJoinSub($fifoSkuSub, 'fb', function ($join) {
+                    $join->on('fb.product_id', '=', 'sb.product_id')
+                        ->on('fb.variant_key', '=', 'sb.variant_key');
+                });
+                $unbatchedExpr = "CASE WHEN ({$bookCol} - COALESCE(fb.fifo_qty, 0)) > 0.0001 THEN ({$bookCol} - COALESCE(fb.fifo_qty, 0)) ELSE 0 END";
+            } else {
+                $unbatchedExpr = "CASE WHEN {$bookCol} > 0.0001 THEN {$bookCol} ELSE 0 END";
+            }
+        }
 
         $costExpr = 'COALESCE(NULLIF(p.cost_price, 0), NULLIF(p.purchase_price, 0), 0)';
         $retailExpr = 'COALESCE(NULLIF(p.retail_price, 0), NULLIF(p.selling_price, 0), 0)';
         if ($hasVariantsTable) {
-            $balJoin->leftJoin('product_variants as pv', 'pv.id', '=', 'sb.variant_key');
-            $varCols = array_flip(Schema::getColumnListing('product_variants'));
+            if ($warehouseId !== null) {
+                $balJoin->leftJoin('product_variants as pv', 'pv.id', '=', 'sb.product_variant_id');
+            } else {
+                $balJoin->leftJoin('product_variants as pv', 'pv.id', '=', 'sb.variant_key');
+            }
+            $varCols = $this->cachedColumnMap('product_variants');
             $vCost = isset($varCols['cost_price']) ? 'NULLIF(pv.cost_price, 0), ' : '';
             $vPurch = isset($varCols['purchase_price']) ? 'NULLIF(pv.purchase_price, 0), ' : '';
             $vSell = isset($varCols['selling_price']) ? 'NULLIF(pv.selling_price, 0), ' : '';
@@ -148,15 +225,16 @@ class InventoryReconciliationService
             $retailExpr = "COALESCE({$vSell}NULLIF(p.retail_price, 0), NULLIF(p.selling_price, 0), 0)";
         }
 
-        $unbatchedExpr = 'CASE WHEN (sb.book_qty - COALESCE(fb.fifo_qty, 0)) > 0.0001 THEN (sb.book_qty - COALESCE(fb.fifo_qty, 0)) ELSE 0 END';
         $sbTotals = $balJoin->selectRaw("
-            COALESCE(SUM(sb.book_qty), 0) as total_book_qty,
+            COUNT(DISTINCT p.id) as sb_prod_count,
+            COALESCE(SUM({$bookCol}), 0) as total_book_qty,
             COALESCE(SUM({$unbatchedExpr}), 0) as total_unbatched_qty,
-            COALESCE(SUM(sb.book_qty * ({$costExpr})), 0) as master_valuation,
+            COALESCE(SUM({$bookCol} * ({$costExpr})), 0) as master_valuation,
             COALESCE(SUM(({$unbatchedExpr}) * ({$costExpr})), 0) as unbatched_valuation,
-            COALESCE(SUM(sb.book_qty * ({$retailExpr})), 0) as retail_valuation
+            COALESCE(SUM({$bookCol} * ({$retailExpr})), 0) as retail_valuation
         ")->first();
 
+        $sbProdCount = (int)($sbTotals->sb_prod_count ?? 0);
         $totalBookQty = (float)($sbTotals->total_book_qty ?? 0.0);
         $totalUnbatchedQty = (float)($sbTotals->total_unbatched_qty ?? 0.0);
         $masterValuation = (float)($sbTotals->master_valuation ?? 0.0);
@@ -165,7 +243,9 @@ class InventoryReconciliationService
         $effectiveValuation = $fifoBatchValuation + $unbatchedValuation;
 
         // Legacy fallback ONLY for products with zero stock_balances rows anywhere
-        if ($warehouseId === null && empty($allowedWarehouseIds)) {
+        $expectedProdCount = $productIds !== null ? count($productIds) : $knownActiveProductCount;
+        $skipLegacyFallback = ($expectedProdCount !== null && $sbProdCount >= $expectedProdCount);
+        if ($warehouseId === null && empty($allowedWarehouseIds) && !$skipLegacyFallback) {
             $legacyQ = DB::table('products as p')
                 ->whereNull('p.deleted_at')
                 ->whereNotExists(function ($q) {
@@ -190,7 +270,7 @@ class InventoryReconciliationService
 
         $inTransitQty = 0.0;
         $inTransitValuation = 0.0;
-        if (Schema::hasTable('stock_transfers') && Schema::hasTable('stock_transfer_items')) {
+        if ($includeInTransit && $this->cachedHasTable('stock_transfers') && $this->cachedHasTable('stock_transfer_items')) {
             $inTransitQ = DB::table('stock_transfer_items')
                 ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
                 ->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id')

@@ -10,3 +10,6 @@ Artisan::command('inspire', function () {
 
 // Automatically transition stale open quotations whose expiry_date has passed.
 Schedule::command('quotations:expire')->hourly()->withoutOverlapping();
+
+// Dispatch scheduled daily Telegram business summary at the store's custom configured time.
+Schedule::command('telegram:send-scheduled-daily')->everyMinute()->withoutOverlapping();

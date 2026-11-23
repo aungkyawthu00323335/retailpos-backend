@@ -15,7 +15,10 @@ class StockReportResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
-        $canViewCost = app(PurchaseAccountingService::class)->canViewCost($request);
+        $attrCanViewCost = $request->attributes->get('_stock_report_can_view_cost');
+        $canViewCost = is_bool($attrCanViewCost)
+            ? $attrCanViewCost
+            : app(PurchaseAccountingService::class)->canViewCost($request);
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
@@ -48,6 +51,11 @@ class StockReportResource extends JsonResource
             $stockQty = (float)$this->stockBalances->sum('quantity');
         }
 
+        $costPrice = (float)($this->cost_price ?: $this->purchase_price);
+        $retailPrice = (float)($this->retail_price ?: $this->selling_price);
+        $code = (string)($this->code ?: ($this->sku ?? ''));
+        $alertQty = (float)($this->alert_quantity ?: ($this->stock_alert ?: ($this->low_qty ?: 10)));
+
         // Lightweight variant formatting
         $variants = [];
         if ($this->has_variants && $this->relationLoaded('variants') && $this->variants->isNotEmpty()) {
@@ -69,23 +77,23 @@ class StockReportResource extends JsonResource
                     }
                 }
 
+                $vCost = (float)($v->cost_price ?: ($v->purchase_price ?? 0));
+                if ($vCost <= 0.0) {
+                    $vCost = $costPrice;
+                }
+
                 $variants[] = [
                     'id' => (int)$v->id,
                     'name' => (string)$v->name,
                     'sku' => (string)($v->sku ?? ''),
-                    'cost_price' => $canViewCost ? (float)$v->cost_price : null,
+                    'cost_price' => $canViewCost ? $vCost : null,
                     'cost_masked' => !$canViewCost,
-                    'retail_price' => (float)($v->selling_price ?? 0.0),
+                    'retail_price' => (float)($v->selling_price ?? 0.0) ?: $retailPrice,
                     'stock_quantity' => $vStock,
                     'values' => $vals,
                 ];
             }
         }
-
-        $costPrice = (float)($this->cost_price ?: $this->purchase_price);
-        $retailPrice = (float)($this->retail_price ?: $this->selling_price);
-        $code = (string)($this->code ?: ($this->sku ?? ''));
-        $alertQty = (float)($this->alert_quantity ?: ($this->stock_alert ?: ($this->low_qty ?: 10)));
 
         return [
             'id' => (int)$this->id,

@@ -11,8 +11,10 @@ use App\Models\Expense;
 use App\Models\Outlet;
 use App\Models\User;
 use App\Services\PurchaseAccountingService;
+use App\Services\TelegramNotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 
 class CashRegisterController extends Controller
@@ -208,8 +210,9 @@ class CashRegisterController extends Controller
         }
 
         $user = $this->resolveAuthUser($request);
+        $telegramPayload = null;
 
-        return DB::transaction(function () use ($request, $validated, $id, $user) {
+        $response = DB::transaction(function () use ($request, $validated, $id, $user, &$telegramPayload) {
             if ($id) {
                 $register = CashRegister::lockForUpdate()->find($id);
             } else {
@@ -262,15 +265,20 @@ class CashRegisterController extends Controller
                 'denominations' => $denominations,
             ]);
 
-            $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
             $payload['closing_cash'] = round($closingCash, 2);
-            $payload['expected_cash'] = $canViewExpected ? round($expectedCash, 2) : null;
-            $payload['difference'] = $canViewExpected ? round($difference, 2) : null;
+            $payload['expected_cash'] = round($expectedCash, 2);
+            $payload['difference'] = round($difference, 2);
             $payload['status'] = 'Closed';
             $payload['closed_at'] = (string)$closedAt;
             $payload['closing_notes'] = (string)($closingNotes ?? '');
             $payload['notes'] = (string)($closingNotes ?? $payload['notes']);
             $payload['denominations'] = $denominations;
+
+            $telegramPayload = $payload;
+
+            $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
+            $payload['expected_cash'] = $canViewExpected ? round($expectedCash, 2) : null;
+            $payload['difference'] = $canViewExpected ? round($difference, 2) : null;
 
             return $this->noStoreJson([
                 'status' => 'success',
@@ -278,6 +286,19 @@ class CashRegisterController extends Controller
                 'register' => $payload,
             ]);
         });
+
+        if ($telegramPayload !== null) {
+            try {
+                $userName = trim((string)($user?->name ?? 'POS Cashier'));
+                $userRole = trim((string)($user?->role ?? ''));
+                $triggeredBy = $userRole !== '' ? "{$userName} ({$userRole})" : $userName;
+                app(TelegramNotificationService::class)->sendRegisterNotification($telegramPayload, $triggeredBy, true);
+            } catch (\Throwable $e) {
+                Log::warning('Telegram auto-notify on register close failed: ' . $e->getMessage());
+            }
+        }
+
+        return $response;
     }
 
     public function recordTransaction(Request $request)
@@ -452,7 +473,7 @@ class CashRegisterController extends Controller
         ];
     }
 
-    private function buildRegisterDetailsPayload(CashRegister $register, ?User $user = null, bool $forInternalCalculation = false): array
+    public function buildRegisterDetailsPayload(CashRegister $register, ?User $user = null, bool $forInternalCalculation = false): array
     {
         $accounting = app(PurchaseAccountingService::class);
         $openedAt = $register->opened_at;

@@ -33,6 +33,7 @@ use App\Http\Controllers\Api\CurrencyController;
 use App\Http\Controllers\Api\VariationController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\CashRegisterController;
+use App\Http\Controllers\Api\TelegramNotificationController;
 
 /*
 |--------------------------------------------------------------------------
@@ -284,5 +285,15 @@ Route::get('settings', [SettingController::class, 'getSettings'])->middleware('p
 Route::post('settings', [SettingController::class, 'updateSettings'])->middleware('permission:general_settings.update,voucher_settings.update,prefix_settings.update');
 Route::post('currencies/{id}/set-default', [CurrencyController::class, 'setDefault'])->middleware('permission:currencies.update');
 $crudResource('currencies', CurrencyController::class, 'currencies', 'dashboard.view,pos.view,sales.view,purchases.view,expenses.view,quotations.view,general_settings.view,reports.view,products.view', ['index', 'store', 'update', 'destroy']);
+
+// Telegram Notifications & Business Intelligence Alerts
+Route::get('telegram/settings', [TelegramNotificationController::class, 'getSettings'])->middleware('permission:general_settings.view');
+Route::post('telegram/settings', [TelegramNotificationController::class, 'updateSettings'])->middleware('permission:general_settings.update');
+Route::get('telegram/preview-daily-summary', [TelegramNotificationController::class, 'previewDailySummary'])->middleware('permission:general_settings.view,reports.view,report_register.view');
+Route::post('telegram/send-daily-summary', [TelegramNotificationController::class, 'sendDailySummary'])->middleware('permission:general_settings.view,general_settings.update,reports.view');
+Route::post('telegram/send-register/{id}', [TelegramNotificationController::class, 'sendRegisterSummary'])->middleware('permission:cash_register.view,report_register.view,general_settings.view,general_settings.update');
+Route::post('telegram/test', [TelegramNotificationController::class, 'sendTest'])->middleware('permission:general_settings.update');
+Route::post('telegram/check-scheduled', [TelegramNotificationController::class, 'checkScheduledDaily']);
+Route::get('telegram/logs', [TelegramNotificationController::class, 'logs'])->middleware('permission:general_settings.view');
 
 
