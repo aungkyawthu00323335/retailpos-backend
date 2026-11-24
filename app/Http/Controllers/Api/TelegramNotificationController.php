@@ -271,12 +271,14 @@ class TelegramNotificationController extends Controller
     public function checkScheduledDaily()
     {
         $result = $this->telegram->dispatchScheduledDailyIfDue(false);
+        $schedule = $this->telegram->getScheduleHint();
         return response()->json([
             'status' => !empty($result['skipped']) ? 'skipped' : (!empty($result['ok']) ? 'sent' : 'error'),
             'reason' => $result['reason'] ?? null,
             'sent_count' => $result['sent_count'] ?? 0,
             'failed_count' => $result['failed_count'] ?? 0,
             'message' => $result['message'] ?? null,
+            'schedule' => $schedule,
         ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
 

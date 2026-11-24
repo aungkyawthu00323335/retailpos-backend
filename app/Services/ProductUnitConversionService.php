@@ -289,15 +289,14 @@ class ProductUnitConversionService
 
     public function warehouseId(?int $warehouseId, ?string $warehouseName): ?int
     {
-        $hasOutlets = Outlet::query()->exists();
-
         if ($warehouseId !== null && $warehouseId > 0) {
-            if (!$hasOutlets) {
+            if (Outlet::whereKey($warehouseId)->exists()) {
                 return $warehouseId;
             }
-            return Outlet::whereKey($warehouseId)->exists() ? $warehouseId : null;
+            return Outlet::query()->exists() ? null : $warehouseId;
         }
 
+        $hasOutlets = Outlet::query()->exists();
         $name = trim((string)$warehouseName);
         if ($name === '') {
             return $hasOutlets ? Outlet::orderBy('id')->value('id') : null;
@@ -327,7 +326,9 @@ class ProductUnitConversionService
         bool $allowOverdraft = false,
         bool $syncAggregates = true,
         ?float $unitCost = null,
-        ?string $movementDate = null
+        ?string $movementDate = null,
+        ?StockBalance $prelockedBalance = null,
+        bool $skipLocks = false
     ): float {
         if (!$warehouseId) {
             throw new RuntimeException('A valid warehouse is required for stock movement.');
@@ -336,11 +337,17 @@ class ProductUnitConversionService
             throw new InvalidArgumentException('Base quantity must be non-negative.');
         }
 
-        Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
-        $query = StockBalance::where('warehouse_id', $warehouseId)
-            ->where('product_id', $product->id);
-        $variantId === null ? $query->whereNull('product_variant_id') : $query->where('product_variant_id', $variantId);
-        $balance = $query->lockForUpdate()->first();
+        if (!$skipLocks) {
+            Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+        }
+
+        $balance = $prelockedBalance;
+        if ($balance === null) {
+            $query = StockBalance::where('warehouse_id', $warehouseId)
+                ->where('product_id', $product->id);
+            $variantId === null ? $query->whereNull('product_variant_id') : $query->where('product_variant_id', $variantId);
+            $balance = $skipLocks ? $query->first() : $query->lockForUpdate()->first();
+        }
 
         if (!$balance) {
             $hasExistingBalances = StockBalance::where('product_id', $product->id)->exists();
@@ -363,7 +370,17 @@ class ProductUnitConversionService
         } else {
             $next = max(0.0, round($next, 4));
         }
-        $balance->update(['quantity' => $next]);
+
+        if ($syncAggregates) {
+            $balance->update(['quantity' => $next]);
+        } else {
+            // Avoid redundant per-item `UPDATE products SET updated_at` from StockBalance::$touches
+            // since caller invokes syncAggregatesForProducts() in batch right after the loop.
+            \Illuminate\Support\Facades\DB::table('stock_balances')
+                ->where('id', $balance->id)
+                ->update(['quantity' => $next, 'updated_at' => now()]);
+            $balance->quantity = $next;
+        }
 
         $movementTimestamp = now();
         if ($movementDate !== null && trim($movementDate) !== '') {

@@ -661,6 +661,7 @@ class TelegramNotificationTest extends TestCase
             'stock_adjustment_id' => $adj->id,
             'product_id' => 1,
             'product_name' => 'Test Item',
+            'product_code' => 'SKU-TEST-01',
             'quantity' => 1,
             'unit_cost' => 2000,
             'subtotal' => 2000,

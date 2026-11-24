@@ -983,8 +983,9 @@ class TelegramNotificationService
             $lines[] = "{$npIcon} <b>" . ($isMy ? 'အမြတ်အရှုံး အနှစ်ချုပ် (P&amp;L)' : 'Profit &amp; Loss Summary') . "</b>";
             $lines[] = "• " . ($isMy ? "အသားတင် အရောင်းဝင်ငွေ: " : "Net Sales Revenue: ")
                 . $this->formatAmount($netSales, $currency);
+            $cogsPrefix = $cogs > 0 ? '-' : '';
             $lines[] = "• " . ($isMy ? "ရောင်းရကုန်ကျစရိတ် (COGS): " : "Cost of Goods Sold (COGS): ")
-                . "-{$this->formatAmount($cogs, $currency)}";
+                . "{$cogsPrefix}{$this->formatAmount($cogs, $currency)}";
             $lines[] = "• " . ($isMy ? "အကြမ်းအမြတ်: " : "Gross Profit: ")
                 . "<b>{$this->formatAmount($gp, $currency)}</b>"
                 . ($netSales > 0 ? " ({$gm}%)" : "");
@@ -1235,6 +1236,64 @@ class TelegramNotificationService
      * Evaluate custom daily schedule in the store's timezone and dispatch once per day when due.
      * Protected by fast 60s cache pre-check + atomic Cache::lock + DB idempotency date guard.
      */
+    /**
+     * Cached schedule metadata (1 hour TTL; explicitly invalidated on settings save & after auto-send).
+     */
+    public function getCachedScheduleMeta(): array
+    {
+        return Cache::remember(self::CACHE_KEY_SCHEDULE_META, 3600, function (): array {
+            $s = TelegramSetting::current();
+            return [
+                'is_enabled' => (bool)$s->is_enabled,
+                'auto_send_daily_enabled' => (bool)$s->auto_send_daily_enabled,
+                'auto_send_daily_time' => $s->getNormalizedScheduleTime(),
+                'last_auto_daily_sent_date' => $s->last_auto_daily_sent_date,
+                'has_bot_token' => $s->getPlainBotToken() !== '',
+            ];
+        });
+    }
+
+    /**
+     * Returns exact next-check delay so desktop/mobile clients sleep until the exact
+     * scheduled time (or stay completely idle when disabled) instead of polling every minute.
+     */
+    public function getScheduleHint(?Carbon $nowOverride = null): array
+    {
+        $tz = $this->getStoreTimezone();
+        $now = $nowOverride ? $nowOverride->copy()->setTimezone($tz) : Carbon::now($tz);
+        $today = $now->toDateString();
+        $meta = $this->getCachedScheduleMeta();
+
+        $active = !empty($meta['is_enabled'])
+            && !empty($meta['auto_send_daily_enabled'])
+            && !empty($meta['has_bot_token']);
+
+        $nextCheckInSeconds = null;
+        if ($active) {
+            [$hh, $mm] = array_pad(explode(':', (string)$meta['auto_send_daily_time']), 2, '00');
+            $target = $now->copy()->setTime((int)$hh, (int)$mm, 5);
+
+            if (($meta['last_auto_daily_sent_date'] ?? null) === $today) {
+                $target->addDay();
+                $nextCheckInSeconds = max(60, (int)$now->diffInSeconds($target, false));
+            } elseif ($now->lt($target)) {
+                $nextCheckInSeconds = max(5, (int)$now->diffInSeconds($target, false));
+            } else {
+                // Target time already passed today but send did not succeed (e.g. offline/no recipients): back off 15 min
+                $nextCheckInSeconds = 900;
+            }
+        }
+
+        return [
+            'is_enabled' => (bool)$meta['is_enabled'],
+            'auto_send_daily_enabled' => (bool)$meta['auto_send_daily_enabled'],
+            'auto_send_daily_time' => (string)$meta['auto_send_daily_time'],
+            'last_auto_daily_sent_date' => $meta['last_auto_daily_sent_date'],
+            'has_bot_token' => (bool)$meta['has_bot_token'],
+            'next_check_in_seconds' => $nextCheckInSeconds,
+        ];
+    }
+
     public function dispatchScheduledDailyIfDue(bool $force = false, ?Carbon $nowOverride = null): array
     {
         $tz = $this->getStoreTimezone();
@@ -1242,18 +1301,9 @@ class TelegramNotificationService
         $today = $now->toDateString();
         $currentHHMM = $now->format('H:i');
 
-        // Ultra-fast <1ms pre-check when invoked by periodic heartbeat (0 DB queries when not due)
+        // Ultra-fast <1ms pre-check (0 DB queries when not due; invalidated immediately on settings save / send)
         if (!$force) {
-            $schedMeta = Cache::remember(self::CACHE_KEY_SCHEDULE_META, 60, function (): array {
-                $s = TelegramSetting::current();
-                return [
-                    'is_enabled' => (bool)$s->is_enabled,
-                    'auto_send_daily_enabled' => (bool)$s->auto_send_daily_enabled,
-                    'auto_send_daily_time' => $s->getNormalizedScheduleTime(),
-                    'last_auto_daily_sent_date' => $s->last_auto_daily_sent_date,
-                    'has_bot_token' => $s->getPlainBotToken() !== '',
-                ];
-            });
+            $schedMeta = $this->getCachedScheduleMeta();
 
             if (!$schedMeta['is_enabled'] || !$schedMeta['auto_send_daily_enabled'] || !$schedMeta['has_bot_token']) {
                 return ['ok' => false, 'skipped' => true, 'reason' => 'schedule_disabled', 'sent_count' => 0, 'failed_count' => 0];
@@ -1370,7 +1420,8 @@ class TelegramNotificationService
 
         foreach ($chunks as $chunk) {
             try {
-                $response = Http::timeout(12)
+                $response = Http::connectTimeout(3)
+                    ->timeout(5)
                     ->withOptions(['verify' => $verifyOption])
                     ->acceptJson()
                     ->post($endpoint, [

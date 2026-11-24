@@ -72,14 +72,14 @@ class Customer extends Model
     }
 
     /**
-     * Restricts a sales query to genuine Accounts Receivable:
-     * excludes voided / cancelled / draft sales (no revenue recognised yet).
+     * Restricts a sales query to genuine posted Accounts Receivable:
+     * excludes voided / cancelled / draft / pending / ordered sales (no revenue recognised yet).
      */
     public static function applyReceivableScope($query)
     {
         return $query
             ->where(function ($q) {
-                $q->whereNull('status')->orWhereNotIn('status', ['Voided', 'Cancelled', 'Draft']);
+                $q->whereNull('status')->orWhereNotIn('status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered']);
             });
     }
 }

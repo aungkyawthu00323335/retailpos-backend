@@ -2967,7 +2967,7 @@ class ReportController extends Controller
             DB::raw("{$saleCustExpr} as customer_id"),
             DB::raw('COUNT(*) as total_orders'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_spent'),
-            DB::raw('COALESCE(SUM(paid_amount), 0) as total_paid'),
+            DB::raw('COALESCE(SUM(CASE WHEN paid_amount > grand_total THEN grand_total ELSE paid_amount END), 0) as total_paid'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_due'),
             DB::raw('MAX(date) as last_purchase_date')
         )->groupBy(DB::raw($saleCustExpr));
@@ -2995,7 +2995,7 @@ class ReportController extends Controller
             DB::raw("{$retCustExpr} as customer_id"),
             DB::raw('COUNT(*) as total_returns'),
             DB::raw('COALESCE(SUM(grand_total), 0) as total_returned_amount'),
-            DB::raw('COALESCE(SUM(paid_amount), 0) as total_refunded_amount'),
+            DB::raw('COALESCE(SUM(CASE WHEN paid_amount > grand_total THEN grand_total ELSE paid_amount END), 0) as total_refunded_amount'),
             DB::raw('COALESCE(SUM(due_amount), 0) as total_return_due')
         )->groupBy(DB::raw($retCustExpr));
 
@@ -3286,17 +3286,13 @@ class ReportController extends Controller
             ? (clone $salesQuery)->selectRaw('
                 COUNT(*) as invoices_count,
                 COALESCE(SUM(grand_total), 0) as total_invoiced,
-                COALESCE(SUM(paid_amount), 0) as total_paid,
+                COALESCE(SUM(CASE WHEN paid_amount > grand_total THEN grand_total ELSE paid_amount END), 0) as total_paid,
                 COALESCE(SUM(due_amount), 0) as total_due
             ')->first()
             : null;
 
-        $saleItemsCountSub = DB::table('sale_items')
-            ->select('sale_id', DB::raw('COUNT(*) as items_count'))
-            ->groupBy('sale_id');
-
+        // Fetch ONLY the paged invoice rows first (avoids scanning entire sale_items table!)
         $rawInvoices = (clone $salesQuery)
-            ->leftJoinSub($saleItemsCountSub, 'sic', 'sic.sale_id', '=', 'sales.id')
             ->select([
                 'sales.id',
                 'sales.reference_no',
@@ -3305,9 +3301,9 @@ class ReportController extends Controller
                 'sales.grand_total',
                 'sales.paid_amount',
                 'sales.due_amount',
+                'sales.status',
                 'sales.payment_status',
                 'sales.payment_type',
-                DB::raw('COALESCE(sic.items_count, 0) as items_count'),
             ])
             ->orderBy('sales.date', 'desc')
             ->orderBy('sales.id', 'desc')
@@ -3317,38 +3313,49 @@ class ReportController extends Controller
 
         $invoicesHasMore = $rawInvoices->count() > $perPage;
         $invoicesSlice = $invoicesHasMore ? $rawInvoices->slice(0, $perPage)->values() : $rawInvoices->values();
-        $invoices = $invoicesSlice->map(function ($s) {
+        $pagedSaleIds = $invoicesSlice->pluck('id')->map(fn ($v) => (int)$v)->all();
+        $saleItemCounts = !empty($pagedSaleIds)
+            ? DB::table('sale_items')
+                ->whereIn('sale_id', $pagedSaleIds)
+                ->selectRaw('sale_id, COUNT(*) as cnt')
+                ->groupBy('sale_id')
+                ->pluck('cnt', 'sale_id')
+                ->all()
+            : [];
+
+        $invoices = $invoicesSlice->map(function ($s) use ($saleItemCounts) {
+            $gt = (float)$s->grand_total;
+            $rawPaid = (float)$s->paid_amount;
+            $effPaid = min($rawPaid, $gt);
             return [
                 'id' => (int)$s->id,
                 'reference_no' => (string)$s->reference_no,
                 'date' => (string)$s->date,
                 'warehouse_name' => (string)($s->warehouse_name ?? 'Main Outlet'),
-                'grand_total' => (float)$s->grand_total,
-                'paid_amount' => (float)$s->paid_amount,
+                'status' => (string)($s->status ?? 'Completed'),
+                'grand_total' => $gt,
+                'paid_amount' => $effPaid,
                 'due_amount' => (float)$s->due_amount,
                 'payment_status' => (string)$s->payment_status,
                 'payment_type' => (string)$s->payment_type,
-                'items_count' => (int)($s->items_count ?? 0),
+                'items_count' => (int)($saleItemCounts[(int)$s->id] ?? 0),
             ];
         })->all();
 
-        $returnsQuery = DB::table('sale_returns')
+        $returnsBaseQuery = DB::table('sale_returns')
             ->where(function ($q) use ($id, $isWalkInCustomer) {
                 $q->where('customer_id', $id);
                 if ($isWalkInCustomer) {
                     $q->orWhereNull('customer_id');
                 }
             });
-        $this->applyActiveDocumentFilter($returnsQuery, 'status');
-
-        $applyWhScope($returnsQuery);
+        $applyWhScope($returnsBaseQuery);
         if (!empty($allowedOutlets)) {
-            $returnsQuery->whereIn('warehouse_id', $allowedOutlets);
+            $returnsBaseQuery->whereIn('warehouse_id', $allowedOutlets);
         }
-        $this->applyReportDateRange($returnsQuery, $startDate, $endDate, 'date');
-
+        $this->applyReportDateRange($returnsBaseQuery, $startDate, $endDate, 'date');
         if (!empty($search)) {
-            $returnsQuery->where(function ($q) use ($search) {
+            $returnsBaseQuery->where(function ($q) use ($search) {
                 $q->where('reference_no', 'like', "%{$search}%")
                   ->orWhere('sale_reference_no', 'like', "%{$search}%")
                   ->orWhere('refund_tender', 'like', "%{$search}%")
@@ -3357,21 +3364,36 @@ class ReportController extends Controller
             });
         }
 
+        // Single-pass conditional aggregation computes BOTH posted returns & unposted pending returns in 1 scan
         $returnsAgg = !$skipSummary && $page === 1
-            ? (clone $returnsQuery)->selectRaw('
-                COUNT(*) as returns_count,
-                COALESCE(SUM(grand_total), 0) as total_returned,
-                COALESCE(SUM(paid_amount), 0) as total_refunded,
-                COALESCE(SUM(due_amount), 0) as total_return_due
-            ')->first()
+            ? (clone $returnsBaseQuery)->selectRaw("
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, 'completed')) NOT IN ('voided','cancelled','canceled','draft','pending','ordered') THEN 1 ELSE 0 END), 0) as returns_count,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, 'completed')) NOT IN ('voided','cancelled','canceled','draft','pending','ordered') THEN grand_total ELSE 0 END), 0) as total_returned,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, 'completed')) NOT IN ('voided','cancelled','canceled','draft','pending','ordered') THEN (CASE WHEN paid_amount > grand_total THEN grand_total ELSE paid_amount END) ELSE 0 END), 0) as total_refunded,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, 'completed')) NOT IN ('voided','cancelled','canceled','draft','pending','ordered') THEN due_amount ELSE 0 END), 0) as total_return_due,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending','draft','ordered') THEN 1 ELSE 0 END), 0) as pending_count,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending','draft','ordered') THEN grand_total ELSE 0 END), 0) as pending_amount
+            ")->first()
             : null;
 
+        $returnsQuery = clone $returnsBaseQuery;
+        $this->applyActiveDocumentFilter($returnsQuery, 'status');
+
+        // Avoid transferring heavy items_payload JSON blobs for every row; compute count in SQL when supported
+        $driver = DB::connection()->getDriverName();
+        $returnsSelect = [
+            'id', 'reference_no', 'sale_reference_no', 'date', 'warehouse_name',
+            'return_reason', 'refund_tender', 'payment_type', 'grand_total',
+            'paid_amount', 'due_amount', 'status', 'payment_status',
+        ];
+        if ($driver === 'mysql' || $driver === 'mariadb') {
+            $returnsSelect[] = DB::raw('CASE WHEN items_payload IS NOT NULL AND JSON_VALID(items_payload) THEN JSON_LENGTH(items_payload) ELSE 1 END as computed_items_count');
+        } else {
+            $returnsSelect[] = 'items_payload';
+        }
+
         $rawReturns = (clone $returnsQuery)
-            ->select([
-                'id', 'reference_no', 'sale_reference_no', 'date', 'warehouse_name',
-                'return_reason', 'refund_tender', 'payment_type', 'grand_total',
-                'paid_amount', 'due_amount', 'status', 'payment_status', 'items_payload',
-            ])
+            ->select($returnsSelect)
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc')
             ->offset($offset)
@@ -3381,10 +3403,14 @@ class ReportController extends Controller
         $returnsHasMore = $rawReturns->count() > $perPage;
         $returnsSlice = $returnsHasMore ? $rawReturns->slice(0, $perPage)->values() : $rawReturns->values();
         $returns = $returnsSlice->map(function ($r) {
-            $items = is_string($r->items_payload) ? json_decode($r->items_payload, true) : null;
-            if (!is_array($items)) {
-                $items = [];
+            if (property_exists($r, 'computed_items_count')) {
+                $itemsCount = max(1, (int)$r->computed_items_count);
+            } else {
+                $items = is_string($r->items_payload ?? null) ? json_decode($r->items_payload, true) : null;
+                $itemsCount = is_array($items) && !empty($items) ? count($items) : 1;
             }
+            $gt = (float)$r->grand_total;
+            $effRefunded = min((float)$r->paid_amount, $gt);
             return [
                 'id' => (int)$r->id,
                 'reference_no' => (string)$r->reference_no,
@@ -3393,31 +3419,39 @@ class ReportController extends Controller
                 'warehouse_name' => (string)($r->warehouse_name ?? 'Main Outlet'),
                 'return_reason' => (string)($r->return_reason ?? 'Customer Return'),
                 'refund_tender' => (string)($r->refund_tender ?? ($r->payment_type ?? 'Cash')),
-                'grand_total' => (float)$r->grand_total,
-                'paid_amount' => (float)$r->paid_amount,
+                'grand_total' => $gt,
+                'paid_amount' => $effRefunded,
                 'due_amount' => (float)$r->due_amount,
                 'status' => (string)($r->status ?? 'Completed'),
                 'payment_status' => (string)($r->payment_status ?? 'Paid'),
-                'items_count' => !empty($items) ? count($items) : 1,
-                'items' => $items,
+                'items_count' => $itemsCount,
             ];
         })->all();
 
         $invoicesCount = (int)($salesAgg->invoices_count ?? count($invoices));
-        $totalInvoiced = (float)($salesAgg->total_invoiced ?? 0);
-        $totalPaid = (float)($salesAgg->total_paid ?? 0);
-        $totalDue = (float)($salesAgg->total_due ?? 0);
+        $totalInvoiced = round((float)($salesAgg->total_invoiced ?? 0), 2);
+        $totalPaid = round((float)($salesAgg->total_paid ?? 0), 2);
+        $totalDue = round((float)($salesAgg->total_due ?? 0), 2);
 
         $returnsCount = (int)($returnsAgg->returns_count ?? count($returns));
-        $totalReturned = (float)($returnsAgg->total_returned ?? 0);
-        $totalRefunded = (float)($returnsAgg->total_refunded ?? 0);
-        $totalReturnDue = (float)($returnsAgg->total_return_due ?? 0);
+        $totalReturned = round((float)($returnsAgg->total_returned ?? 0), 2);
+        $totalRefunded = round((float)($returnsAgg->total_refunded ?? 0), 2);
+        $totalReturnDue = round((float)($returnsAgg->total_return_due ?? 0), 2);
 
+        $pendingReturnsCount = (int)($returnsAgg->pending_count ?? 0);
+        $pendingReturnsAmount = round((float)($returnsAgg->pending_amount ?? 0), 2);
+
+        // Exact Double-Entry AR Reconciliation:
+        // Net Sales - Net Collected === Invoice Due - Unrefunded Return Credit === Signed Net Balance
         $netInvoiced = round($totalInvoiced - $totalReturned, 2);
         $netPaid = round($totalPaid - $totalRefunded, 2);
-        $netDue = max(0.0, round($totalDue - $totalReturnDue, 2));
+        $signedNetBalance = round($totalDue - $totalReturnDue, 2);
+        $netDue = $signedNetBalance > 0.005 ? $signedNetBalance : 0.0;
+        $creditBalance = $signedNetBalance < -0.005 ? round(abs($signedNetBalance), 2) : 0.0;
         $returnRatePct = $totalInvoiced > 0 ? round(($totalReturned / $totalInvoiced) * 100, 2) : 0.0;
-        $paymentRatePct = $totalInvoiced > 0 ? round(($totalPaid / $totalInvoiced) * 100, 2) : 100.0;
+        $paymentRatePct = $netInvoiced > 0
+            ? round(min(100.0, max(0.0, ($netPaid / $netInvoiced) * 100)), 2)
+            : ($netDue <= 0.005 ? 100.0 : 0.0);
         $averageOrderValue = $invoicesCount > 0 ? round($totalInvoiced / $invoicesCount, 2) : 0.0;
 
         $totalStatementCount = max($invoicesCount, $returnsCount);
@@ -3452,10 +3486,13 @@ class ReportController extends Controller
                     'net_paid' => $netPaid,
                     'total_due' => $totalDue,
                     'net_due' => $netDue,
+                    'credit_balance' => $creditBalance,
+                    'signed_net_balance' => $signedNetBalance,
                     'return_rate_pct' => $returnRatePct,
                 ],
                 'summary' => [
                     'invoices_count' => $invoicesCount,
+                    'total_orders' => $invoicesCount,
                     'total_invoiced' => $totalInvoiced,
                     'total_paid' => $totalPaid,
                     'total_due' => $totalDue,
@@ -3463,14 +3500,30 @@ class ReportController extends Controller
                     'total_returned' => $totalReturned,
                     'total_refunded' => $totalRefunded,
                     'total_return_due' => $totalReturnDue,
+                    'pending_returns_count' => $pendingReturnsCount,
+                    'pending_returns_amount' => $pendingReturnsAmount,
                     'net_invoiced' => $netInvoiced,
                     'net_paid' => $netPaid,
                     'net_due' => $netDue,
+                    'credit_balance' => $creditBalance,
+                    'signed_net_balance' => $signedNetBalance,
                     'return_rate_pct' => $returnRatePct,
                     'payment_rate_pct' => $paymentRatePct,
                     'average_order_value' => $averageOrderValue,
                 ],
                 'pagination' => $pagination,
+                'invoices_pagination' => [
+                    'current_page' => $page,
+                    'per_page' => $perPage,
+                    'total' => $invoicesCount,
+                    'has_more' => $invoicesHasMore,
+                ],
+                'returns_pagination' => [
+                    'current_page' => $page,
+                    'per_page' => $perPage,
+                    'total' => $returnsCount,
+                    'has_more' => $returnsHasMore,
+                ],
                 'invoices' => $invoices,
                 'returns' => $returns,
             ],
@@ -4076,7 +4129,9 @@ class ReportController extends Controller
     }
 
     /**
-     * Supplier Statement & Accounts Payable Ledger Drilldown (SQL totals + paginated rows, single history pass)
+     * Supplier Statement & Accounts Payable Ledger Drilldown
+     * Index-native SQL aggregation, zero N+1/full-table scans, single-pass posted+pending returns,
+     * exact double-entry AP reconciliation (Gross - Returns = Net Purchases; Open PO Due - Unallocated Credit + Opening = Signed Net AP).
      */
     public function supplierStatement(Request $request, $id)
     {
@@ -4110,16 +4165,67 @@ class ReportController extends Controller
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $offset = ($page - 1) * $perPage;
 
-        $applySupMatch = function ($q) use ($id, $supplier) {
-            $q->where('supplier_id', $id);
-            if (!empty($supplier->name)) {
-                $q->orWhere(function ($sq) use ($supplier) {
-                    $sq->whereNull('supplier_id')->where('supplier_name', $supplier->name);
-                });
+        $hasEndDate = !empty($endDate);
+        $hasStartDate = !empty($startDate);
+        $isDateFiltered = $hasStartDate || $hasEndDate;
+        $isFiltered = $isDateFiltered || $hasWarehouseFilter || $search !== '' || !empty($allowedOutlets);
+        $asOfEnd = $hasEndDate ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
+
+        // Fast index probes: avoid OR-conditions that defeat supplier_id / warehouse_id covering indexes
+        $hasNullPoSup = !empty($supplier->name) && DB::table('purchases')->whereNull('supplier_id')->exists();
+        $hasNullPrSup = !empty($supplier->name) && DB::table('purchase_returns')->whereNull('supplier_id')->exists();
+        $hasNullPoWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('purchases')->whereNull('warehouse_id')->exists()
+            : false;
+        $hasNullPrWh = $hasWarehouseFilter && $warehouseIdResolved !== null
+            ? DB::table('purchase_returns')->whereNull('warehouse_id')->exists()
+            : false;
+
+        $applyPoSupMatch = function ($q) use ($id, $supplier, $hasNullPoSup) {
+            if (!$hasNullPoSup) {
+                $q->where('supplier_id', $id);
+                return;
             }
+            $q->where(function ($sub) use ($id, $supplier) {
+                $sub->where('supplier_id', $id)
+                    ->orWhere(function ($sq) use ($supplier) {
+                        $sq->whereNull('supplier_id')->where('supplier_name', $supplier->name);
+                    });
+            });
         };
-        $applyWhScope = function ($q) use ($hasWarehouseFilter, $warehouse, $warehouseIdResolved) {
+        $applyPrSupMatch = function ($q) use ($id, $supplier, $hasNullPrSup) {
+            if (!$hasNullPrSup) {
+                $q->where('supplier_id', $id);
+                return;
+            }
+            $q->where(function ($sub) use ($id, $supplier) {
+                $sub->where('supplier_id', $id)
+                    ->orWhere(function ($sq) use ($supplier) {
+                        $sq->whereNull('supplier_id')->where('supplier_name', $supplier->name);
+                    });
+            });
+        };
+        $applyPoWhScope = function ($q) use ($hasWarehouseFilter, $warehouse, $warehouseIdResolved, $hasNullPoWh) {
             if (!$hasWarehouseFilter) {
+                return;
+            }
+            if ($warehouseIdResolved !== null && !$hasNullPoWh) {
+                $q->where('warehouse_id', $warehouseIdResolved);
+                return;
+            }
+            $q->where(function ($wq) use ($warehouse, $warehouseIdResolved) {
+                $wq->where('warehouse_name', $warehouse);
+                if ($warehouseIdResolved !== null) {
+                    $wq->orWhere('warehouse_id', $warehouseIdResolved);
+                }
+            });
+        };
+        $applyPrWhScope = function ($q) use ($hasWarehouseFilter, $warehouse, $warehouseIdResolved, $hasNullPrWh) {
+            if (!$hasWarehouseFilter) {
+                return;
+            }
+            if ($warehouseIdResolved !== null && !$hasNullPrWh) {
+                $q->where('warehouse_id', $warehouseIdResolved);
                 return;
             }
             $q->where(function ($wq) use ($warehouse, $warehouseIdResolved) {
@@ -4153,40 +4259,38 @@ class ReportController extends Controller
             });
         };
 
-        $purchQuery = DB::table('purchases')
-            ->whereIn('status', ['Received', 'Completed'])
-            ->where($applySupMatch);
+        $purchQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
+        $applyPoSupMatch($purchQuery);
         $this->excludeOpeningStockPurchases($purchQuery);
         if (!empty($allowedOutlets)) {
             $purchQuery->whereIn('warehouse_id', $allowedOutlets);
         }
-        $applyWhScope($purchQuery);
+        $applyPoWhScope($purchQuery);
         $this->applyReportDateRange($purchQuery, !empty($startDate) ? (string)$startDate : null, !empty($endDate) ? (string)$endDate : null, 'date');
         $applyPoSearch($purchQuery);
 
-        $purchItemCountSub = DB::table('purchase_items')
-            ->select('purchase_id', DB::raw('COUNT(*) as items_count'))
-            ->groupBy('purchase_id');
+        // Fetch ONLY the paged purchase rows first (avoids scanning entire purchase_items table!)
+        $poSelectCols = [
+            'id',
+            'reference_no',
+            'date',
+            'warehouse_name',
+            'grand_total',
+            'paid_amount',
+            'due_amount',
+            'returned_credit_amount',
+            'status',
+            'payment_status',
+            'payment_type',
+        ];
+        if ($hasEndDate) {
+            $poSelectCols[] = 'payments_payload';
+        }
 
         $rawPurchasesPage = (clone $purchQuery)
-            ->leftJoinSub($purchItemCountSub, 'pic', 'pic.purchase_id', '=', 'purchases.id')
-            ->select([
-                'purchases.id',
-                'purchases.reference_no',
-                'purchases.date',
-                'purchases.warehouse_name',
-                'purchases.grand_total',
-                'purchases.paid_amount',
-                'purchases.due_amount',
-                'purchases.returned_credit_amount',
-                'purchases.payments_payload',
-                'purchases.status',
-                'purchases.payment_status',
-                'purchases.payment_type',
-                DB::raw('COALESCE(pic.items_count, 0) as items_count'),
-            ])
-            ->orderBy('purchases.date', 'desc')
-            ->orderBy('purchases.id', 'desc')
+            ->select($poSelectCols)
+            ->orderBy('date', 'desc')
+            ->orderBy('id', 'desc')
             ->offset($offset)
             ->limit($perPage + 1)
             ->get();
@@ -4194,20 +4298,45 @@ class ReportController extends Controller
         $purchHasMore = $rawPurchasesPage->count() > $perPage;
         $rawPurchases = ($purchHasMore ? $rawPurchasesPage->slice(0, $perPage) : $rawPurchasesPage)->values();
 
-        $returnsQuery = DB::table('purchase_returns')
-            ->whereIn('status', ['Completed', 'Received'])
-            ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
-            ->where($applySupMatch);
-        $applyWhScope($returnsQuery);
-        $this->applyReportDateRange($returnsQuery, !empty($startDate) ? (string)$startDate : null, !empty($endDate) ? (string)$endDate : null, 'date');
-        $applyPrSearch($returnsQuery);
+        // Batch item counts ONLY for the paged purchase IDs (<1ms via idx_pi_pur_prod)
+        $pagedPoIds = $rawPurchases->pluck('id')->map(fn ($v) => (int)$v)->all();
+        $poItemCounts = !empty($pagedPoIds)
+            ? DB::table('purchase_items')
+                ->whereIn('purchase_id', $pagedPoIds)
+                ->selectRaw('purchase_id, COUNT(*) as cnt')
+                ->groupBy('purchase_id')
+                ->pluck('cnt', 'purchase_id')
+                ->all()
+            : [];
+
+        // Base purchase_returns scope (status-agnostic so 1 scan computes both posted & pending returns)
+        $returnsBaseQuery = DB::table('purchase_returns')
+            ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets));
+        $applyPrSupMatch($returnsBaseQuery);
+        $applyPrWhScope($returnsBaseQuery);
+        $this->applyReportDateRange($returnsBaseQuery, !empty($startDate) ? (string)$startDate : null, !empty($endDate) ? (string)$endDate : null, 'date');
+        $applyPrSearch($returnsBaseQuery);
+
+        $returnsQuery = (clone $returnsBaseQuery)->whereIn('status', ['Completed', 'Received']);
+
+        // Compute items_count in SQL on MySQL/MariaDB to avoid transferring heavy items_payload JSON blobs
+        $driver = DB::connection()->getDriverName();
+        $prSelectCols = [
+            'id', 'reference_no', 'purchase_reference_no', 'date', 'warehouse_name',
+            'return_reason', 'payment_type', 'grand_total', 'paid_amount', 'due_amount',
+            'status', 'payment_status',
+        ];
+        if ($hasEndDate) {
+            $prSelectCols[] = 'payments_payload';
+        }
+        if ($driver === 'mysql' || $driver === 'mariadb') {
+            $prSelectCols[] = DB::raw('CASE WHEN items_payload IS NOT NULL AND JSON_VALID(items_payload) THEN JSON_LENGTH(items_payload) ELSE 1 END as computed_items_count');
+        } else {
+            $prSelectCols[] = 'items_payload';
+        }
 
         $rawReturnsPage = (clone $returnsQuery)
-            ->select([
-                'id', 'reference_no', 'purchase_reference_no', 'date', 'warehouse_name',
-                'return_reason', 'payment_type', 'grand_total', 'paid_amount', 'due_amount',
-                'status', 'payment_status', 'items_payload', 'payments_payload',
-            ])
+            ->select($prSelectCols)
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc')
             ->offset($offset)
@@ -4217,11 +4346,11 @@ class ReportController extends Controller
         $returnsHasMore = $rawReturnsPage->count() > $perPage;
         $rawReturns = ($returnsHasMore ? $rawReturnsPage->slice(0, $perPage) : $rawReturnsPage)->values();
 
-        $hasEndDate = !empty($endDate);
-        $hasStartDate = !empty($startDate);
-        $isDateFiltered = $hasStartDate || $hasEndDate;
-        $isFiltered = $isDateFiltered || $hasWarehouseFilter || $search !== '' || !empty($allowedOutlets);
-        $asOfEnd = $hasEndDate ? $accounting->normalizeFilterBoundaryDate((string)$endDate, true) : null;
+        // Only probe purchase_return_allocations when summary or as-of end-date maps are needed (0 extra queries on Load +50 pagination)
+        $needsPraCheck = (!$skipSummary && $page === 1) || $hasEndDate;
+        $hasPraRows = $needsPraCheck
+            && $accounting->schemaHasColumn('purchase_return_allocations', 'purchase_return_id')
+            && DB::table('purchase_return_allocations')->exists();
 
         // Compute summary totals cleanly via SQL or single cumulative pass BEFORE mapping paginated rows
         $poPeriodCount = 0;
@@ -4233,6 +4362,8 @@ class ReportController extends Controller
         $totalRefunded = 0.0;
         $totalReturnDue = 0.0;
         $unallocatedReturnCredit = 0.0;
+        $pendingReturnsCount = 0;
+        $pendingReturnsAmount = 0.0;
         $openingBalance = 0.0;
         $openingBalanceAdjustment = 0.0;
         $ledgerBalanceDue = (float)($supplier->balance_due ?? 0.0);
@@ -4249,18 +4380,25 @@ class ReportController extends Controller
                 $poPeriodCount = (int)($periodPoAgg->cnt ?? 0);
                 $totalPurchased = (float)($periodPoAgg->grand_sum ?? 0);
 
-                $periodPrAgg = (clone $returnsQuery)->selectRaw('COUNT(*) as cnt, COALESCE(SUM(grand_total), 0) as grand_sum')->first();
+                // Single-pass conditional aggregation for posted + unposted pending returns in period
+                $periodPrAgg = (clone $returnsBaseQuery)->selectRaw("
+                    COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN 1 ELSE 0 END), 0) as cnt,
+                    COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN grand_total ELSE 0 END), 0) as grand_sum,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending', 'draft', 'ordered') THEN 1 ELSE 0 END), 0) as pending_cnt,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending', 'draft', 'ordered') THEN grand_total ELSE 0 END), 0) as pending_amt
+                ")->first();
                 $prPeriodCount = (int)($periodPrAgg->cnt ?? 0);
                 $totalReturned = (float)($periodPrAgg->grand_sum ?? 0);
+                $pendingReturnsCount = (int)($periodPrAgg->pending_cnt ?? 0);
+                $pendingReturnsAmount = round((float)($periodPrAgg->pending_amt ?? 0), 2);
 
-                $cumPoQuery = DB::table('purchases')
-                    ->whereIn('status', ['Received', 'Completed'])
-                    ->where($applySupMatch);
+                $cumPoQuery = DB::table('purchases')->whereIn('status', ['Received', 'Completed']);
+                $applyPoSupMatch($cumPoQuery);
                 $this->excludeOpeningStockPurchases($cumPoQuery);
                 if (!empty($allowedOutlets)) {
                     $cumPoQuery->whereIn('warehouse_id', $allowedOutlets);
                 }
-                $applyWhScope($cumPoQuery);
+                $applyPoWhScope($cumPoQuery);
                 $applyPoSearch($cumPoQuery);
                 if ($hasEndDate) {
                     $this->applyReportDateRange($cumPoQuery, null, (string)$endDate, 'date');
@@ -4269,20 +4407,22 @@ class ReportController extends Controller
 
                 $cumPrQuery = DB::table('purchase_returns')
                     ->whereIn('status', ['Completed', 'Received'])
-                    ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets))
-                    ->where($applySupMatch);
-                $applyWhScope($cumPrQuery);
+                    ->when(!empty($allowedOutlets), fn($q) => $q->whereIn('warehouse_id', $allowedOutlets));
+                $applyPrSupMatch($cumPrQuery);
+                $applyPrWhScope($cumPrQuery);
                 $applyPrSearch($cumPrQuery);
                 if ($hasEndDate) {
                     $this->applyReportDateRange($cumPrQuery, null, (string)$endDate, 'date');
                 }
                 $cumPrRows = $cumPrQuery->get(['id', 'date', 'grand_total', 'paid_amount', 'due_amount', 'payments_payload']);
 
-                $cumMaps = $accounting->computeAsOfPurchaseReturnMaps(
-                    $cumPoRows->pluck('id')->all(),
-                    $cumPrRows->pluck('id')->all(),
-                    $closingCutoff
-                );
+                $cumMaps = $hasPraRows
+                    ? $accounting->computeAsOfPurchaseReturnMaps(
+                        $cumPoRows->pluck('id')->all(),
+                        $cumPrRows->pluck('id')->all(),
+                        $closingCutoff
+                    )
+                    : ['po_alloc' => [], 'po_has_any_alloc' => [], 'pr_alloc' => []];
                 if ($hasEndDate) {
                     $pagePoMaps = $cumMaps;
                 }
@@ -4336,36 +4476,56 @@ class ReportController extends Controller
                     COALESCE(SUM(due_amount), 0) as due_sum
                 ')->first();
                 $poPeriodCount = (int)($poSum->cnt ?? 0);
-                $totalPurchased = (float)($poSum->grand_sum ?? 0);
-                $totalPaid = (float)($poSum->paid_sum ?? 0);
-                $totalDue = (float)($poSum->due_sum ?? 0);
+                $totalPurchased = round((float)($poSum->grand_sum ?? 0), 2);
+                $totalPaid = round((float)($poSum->paid_sum ?? 0), 2);
+                $totalDue = round((float)($poSum->due_sum ?? 0), 2);
 
-                $hasRel = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
-                $praSub = DB::table('purchase_return_allocations')
-                    ->select('purchase_return_id', DB::raw('COALESCE(SUM(amount), 0) as allocated'))
-                    ->when($hasRel, fn($q) => $q->whereNull('released_at'))
-                    ->groupBy('purchase_return_id');
-                $prSum = (clone $returnsQuery)
-                    ->leftJoinSub($praSub, 'pra', 'pra.purchase_return_id', '=', 'purchase_returns.id')
-                    ->selectRaw('
-                        COUNT(*) as cnt,
-                        COALESCE(SUM(purchase_returns.grand_total), 0) as grand_sum,
-                        COALESCE(SUM(purchase_returns.paid_amount), 0) as paid_sum,
-                        COALESCE(SUM(purchase_returns.due_amount), 0) as due_sum,
-                        COALESCE(SUM(CASE WHEN (purchase_returns.due_amount - COALESCE(pra.allocated, 0)) > 0 THEN (purchase_returns.due_amount - COALESCE(pra.allocated, 0)) ELSE 0 END), 0) as unalloc_sum
-                    ')->first();
+                // Single-pass conditional aggregation for posted + unposted pending returns
+                if ($hasPraRows) {
+                    $hasRel = $accounting->schemaHasColumn('purchase_return_allocations', 'released_at');
+                    $praSub = DB::table('purchase_return_allocations')
+                        ->select('purchase_return_id', DB::raw('COALESCE(SUM(amount), 0) as allocated'))
+                        ->when($hasRel, fn($q) => $q->whereNull('released_at'))
+                        ->groupBy('purchase_return_id');
+                    $prSum = (clone $returnsBaseQuery)
+                        ->leftJoinSub($praSub, 'pra', 'pra.purchase_return_id', '=', 'purchase_returns.id')
+                        ->selectRaw("
+                            COALESCE(SUM(CASE WHEN purchase_returns.status IN ('Completed', 'Received') THEN 1 ELSE 0 END), 0) as cnt,
+                            COALESCE(SUM(CASE WHEN purchase_returns.status IN ('Completed', 'Received') THEN purchase_returns.grand_total ELSE 0 END), 0) as grand_sum,
+                            COALESCE(SUM(CASE WHEN purchase_returns.status IN ('Completed', 'Received') THEN purchase_returns.paid_amount ELSE 0 END), 0) as paid_sum,
+                            COALESCE(SUM(CASE WHEN purchase_returns.status IN ('Completed', 'Received') THEN purchase_returns.due_amount ELSE 0 END), 0) as due_sum,
+                            COALESCE(SUM(CASE WHEN purchase_returns.status IN ('Completed', 'Received') AND (purchase_returns.due_amount - COALESCE(pra.allocated, 0)) > 0 THEN (purchase_returns.due_amount - COALESCE(pra.allocated, 0)) ELSE 0 END), 0) as unalloc_sum,
+                            COALESCE(SUM(CASE WHEN LOWER(COALESCE(purchase_returns.status, '')) IN ('pending', 'draft', 'ordered') THEN 1 ELSE 0 END), 0) as pending_cnt,
+                            COALESCE(SUM(CASE WHEN LOWER(COALESCE(purchase_returns.status, '')) IN ('pending', 'draft', 'ordered') THEN purchase_returns.grand_total ELSE 0 END), 0) as pending_amt
+                        ")->first();
+                } else {
+                    $prSum = (clone $returnsBaseQuery)->selectRaw("
+                        COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN 1 ELSE 0 END), 0) as cnt,
+                        COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN grand_total ELSE 0 END), 0) as grand_sum,
+                        COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN paid_amount ELSE 0 END), 0) as paid_sum,
+                        COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') THEN due_amount ELSE 0 END), 0) as due_sum,
+                        COALESCE(SUM(CASE WHEN status IN ('Completed', 'Received') AND due_amount > 0 THEN due_amount ELSE 0 END), 0) as unalloc_sum,
+                        COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending', 'draft', 'ordered') THEN 1 ELSE 0 END), 0) as pending_cnt,
+                        COALESCE(SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('pending', 'draft', 'ordered') THEN grand_total ELSE 0 END), 0) as pending_amt
+                    ")->first();
+                }
+
                 $prPeriodCount = (int)($prSum->cnt ?? 0);
-                $totalReturned = (float)($prSum->grand_sum ?? 0);
-                $totalRefunded = (float)($prSum->paid_sum ?? 0);
-                $totalReturnDue = (float)($prSum->due_sum ?? 0);
+                $totalReturned = round((float)($prSum->grand_sum ?? 0), 2);
+                $totalRefunded = round((float)($prSum->paid_sum ?? 0), 2);
+                $totalReturnDue = round((float)($prSum->due_sum ?? 0), 2);
                 $unallocatedReturnCredit = round((float)($prSum->unalloc_sum ?? 0), 2);
+                $pendingReturnsCount = (int)($prSum->pending_cnt ?? 0);
+                $pendingReturnsAmount = round((float)($prSum->pending_amt ?? 0), 2);
 
-                $openAdjMap = $accounting->computeSupplierOpeningBalanceAdjustments([$id], null);
-                $openingBalanceAdjustment = round((float)($openAdjMap[$id]['opening_adjustment'] ?? 0.0), 2);
+                // Reuse already-aggregated open PO due & unallocated return credit (0 extra queries, exact PurchaseAccountingService parity)
+                $rawAdj = round($ledgerBalanceDue - ($totalDue - $unallocatedReturnCredit), 2);
+                $hasSubledgerDocs = ($totalDue > 0.005 || $unallocatedReturnCredit > 0.005);
+                $openingBalanceAdjustment = ($hasSubledgerDocs ? ($rawAdj > 0.005) : (abs($rawAdj) > 0.005)) ? $rawAdj : 0.0;
                 $openingBalance = $openingBalanceAdjustment;
             }
         } else {
-            if ($hasEndDate) {
+            if ($hasEndDate && $hasPraRows) {
                 $pagePoMaps = $accounting->computeAsOfPurchaseReturnMaps(
                     $rawPurchases->pluck('id')->all(),
                     $rawReturns->pluck('id')->all(),
@@ -4374,7 +4534,7 @@ class ReportController extends Controller
             }
         }
 
-        $purchases = $rawPurchases->map(function ($p) use ($hasEndDate, $asOfEnd, $pagePoMaps, $accounting) {
+        $purchases = $rawPurchases->map(function ($p) use ($hasEndDate, $asOfEnd, $pagePoMaps, $accounting, $poItemCounts) {
             $paid = $hasEndDate
                 ? $accounting->sumPayloadPaymentsAsOf($p->payments_payload ?? null, (float)$p->paid_amount, (string)$p->date, $asOfEnd)
                 : (float)$p->paid_amount;
@@ -4399,14 +4559,16 @@ class ReportController extends Controller
                 'status' => (string)($p->status ?? 'Received'),
                 'payment_status' => $pStatus,
                 'payment_type' => (string)($p->payment_type ?? 'Cash'),
-                'items_count' => (int)($p->items_count ?? 0),
+                'items_count' => (int)($poItemCounts[(int)$p->id] ?? 0),
             ];
         });
 
         $returns = $rawReturns->map(function ($r) use ($hasEndDate, $asOfEnd, $accounting) {
-            $items = !empty($r->items_payload) ? json_decode((string)$r->items_payload, true) : null;
-            if (!is_array($items)) {
-                $items = [];
+            if (property_exists($r, 'computed_items_count')) {
+                $itemsCount = max(1, (int)$r->computed_items_count);
+            } else {
+                $decoded = is_string($r->items_payload ?? null) ? json_decode($r->items_payload, true) : null;
+                $itemsCount = is_array($decoded) && !empty($decoded) ? count($decoded) : 1;
             }
             $paid = $hasEndDate
                 ? $accounting->sumPayloadPaymentsAsOf($r->payments_payload ?? null, (float)$r->paid_amount, (string)$r->date, $asOfEnd)
@@ -4431,8 +4593,7 @@ class ReportController extends Controller
                 'due_amount' => $due,
                 'status' => (string)($r->status ?? 'Completed'),
                 'payment_status' => $pStatus,
-                'items_count' => !empty($items) ? count($items) : 1,
-                'items' => $items,
+                'items_count' => $itemsCount,
             ];
         });
 
@@ -4442,7 +4603,10 @@ class ReportController extends Controller
         $netPurchased = round($totalPurchased - $totalReturned, 2);
         $netPaid = round($totalPaid - $totalRefunded, 2);
         $returnRatePct = $totalPurchased > 0 ? round(($totalReturned / $totalPurchased) * 100, 2) : 0.0;
-        $paymentRatePct = $totalPurchased > 0 ? round(($totalPaid / $totalPurchased) * 100, 2) : 100.0;
+        $netPayableBase = round($netPurchased + $openingBalance, 2);
+        $paymentRatePct = $netPayableBase > 0.005
+            ? round(min(100.0, max(0.0, ($netPaid / $netPayableBase) * 100)), 2)
+            : ($positivePayable <= 0.005 ? 100.0 : 0.0);
         $averagePurchaseValue = $poPeriodCount > 0 ? round($totalPurchased / $poPeriodCount, 2) : 0.0;
         $lastPurchaseDate = $purchases->isNotEmpty() ? $purchases->first()['date'] : ($supplier->updated_at ?? '');
 
@@ -4451,18 +4615,11 @@ class ReportController extends Controller
                 return $this->maskAssocNumericKeys($row, ['grand_total', 'paid_amount', 'due_amount'], null);
             })->values();
             $returns = $returns->map(function ($row) {
-                $masked = $this->maskAssocNumericKeys($row, ['grand_total', 'paid_amount', 'due_amount'], null);
-                $masked['items'] = array_map(
-                    fn($it) => is_array($it)
-                        ? $this->maskAssocNumericKeys($it, ['unit_cost', 'base_unit_cost', 'tax', 'discount', 'subtotal', 'tax_exclusive_subtotal', 'landed_total', 'landed_base_unit_cost'], null)
-                        : $it,
-                    $masked['items'] ?? []
-                );
-                return $masked;
+                return $this->maskAssocNumericKeys($row, ['grand_total', 'paid_amount', 'due_amount'], null);
             })->values();
             $ledgerBalanceDue = $openingBalance = $openingBalanceAdjustment = $totalDue = $totalReturnDue = $unallocatedReturnCredit = 0.0;
             $totalPurchased = $netPurchased = $totalPaid = $signedNetDue = $creditBalance = $positivePayable = 0.0;
-            $totalReturned = $totalRefunded = $netPaid = $returnRatePct = $paymentRatePct = $averagePurchaseValue = 0.0;
+            $totalReturned = $totalRefunded = $netPaid = $returnRatePct = $paymentRatePct = $averagePurchaseValue = $pendingReturnsAmount = 0.0;
         }
 
         $totalCount = max($poPeriodCount, $prPeriodCount, count($purchases), count($returns));
@@ -4476,6 +4633,8 @@ class ReportController extends Controller
             'returns_has_more' => $returnsHasMore,
         ];
 
+        $supplierCode = 'SUP-' . str_pad((string)$supplier->id, 5, '0', STR_PAD_LEFT);
+
         return $this->noStoreJson([
             'status' => 'success',
             'cost_masked' => !$canViewCost,
@@ -4483,6 +4642,7 @@ class ReportController extends Controller
                 'cost_masked' => !$canViewCost,
                 'supplier' => [
                     'id' => (int)$supplier->id,
+                    'code' => $supplierCode,
                     'name' => (string)$supplier->name,
                     'contact_person' => (string)($supplier->contact_person ?? ''),
                     'phone' => (string)($supplier->phone ?? ''),
@@ -4520,9 +4680,12 @@ class ReportController extends Controller
                     'total_return_due' => $totalReturnDue,
                     'returned_credit' => $totalReturnDue,
                     'unallocated_credit' => $unallocatedReturnCredit,
+                    'pending_returns_count' => $pendingReturnsCount,
+                    'pending_returns_amount' => $pendingReturnsAmount,
                     'net_purchased' => $netPurchased,
                     'net_paid' => $netPaid,
                     'net_due' => $signedNetDue,
+                    'signed_net_balance' => $signedNetDue,
                     'credit_balance' => $creditBalance,
                     'opening_balance' => $openingBalance,
                     'opening_balance_adjustment' => $openingBalanceAdjustment,
@@ -4531,6 +4694,18 @@ class ReportController extends Controller
                     'average_purchase_value' => $averagePurchaseValue,
                 ],
                 'pagination' => $pagination,
+                'purchases_pagination' => [
+                    'current_page' => $page,
+                    'per_page' => $perPage,
+                    'total' => $poPeriodCount,
+                    'has_more' => $purchHasMore,
+                ],
+                'returns_pagination' => [
+                    'current_page' => $page,
+                    'per_page' => $perPage,
+                    'total' => $prPeriodCount,
+                    'has_more' => $returnsHasMore,
+                ],
                 'purchases' => $purchases->all(),
                 'returns' => $returns->all(),
             ],

@@ -635,27 +635,40 @@ class PurchaseAccountingService
     private static array $schemaCache = [];
 
     /**
-     * Request-lifetime / worker-safe cached Schema::hasTable check.
+     * Request-lifetime + cross-request cached Schema::hasTable check.
+     * Eliminates 100–350ms MariaDB INFORMATION_SCHEMA overhead on every POS/Register HTTP request.
      */
     public function schemaHasTable(string $table): bool
     {
         $appId = spl_object_id(app());
         $key = "{$appId}|t|{$table}";
         if (!array_key_exists($key, self::$schemaCache)) {
-            self::$schemaCache[$key] = Schema::hasTable($table);
+            if (app()->runningUnitTests()) {
+                self::$schemaCache[$key] = Schema::hasTable($table);
+            } else {
+                $dbName = (string)(DB::getDatabaseName() ?? 'default');
+                $cacheKey = "pos_schema_v1:{$dbName}:t:{$table}";
+                self::$schemaCache[$key] = (bool)Cache::remember($cacheKey, 3600, fn () => Schema::hasTable($table));
+            }
         }
         return self::$schemaCache[$key];
     }
 
     /**
-     * Request-lifetime / worker-safe cached Schema::hasColumn check.
+     * Request-lifetime + cross-request cached Schema::hasColumn check.
      */
     public function schemaHasColumn(string $table, string $column): bool
     {
         $appId = spl_object_id(app());
         $key = "{$appId}|c|{$table}|{$column}";
         if (!array_key_exists($key, self::$schemaCache)) {
-            self::$schemaCache[$key] = Schema::hasColumn($table, $column);
+            if (app()->runningUnitTests()) {
+                self::$schemaCache[$key] = Schema::hasColumn($table, $column);
+            } else {
+                $dbName = (string)(DB::getDatabaseName() ?? 'default');
+                $cacheKey = "pos_schema_v1:{$dbName}:c:{$table}:{$column}";
+                self::$schemaCache[$key] = (bool)Cache::remember($cacheKey, 3600, fn () => Schema::hasColumn($table, $column));
+            }
         }
         return self::$schemaCache[$key];
     }
@@ -1181,24 +1194,18 @@ class PurchaseAccountingService
             }
             $hasSplitFlag = $this->schemaHasColumn($table, 'has_register_split');
             $seenDocIds = [];
-            foreach (array_chunk($ids, 400) as $chunkIndex => $chunk) {
-                $docs = DB::table($table)
+            $cols = ['id', 'status', 'cash_register_id', 'payment_type', 'paid_amount', 'payments_payload'];
+
+            // 1. Index-native lookup for directly linked documents (avoids OR index_merge full scan)
+            foreach (array_chunk($ids, 400) as $chunk) {
+                $linkedDocs = DB::table($table)
+                    ->whereIn('cash_register_id', $chunk)
                     ->whereIn('status', $statuses)
                     ->where('paid_amount', '>', 0)
-                    ->where(function ($q) use ($chunk, $chunkIndex, $hasSplitFlag) {
-                        $q->whereIn('cash_register_id', $chunk);
-                        if ($chunkIndex === 0) {
-                            if ($hasSplitFlag) {
-                                $q->orWhere('has_register_split', true);
-                            } else {
-                                $q->orWhere('payments_payload', 'like', '%cash_register_id%');
-                            }
-                        }
-                    })
-                    ->select(['id', 'status', 'cash_register_id', 'payment_type', 'paid_amount', 'payments_payload'])
+                    ->select($cols)
                     ->get();
 
-                foreach ($docs as $doc) {
+                foreach ($linkedDocs as $doc) {
                     $docId = (int)$doc->id;
                     if (isset($seenDocIds[$docId])) {
                         continue;
@@ -1209,6 +1216,29 @@ class PurchaseAccountingService
                         if (isset($idSet[$rid])) {
                             $result[$rid][$bucketKey] = round($result[$rid][$bucketKey] + (float)$amt, 2);
                         }
+                    }
+                }
+            }
+
+            // 2. Separate indexed lookup ONLY for multi-register split documents
+            $splitQuery = DB::table($table)
+                ->whereIn('status', $statuses)
+                ->where('paid_amount', '>', 0);
+            if ($hasSplitFlag) {
+                $splitQuery->where('has_register_split', true);
+            } else {
+                $splitQuery->where('payments_payload', 'like', '%cash_register_id%');
+            }
+            foreach ($splitQuery->select($cols)->get() as $doc) {
+                $docId = (int)$doc->id;
+                if (isset($seenDocIds[$docId])) {
+                    continue;
+                }
+                $seenDocIds[$docId] = true;
+                $byReg = $this->extractDocumentCashByRegister($doc, $statuses);
+                foreach ($byReg as $rid => $amt) {
+                    if (isset($idSet[$rid])) {
+                        $result[$rid][$bucketKey] = round($result[$rid][$bucketKey] + (float)$amt, 2);
                     }
                 }
             }

@@ -57,7 +57,7 @@ class SaleController extends Controller
         int $saleId,
         float $unitCost
     ): void {
-        if ($unitCost <= 0 || !\Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'unit_cost')) {
+        if ($unitCost <= 0 || !app(\App\Services\PurchaseAccountingService::class)->schemaHasColumn('stock_movements', 'unit_cost')) {
             return;
         }
         \App\Models\StockMovement::where('warehouse_id', $warehouseId)
@@ -119,14 +119,10 @@ class SaleController extends Controller
             $variantId
         );
 
-        // Only allow client-provided conversion_rate when product has NO linked sale units at all
-        if (($linkedUnit['id'] ?? null) === null && !empty($item['conversion_rate']) && (float)$item['conversion_rate'] > 0) {
-            $hasActiveSaleLinks = $product->relationLoaded('unitLinks')
-                ? $product->unitLinks->contains(fn ($ul) => (bool)$ul->is_active && $ul->unit_type === 'sale')
-                : $product->unitLinks()->where('is_active', true)->where('unit_type', 'sale')->exists();
-            if (!$hasActiveSaleLinks) {
-                $linkedUnit['conversion_rate'] = (float)$item['conversion_rate'];
-            }
+        // Prevent client-side conversion_rate tampering on standard single-unit products:
+        // when no linked sale unit matched, authoritative base conversion rate is strictly 1.0.
+        if (($linkedUnit['id'] ?? null) === null) {
+            $linkedUnit['conversion_rate'] = 1.0;
         }
 
         return $linkedUnit;
@@ -158,7 +154,7 @@ class SaleController extends Controller
      * Reconciles cash drawer registers with shift immutability protection.
      * Closed shifts (Z-Reports) are strictly IMMUTABLE. Adjustments NEVER hijack another cashier's shift.
      */
-    protected function reconcileRegisterCash(?Sale $sale, float $cashAmount, string $action = 'increment', ?string $warehouseName = null, ?int $registerId = null, bool $recordCrossShiftVoidTx = false): void
+    protected function reconcileRegisterCash(?Sale $sale, float $cashAmount, string $action = 'increment', ?string $warehouseName = null, ?int $registerId = null, bool $recordCrossShiftVoidTx = false, ?\App\Models\CashRegister $prelockedRegister = null): void
     {
         if ($cashAmount <= 0.001) {
             return;
@@ -169,7 +165,13 @@ class SaleController extends Controller
 
         $targetReg = null;
         $explicitlyClosed = false;
-        if ($regId) {
+        if ($prelockedRegister !== null && (!$regId || (int)$prelockedRegister->id === (int)$regId)) {
+            if (in_array(strtolower(trim((string)$prelockedRegister->status)), ['open', 'opened'], true)) {
+                $targetReg = $prelockedRegister;
+            } else {
+                $explicitlyClosed = true;
+            }
+        } elseif ($regId) {
             $reg = \App\Models\CashRegister::lockForUpdate()->find($regId);
             if ($reg) {
                 if (in_array(strtolower(trim((string)$reg->status)), ['open', 'opened'], true)) {
@@ -185,7 +187,7 @@ class SaleController extends Controller
             $ownerId = $sale?->user_id ?: auth()->id();
             $ownerName = $sale?->user_name ?: auth()->user()?->name;
             if ($ownerId || $ownerName || !$explicitlyClosed) {
-                $fallbackQuery = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
+                $fallbackQuery = \App\Models\CashRegister::whereIn('status', ['open', 'Open', 'OPEN', 'opened', 'Opened', 'OPENED'])
                     ->when($sale?->warehouse_id, fn($q) => $q->where('warehouse_id', $sale->warehouse_id), fn($q) => $q->where('warehouse_name', $whName));
                 if ($ownerId || $ownerName) {
                     $fallbackQuery->where(function ($q) use ($ownerId, $ownerName) {
@@ -215,7 +217,7 @@ class SaleController extends Controller
                 && $explicitlyClosed
                 && $regId
                 && (int)$targetReg->id !== (int)$regId
-                && \Illuminate\Support\Facades\Schema::hasTable('cash_register_transactions')) {
+                && app(\App\Services\PurchaseAccountingService::class)->schemaHasTable('cash_register_transactions')) {
                 \App\Models\CashRegisterTransaction::create([
                     'cash_register_id' => $targetReg->id,
                     'type' => 'void_refund',
@@ -951,8 +953,8 @@ class SaleController extends Controller
             || strtolower(trim((string)($authUser->roleModel?->name ?? ($authUser->role ?? '')))) === 'cashier');
 
         try {
-            $sale = $this->createSaleFromValidated($validated, $authUser, $isOffline);
-            $sale->load(['items', 'payments']);
+            $sale = $this->createSaleFromValidated($validated, $authUser, $isOffline, true);
+            $sale->loadMissing(['items', 'payments']);
             $this->maskSaleCostFields($sale, $canViewCost);
 
             return response()->json([
@@ -996,37 +998,40 @@ class SaleController extends Controller
     /**
      * Executes atomic creation of a single sale record with pessimistic stock lock & FIFO COGS
      */
-    public function createSaleFromValidated(array $validated, ?User $authUser, bool $isOfflineSync = false): Sale
+    public function createSaleFromValidated(array $validated, ?User $authUser, bool $isOfflineSync = false, bool $skipIdempotencyCheck = false): Sale
     {
-        // 1. Idempotency Check:
+        // 1. Idempotency Check (skipped when already verified by store()/bulkSync())
         $idempotencyKey = $validated['idempotency_key'] ?? null;
-        $existingSale = $this->findIdempotentExistingSale(
-            is_string($idempotencyKey) ? $idempotencyKey : null,
-            $validated
-        );
-        if ($existingSale) {
-            return $existingSale;
+        if (!$skipIdempotencyCheck) {
+            $existingSale = $this->findIdempotentExistingSale(
+                is_string($idempotencyKey) ? $idempotencyKey : null,
+                $validated
+            );
+            if ($existingSale) {
+                return $existingSale;
+            }
         }
 
         DB::beginTransaction();
         try {
             $isExplicitBackOffice = array_key_exists('pos_flag', $validated) && !$validated['pos_flag'];
-            $isOffline = $isOfflineSync || (!$isExplicitBackOffice && (!empty($validated['is_offline_sync']) || !empty($validated['allow_offline_sync'])));
+            $isOffline = $isOfflineSync && !$isExplicitBackOffice;
 
             // Determine reference_no atomically with zero race condition:
             $refNo = $this->acquireUniqueReference('sale', $validated['reference_no'] ?? null, (int)($validated['warehouse_id'] ?? 0));
 
-            // 🛡️ Server-Side Line-by-Line Arithmetic Verification & Tax-Exclusive Base Extraction
+            // 🛡️ Server-Side Line-by-Line Arithmetic Verification & Tax-Exclusive Base Extraction (strict 2dp ledger parity)
             $computedSubtotal = 0.0;
             $taxExclusiveBaseTotal = 0.0;
             foreach ($validated['items'] as &$itemRef) {
                 $itemQty = (float)($itemRef['quantity'] ?? 0);
                 $itemPrice = (float)($itemRef['unit_price'] ?? 0);
-                $lineGross = max(0.0, round($itemQty * $itemPrice, 4));
-                $itemDisc = min($lineGross, max(0.0, (float)($itemRef['discount'] ?? 0)));
-                $itemRef['discount'] = round($itemDisc, 2);
-                $itemTax = max(0.0, (float)($itemRef['tax'] ?? 0));
-                $lineBase = max(0.0, $lineGross - $itemDisc);
+                $lineGross = max(0.0, round($itemQty * $itemPrice, 2));
+                $itemDisc = round(min($lineGross, max(0.0, (float)($itemRef['discount'] ?? 0))), 2);
+                $itemRef['discount'] = $itemDisc;
+                $itemTax = round(max(0.0, (float)($itemRef['tax'] ?? 0)), 2);
+                $itemRef['tax'] = $itemTax;
+                $lineBase = max(0.0, round($lineGross - $itemDisc, 2));
                 $lineSubtotal = round($lineBase + $itemTax, 2);
                 $itemRef['subtotal'] = $lineSubtotal;
                 $computedSubtotal += $lineSubtotal;
@@ -1035,12 +1040,13 @@ class SaleController extends Controller
             unset($itemRef);
 
             $computedSubtotal = round($computedSubtotal, 2);
+            $taxExclusiveBaseTotal = round($taxExclusiveBaseTotal, 2);
             $orderDiscount = round(min(max(0.0, (float)($validated['discount'] ?? 0)), $taxExclusiveBaseTotal), 2);
-            $shipping = max(0.0, (float)($validated['shipping'] ?? 0));
-            $taxRate = max(0.0, (float)($validated['tax_rate'] ?? 0));
+            $shipping = round(max(0.0, (float)($validated['shipping'] ?? 0)), 2);
+            $taxRate = min(100.0, max(0.0, (float)($validated['tax_rate'] ?? 0)));
 
             // Calculate Order Tax strictly on Tax-Exclusive Base to prevent Tax-on-Tax (Compound Tax)
-            $taxableBase = max(0.0, $taxExclusiveBaseTotal - $orderDiscount);
+            $taxableBase = max(0.0, round($taxExclusiveBaseTotal - $orderDiscount, 2));
             $orderTaxAmount = round($taxableBase * ($taxRate / 100.0), 2);
             if ($taxRate <= 0 && isset($validated['tax_amount']) && (float)$validated['tax_amount'] > 0) {
                 $orderTaxAmount = round((float)$validated['tax_amount'], 2);
@@ -1048,16 +1054,35 @@ class SaleController extends Controller
 
             $computedGrandTotal = max(0.0, round($computedSubtotal - $orderDiscount + $orderTaxAmount + $shipping, 2));
 
-            $subtotal = round($computedSubtotal, 2);
+            $subtotal = $computedSubtotal;
             $grandTotal = $computedGrandTotal;
 
             $unitService = app(ProductUnitConversionService::class);
             $accounting = app(\App\Services\PurchaseAccountingService::class);
 
-            // 🛡️ Payments Array Reconciliation & Validation
+            // 🛡️ Payments Array Reconciliation & Non-Cash Overpayment Protection
             if (!empty($validated['payments']) && is_array($validated['payments'])) {
                 $validated['payments'] = $this->sortPaymentsNonCashFirst($validated['payments'], $accounting);
                 $paymentsSum = round(array_sum(array_map(fn($p) => max(0.0, (float)($p['amount'] ?? 0)), $validated['payments'])), 2);
+                $nonCashSum = round(array_sum(array_map(
+                    fn($p) => !$accounting->isCashPaymentType((string)($p['payment_type'] ?? 'Cash'))
+                        ? max(0.0, (float)($p['amount'] ?? 0))
+                        : 0.0,
+                    $validated['payments']
+                )), 2);
+                if ($nonCashSum > $grandTotal + 0.01) {
+                    $msg = "Non-cash payment total ({$nonCashSum}) cannot exceed grand total ({$grandTotal}). Change can only be returned from Cash tender.";
+                    $val = \Illuminate\Support\Facades\Validator::make([], []);
+                    $val->errors()->add('payments', $msg);
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: $val,
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422)
+                    );
+                }
                 $cappedSum = round(min($grandTotal, $paymentsSum), 2);
                 $normalizedPaid = isset($validated['paid_amount']) ? min($grandTotal, max(0.0, (float)$validated['paid_amount'])) : $cappedSum;
                 if (isset($validated['paid_amount']) && abs($paymentsSum - (float)$validated['paid_amount']) > 0.01 && abs($cappedSum - $normalizedPaid) > 0.01) {
@@ -1124,9 +1149,20 @@ class SaleController extends Controller
             } else {
                 $received = (float)($validated['received_amount'] ?? $paidAmount);
                 $hasCashComponent = $accounting->isCashPaymentType($resolvedPayType);
+                if (!$hasCashComponent && !empty($validated['payments']) && is_array($validated['payments'])) {
+                    foreach ($validated['payments'] as $pCheck) {
+                        if ((float)($pCheck['amount'] ?? 0) > 0 && $accounting->isCashPaymentType((string)($pCheck['payment_type'] ?? ''))) {
+                            $hasCashComponent = true;
+                            break;
+                        }
+                    }
+                }
                 $change = $hasCashComponent
-                    ? (float)($validated['change_amount'] ?? max(0.0, round($received - $paidAmount, 2)))
+                    ? max(0.0, round($received - $paidAmount, 2))
                     : 0.0;
+                if ($hasCashComponent && $change <= 0.001 && isset($validated['change_amount']) && empty($validated['payments'])) {
+                    $change = max(0.0, round((float)$validated['change_amount'], 2));
+                }
             }
 
             $rawDateInput = trim((string)$validated['date']);
@@ -1182,8 +1218,10 @@ class SaleController extends Controller
 
             // Lock Hierarchy Step 1: CashRegister (with Immutable Late-Offline Reconciliation protection)
             $cashRegisterId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+            $lockedRegister = null;
             $isLateOfflineReconciliation = false;
             $syncingOpenRegId = null;
+            $openRegStatuses = ['open', 'Open', 'OPEN', 'opened', 'Opened', 'OPENED'];
             if ($cashRegisterId !== null) {
                 $explicitReg = \App\Models\CashRegister::where('id', $cashRegisterId)->lockForUpdate()->first();
                 if (!$explicitReg) {
@@ -1229,10 +1267,8 @@ class SaleController extends Controller
                         );
                     }
 
-                    // Late offline sync onto an already closed shift: accept for sales & stock accounting,
-                    // log immutable audit entry, and do NOT mutate closed Z-report or today's open drawer.
                     $isLateOfflineReconciliation = true;
-                    $syncingOpenRegId = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
+                    $syncingOpenRegId = \App\Models\CashRegister::whereIn('status', $openRegStatuses)
                         ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $validated['warehouse_name']))
                         ->orderByDesc('id')
                         ->value('id');
@@ -1253,9 +1289,10 @@ class SaleController extends Controller
                             ], 422)
                         );
                     }
+                    $lockedRegister = $explicitReg;
                 }
             } else {
-                $activeReg = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
+                $activeReg = \App\Models\CashRegister::whereIn('status', $openRegStatuses)
                     ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $validated['warehouse_name']))
                     ->where(function ($q) use ($validated, $authUser, $userName) {
                         $uId = $validated['user_id'] ?? $authUser?->id;
@@ -1277,7 +1314,7 @@ class SaleController extends Controller
                     }
 
                     if ($isPriorShiftOffline) {
-                        $matchedClosed = \App\Models\CashRegister::whereRaw('LOWER(status) NOT IN (?, ?)', ['open', 'opened'])
+                        $matchedClosed = \App\Models\CashRegister::whereNotIn('status', $openRegStatuses)
                             ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $validated['warehouse_name']))
                             ->where('opened_at', '<=', $txDate)
                             ->orderByDesc('opened_at')
@@ -1287,9 +1324,10 @@ class SaleController extends Controller
                         $syncingOpenRegId = (int)$activeReg->id;
                     } else {
                         $cashRegisterId = (int)$activeReg->id;
+                        $lockedRegister = $activeReg;
                     }
                 } elseif ($isOffline) {
-                    $matchedClosed = \App\Models\CashRegister::whereRaw('LOWER(status) NOT IN (?, ?)', ['open', 'opened'])
+                    $matchedClosed = \App\Models\CashRegister::whereNotIn('status', $openRegStatuses)
                         ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $validated['warehouse_name']))
                         ->where('opened_at', '<=', $txDate)
                         ->orderByDesc('opened_at')
@@ -1301,11 +1339,15 @@ class SaleController extends Controller
                 }
             }
 
-            // Lock Hierarchy Step 2: Customer (Walk-in credit guard + Credit limit check)
+            // Lock Hierarchy Step 2: Customer (Walk-in credit guard + phantom customer_id protection + Credit limit check)
             $cId = $validated['customer_id'] ?? null;
             $cName = strtolower(trim((string)($validated['customer_name'] ?? '')));
-            $isWalkIn = str_contains($cName, 'walk-in') || str_contains($cName, 'walk in') || empty($cId);
+            $isWalkIn = str_contains($cName, 'walk-in') || str_contains($cName, 'walk in') || str_contains($cName, 'walkin') || $cName === 'guest' || empty($cId);
             $lockedCustomer = $cId ? Customer::where('id', $cId)->lockForUpdate()->first() : null;
+            if (!$isWalkIn && $lockedCustomer === null) {
+                // Non-existent / phantom customer_id cannot carry Accounts Receivable credit
+                $isWalkIn = true;
+            }
             if (!$isWalkIn && $lockedCustomer && (str_contains(strtolower($lockedCustomer->name), 'walk-in') || str_contains(strtolower($lockedCustomer->name), 'walk in'))) {
                 $isWalkIn = true;
             }
@@ -1387,27 +1429,42 @@ class SaleController extends Controller
             }
             $sale = Sale::create($saleCreateAttrs);
 
-            // Pre-fetch all products & variants in a single bulk query with deterministic sorting to eliminate N+1 queries & deadlocks
+            // Pre-fetch all products & variants in a single indexed bulk query with deterministic sorting (zero OR index_merge when IDs present)
             $itemProductIds = array_values(array_unique(array_filter(array_column($validated['items'], 'product_id'))));
             sort($itemProductIds);
-            $itemProductCodes = array_values(array_unique(array_filter(array_column($validated['items'], 'product_code'))));
-            sort($itemProductCodes);
+            $missingIdProductCodes = [];
+            foreach ($validated['items'] as $itPre) {
+                if (empty($itPre['product_id']) && !empty($itPre['product_code'])) {
+                    $missingIdProductCodes[] = (string)$itPre['product_code'];
+                }
+            }
+            $missingIdProductCodes = array_values(array_unique($missingIdProductCodes));
+            sort($missingIdProductCodes);
 
-            $productsMap = Product::with(['variants', 'unitLinks.unit'])
-                ->where(function ($q) use ($itemProductIds, $itemProductCodes) {
-                    if (!empty($itemProductIds)) {
-                        $q->whereIn('id', $itemProductIds);
-                    }
-                    if (!empty($itemProductCodes)) {
-                        $q->orWhereIn('code', $itemProductCodes);
-                    }
-                })
-                ->orderBy('id')
-                ->lockForUpdate()
-                ->get();
+            $productsQuery = Product::with(['variants', 'unitLinks.unit']);
+            if (!empty($itemProductIds) && !empty($missingIdProductCodes)) {
+                $productsQuery->where(function ($q) use ($itemProductIds, $missingIdProductCodes) {
+                    $q->whereIn('id', $itemProductIds)->orWhereIn('code', $missingIdProductCodes);
+                });
+            } elseif (!empty($itemProductIds)) {
+                $productsQuery->whereIn('id', $itemProductIds);
+            } elseif (!empty($missingIdProductCodes)) {
+                $productsQuery->whereIn('code', $missingIdProductCodes);
+            }
+            $productsMap = $productsQuery->orderBy('id')->lockForUpdate()->get();
 
             $productsById = $productsMap->keyBy('id');
             $productsByCode = $productsMap->keyBy('code');
+
+            // Resolve and cache authoritative unit links ONCE per item line (avoids 3x redundant resolution)
+            $resolvedUnitsByIdx = [];
+            foreach ($validated['items'] as $itIdx => $itPre) {
+                $pPre = (!empty($itPre['product_id']) && isset($productsById[$itPre['product_id']]))
+                    ? $productsById[$itPre['product_id']]
+                    : ($productsByCode[$itPre['product_code']] ?? null);
+                $vPreId = !empty($itPre['product_variant_id']) ? (int)$itPre['product_variant_id'] : null;
+                $resolvedUnitsByIdx[$itIdx] = $this->resolveSaleItemUnit($pPre, $itPre, $vPreId, $unitService);
+            }
 
             // 🛡️ Strict Retail Accounting Rule: Parent Variable Products CAN NEVER be sold directly!
             foreach ($validated['items'] as $itIdx => &$itRef) {
@@ -1438,17 +1495,21 @@ class SaleController extends Controller
             unset($itRef);
 
             // 🛡️ Below-Cost Selling Guard: prevent selling below cost price without supervisor/manager authorization
-            $managerPin = $validated['manager_pin'] ?? request()?->input('manager_pin');
-            $managerPinSetting = (string)\App\Models\Setting::get('manager_pin', '1234');
             $authRole = $authUser
                 ? ($authUser->roleModel?->name ?? ($authUser->role ?? 'Cashier'))
                 : (!empty($userRole) ? $userRole : 'Cashier');
-            $isManagerAuthorized = in_array(strtolower((string)$authRole), ['super admin', 'admin', 'manager'])
-                || (!empty($managerPin) && (string)$managerPin === $managerPinSetting);
+            $isManagerAuthorized = in_array(strtolower((string)$authRole), ['super admin', 'admin', 'manager'], true)
+                || ($authUser?->isSuperAdmin() ?? false);
+            if (!$isManagerAuthorized) {
+                $managerPin = $validated['manager_pin'] ?? request()?->input('manager_pin');
+                if (!empty($managerPin) && $accounting->verifyManagerPin((string)$managerPin)) {
+                    $isManagerAuthorized = true;
+                }
+            }
 
             if (!$isManagerAuthorized) {
                 $totalEstimatedBaseCost = 0.0;
-                foreach ($validated['items'] as $it) {
+                foreach ($validated['items'] as $itIdx => $it) {
                     $prod = (!empty($it['product_id']) && isset($productsById[$it['product_id']]))
                         ? $productsById[$it['product_id']]
                         : ($productsByCode[$it['product_code']] ?? null);
@@ -1458,10 +1519,10 @@ class SaleController extends Controller
                     $costPrice = (float)($vObj?->cost_price ?: ($vObj?->purchase_price ?: ($prod->cost_price ?: ($prod->purchase_price ?: 0))));
                     if ($costPrice <= 0) continue;
 
-                    $linkedUnit = $this->resolveSaleItemUnit($prod, $it, $vId, $unitService);
+                    $linkedUnit = $resolvedUnitsByIdx[$itIdx] ?? $this->resolveSaleItemUnit($prod, $it, $vId, $unitService);
                     $cRate = (float)($linkedUnit['conversion_rate'] ?? 1);
                     if ($cRate <= 0) $cRate = 1.0;
-                    $bQty = (float)($it['quantity'] ?? 0) * $cRate;
+                    $bQty = round((float)($it['quantity'] ?? 0) * $cRate, 4);
                     $totalEstimatedBaseCost += ($bQty * $costPrice);
 
                     $sub = (float)($it['subtotal'] ?? 0);
@@ -1521,9 +1582,10 @@ class SaleController extends Controller
             }
 
             // Upfront aggregate stock pre-check across all cart items for each product/variant in the specified warehouse
+            $stockBalances = collect();
             if (($sale->status) === 'Completed') {
                 $requiredStockByItem = [];
-                foreach ($validated['items'] as $item) {
+                foreach ($validated['items'] as $itIdx => $item) {
                     $product = (!empty($item['product_id']) && isset($productsById[$item['product_id']]))
                         ? $productsById[$item['product_id']]
                         : ($productsByCode[$item['product_code']] ?? null);
@@ -1531,9 +1593,9 @@ class SaleController extends Controller
                     if (!$product) continue;
 
                     $variantId = !empty($item['product_variant_id']) ? (int)$item['product_variant_id'] : null;
-                    $linkedUnit = $this->resolveSaleItemUnit($product, $item, $variantId, $unitService);
+                    $linkedUnit = $resolvedUnitsByIdx[$itIdx] ?? $this->resolveSaleItemUnit($product, $item, $variantId, $unitService);
                     $convRate = (float)($linkedUnit['conversion_rate'] ?? 1);
-                    $baseQty = (float)$item['quantity'] * ($convRate > 0 ? $convRate : 1.0);
+                    $baseQty = round((float)$item['quantity'] * ($convRate > 0 ? $convRate : 1.0), 4);
                     $key = $product->id . '_' . ($variantId ?? '0');
                     if (!isset($requiredStockByItem[$key])) {
                         $requiredStockByItem[$key] = [
@@ -1542,7 +1604,7 @@ class SaleController extends Controller
                             'total_base_qty' => 0.0,
                         ];
                     }
-                    $requiredStockByItem[$key]['total_base_qty'] += $baseQty;
+                    $requiredStockByItem[$key]['total_base_qty'] = round($requiredStockByItem[$key]['total_base_qty'] + $baseQty, 4);
                 }
 
                 ksort($requiredStockByItem);
@@ -1560,10 +1622,20 @@ class SaleController extends Controller
                     ->get()
                     ->keyBy(fn($sb) => $sb->product_id . '_' . ($sb->product_variant_id ?? '0'));
 
-                $existingProductBalances = StockBalance::whereIn('product_id', $reqProductIds)
-                    ->distinct()
-                    ->pluck('product_id')
-                    ->flip();
+                // Lazy legacy balance check ONLY when at least one cart item has no StockBalance row in this warehouse
+                $missingBalanceProductIds = [];
+                foreach ($requiredStockByItem as $req) {
+                    $balKey = $req['product']->id . '_' . ($req['variant_id'] ?? '0');
+                    if (!$stockBalances->has($balKey) && $req['variant_id'] === null) {
+                        $missingBalanceProductIds[] = $req['product']->id;
+                    }
+                }
+                $existingProductBalances = !empty($missingBalanceProductIds)
+                    ? StockBalance::whereIn('product_id', array_values(array_unique($missingBalanceProductIds)))
+                        ->distinct()
+                        ->pluck('product_id')
+                        ->flip()
+                    : collect();
 
                 foreach ($requiredStockByItem as $req) {
                     $prod = $req['product'];
@@ -1575,7 +1647,6 @@ class SaleController extends Controller
                     $balance = $sb !== null ? (float)$sb->quantity : null;
                     $available = $balance !== null ? $balance : 0.0;
 
-                    // If no StockBalance record exists at all, check if legacy product has stock_quantity
                     if ($balance === null) {
                         $hasBalances = isset($existingProductBalances[$prod->id]);
                         if (!$hasBalances && $varId === null) {
@@ -1593,7 +1664,6 @@ class SaleController extends Controller
                         }
                         $whName = $validated['warehouse_name'] ?? 'Selected Warehouse';
 
-                        $isOffline = $isOfflineSync || !empty($validated['is_offline_sync']) || !empty($validated['allow_offline_sync']);
                         if ($isOffline) {
                             \Illuminate\Support\Facades\Log::warning("POS Offline Sync: Stock overdraft accepted for '{$prod->name}{$varName}' in '{$whName}'. Needed: {$totalBaseNeeded}, Available: {$available}.");
                             $notesExtra = "[Offline Sync Overdraft: {$prod->name}{$varName} requested {$totalBaseNeeded}, avail was {$available}]";
@@ -1611,8 +1681,9 @@ class SaleController extends Controller
             $totalSaleCogs = 0.0;
             $touchedProductIds = [];
             $touchedVariantIds = [];
+            $createdItems = [];
 
-            foreach ($validated['items'] as $item) {
+            foreach ($validated['items'] as $itIdx => $item) {
                 $product = (!empty($item['product_id']) && isset($productsById[$item['product_id']]))
                     ? $productsById[$item['product_id']]
                     : ($productsByCode[$item['product_code']] ?? null);
@@ -1622,11 +1693,10 @@ class SaleController extends Controller
                     throw new \RuntimeException('Selected variant does not belong to the product.');
                 }
                 if ($product && $product->has_variants && empty($variantId)) {
-                    // 🛡️ Strict Variation Rule: Parent products can NEVER be sold directly!
                     throw new \RuntimeException("ကုန်ပစ္စည်း '{$product->name}' သည် Variation ကုန်ပစ္စည်းဖြစ်ပါသည်။ သီးခြား Variation (Size/Color) ရွေးချယ်ပေးရန် လိုအပ်ပါသည်။");
                 }
 
-                $linkedUnit = $this->resolveSaleItemUnit($product, $item, $variantId, $unitService);
+                $linkedUnit = $resolvedUnitsByIdx[$itIdx] ?? $this->resolveSaleItemUnit($product, $item, $variantId, $unitService);
                 $quantity = (float)$item['quantity'];
                 $baseQuantity = $unitService->baseQuantity($quantity, (float)$linkedUnit['conversion_rate']);
                 $baseUnitPrice = $unitService->basePrice((float)$item['unit_price'], (float)$linkedUnit['conversion_rate']);
@@ -1650,9 +1720,9 @@ class SaleController extends Controller
                 }
 
                 $createItem = function($avgCost = 0.0, $cogs = 0.0) use (
-                    $sale, $product, $variantId, $linkedUnit, $item, $vName, $baseUnitPrice, $quantity, $baseQuantity
+                    $sale, $product, $variantId, $linkedUnit, $item, $vName, $baseUnitPrice, $quantity, $baseQuantity, &$createdItems
                 ) {
-                    return SaleItem::create([
+                    $created = SaleItem::create([
                         'sale_id' => $sale->id,
                         'product_id' => $product?->id,
                         'product_variant_id' => $variantId,
@@ -1671,32 +1741,13 @@ class SaleController extends Controller
                         'subtotal' => (float)$item['subtotal'],
                         'base_unit_cost' => $avgCost,
                         'total_cogs' => $cogs,
-                    ])->id;
+                    ]);
+                    $createdItems[] = $created;
+                    return $created->id;
                 };
 
-                // Reduce inventory stock if completed and deplete FIFO batches
+                // Deplete FIFO first so exact avg_unit_cost is written directly in applyStock() (eliminates per-item syncMovementUnitCost scan+UPDATE!)
                 if ($sale->status === 'Completed' && $product) {
-                    $unitService->applyStock(
-                        product: $product,
-                        warehouseId: $warehouseId,
-                        variantId: $variantId,
-                        baseQuantity: $baseQuantity,
-                        direction: 'out',
-                        movementType: 'sale',
-                        referenceType: 'sale',
-                        referenceId: (string)$sale->id,
-                        note: 'Sale completed in ' . $linkedUnit['unit_name'],
-                        notifyRestock: true,
-                        allowOverdraft: $isOffline,
-                        syncAggregates: false,
-                        movementDate: (string)$sale->date
-                    );
-                    $touchedProductIds[] = $product->id;
-                    if ($variantId) {
-                        $touchedVariantIds[] = (int)$variantId;
-                    }
-
-                    // FIFO Inventory COGS Depletion
                     $fallbackCost = 0.0;
                     if ($variantId && $product->relationLoaded('variants')) {
                         $varObj = $product->variants->firstWhere('id', $variantId);
@@ -1717,14 +1768,32 @@ class SaleController extends Controller
                         fallbackCost: $fallbackCost
                     );
 
-                    $this->syncMovementUnitCost(
-                        (int)$warehouseId,
-                        (int)$product->id,
-                        $variantId,
-                        'sale',
-                        (int)$sale->id,
-                        (float)($depletion['avg_unit_cost'] ?? 0)
+                    $avgUnitCost = (float)($depletion['avg_unit_cost'] ?? 0);
+                    $balKey = $product->id . '_' . ($variantId ?? '0');
+                    $prelockedSb = $stockBalances->get($balKey);
+
+                    $unitService->applyStock(
+                        product: $product,
+                        warehouseId: $warehouseId,
+                        variantId: $variantId,
+                        baseQuantity: $baseQuantity,
+                        direction: 'out',
+                        movementType: 'sale',
+                        referenceType: 'sale',
+                        referenceId: (string)$sale->id,
+                        note: 'Sale completed in ' . $linkedUnit['unit_name'],
+                        notifyRestock: true,
+                        allowOverdraft: $isOffline,
+                        syncAggregates: false,
+                        unitCost: $avgUnitCost > 0 ? $avgUnitCost : null,
+                        movementDate: (string)$sale->date,
+                        prelockedBalance: $prelockedSb,
+                        skipLocks: true
                     );
+                    $touchedProductIds[] = $product->id;
+                    if ($variantId) {
+                        $touchedVariantIds[] = (int)$variantId;
+                    }
 
                     $totalSaleCogs += (float)$depletion['total_cogs'];
                 } else {
@@ -1736,15 +1805,14 @@ class SaleController extends Controller
                 $unitService->syncAggregatesForProducts($touchedProductIds, $touchedVariantIds);
             }
 
-            if ($sale->status === 'Completed' && $totalSaleCogs > 0) {
-                $sale->update(['total_cogs' => round($totalSaleCogs, 2)]);
-            }
-
             // Record payment transaction(s) only for Completed sales (Draft/Pending/Ordered remain unposted)
             $cashAddedToRegister = 0.0;
             $nonCashCollected = 0.0;
+            $computedCashChange = 0.0;
+            $createdPayments = [];
             if ($sale->status === 'Completed') {
                 $paymentRegisterId = $isLateOfflineReconciliation ? null : $cashRegisterId;
+                $payRefStamp = date('YmdHis');
                 if (!empty($validated['payments']) && is_array($validated['payments'])) {
                     $runningRemainingDue = (float)$grandTotal;
                     foreach ($validated['payments'] as $idx => $p) {
@@ -1755,13 +1823,16 @@ class SaleController extends Controller
                         $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmount, 2));
                         $pType = $p['payment_type'] ?? $sale->payment_type;
                         $isCashLeg = $accounting->isCashPaymentType($pType);
-                        $recAmt = isset($p['received_amount']) ? (float)$p['received_amount'] : $rawAmount;
+                        $recAmt = isset($p['received_amount']) ? max($netAmount, (float)$p['received_amount']) : $rawAmount;
                         $chgAmt = $isCashLeg
-                            ? (isset($p['change_amount']) ? (float)$p['change_amount'] : max(0.0, round($recAmt - $netAmount, 2)))
+                            ? max(0.0, round($recAmt - $netAmount, 2))
                             : 0.0;
-                        SalePayment::create([
+                        if ($isCashLeg && $chgAmt <= 0.001 && isset($p['change_amount'])) {
+                            $chgAmt = max(0.0, round((float)$p['change_amount'], 2));
+                        }
+                        $createdPayments[] = SalePayment::create([
                             'sale_id' => $sale->id,
-                            'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999) . '-' . ($idx + 1),
+                            'reference_no' => 'PAY-' . $payRefStamp . '-' . $sale->id . '-' . ($idx + 1),
                             'payment_date' => $p['payment_date'] ?? $sale->date,
                             'payment_type' => $pType,
                             'cash_register_id' => $paymentRegisterId,
@@ -1777,21 +1848,23 @@ class SaleController extends Controller
 
                         if ($isCashLeg) {
                             $cashAddedToRegister = round($cashAddedToRegister + $netAmount, 2);
+                            $computedCashChange = round($computedCashChange + $chgAmt, 2);
                         } else {
                             $nonCashCollected = round($nonCashCollected + $netAmount, 2);
                         }
                     }
                 } elseif ($paidAmount > 0) {
                     $isCashScalar = $accounting->isCashPaymentType($sale->payment_type);
-                    SalePayment::create([
+                    $scalarChange = $isCashScalar ? $change : 0.0;
+                    $createdPayments[] = SalePayment::create([
                         'sale_id' => $sale->id,
-                        'reference_no' => 'PAY-' . date('Ymd') . '-' . rand(1000, 9999),
+                        'reference_no' => 'PAY-' . $payRefStamp . '-' . $sale->id . '-1',
                         'payment_date' => $sale->date,
                         'payment_type' => $sale->payment_type,
                         'cash_register_id' => $paymentRegisterId,
                         'amount' => $paidAmount,
                         'received_amount' => $received,
-                        'change_amount' => $isCashScalar ? $change : 0.0,
+                        'change_amount' => $scalarChange,
                         'notes' => 'Payment recorded at POS checkout',
                         'created_by' => $sale->created_by,
                         'user_id' => $sale->user_id,
@@ -1801,6 +1874,7 @@ class SaleController extends Controller
 
                     if ($isCashScalar) {
                         $cashAddedToRegister = round($cashAddedToRegister + $paidAmount, 2);
+                        $computedCashChange = $scalarChange;
                     } else {
                         $nonCashCollected = round($nonCashCollected + $paidAmount, 2);
                     }
@@ -1829,21 +1903,29 @@ class SaleController extends Controller
                         ]);
                     }
                 } elseif ($cashAddedToRegister > 0) {
-                    $this->reconcileRegisterCash($sale, $cashAddedToRegister, 'increment', null, $cashRegisterId);
+                    $this->reconcileRegisterCash($sale, $cashAddedToRegister, 'increment', null, $cashRegisterId, false, $lockedRegister);
                 }
             }
 
-            // Update customer total spend and visit count
-            if ($sale->status === 'Completed' && !empty($validated['customer_id'])) {
-                $cust = Customer::where('id', $validated['customer_id'])->lockForUpdate()->first();
-                if ($cust) {
-                    $newTotalSpent = (float)$cust->total_spent + $grandTotal;
+            // Single consolidated post-loop header update (COGS + authoritative split-payment change_amount)
+            $headerUpdates = [];
+            if ($sale->status === 'Completed' && $totalSaleCogs > 0) {
+                $headerUpdates['total_cogs'] = round($totalSaleCogs, 2);
+            }
+            if ($sale->status === 'Completed' && !empty($validated['payments']) && abs($computedCashChange - (float)$sale->change_amount) > 0.001) {
+                $headerUpdates['change_amount'] = $computedCashChange;
+            }
+            if (!empty($headerUpdates)) {
+                $sale->update($headerUpdates);
+            }
 
-                    $cust->update([
-                        'total_spent' => $newTotalSpent,
-                        'total_visits' => (int)$cust->total_visits + 1,
-                    ]);
-                }
+            // Update customer total spend and visit count (reusing already-locked $lockedCustomer!)
+            if ($sale->status === 'Completed' && $lockedCustomer !== null) {
+                $newTotalSpent = round((float)$lockedCustomer->total_spent + $grandTotal, 2);
+                $lockedCustomer->update([
+                    'total_spent' => $newTotalSpent,
+                    'total_visits' => (int)$lockedCustomer->total_visits + 1,
+                ]);
             }
 
             // Atomically mark converted quotation as Ordered with pessimistic status & expiry safety check
@@ -1885,6 +1967,8 @@ class SaleController extends Controller
             }
 
             DB::commit();
+            $sale->setRelation('items', new \Illuminate\Database\Eloquent\Collection($createdItems));
+            $sale->setRelation('payments', new \Illuminate\Database\Eloquent\Collection($createdPayments));
             $this->clearSaleRelatedCaches();
             return $sale;
         } catch (\Throwable $e) {
@@ -1949,8 +2033,8 @@ class SaleController extends Controller
                 }
                 $validated = $validator->validated();
 
-                $sale = $this->createSaleFromValidated($validated, $authUser, true);
-                $sale->load(['items', 'payments']);
+                $sale = $this->createSaleFromValidated($validated, $authUser, true, true);
+                $sale->loadMissing(['items', 'payments']);
                 $this->maskSaleCostFields($sale, $canViewCost);
                 $synced[] = [
                     'idempotency_key' => $idempotencyKey ?: ($sale->idempotency_key ?? null),
@@ -1995,7 +2079,7 @@ class SaleController extends Controller
             'warehouse_id' => 'nullable|integer',
             'date' => 'required|string',
             'status' => 'nullable|string|in:Completed,Pending,Draft,Ordered',
-            'tax_rate' => 'nullable|numeric|min:0',
+            'tax_rate' => 'nullable|numeric|min:0|max:100',
             'tax_amount' => 'nullable|numeric|min:0',
             'discount' => 'nullable|numeric|min:0',
             'shipping' => 'nullable|numeric|min:0',

@@ -19,6 +19,8 @@ use Illuminate\Support\Facades\Schema;
 
 class CashRegisterController extends Controller
 {
+    private const OPEN_STATUSES = ['open', 'Open', 'OPEN', 'opened', 'Opened', 'OPENED'];
+
     private function noStoreJson(array $payload, int $status = 200)
     {
         return response()->json($payload, $status)
@@ -55,7 +57,7 @@ class CashRegisterController extends Controller
         $userName = $request->input('user_name', $user?->name);
         $warehouse = $request->input('warehouse', $request->input('warehouse_name'));
 
-        $query = CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened']);
+        $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
 
         if ($userId) {
             $query->where(function ($q) use ($userId, $userName) {
@@ -104,57 +106,73 @@ class CashRegisterController extends Controller
         ]);
 
         $user = $this->resolveAuthUser($request);
-        $userId = $validated['user_id'] ?? $user?->id;
-        $userName = $validated['user_name'] ?? ($user?->name ?? 'Super Admin');
+        $isManager = $user && ($user->isSuperAdmin() || in_array(strtolower((string)($user->roleModel?->name ?? $user->role ?? '')), ['super admin', 'admin', 'manager'], true));
+        $userId = ($isManager && !empty($validated['user_id'])) ? (int)$validated['user_id'] : ($user?->id ?? ($validated['user_id'] ?? null));
+        $userName = ($isManager && !empty($validated['user_name'])) ? $validated['user_name'] : ($user?->name ?? ($validated['user_name'] ?? 'Super Admin'));
 
-        $warehouseName = $validated['warehouse_name'] ?? 'Main Branch Outlet';
-        $warehouseId = $validated['warehouse_id'] ?? null;
-        if (!$warehouseId && $warehouseName) {
+        $warehouseId = !empty($validated['warehouse_id']) ? (int)$validated['warehouse_id'] : null;
+        $warehouseName = trim((string)($validated['warehouse_name'] ?? ''));
+        if ($warehouseId && $warehouseName === '') {
+            $outlet = Outlet::find($warehouseId);
+            $warehouseName = $outlet?->name ?? 'Main Branch Outlet';
+        } elseif (!$warehouseId && $warehouseName !== '') {
             $outlet = Outlet::where('name', $warehouseName)->first();
             $warehouseId = $outlet?->id ?? 1;
+        } elseif (!$warehouseId && $warehouseName === '') {
+            $outlet = Outlet::orderBy('id')->first();
+            $warehouseId = $outlet?->id ?? 1;
+            $warehouseName = $outlet?->name ?? 'Main Branch Outlet';
         }
 
-        // Check if there is already an open register for this user & warehouse
-        $existing = CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
-            ->where(function ($q) use ($userId, $userName) {
-                if ($userId) $q->where('user_id', $userId);
-                if ($userName) $q->orWhere('user_name', $userName);
-            })
-            ->where('warehouse_name', $warehouseName)
-            ->first();
+        return DB::transaction(function () use ($validated, $user, $userId, $userName, $warehouseId, $warehouseName) {
+            // Atomic lock prevents duplicate open shifts on concurrent double-click
+            $existing = CashRegister::whereIn('status', self::OPEN_STATUSES)
+                ->where(function ($q) use ($userId, $userName) {
+                    if ($userId) {
+                        $q->where('user_id', $userId);
+                    }
+                    if ($userName) {
+                        $q->orWhere('user_name', $userName);
+                    }
+                })
+                ->where('warehouse_name', $warehouseName)
+                ->orderByDesc('id')
+                ->lockForUpdate()
+                ->first();
 
-        if ($existing) {
+            if ($existing) {
+                return $this->noStoreJson([
+                    'status' => 'success',
+                    'message' => 'An active cash register is already open for this cashier.',
+                    'has_open_register' => true,
+                    'register' => $this->buildRegisterDetailsPayload($existing, $user),
+                ]);
+            }
+
+            $refNo = 'REG-' . date('Ymd-His') . '-' . str_pad((string)random_int(0, 9999), 4, '0', STR_PAD_LEFT);
+            $openingCash = round((float)$validated['opening_cash'], 2);
+
+            $register = CashRegister::create([
+                'reference_no' => $refNo,
+                'register_name' => $validated['register_name'] ?? 'Register 01',
+                'user_id' => $userId,
+                'user_name' => $userName,
+                'warehouse_id' => $warehouseId,
+                'warehouse_name' => $warehouseName,
+                'opening_cash' => $openingCash,
+                'expected_cash' => $openingCash,
+                'status' => 'open',
+                'opened_at' => now(),
+                'opening_notes' => $validated['opening_notes'] ?? null,
+            ]);
+
             return $this->noStoreJson([
                 'status' => 'success',
-                'message' => 'An active cash register is already open for this cashier.',
+                'message' => 'Cash register opened successfully',
                 'has_open_register' => true,
-                'register' => $this->buildRegisterDetailsPayload($existing, $user),
+                'register' => $this->buildInitialRegisterPayload($register, $user),
             ]);
-        }
-
-        $refNo = 'REG-' . date('Ymd') . '-' . str_pad((string)rand(100, 9999), 4, '0', STR_PAD_LEFT);
-        $openingCash = round((float)$validated['opening_cash'], 2);
-
-        $register = CashRegister::create([
-            'reference_no' => $refNo,
-            'register_name' => $validated['register_name'] ?? 'Register 01',
-            'user_id' => $userId,
-            'user_name' => $userName,
-            'warehouse_id' => $warehouseId,
-            'warehouse_name' => $warehouseName,
-            'opening_cash' => $openingCash,
-            'expected_cash' => $openingCash,
-            'status' => 'open',
-            'opened_at' => now(),
-            'opening_notes' => $validated['opening_notes'] ?? null,
-        ]);
-
-        return $this->noStoreJson([
-            'status' => 'success',
-            'message' => 'Cash register opened successfully',
-            'has_open_register' => true,
-            'register' => $this->buildInitialRegisterPayload($register, $user),
-        ]);
+        });
     }
 
     public function details(Request $request, $id = null)
@@ -167,7 +185,7 @@ class CashRegisterController extends Controller
             $userId = $user?->id;
             $userName = $request->input('user_name', $user?->name);
 
-            $query = CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened']);
+            $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
             if ($userId) {
                 $query->where(function ($q) use ($userId, $userName) {
                     $q->where('user_id', $userId);
@@ -219,7 +237,7 @@ class CashRegisterController extends Controller
                 $userId = $user?->id;
                 $userName = $request->input('user_name', $user?->name);
 
-                $query = CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened']);
+                $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
                 if ($userId) {
                     $query->where(function ($q) use ($userId, $userName) {
                         $q->where('user_id', $userId);
@@ -288,14 +306,24 @@ class CashRegisterController extends Controller
         });
 
         if ($telegramPayload !== null) {
-            try {
-                $userName = trim((string)($user?->name ?? 'POS Cashier'));
-                $userRole = trim((string)($user?->role ?? ''));
-                $triggeredBy = $userRole !== '' ? "{$userName} ({$userRole})" : $userName;
-                app(TelegramNotificationService::class)->sendRegisterNotification($telegramPayload, $triggeredBy, true);
-            } catch (\Throwable $e) {
-                Log::warning('Telegram auto-notify on register close failed: ' . $e->getMessage());
-            }
+            $userName = trim((string)($user?->name ?? 'POS Cashier'));
+            $userRole = trim((string)($user?->role ?? ''));
+            $triggeredBy = $userRole !== '' ? "{$userName} ({$userRole})" : $userName;
+
+            // Send Telegram summary after HTTP response is flushed so POS register close never stalls on external network I/O.
+            // Guard with a one-shot flag so multi-request test containers / long-lived workers never fire twice.
+            $telegramDispatched = false;
+            app()->terminating(function () use ($telegramPayload, $triggeredBy, &$telegramDispatched) {
+                if ($telegramDispatched) {
+                    return;
+                }
+                $telegramDispatched = true;
+                try {
+                    app(TelegramNotificationService::class)->sendRegisterNotification($telegramPayload, $triggeredBy, true);
+                } catch (\Throwable $e) {
+                    Log::warning('Telegram auto-notify on register close failed: ' . $e->getMessage());
+                }
+            });
         }
 
         return $response;
@@ -331,7 +359,7 @@ class CashRegisterController extends Controller
                 $userId = $user?->id;
                 $userName = $request->input('user_name', $user?->name);
 
-                $query = CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened']);
+                $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
                 if ($userId) {
                     $query->where(function ($q) use ($userId, $userName) {
                         $q->where('user_id', $userId);
@@ -350,38 +378,62 @@ class CashRegisterController extends Controller
                 ], 404);
             }
 
-            // If Safe Drop, ensure drawer has enough cash
+            // Single-pass shift computation (avoids running buildRegisterDetailsPayload twice under lockForUpdate)
             $currentPayload = $this->buildRegisterDetailsPayload($register, $user, true);
             $currentExpectedCash = (float)($currentPayload['expected_cash'] ?? 0);
+            $txAmount = round((float)$validated['amount'], 2);
 
-            if ($validated['type'] === 'drop' && (float)$validated['amount'] > $currentExpectedCash + 0.005) {
+            if ($validated['type'] === 'drop' && $txAmount > $currentExpectedCash + 0.005) {
                 return response()->json([
                     'status' => 'error',
-                    'message' => 'Safe drop amount (' . number_format($validated['amount']) . ' Ks) cannot exceed current drawer cash (' . number_format($currentExpectedCash) . ' Ks).',
+                    'message' => 'Safe drop amount (' . number_format($txAmount) . ' Ks) cannot exceed current drawer cash (' . number_format($currentExpectedCash) . ' Ks).',
                 ], 422);
             }
 
             $tx = CashRegisterTransaction::create([
                 'cash_register_id' => $register->id,
                 'type' => $validated['type'],
-                'amount' => round((float)$validated['amount'], 2),
+                'amount' => $txAmount,
                 'reason' => $validated['reason'],
                 'authorized_by' => $authorizerName,
                 'manager_pin_verified' => true,
             ]);
 
-            $delta = $validated['type'] === 'float_in'
-                ? round((float)$validated['amount'], 2)
-                : -round((float)$validated['amount'], 2);
-            $register->update(['expected_cash' => round($currentExpectedCash + $delta, 2)]);
+            $delta = $validated['type'] === 'float_in' ? $txAmount : -$txAmount;
+            $newExpectedCash = round($currentExpectedCash + $delta, 2);
+            $register->update(['expected_cash' => $newExpectedCash]);
 
-            $updatedPayload = $this->buildRegisterDetailsPayload($register->fresh(), $user, false);
+            // Update payload in memory instead of re-querying all shift tables a second time
+            if ($validated['type'] === 'float_in') {
+                $currentPayload['floats_in'] = round((float)($currentPayload['floats_in'] ?? 0) + $txAmount, 2);
+            } else {
+                $newDrops = round((float)($currentPayload['cash_drops'] ?? 0) + $txAmount, 2);
+                $currentPayload['cash_drops'] = $newDrops;
+                $currentPayload['safe_drops'] = $newDrops;
+            }
+            $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
+            $currentPayload['expected_cash'] = $canViewExpected ? $newExpectedCash : null;
+            $currentPayload['closing_cash'] = $newExpectedCash;
+            $currentPayload['difference'] = $canViewExpected ? 0.0 : null;
+            $existingTxList = is_iterable($currentPayload['register_transactions'] ?? null)
+                ? collect($currentPayload['register_transactions'])->all()
+                : [];
+            array_unshift($existingTxList, [
+                'id' => (int)$tx->id,
+                'type' => $tx->type,
+                'amount' => (float)$tx->amount,
+                'reason' => $tx->reason ?? '',
+                'authorized_by' => $tx->authorized_by ?? '',
+                'manager_pin_verified' => (bool)$tx->manager_pin_verified,
+                'created_at' => (string)$tx->created_at,
+            ]);
+            $currentPayload['register_transactions'] = $existingTxList;
 
             return $this->noStoreJson([
                 'status' => 'success',
                 'message' => ($validated['type'] === 'drop' ? 'Safe drop' : 'Float addition') . ' recorded successfully',
                 'transaction' => $tx,
-                'register' => $updatedPayload,
+                'register' => $currentPayload,
             ]);
         });
     }
@@ -390,14 +442,16 @@ class CashRegisterController extends Controller
      * Normalize payment method names to eliminate generic "Digital / Mobile"
      * and accurately show individual tender types (KBZPay, WavePay, KPay, Card, Cash, etc.)
      */
-    private function normalizePaymentMethodName(string $raw): string
+    private function normalizePaymentMethodName(string $raw, ?PurchaseAccountingService $accounting = null): string
     {
         $trimmed = trim($raw);
         if ($trimmed === '') {
             return 'Other';
         }
         $lower = strtolower($trimmed);
-        if ($lower === 'cash') return 'Cash';
+        if ($lower === 'cash' || ($accounting !== null && $accounting->isCashPaymentType($trimmed))) {
+            return 'Cash';
+        }
         if (in_array($lower, ['kbzpay', 'kbz pay', 'kbz_pay'])) return 'KBZPay';
         if (in_array($lower, ['kpay', 'k pay', 'k-pay'])) return 'KPay';
         if (in_array($lower, ['wave', 'wavepay', 'wave pay', 'wave_pay'])) return 'WavePay';
@@ -479,84 +533,85 @@ class CashRegisterController extends Controller
         $openedAt = $register->opened_at;
         $closedAt = $register->closed_at ?? now();
 
-        // 1. Query posted Completed sales associated strictly with this register (excluding unposted & late-offline sales)
+        // 1. Index-native split queries for posted Completed sales strictly associated with this register
         $hasLateOfflineCol = $accounting->schemaHasColumn('sales', 'late_offline_reconciliation');
-        $salesQuery = DB::table('sales')
+        $saleCols = ['id', 'reference_no', 'customer_name', 'grand_total', 'paid_amount', 'due_amount', 'payment_status', 'payment_type', 'date', 'created_at'];
+
+        $linkedSales = DB::table('sales')
+            ->where('cash_register_id', $register->id)
             ->whereNotIn('status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
             ->when($hasLateOfflineCol, fn ($q) => $q->where(function ($sub) {
                 $sub->whereNull('late_offline_reconciliation')->orWhere('late_offline_reconciliation', false);
             }))
-            ->where(function ($q) use ($register, $openedAt, $closedAt) {
-                $q->where('cash_register_id', $register->id)
-                  ->orWhere(function ($sub) use ($register, $openedAt, $closedAt) {
-                      $sub->whereNull('cash_register_id')
-                          ->where('pos_flag', true)
-                          ->where('warehouse_name', $register->warehouse_name)
-                          ->whereBetween('created_at', [$openedAt, $closedAt]);
-                      if ($register->user_id) {
-                          $sub->where('user_id', $register->user_id);
-                      }
-                  });
-            });
-
-        $sales = $salesQuery
             ->orderByDesc('id')
-            ->get(['id', 'reference_no', 'customer_name', 'grand_total', 'paid_amount', 'due_amount', 'payment_status', 'payment_type', 'date', 'created_at']);
+            ->get($saleCols);
+
+        $unlinkedSales = DB::table('sales')
+            ->whereNull('cash_register_id')
+            ->where('pos_flag', true)
+            ->where('warehouse_name', $register->warehouse_name)
+            ->whereBetween('created_at', [$openedAt, $closedAt])
+            ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
+            ->whereNotIn('status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
+            ->when($hasLateOfflineCol, fn ($q) => $q->where(function ($sub) {
+                $sub->whereNull('late_offline_reconciliation')->orWhere('late_offline_reconciliation', false);
+            }))
+            ->orderByDesc('id')
+            ->get($saleCols);
+
+        $sales = $unlinkedSales->isEmpty()
+            ? $linkedSales
+            : $linkedSales->concat($unlinkedSales)->unique('id')->sortByDesc('id')->values();
 
         $totalSales = (float)$sales->sum('grand_total');
         $txCount = $sales->count();
         $saleIds = $sales->pluck('id')->all();
 
-        // 2. Query SalePayments collected directly during this register session (chunked SQLite-safe & zero N+1)
+        // 2. Index-native split queries for SalePayments collected directly during this register session (zero OR index-merge, zero N+1)
         $hasSpRegCol = $accounting->schemaHasColumn('sale_payments', 'cash_register_id');
         $payments = collect();
+        $seenPaymentIds = [];
+        $allPaymentSaleIdSet = [];
+
         if ($hasSpRegCol) {
+            // 2a. Directly linked payments for this register (uses cash_register_id index cleanly)
+            $linkedPayments = DB::table('sale_payments')
+                ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
+                ->whereNotIn('sales.status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
+                ->when($hasLateOfflineCol, fn ($q) => $q->where(function ($sub) {
+                    $sub->whereNull('sales.late_offline_reconciliation')->orWhere('sales.late_offline_reconciliation', false);
+                }))
+                ->where('sale_payments.cash_register_id', $register->id)
+                ->get(['sale_payments.*']);
+
+            foreach ($linkedPayments as $pRow) {
+                $seenPaymentIds[$pRow->id] = true;
+                $allPaymentSaleIdSet[(int)$pRow->sale_id] = true;
+                $payments->push($pRow);
+            }
+
+            // 2b. Unlinked legacy payments on this session's sales (uses sale_id index cleanly, no OR)
             if (!empty($saleIds)) {
-                $seenPaymentIds = [];
-                foreach (array_chunk($saleIds, 400) as $chunkIdx => $idChunk) {
-                    $pq = DB::table('sale_payments')
+                foreach (array_chunk($saleIds, 400) as $idChunk) {
+                    $unlinkedPq = DB::table('sale_payments')
                         ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
                         ->whereNotIn('sales.status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
                         ->when($hasLateOfflineCol, fn ($q) => $q->where(function ($sub) {
                             $sub->whereNull('sales.late_offline_reconciliation')->orWhere('sales.late_offline_reconciliation', false);
                         }))
-                        ->where(function ($q) use ($register, $idChunk, $openedAt, $closedAt, $chunkIdx) {
-                            if ($chunkIdx === 0) {
-                                $q->where('sale_payments.cash_register_id', $register->id)
-                                  ->orWhere(function ($sub) use ($register, $idChunk, $openedAt, $closedAt) {
-                                      $sub->whereNull('sale_payments.cash_register_id')
-                                          ->whereIn('sale_payments.sale_id', $idChunk)
-                                          ->whereBetween('sale_payments.created_at', [$openedAt, $closedAt]);
-                                      if ($register->user_id) {
-                                          $sub->where('sale_payments.user_id', $register->user_id);
-                                      }
-                                  });
-                            } else {
-                                $q->whereNull('sale_payments.cash_register_id')
-                                  ->whereIn('sale_payments.sale_id', $idChunk)
-                                  ->whereBetween('sale_payments.created_at', [$openedAt, $closedAt]);
-                                if ($register->user_id) {
-                                    $q->where('sale_payments.user_id', $register->user_id);
-                                }
-                            }
-                        })
+                        ->whereNull('sale_payments.cash_register_id')
+                        ->whereIn('sale_payments.sale_id', $idChunk)
+                        ->whereBetween('sale_payments.created_at', [$openedAt, $closedAt])
+                        ->when($register->user_id, fn ($q) => $q->where('sale_payments.user_id', $register->user_id))
                         ->get(['sale_payments.*']);
-                    foreach ($pq as $pRow) {
+                    foreach ($unlinkedPq as $pRow) {
                         if (!isset($seenPaymentIds[$pRow->id])) {
                             $seenPaymentIds[$pRow->id] = true;
+                            $allPaymentSaleIdSet[(int)$pRow->sale_id] = true;
                             $payments->push($pRow);
                         }
                     }
                 }
-            } else {
-                $payments = DB::table('sale_payments')
-                    ->join('sales', 'sale_payments.sale_id', '=', 'sales.id')
-                    ->whereNotIn('sales.status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
-                    ->when($hasLateOfflineCol, fn ($q) => $q->where(function ($sub) {
-                        $sub->whereNull('sales.late_offline_reconciliation')->orWhere('sales.late_offline_reconciliation', false);
-                    }))
-                    ->where('sale_payments.cash_register_id', $register->id)
-                    ->get(['sale_payments.*']);
             }
         } elseif (!empty($saleIds)) {
             foreach (array_chunk($saleIds, 400) as $idChunk) {
@@ -570,14 +625,21 @@ class CashRegisterController extends Controller
                     ->whereBetween('sale_payments.created_at', [$openedAt, $closedAt])
                     ->get(['sale_payments.*']);
                 foreach ($pq as $pRow) {
+                    $allPaymentSaleIdSet[(int)$pRow->sale_id] = true;
                     $payments->push($pRow);
                 }
             }
         }
 
-        $allPaymentSaleIdSet = [];
-        if (!empty($saleIds)) {
-            foreach (array_chunk($saleIds, 400) as $idChunk) {
+        // Lazy fallback check: only hit sale_payments for paid sales not already covered by $payments
+        $missingPaymentSaleIds = [];
+        foreach ($sales as $s) {
+            if (!isset($allPaymentSaleIdSet[(int)$s->id]) && (float)$s->paid_amount > 0) {
+                $missingPaymentSaleIds[] = (int)$s->id;
+            }
+        }
+        if (!empty($missingPaymentSaleIds)) {
+            foreach (array_chunk($missingPaymentSaleIds, 400) as $idChunk) {
                 foreach (DB::table('sale_payments')->whereIn('sale_id', $idChunk)->distinct()->pluck('sale_id') as $psId) {
                     $allPaymentSaleIdSet[(int)$psId] = true;
                 }
@@ -589,7 +651,7 @@ class CashRegisterController extends Controller
 
         foreach ($payments as $p) {
             $rawMethod = (string)($p->payment_type ?? 'Cash');
-            $methodName = $this->normalizePaymentMethodName($rawMethod);
+            $methodName = $this->normalizePaymentMethodName($rawMethod, $accounting);
             $netAmount = max(0.0, (float)$p->amount);
 
             $tenderTotals[$methodName] = ($tenderTotals[$methodName] ?? 0.0) + $netAmount;
@@ -602,7 +664,7 @@ class CashRegisterController extends Controller
                 continue;
             }
             $rawMethod = (string)($s->payment_type ?? 'Cash');
-            $methodName = $this->normalizePaymentMethodName($rawMethod);
+            $methodName = $this->normalizePaymentMethodName($rawMethod, $accounting);
             $paid = (float)$s->paid_amount;
             if ($paid > 0) {
                 $tenderTotals[$methodName] = ($tenderTotals[$methodName] ?? 0.0) + $paid;
@@ -632,106 +694,168 @@ class CashRegisterController extends Controller
             }
         }
 
-        // 3. Query Completed refunds/returns during this register session (register-isolated & split-payment aware)
+        // 3. Index-native split queries for Completed refunds/returns (strictly register-isolated, zero cross-register double counting)
         $hasSrRegCol = $accounting->schemaHasColumn('sale_returns', 'cash_register_id');
         $hasSrSplitCol = $accounting->schemaHasColumn('sale_returns', 'has_register_split');
-        $returnsQuery = DB::table('sale_returns')->where('status', 'Completed');
-        if ($hasSrRegCol) {
-            $returnsQuery->where(function ($q) use ($register, $openedAt, $closedAt, $hasSrSplitCol) {
-                $q->where('cash_register_id', $register->id);
-                if ($hasSrSplitCol) {
-                    $q->orWhere('has_register_split', true);
-                } else {
-                    $q->orWhere('payments_payload', 'like', '%"cash_register_id":' . $register->id . '%');
-                }
-                $q->orWhere(function ($sub) use ($register, $openedAt, $closedAt) {
-                      $sub->whereNull('cash_register_id')
-                          ->where('warehouse_name', $register->warehouse_name)
-                          ->whereBetween('created_at', [$openedAt, $closedAt]);
-                      if ($register->user_id) {
-                          $sub->where('user_id', $register->user_id);
-                      }
-                  });
-            });
-        } else {
-            $returnsQuery->where('warehouse_name', $register->warehouse_name)
-                ->whereBetween('created_at', [$openedAt, $closedAt])
-                ->when($register->user_id, fn($q) => $q->where('user_id', $register->user_id));
-        }
+        $retCols = ['id', 'cash_register_id', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload'];
+        $returnsById = [];
 
-        $returns = $returnsQuery->get(['id', 'cash_register_id', 'grand_total', 'paid_amount', 'refund_tender', 'payment_type', 'payments_payload']);
+        if ($hasSrRegCol) {
+            foreach (DB::table('sale_returns')->where('status', 'Completed')->where('cash_register_id', $register->id)->get($retCols) as $r) {
+                $returnsById[(int)$r->id] = $r;
+            }
+            if ($hasSrSplitCol) {
+                foreach (DB::table('sale_returns')->where('status', 'Completed')->where('has_register_split', true)->get($retCols) as $r) {
+                    $returnsById[(int)$r->id] = $r;
+                }
+            } else {
+                foreach (DB::table('sale_returns')->where('status', 'Completed')->where('payments_payload', 'like', '%"cash_register_id":' . $register->id . '%')->get($retCols) as $r) {
+                    $returnsById[(int)$r->id] = $r;
+                }
+            }
+            $unlinkedReturns = DB::table('sale_returns')
+                ->where('status', 'Completed')
+                ->whereNull('cash_register_id')
+                ->where('warehouse_name', $register->warehouse_name)
+                ->whereBetween('created_at', [$openedAt, $closedAt])
+                ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
+                ->get($retCols);
+            foreach ($unlinkedReturns as $r) {
+                $returnsById[(int)$r->id] = $r;
+            }
+        } else {
+            $unlinkedReturns = DB::table('sale_returns')
+                ->where('status', 'Completed')
+                ->where('warehouse_name', $register->warehouse_name)
+                ->whereBetween('created_at', [$openedAt, $closedAt])
+                ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
+                ->get($retCols);
+            foreach ($unlinkedReturns as $r) {
+                $returnsById[(int)$r->id] = $r;
+            }
+        }
 
         $totalRefunds = 0.0;
         $cashRefunds = 0.0;
-        foreach ($returns as $r) {
+        foreach ($returnsById as $r) {
             $retTotal = (float)($r->grand_total ?? 0);
-            $totalRefunds += $retTotal;
             $payloadLines = !empty($r->payments_payload) ? json_decode((string)$r->payments_payload, true) : null;
             if (is_array($payloadLines) && !empty($payloadLines)) {
+                $matchedLegTotal = 0.0;
+                $matchedCash = 0.0;
+                $belongsToThisReg = false;
+                $headerMatchesReg = !empty($r->cash_register_id) && (int)$r->cash_register_id === (int)$register->id;
+                $headerIsNull = empty($r->cash_register_id);
+
                 foreach ($payloadLines as $line) {
                     if (!is_array($line)) continue;
-                    $legRegId = isset($line['cash_register_id']) && $line['cash_register_id'] !== ''
+                    $hasExplicitLegReg = isset($line['cash_register_id']) && $line['cash_register_id'] !== '' && $line['cash_register_id'] !== null;
+                    $legRegId = $hasExplicitLegReg
                         ? (int)$line['cash_register_id']
-                        : (!empty($r->cash_register_id) ? (int)$r->cash_register_id : null);
+                        : ($headerMatchesReg ? (int)$register->id : ($headerIsNull ? null : (int)$r->cash_register_id));
+
                     if ($legRegId !== null && $legRegId !== (int)$register->id) {
                         continue;
                     }
-                    $legType = strtolower(trim((string)($line['payment_type'] ?? '')));
-                    if ($legType === 'cash' || str_contains($legType, 'cash')) {
-                        $cashRefunds += max(0.0, (float)($line['amount'] ?? 0));
+                    if ($legRegId === null && !$headerIsNull) {
+                        continue;
                     }
+                    if ($legRegId === null && $hasSrSplitCol && !empty($r->payments_payload) && str_contains((string)$r->payments_payload, '"cash_register_id"')) {
+                        continue;
+                    }
+
+                    $belongsToThisReg = true;
+                    $legAmt = max(0.0, (float)($line['amount'] ?? 0));
+                    $matchedLegTotal += $legAmt;
+                    $legType = (string)($line['payment_type'] ?? '');
+                    if ($accounting->isCashPaymentType($legType)) {
+                        $matchedCash += $legAmt;
+                    }
+                }
+
+                if ($belongsToThisReg) {
+                    $totalRefunds += ($matchedLegTotal > 0 ? $matchedLegTotal : $retTotal);
+                    $cashRefunds += $matchedCash;
                 }
             } else {
                 if (!empty($r->cash_register_id) && (int)$r->cash_register_id !== (int)$register->id) {
                     continue;
                 }
-                $tender = strtolower(trim((string)($r->refund_tender ?? $r->payment_type ?? 'cash')));
+                $totalRefunds += $retTotal;
+                $tender = (string)($r->refund_tender ?? $r->payment_type ?? 'Cash');
                 $paidOut = max(0.0, (float)($r->paid_amount ?? 0));
-                if ($paidOut > 0 && ($tender === 'cash' || str_contains($tender, 'cash'))) {
+                if ($paidOut > 0 && $accounting->isCashPaymentType($tender)) {
                     $cashRefunds += $paidOut;
                 }
             }
         }
 
-        // 4. Query paid expenses during this shift using expense_payments ledger (never deduct Unpaid expenses)
+        // 4. Index-native split queries for paid expenses (eliminates 1,000ms+ OR ref_or_null full table scan)
         $hasExpRegCol = $accounting->schemaHasColumn('expenses', 'cash_register_id');
         $hasEpRegCol = $accounting->schemaHasColumn('expense_payments', 'cash_register_id');
-        $expensePaymentsQuery = DB::table('expense_payments')
-            ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id');
+        $hasExpStatusCol = $accounting->schemaHasColumn('expenses', 'status');
+        $hasExpPayStatusCol = $accounting->schemaHasColumn('expenses', 'payment_status');
+        $applyActiveExpenseFilter = function ($q) use ($hasExpStatusCol, $hasExpPayStatusCol) {
+            if ($hasExpStatusCol) {
+                $q->where(fn ($s) => $s->whereNull('expenses.status')->orWhereNotIn('expenses.status', ['Voided', 'Draft', 'Pending', 'Cancelled']));
+            }
+            if ($hasExpPayStatusCol) {
+                $q->where(fn ($s) => $s->whereNull('expenses.payment_status')->orWhereNotIn('expenses.payment_status', ['Voided', 'Cancelled']));
+            }
+        };
+        $expensePaymentRows = collect();
+        $seenEpIds = [];
 
         if ($hasEpRegCol) {
-            $expensePaymentsQuery->where(function ($q) use ($register, $hasExpRegCol, $openedAt, $closedAt) {
-                $q->where('expense_payments.cash_register_id', $register->id)
-                  ->orWhere(function ($sub) use ($register, $hasExpRegCol, $openedAt, $closedAt) {
-                      $sub->whereNull('expense_payments.cash_register_id')
-                          ->where(function ($expMatch) use ($register, $hasExpRegCol, $openedAt, $closedAt) {
-                              if ($hasExpRegCol) {
-                                  $expMatch->where('expenses.cash_register_id', $register->id)
-                                      ->orWhere(function ($legacy) use ($register, $openedAt, $closedAt) {
-                                          $legacy->whereNull('expenses.cash_register_id')
-                                              ->where('expenses.warehouse_name', $register->warehouse_name)
-                                              ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt]);
-                                          if ($register->user_id) {
-                                              $legacy->where('expense_payments.user_id', $register->user_id);
-                                          }
-                                      });
-                              } else {
-                                  $expMatch->where('expenses.warehouse_name', $register->warehouse_name)
-                                      ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt]);
-                                  if ($register->user_id) {
-                                      $expMatch->where('expense_payments.user_id', $register->user_id);
-                                  }
-                              }
-                          });
-                  });
-            });
-        } else {
-            $expensePaymentsQuery->where('expenses.warehouse_name', $register->warehouse_name)
-                ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt])
-                ->when($register->user_id, fn($q) => $q->where('expense_payments.user_id', $register->user_id));
-        }
+            $linkedEps = DB::table('expense_payments')
+                ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                ->where('expense_payments.cash_register_id', $register->id)
+                ->tap($applyActiveExpenseFilter)
+                ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
+            foreach ($linkedEps as $ep) {
+                $seenEpIds[(int)$ep->id] = true;
+                $expensePaymentRows->push($ep);
+            }
 
-        $expensePaymentRows = $expensePaymentsQuery->get(['expense_payments.amount', 'expense_payments.payment_type']);
+            if ($hasExpRegCol) {
+                $expLinkedEps = DB::table('expense_payments')
+                    ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                    ->whereNull('expense_payments.cash_register_id')
+                    ->where('expenses.cash_register_id', $register->id)
+                    ->tap($applyActiveExpenseFilter)
+                    ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
+                foreach ($expLinkedEps as $ep) {
+                    if (!isset($seenEpIds[(int)$ep->id])) {
+                        $seenEpIds[(int)$ep->id] = true;
+                        $expensePaymentRows->push($ep);
+                    }
+                }
+            }
+
+            $windowEps = DB::table('expense_payments')
+                ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt])
+                ->whereNull('expense_payments.cash_register_id')
+                ->when($hasExpRegCol, fn ($q) => $q->whereNull('expenses.cash_register_id'))
+                ->where('expenses.warehouse_name', $register->warehouse_name)
+                ->when($register->user_id, fn ($q) => $q->where('expense_payments.user_id', $register->user_id))
+                ->tap($applyActiveExpenseFilter)
+                ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
+            foreach ($windowEps as $ep) {
+                if (!isset($seenEpIds[(int)$ep->id])) {
+                    $seenEpIds[(int)$ep->id] = true;
+                    $expensePaymentRows->push($ep);
+                }
+            }
+        } else {
+            $expensePaymentRows = DB::table('expense_payments')
+                ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
+                ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt])
+                ->where('expenses.warehouse_name', $register->warehouse_name)
+                ->when($register->user_id, fn ($q) => $q->where('expense_payments.user_id', $register->user_id))
+                ->tap($applyActiveExpenseFilter)
+                ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
+        }
 
         $totalExpenses = 0.0;
         $cashExpenses = 0.0;
@@ -739,45 +863,52 @@ class CashRegisterController extends Controller
         foreach ($expensePaymentRows as $ep) {
             $amt = max(0.0, (float)($ep->amount ?? 0));
             $totalExpenses += $amt;
-            $pMethod = strtolower(trim((string)($ep->payment_type ?? 'cash')));
-            if ($pMethod === 'cash' || str_contains($pMethod, 'cash')) {
+            $pMethod = (string)($ep->payment_type ?? 'Cash');
+            if ($accounting->isCashPaymentType($pMethod)) {
                 $cashExpenses += $amt;
             } else {
                 $digitalExpenses += $amt;
             }
         }
 
-        // Legacy expenses without expense_payments rows (SQL NOT EXISTS, zero N+1)
-        $legacyExpenseQuery = DB::table('expenses')
-            ->where('paid_amount', '>', 0)
-            ->whereIn('payment_status', ['Paid', 'Partial'])
-            ->whereNotExists(function ($q) {
-                $q->select(DB::raw(1))
-                    ->from('expense_payments')
-                    ->whereColumn('expense_payments.expense_id', 'expenses.id');
-            });
+        // Legacy expenses without expense_payments rows (split linked vs unlinked for index performance)
+        $legacyExpRows = [];
         if ($hasExpRegCol) {
-            $legacyExpenseQuery->where(function ($q) use ($register, $openedAt, $closedAt) {
-                $q->where('cash_register_id', $register->id)
-                  ->orWhere(function ($sub) use ($register, $openedAt, $closedAt) {
-                      $sub->whereNull('cash_register_id')
-                          ->where('warehouse_name', $register->warehouse_name)
-                          ->whereBetween('created_at', [$openedAt, $closedAt]);
-                      if ($register->user_id) {
-                          $sub->where('user_id', $register->user_id);
-                      }
-                  });
-            });
-        } else {
-            $legacyExpenseQuery->where('warehouse_name', $register->warehouse_name)
-                ->whereBetween('created_at', [$openedAt, $closedAt])
-                ->when($register->user_id, fn($q) => $q->where('user_id', $register->user_id));
+            foreach (
+                DB::table('expenses')
+                    ->where('cash_register_id', $register->id)
+                    ->where('paid_amount', '>', 0)
+                    ->whereIn('payment_status', ['Paid', 'Partial'])
+                    ->when($hasExpStatusCol, fn ($q) => $q->where(fn ($s) => $s->whereNull('status')->orWhereNotIn('status', ['Voided', 'Draft', 'Pending', 'Cancelled'])))
+                    ->whereNotExists(function ($q) {
+                        $q->select(DB::raw(1))->from('expense_payments')->whereColumn('expense_payments.expense_id', 'expenses.id');
+                    })
+                    ->get(['id', 'paid_amount', 'payment_method']) as $exp
+            ) {
+                $legacyExpRows[(int)$exp->id] = $exp;
+            }
         }
-        foreach ($legacyExpenseQuery->get(['id', 'paid_amount', 'payment_method']) as $exp) {
+        foreach (
+            DB::table('expenses')
+                ->when($hasExpRegCol, fn ($q) => $q->whereNull('cash_register_id'))
+                ->where('warehouse_name', $register->warehouse_name)
+                ->whereBetween('created_at', [$openedAt, $closedAt])
+                ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
+                ->where('paid_amount', '>', 0)
+                ->whereIn('payment_status', ['Paid', 'Partial'])
+                ->when($hasExpStatusCol, fn ($q) => $q->where(fn ($s) => $s->whereNull('status')->orWhereNotIn('status', ['Voided', 'Draft', 'Pending', 'Cancelled'])))
+                ->whereNotExists(function ($q) {
+                    $q->select(DB::raw(1))->from('expense_payments')->whereColumn('expense_payments.expense_id', 'expenses.id');
+                })
+                ->get(['id', 'paid_amount', 'payment_method']) as $exp
+        ) {
+            $legacyExpRows[(int)$exp->id] = $exp;
+        }
+        foreach ($legacyExpRows as $exp) {
             $paidAmt = max(0.0, (float)($exp->paid_amount ?? 0));
             $totalExpenses += $paidAmt;
-            $pMethod = strtolower(trim((string)($exp->payment_method ?? 'cash')));
-            if ($pMethod === 'cash' || str_contains($pMethod, 'cash')) {
+            $pMethod = (string)($exp->payment_method ?? 'Cash');
+            if ($accounting->isCashPaymentType($pMethod)) {
                 $cashExpenses += $paidAmt;
             } else {
                 $digitalExpenses += $paidAmt;
@@ -796,7 +927,7 @@ class CashRegisterController extends Controller
             $amt = (float)($rtx->amount ?? 0);
             if ($rtx->type === 'float_in') {
                 $floatsIn += $amt;
-            } elseif ($rtx->type === 'drop') {
+            } elseif ($rtx->type === 'drop' || $rtx->type === 'safe_drop') {
                 $cashDrops += $amt;
             } elseif ($rtx->type === 'void_refund') {
                 $cashRefunds += $amt;
@@ -833,7 +964,7 @@ class CashRegisterController extends Controller
 
         // ACC-04: Blind Cash Reconciliation - hide expected cash & variance from cashiers on open shifts
         $canViewExpected = $forInternalCalculation || ($user ? $user->hasPermission('cash_register.view_expected') : false);
-        $hideExpected = (strtolower((string)$register->status) === 'open' && !$canViewExpected);
+        $hideExpected = (!$isClosedReg && !$canViewExpected);
 
         $paymentBreakdown = [];
         // Cash is always listed first
@@ -900,7 +1031,7 @@ class CashRegisterController extends Controller
             'created_by' => $register->user_name ?? 'Super Admin',
             'cashier_name' => $register->user_name ?? 'Super Admin',
             'user_name' => $register->user_name ?? 'Super Admin',
-            'user_role' => 'Lead Cashier',
+            'user_role' => $user?->roleModel?->name ?? ($user?->role ?? 'Cashier'),
             'payment_breakdown' => $paymentBreakdown,
             'recent_transactions' => $sales->take(20)->values(),
             'denominations' => $register->denominations,
