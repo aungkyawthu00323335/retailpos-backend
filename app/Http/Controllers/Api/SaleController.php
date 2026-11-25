@@ -230,6 +230,140 @@ class SaleController extends Controller
         }
     }
 
+    private function normalizeSaleDateTime(?string $rawDate): string
+    {
+        $trimmed = trim((string)($rawDate ?? ''));
+        if ($trimmed === '') {
+            return now()->format('Y-m-d H:i:s');
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/', $trimmed)) {
+            return $trimmed;
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $trimmed)) {
+            return $trimmed . ' ' . now()->format('H:i:s');
+        }
+        try {
+            return \Carbon\Carbon::parse($trimmed)->format('Y-m-d H:i:s');
+        } catch (\Throwable $e) {
+            return str_contains($trimmed, ':') ? $trimmed : ($trimmed . ' ' . now()->format('H:i:s'));
+        }
+    }
+
+    /**
+     * Reconcile per-payment-leg cash register deductions when voiding or deleting a sale.
+     * - Open leg register: decrements expected_cash only (deleting sale_payments removes cash_sales cleanly, zero double-deduction).
+     * - Closed leg register: posts a `void_refund` transaction & decrements the voiding actor's (or sale owner's) active open shift.
+     */
+    private function reconcileSaleVoidCashByLeg(
+        Sale $sale,
+        \Illuminate\Support\Collection $payments,
+        \App\Services\PurchaseAccountingService $accountingService,
+        ?\App\Models\User $actor = null
+    ): void {
+        $cashByReg = [];
+        if ($payments->isNotEmpty()) {
+            foreach ($payments as $p) {
+                if (!$accountingService->isCashPaymentType($p->payment_type)) {
+                    continue;
+                }
+                $amt = round((float)$p->amount, 2);
+                if ($amt <= 0.001) {
+                    continue;
+                }
+                $legRegId = $p->cash_register_id ? (int)$p->cash_register_id : ($sale->cash_register_id ? (int)$sale->cash_register_id : 0);
+                $cashByReg[$legRegId] = round(($cashByReg[$legRegId] ?? 0.0) + $amt, 2);
+            }
+        } elseif ($accountingService->isCashPaymentType($sale->payment_type) && (float)$sale->paid_amount > 0.001) {
+            $legRegId = $sale->cash_register_id ? (int)$sale->cash_register_id : 0;
+            $cashByReg[$legRegId] = round((float)$sale->paid_amount, 2);
+        }
+
+        if (empty($cashByReg)) {
+            return;
+        }
+
+        $findFallbackOpenRegister = function () use ($sale, $actor): ?\App\Models\CashRegister {
+            $baseQuery = fn () => \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
+                ->when(
+                    $sale->warehouse_id,
+                    fn ($q) => $q->where('warehouse_id', $sale->warehouse_id),
+                    fn ($q) => $q->where('warehouse_name', $sale->warehouse_name)
+                );
+
+            // Prefer voiding actor's active open shift first (e.g. Admin/Manager voiding a closed-shift sale)
+            $actorId = $actor?->id ?? auth()->id();
+            $actorName = $actor?->name ?? auth()->user()?->name;
+            if ($actorId || $actorName) {
+                $actorReg = $baseQuery()->where(function ($q) use ($actorId, $actorName) {
+                    if ($actorId) {
+                        $q->where('user_id', $actorId);
+                    }
+                    if ($actorName) {
+                        $q->orWhere('user_name', $actorName);
+                    }
+                })->orderByDesc('id')->lockForUpdate()->first();
+                if ($actorReg) {
+                    return $actorReg;
+                }
+            }
+
+            // Fall back to the original sale owner's open shift in the same branch
+            $ownerId = $sale->user_id;
+            $ownerName = $sale->user_name;
+            if ($ownerId || $ownerName) {
+                return $baseQuery()->where(function ($q) use ($ownerId, $ownerName) {
+                    if ($ownerId) {
+                        $q->where('user_id', $ownerId);
+                    }
+                    if ($ownerName) {
+                        $q->orWhere('user_name', $ownerName);
+                    }
+                })->orderByDesc('id')->lockForUpdate()->first();
+            }
+
+            return null;
+        };
+
+        $hasTxTable = $accountingService->schemaHasTable('cash_register_transactions');
+
+        foreach ($cashByReg as $regId => $legCashAmount) {
+            if ($legCashAmount <= 0.001) {
+                continue;
+            }
+            if ($regId > 0) {
+                $reg = \App\Models\CashRegister::lockForUpdate()->find($regId);
+                if ($reg && in_array(strtolower(trim((string)$reg->status)), ['open', 'opened'], true)) {
+                    // Payment leg belongs to an OPEN shift: decrement expected_cash only (no void_refund tx since sale_payments row is deleted)
+                    $curExpected = $reg->expected_cash !== null ? (float)$reg->expected_cash : (float)$reg->opening_cash;
+                    $reg->update(['expected_cash' => round($curExpected - $legCashAmount, 2)]);
+                    continue;
+                }
+                if ($reg) {
+                    // Payment leg belongs to a CLOSED (immutable) shift: record void_refund outflow on current active open shift
+                    $openReg = $findFallbackOpenRegister();
+                    if ($openReg) {
+                        $curExpected = $openReg->expected_cash !== null ? (float)$openReg->expected_cash : (float)$openReg->opening_cash;
+                        $openReg->update(['expected_cash' => round($curExpected - $legCashAmount, 2)]);
+                        if ($hasTxTable) {
+                            \App\Models\CashRegisterTransaction::create([
+                                'cash_register_id' => $openReg->id,
+                                'type' => 'void_refund',
+                                'amount' => round($legCashAmount, 2),
+                                'reason' => 'Cross-shift void cash refund for Sale #' . ($sale->reference_no ?? ''),
+                                'authorized_by' => $sale->voided_by ?? ($actor?->name ?? auth()->user()?->name ?? 'Manager'),
+                                'manager_pin_verified' => true,
+                            ]);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Back-office cash payment (no register attached): reconcile only if sale owner/actor has an open shift
+            $this->reconcileRegisterCash($sale, $legCashAmount, 'decrement', null, null, false);
+        }
+    }
+
     /**
      * Guard against voiding/deleting a cash sale tied to a closed shift when no active open shift exists to absorb the refund.
      */
@@ -242,14 +376,17 @@ class SaleController extends Controller
         if (!\Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
             return false;
         }
-        $referencedRegIds = $payments
-            ->filter(fn($p) => $accountingService->isCashPaymentType($p->payment_type) && !empty($p->cash_register_id))
-            ->pluck('cash_register_id')
-            ->map(fn($rid) => (int)$rid)
-            ->when(!empty($sale->cash_register_id), fn($col) => $col->push((int)$sale->cash_register_id))
-            ->filter(fn($rid) => $rid > 0)
-            ->unique()
-            ->values();
+        $referencedRegIds = collect();
+        if ($payments->isNotEmpty()) {
+            $referencedRegIds = $payments
+                ->filter(fn($p) => $accountingService->isCashPaymentType($p->payment_type))
+                ->map(fn($p) => (int)($p->cash_register_id ?: ($sale->cash_register_id ?: 0)))
+                ->filter(fn($rid) => $rid > 0)
+                ->unique()
+                ->values();
+        } elseif (!empty($sale->cash_register_id) && $accountingService->isCashPaymentType($sale->payment_type) && (float)$sale->paid_amount > 0.001) {
+            $referencedRegIds = collect([(int)$sale->cash_register_id]);
+        }
 
         if ($referencedRegIds->isEmpty()) {
             return false;
@@ -262,8 +399,14 @@ class SaleController extends Controller
             return false;
         }
 
-        $ownerId = $sale->user_id ?: ($actor?->id ?? auth()->id());
-        $ownerName = $sale->user_name ?: ($actor?->name ?? auth()->user()?->name);
+        $candidateIds = array_values(array_unique(array_filter([
+            $actor?->id ?? auth()->id(),
+            $sale->user_id,
+        ])));
+        $candidateNames = array_values(array_unique(array_filter([
+            $actor?->name ?? auth()->user()?->name,
+            $sale->user_name,
+        ])));
 
         $fallbackOpenExists = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
             ->when(
@@ -271,13 +414,13 @@ class SaleController extends Controller
                 fn($q) => $q->where('warehouse_id', $sale->warehouse_id),
                 fn($q) => $q->where('warehouse_name', $sale->warehouse_name)
             )
-            ->when($ownerId || $ownerName, function ($q) use ($ownerId, $ownerName) {
-                $q->where(function ($sub) use ($ownerId, $ownerName) {
-                    if ($ownerId) {
-                        $sub->where('user_id', $ownerId);
+            ->when(!empty($candidateIds) || !empty($candidateNames), function ($q) use ($candidateIds, $candidateNames) {
+                $q->where(function ($sub) use ($candidateIds, $candidateNames) {
+                    if (!empty($candidateIds)) {
+                        $sub->whereIn('user_id', $candidateIds);
                     }
-                    if ($ownerName) {
-                        $sub->orWhere('user_name', $ownerName);
+                    if (!empty($candidateNames)) {
+                        $sub->orWhereIn('user_name', $candidateNames);
                     }
                 });
             })
@@ -1111,7 +1254,7 @@ class SaleController extends Controller
                     $rawPaid = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : round($grandTotal * 0.5, 2);
                     $paidAmount = min($grandTotal, max(0.0, $rawPaid));
                     $dueAmount = max(0.0, round($grandTotal - $paidAmount, 2));
-                    $paymentStatus = $dueAmount <= 0.001 ? 'Paid' : 'Partial';
+                    $paymentStatus = $dueAmount <= 0.001 ? 'Paid' : ($paidAmount > 0.001 ? 'Partial' : 'Unpaid');
                 } elseif ($explicitStatus === 'Paid') {
                     $rawPaid = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $grandTotal;
                     $paidAmount = min($grandTotal, max(0.0, $rawPaid));
@@ -1370,7 +1513,12 @@ class SaleController extends Controller
                 if ($lockedCustomer->credit_limit !== null && (float)$lockedCustomer->credit_limit > 0) {
                     $existingDueQuery = Sale::where('customer_id', $lockedCustomer->id);
                     Customer::applyReceivableScope($existingDueQuery);
-                    $currentOutstanding = (float)$existingDueQuery->sum('due_amount');
+                    $grossOutstanding = (float)$existingDueQuery->sum('due_amount');
+                    $openReturnCredits = (float)\App\Models\SaleReturn::where('customer_id', $lockedCustomer->id)
+                        ->where('status', 'Completed')
+                        ->where('due_amount', '>', 0)
+                        ->sum('due_amount');
+                    $currentOutstanding = max(0.0, round($grossOutstanding - $openReturnCredits, 2));
                     if ($currentOutstanding + $dueAmount > (float)$lockedCustomer->credit_limit + 0.001) {
                         $limitStr = number_format((float)$lockedCustomer->credit_limit, 2);
                         $currentStr = number_format($currentOutstanding, 2);
@@ -1818,11 +1966,9 @@ class SaleController extends Controller
                     foreach ($validated['payments'] as $idx => $p) {
                         $rawAmount = (float)($p['amount'] ?? 0);
                         if ($rawAmount <= 0) continue;
-                        $netAmount = min($runningRemainingDue, $rawAmount);
-                        if ($netAmount <= 0 && count($validated['payments']) > 1) continue;
-                        $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmount, 2));
                         $pType = $p['payment_type'] ?? $sale->payment_type;
                         $isCashLeg = $accounting->isCashPaymentType($pType);
+                        $netAmount = min($runningRemainingDue, $rawAmount);
                         $recAmt = isset($p['received_amount']) ? max($netAmount, (float)$p['received_amount']) : $rawAmount;
                         $chgAmt = $isCashLeg
                             ? max(0.0, round($recAmt - $netAmount, 2))
@@ -1830,6 +1976,9 @@ class SaleController extends Controller
                         if ($isCashLeg && $chgAmt <= 0.001 && isset($p['change_amount'])) {
                             $chgAmt = max(0.0, round((float)$p['change_amount'], 2));
                         }
+                        if ($netAmount <= 0 && !$isCashLeg && count($validated['payments']) > 1) continue;
+                        if ($netAmount <= 0 && $isCashLeg && $chgAmt <= 0.001 && count($validated['payments']) > 1) continue;
+                        $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmount, 2));
                         $createdPayments[] = SalePayment::create([
                             'sale_id' => $sale->id,
                             'reference_no' => 'PAY-' . $payRefStamp . '-' . $sale->id . '-' . ($idx + 1),
@@ -2161,6 +2310,7 @@ class SaleController extends Controller
             'payments.*.received_amount' => 'nullable|numeric|min:0',
             'payments.*.change_amount' => 'nullable|numeric|min:0',
             'payments.*.payment_date' => 'nullable|string',
+            'payments.*.cash_register_id' => 'nullable|integer',
             'payments.*.notes' => 'nullable|string',
             'payments.*.user_id' => 'nullable|integer',
             'payments.*.user_name' => 'nullable|string|max:255',
@@ -2220,6 +2370,20 @@ class SaleController extends Controller
 
             if (!empty($validated['payments']) && is_array($validated['payments'])) {
                 $paymentsList = $this->sortPaymentsNonCashFirst($validated['payments'], $accounting);
+                $nonCashSum = round(array_sum(array_map(
+                    fn($p) => !$accounting->isCashPaymentType((string)($p['payment_type'] ?? 'Cash'))
+                        ? max(0.0, (float)($p['amount'] ?? 0))
+                        : 0.0,
+                    $paymentsList
+                )), 2);
+                if ($nonCashSum > $remainingDue + 0.01) {
+                    DB::rollBack();
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => "Non-cash payment total ({$nonCashSum}) cannot exceed remaining due balance ({$remainingDue}). Change can only be returned from Cash tender.",
+                    ], 422);
+                }
+
                 $totalNetPaying = 0.0;
                 $runningRemainingDue = $remainingDue;
                 foreach ($paymentsList as $idx => $p) {
@@ -2242,7 +2406,8 @@ class SaleController extends Controller
                     $totalNetPaying = round($totalNetPaying + $netAmt, 2);
                     $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmt, 2));
 
-                    $legReg = $accounting->resolveCashRegisterId($explicitRegId, $user, $sale->warehouse_id, $pType, $netAmt);
+                    $legExplicitRegId = !empty($p['cash_register_id']) ? (int)$p['cash_register_id'] : $explicitRegId;
+                    $legReg = $accounting->resolveCashRegisterId($legExplicitRegId, $user, $sale->warehouse_id, $pType, $netAmt, true);
                     if ($legReg['error'] !== null) {
                         DB::rollBack();
                         return response()->json(['status' => 'error', 'message' => $legReg['error']], 422);
@@ -2251,7 +2416,7 @@ class SaleController extends Controller
                     SalePayment::create([
                         'sale_id' => $sale->id,
                         'reference_no' => 'PAY-' . date('Ymd') . '-' . str_pad((string)mt_rand(1000, 99999), 5, '0', STR_PAD_LEFT) . '-' . ($idx + 1),
-                        'payment_date' => $p['payment_date'] ?? ($validated['payment_date'] ?? date('Y-m-d H:i:s')),
+                        'payment_date' => $this->normalizeSaleDateTime($p['payment_date'] ?? ($validated['payment_date'] ?? null)),
                         'payment_type' => $pType,
                         'cash_register_id' => $legReg['cash_register_id'],
                         'amount' => $netAmt,
@@ -2264,7 +2429,7 @@ class SaleController extends Controller
                         'user_role' => $userRole,
                     ]);
 
-                    if ($isCashLeg) {
+                    if ($isCashLeg && $legReg['cash_register_id'] !== null) {
                         $cashAdded = round($cashAdded + $netAmt, 2);
                         $this->reconcileRegisterCash($sale, $netAmt, 'increment', $sale->warehouse_name, $legReg['cash_register_id']);
                     }
@@ -2286,19 +2451,26 @@ class SaleController extends Controller
                 ]);
             } else {
                 $payingAmount = round((float)$validated['amount'], 2);
-                $netPaying = round(min($remainingDue, $payingAmount), 2);
                 $isCashSingle = $accounting->isCashPaymentType($validated['payment_type']);
+                if (!$isCashSingle && $payingAmount > $remainingDue + 0.01) {
+                    DB::rollBack();
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => "Non-cash payment amount ({$payingAmount}) cannot exceed remaining due balance ({$remainingDue}). Change can only be returned from Cash tender.",
+                    ], 422);
+                }
+                $netPaying = round(min($remainingDue, $payingAmount), 2);
                 $changeAmt = $isCashSingle ? max(0.0, round($payingAmount - $netPaying, 2)) : 0.0;
                 $newPaid = round((float)$sale->paid_amount + $netPaying, 2);
                 $newDue = max(0.0, round((float)$sale->grand_total - $newPaid - (float)($sale->returned_credit_amount ?? 0), 2));
                 $newStatus = $newDue <= 0.001 ? 'Paid' : 'Partial';
 
-                $newPaymentType = $sale->payment_type;
-                if ($sale->payment_type && $sale->payment_type !== $validated['payment_type'] && $sale->paid_amount > 0) {
+                $newPaymentType = $validated['payment_type'];
+                if ($sale->paid_amount > 0.001 && $sale->payment_type && $sale->payment_type !== $validated['payment_type']) {
                     $newPaymentType = 'Split Payment';
                 }
 
-                $legReg = $accounting->resolveCashRegisterId($explicitRegId, $user, $sale->warehouse_id, $validated['payment_type'], $netPaying);
+                $legReg = $accounting->resolveCashRegisterId($explicitRegId, $user, $sale->warehouse_id, $validated['payment_type'], $netPaying, true);
                 if ($legReg['error'] !== null) {
                     DB::rollBack();
                     return response()->json(['status' => 'error', 'message' => $legReg['error']], 422);
@@ -2307,7 +2479,7 @@ class SaleController extends Controller
                 SalePayment::create([
                     'sale_id' => $sale->id,
                     'reference_no' => 'PAY-' . date('Ymd') . '-' . str_pad((string)mt_rand(1000, 99999), 5, '0', STR_PAD_LEFT),
-                    'payment_date' => $validated['payment_date'] ?? date('Y-m-d H:i:s'),
+                    'payment_date' => $this->normalizeSaleDateTime($validated['payment_date'] ?? null),
                     'payment_type' => $validated['payment_type'],
                     'cash_register_id' => $legReg['cash_register_id'],
                     'amount' => $netPaying,
@@ -2320,7 +2492,7 @@ class SaleController extends Controller
                     'user_role' => $userRole,
                 ]);
 
-                if ($accounting->isCashPaymentType($validated['payment_type'])) {
+                if ($isCashSingle && $legReg['cash_register_id'] !== null) {
                     $cashAdded += $netPaying;
                     $this->reconcileRegisterCash($sale, $netPaying, 'increment', $sale->warehouse_name, $legReg['cash_register_id']);
                 }
@@ -2465,7 +2637,11 @@ class SaleController extends Controller
                     if ($custObj && $custObj->credit_limit !== null && (float)$custObj->credit_limit > 0) {
                         $existingDueQuery = Sale::where('customer_id', $custObj->id)->where('id', '!=', $sale->id);
                         Customer::applyReceivableScope($existingDueQuery);
-                        $currentOutstanding = (float)$existingDueQuery->sum('due_amount');
+                        $grossOutstanding = (float)$existingDueQuery->sum('due_amount');
+                        $openReturnCredits = (float)\App\Models\SaleReturn::where('customer_id', $custObj->id)
+                            ->tap(fn($q) => Customer::applyActiveReturnCreditScope($q))
+                            ->sum('due_amount');
+                        $currentOutstanding = max(0.0, round($grossOutstanding - $openReturnCredits, 2));
                         if ($currentOutstanding + $newDue > (float)$custObj->credit_limit + 0.001) {
                             $limitStr = number_format((float)$custObj->credit_limit, 2);
                             $currentStr = number_format($currentOutstanding, 2);
@@ -2480,10 +2656,10 @@ class SaleController extends Controller
                 }
             }
 
-            if ($newPaid <= 0.001) {
-                $newStatus = 'Unpaid';
-            } elseif ($newDue <= 0.001) {
+            if ($newDue <= 0.001) {
                 $newStatus = 'Paid';
+            } elseif ($newPaid <= 0.001) {
+                $newStatus = 'Unpaid';
             } else {
                 $newStatus = 'Partial';
             }
@@ -2497,9 +2673,11 @@ class SaleController extends Controller
                 $newPaymentType = 'Cash';
             }
 
+            $remainingChange = round((float)$remainingPayments->sum('change_amount'), 2);
             $sale->update([
                 'paid_amount' => $newPaid,
                 'due_amount' => $newDue,
+                'change_amount' => $remainingChange,
                 'payment_status' => $newStatus,
                 'payment_type' => $newPaymentType,
             ]);
@@ -2559,7 +2737,7 @@ class SaleController extends Controller
             'warehouse_name'  => 'nullable|string|max:255',
             'date'            => 'nullable|string',
             'status'          => 'nullable|string|in:Completed,Pending,Draft,Ordered',
-            'tax_rate'        => 'nullable|numeric|min:0',
+            'tax_rate'        => 'nullable|numeric|min:0|max:100',
             'tax_amount'      => 'nullable|numeric|min:0',
             'discount'        => 'nullable|numeric|min:0',
             'shipping'        => 'nullable|numeric|min:0',
@@ -2571,6 +2749,7 @@ class SaleController extends Controller
             'received_amount' => 'nullable|numeric|min:0',
             'payment_status'  => 'nullable|string',
             'payment_type'    => 'nullable|string',
+            'cash_register_id'=> 'nullable|integer',
             'notes'           => 'nullable|string',
             'pos_flag'        => 'nullable|boolean',
             'created_by'      => 'nullable|string|max:255',
@@ -2599,6 +2778,7 @@ class SaleController extends Controller
             'payments'        => 'nullable|array',
             'payments.*.payment_type' => 'nullable|string|max:100',
             'payments.*.payment_date' => 'nullable|string',
+            'payments.*.cash_register_id' => 'nullable|integer',
             'payments.*.amount' => 'nullable|numeric|min:0',
             'payments.*.received_amount' => 'nullable|numeric|min:0',
             'payments.*.change_amount' => 'nullable|numeric|min:0',
@@ -2658,7 +2838,7 @@ class SaleController extends Controller
                 foreach ($validated['items'] as &$it) {
                     $lQty = (float)($it['quantity'] ?? 0);
                     $lPrice = (float)($it['unit_price'] ?? 0);
-                    $lGross = max(0.0, round($lQty * $lPrice, 4));
+                    $lGross = max(0.0, round($lQty * $lPrice, 2));
                     $lDisc = min($lGross, max(0.0, (float)($it['discount'] ?? 0)));
                     $it['discount'] = round($lDisc, 2);
                     $lTax = max(0.0, (float)($it['tax'] ?? 0));
@@ -3509,6 +3689,25 @@ class SaleController extends Controller
             } elseif (isset($validated['payments']) && is_array($validated['payments'])) {
                 $validated['payments'] = $this->sortPaymentsNonCashFirst($validated['payments'], $accountingService);
                 $paymentsSum = round(array_sum(array_map(fn($p) => max(0.0, (float)($p['amount'] ?? 0)), $validated['payments'])), 2);
+                $nonCashSum = round(array_sum(array_map(
+                    fn($p) => !$accountingService->isCashPaymentType((string)($p['payment_type'] ?? 'Cash'))
+                        ? max(0.0, (float)($p['amount'] ?? 0))
+                        : 0.0,
+                    $validated['payments']
+                )), 2);
+                if ($nonCashSum > $netCollectible + 0.01) {
+                    $msg = "Non-cash payment total ({$nonCashSum}) cannot exceed collectible total ({$netCollectible}). Change can only be returned from Cash tender.";
+                    $val = \Illuminate\Support\Facades\Validator::make([], []);
+                    $val->errors()->add('payments', $msg);
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: $val,
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422)
+                    );
+                }
                 $cappedSum = round(min($netCollectible, $paymentsSum), 2);
                 $normalizedPaid = isset($validated['paid_amount']) ? min($netCollectible, max(0.0, (float)$validated['paid_amount'])) : $cappedSum;
                 if (isset($validated['paid_amount']) && abs($paymentsSum - (float)$validated['paid_amount']) > 0.01 && abs($cappedSum - $normalizedPaid) > 0.01) {
@@ -3529,18 +3728,29 @@ class SaleController extends Controller
                 $paymentStatus = $dueAmount <= 0.001 ? 'Paid' : ($paidAmount > 0.001 ? 'Partial' : 'Unpaid');
             } else {
                 $explicitStatus = $validated['payment_status'] ?? null;
+                $singlePayTypeCheck = $validated['payment_type'] ?? $sale->payment_type ?? 'Cash';
+                if (isset($validated['paid_amount']) && !$accountingService->isCashPaymentType($singlePayTypeCheck) && (float)$validated['paid_amount'] > $netCollectible + 0.01) {
+                    $msg = "Non-cash payment amount ({$validated['paid_amount']}) cannot exceed collectible total ({$netCollectible}).";
+                    $val = \Illuminate\Support\Facades\Validator::make([], []);
+                    $val->errors()->add('paid_amount', $msg);
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: $val,
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['paid_amount' => [$msg]],
+                        ], 422)
+                    );
+                }
                 if ($explicitStatus === 'Unpaid') {
                     $paidAmount = 0.0;
                     $dueAmount = $netCollectible;
                     $paymentStatus = $netCollectible <= 0.001 ? 'Paid' : 'Unpaid';
                 } elseif ($explicitStatus === 'Partial') {
                     $rawPaid = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : (float)$sale->paid_amount;
-                    if ($rawPaid <= 0 || ($netCollectible > 0 && $rawPaid >= $netCollectible)) {
-                        $rawPaid = round($netCollectible * 0.5, 2);
-                    }
                     $paidAmount = min($netCollectible, max(0.0, $rawPaid));
                     $dueAmount = max(0.0, round($netCollectible - $paidAmount, 2));
-                    $paymentStatus = $dueAmount <= 0.001 ? 'Paid' : 'Partial';
+                    $paymentStatus = $dueAmount <= 0.001 ? 'Paid' : ($paidAmount > 0.001 ? 'Partial' : 'Unpaid');
                 } elseif ($explicitStatus === 'Paid') {
                     $rawPaid = isset($validated['paid_amount']) ? (float)$validated['paid_amount'] : $netCollectible;
                     $paidAmount = min($netCollectible, max(0.0, $rawPaid));
@@ -3595,7 +3805,12 @@ class SaleController extends Controller
                 if ($custObj && $custObj->credit_limit !== null && (float)$custObj->credit_limit > 0) {
                     $existingDueQuery = Sale::where('customer_id', $custObj->id)->where('id', '!=', $sale->id);
                     Customer::applyReceivableScope($existingDueQuery);
-                    $currentOutstanding = (float)$existingDueQuery->sum('due_amount');
+                    $grossOutstanding = (float)$existingDueQuery->sum('due_amount');
+                    $openReturnCredits = (float)\App\Models\SaleReturn::where('customer_id', $custObj->id)
+                        ->where('status', 'Completed')
+                        ->where('due_amount', '>', 0)
+                        ->sum('due_amount');
+                    $currentOutstanding = max(0.0, round($grossOutstanding - $openReturnCredits, 2));
                     if ($currentOutstanding + $dueAmount > (float)$custObj->credit_limit + 0.001) {
                         $limitStr = number_format((float)$custObj->credit_limit, 2);
                         $currentStr = number_format($currentOutstanding, 2);
@@ -3619,54 +3834,69 @@ class SaleController extends Controller
             }
 
             $oldRegisterId = $sale->cash_register_id;
-            $effectiveRegId = $sale->cash_register_id;
-            $ownerId = $sale->user_id ?: ($authUser?->id);
-            $ownerName = $sale->user_name ?: ($authUser?->name);
-            if ($warehouseChanged) {
-                $newOpenRegQuery = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
-                    ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $newWarehouseName));
-                if ($ownerId || $ownerName) {
-                    $newOpenRegQuery->where(function ($q) use ($ownerId, $ownerName) {
-                        if ($ownerId) {
-                            $q->where('user_id', $ownerId);
+            $beforeCashByReg = [];
+            $priorSalePayments = $sale->payments()->get();
+            if ($prevStatus === 'Completed') {
+                if ($priorSalePayments->isNotEmpty()) {
+                    foreach ($priorSalePayments as $ep) {
+                        if ($accountingService->isCashPaymentType($ep->payment_type) && (float)$ep->amount > 0.001) {
+                            $rId = (int)($ep->cash_register_id ?: ($oldRegisterId ?: 0));
+                            if ($rId > 0) {
+                                $beforeCashByReg[$rId] = round(($beforeCashByReg[$rId] ?? 0.0) + (float)$ep->amount, 2);
+                            }
                         }
-                        if ($ownerName) {
-                            $q->orWhere('user_name', $ownerName);
-                        }
-                    });
+                    }
+                } elseif ($accountingService->isCashPaymentType($sale->payment_type) && (float)$sale->paid_amount > 0.001 && $oldRegisterId) {
+                    $beforeCashByReg[(int)$oldRegisterId] = round((float)$sale->paid_amount, 2);
                 }
-                $newOpenReg = $newOpenRegQuery->orderByDesc('id')->first();
-                $effectiveRegId = $newOpenReg?->id;
-            } elseif (!$effectiveRegId && ($ownerId || $ownerName)) {
-                $openRegQuery = \App\Models\CashRegister::whereRaw('LOWER(status) IN (?, ?)', ['open', 'opened'])
-                    ->when($warehouseId, fn($q) => $q->where('warehouse_id', $warehouseId), fn($q) => $q->where('warehouse_name', $newWarehouseName))
-                    ->where(function ($q) use ($ownerId, $ownerName) {
-                        if ($ownerId) {
-                            $q->where('user_id', $ownerId);
-                        }
-                        if ($ownerName) {
-                            $q->orWhere('user_name', $ownerName);
-                        }
-                    });
-                $effectiveRegId = $openRegQuery->orderByDesc('id')->first()?->id;
             }
 
-            $isRewritingPayments = $targetStatus !== 'Completed'
-                || (isset($validated['payments']) && is_array($validated['payments']))
-                || array_key_exists('paid_amount', $validated)
-                || array_key_exists('payment_status', $validated)
-                || abs($paidAmount - $prevPaidAmount) > 0.001;
-            if ($isRewritingPayments) {
-                foreach ($sale->payments()->get() as $existingPay) {
-                    if ($errMsg = $accountingService->assertPaymentLegRegisterMutable(
-                        $existingPay->cash_register_id ? (int)$existingPay->cash_register_id : null,
-                        $oldRegisterId ? (int)$oldRegisterId : null,
-                        $existingPay->payment_type
-                    )) {
-                        DB::rollBack();
-                        return response()->json(['status' => 'error', 'message' => $errMsg], 422);
-                    }
+            $effectiveRegId = $sale->cash_register_id;
+            // Never assign newly added/rewritten payments to a CLOSED shift,
+            // while gracefully accepting echoed original header/leg closed cash_register_id (actual closed-shift cash deltas are strictly blocked below via assertCashRegisterDeltaMutable).
+            $existingHeaderRegIsOpen = false;
+            if ($effectiveRegId && !$warehouseChanged) {
+                $existingHeaderReg = \App\Models\CashRegister::find($effectiveRegId);
+                $existingHeaderRegIsOpen = $existingHeaderReg !== null
+                    && in_array(strtolower(trim((string)$existingHeaderReg->status)), ['open', 'opened'], true);
+            }
+            $explicitHeaderRegId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+            $isEchoedClosedHeaderReg = $explicitHeaderRegId !== null
+                && $oldRegisterId !== null
+                && $explicitHeaderRegId === (int)$oldRegisterId
+                && !$existingHeaderRegIsOpen;
+            if ($explicitHeaderRegId && !$isEchoedClosedHeaderReg) {
+                $hdrCheck = $accountingService->resolveCashRegisterId($explicitHeaderRegId, $authUser ?? null, $warehouseId, 'Cash', 1.0, true);
+                if ($hdrCheck['error'] !== null) {
+                    DB::rollBack();
+                    return response()->json(['status' => 'error', 'message' => $hdrCheck['error']], 422);
                 }
+                $newPaymentRegId = $hdrCheck['cash_register_id'];
+            } elseif ($existingHeaderRegIsOpen) {
+                $newPaymentRegId = (int)$effectiveRegId;
+            } else {
+                // Find acting user's (or sale owner's) current OPEN shift in the target branch
+                $actorForReg = $authUser ?? ($sale->user_id ? User::find($sale->user_id) : null);
+                $openCheck = $accountingService->resolveCashRegisterId(null, $actorForReg, $warehouseId, 'Cash', 1.0, true);
+                $newPaymentRegId = $openCheck['cash_register_id'];
+            }
+            if ($warehouseChanged || !$effectiveRegId) {
+                $effectiveRegId = $newPaymentRegId;
+            }
+
+            $priorLegRegIds = $priorSalePayments
+                ->pluck('cash_register_id')
+                ->filter(fn($rid) => !empty($rid))
+                ->map(fn($rid) => (int)$rid)
+                ->unique()
+                ->all();
+            if ($oldRegisterId) {
+                $priorLegRegIds[] = (int)$oldRegisterId;
+            }
+
+            $normalizedEditDate = isset($validated['date']) ? $this->normalizeSaleDateTime($validated['date']) : null;
+            if ($normalizedEditDate !== null) {
+                $validated['date'] = $normalizedEditDate;
             }
 
             if ($targetStatus !== 'Completed') {
@@ -3687,20 +3917,40 @@ class SaleController extends Controller
                     $chgAmt = $isCashLeg
                         ? (isset($p['change_amount']) ? (float)$p['change_amount'] : max(0.0, round($recAmt - $netAmount, 2)))
                         : 0.0;
+
+                    $legExplicitRegId = !empty($p['cash_register_id']) ? (int)$p['cash_register_id'] : null;
+                    if ($legExplicitRegId !== null) {
+                        $legRegModel = \App\Models\CashRegister::find($legExplicitRegId);
+                        $legRegIsClosed = $legRegModel !== null && !in_array(strtolower(trim((string)$legRegModel->status)), ['open', 'opened'], true);
+                        if ($legRegIsClosed && in_array($legExplicitRegId, $priorLegRegIds, true)) {
+                            // Preserve historical closed-shift leg attribution; assertCashRegisterDeltaMutable below blocks any cash delta on closed shifts
+                            $legRegId = $legExplicitRegId;
+                        } else {
+                            $legCheck = $accountingService->resolveCashRegisterId($legExplicitRegId, $authUser ?? null, $warehouseId, $pType, $netAmount, true);
+                            if ($legCheck['error'] !== null) {
+                                DB::rollBack();
+                                return response()->json(['status' => 'error', 'message' => $legCheck['error']], 422);
+                            }
+                            $legRegId = $legCheck['cash_register_id'];
+                        }
+                    } else {
+                        $legRegId = $newPaymentRegId;
+                    }
+
                     SalePayment::create([
                         'sale_id' => $sale->id,
-                        'cash_register_id' => $p['cash_register_id'] ?? $effectiveRegId,
+                        'cash_register_id' => $legRegId,
                         'reference_no' => 'PAY-' . date('Ymd') . '-' . strtoupper(\Illuminate\Support\Str::random(6)) . '-' . ($idx + 1),
-                        'payment_date' => $p['payment_date'] ?? ($validated['date'] ?? $sale->date),
+                        'payment_date' => $this->normalizeSaleDateTime($p['payment_date'] ?? ($validated['date'] ?? $sale->date)),
                         'payment_type' => $pType,
                         'amount' => $netAmount,
                         'received_amount' => $recAmt,
                         'change_amount' => $chgAmt,
                         'notes' => $p['notes'] ?? 'Updated payment record',
                         'created_by' => $sale->created_by,
-                        'user_id' => $sale->user_id,
-                        'user_name' => $sale->user_name ?? $sale->created_by,
-                        'user_role' => $sale->user_role ?? 'Cashier',
+                        'user_id' => $authUser?->id ?? $sale->user_id,
+                        'user_name' => $authUser?->name ?? ($sale->user_name ?? $sale->created_by),
+                        'user_role' => $authUser?->role ?? ($sale->user_role ?? 'Cashier'),
                     ]);
                 }
             } elseif (array_key_exists('paid_amount', $validated) || array_key_exists('payment_status', $validated) || abs($paidAmount - $prevPaidAmount) > 0.001) {
@@ -3711,18 +3961,18 @@ class SaleController extends Controller
                     if ($existingPayments->isEmpty()) {
                         SalePayment::create([
                             'sale_id' => $sale->id,
-                            'cash_register_id' => $effectiveRegId,
+                            'cash_register_id' => $newPaymentRegId,
                             'reference_no' => 'PAY-' . date('Ymd') . '-' . strtoupper(\Illuminate\Support\Str::random(6)),
-                            'payment_date' => $validated['date'] ?? $sale->date,
+                            'payment_date' => $this->normalizeSaleDateTime($validated['date'] ?? $sale->date),
                             'payment_type' => $validated['payment_type'] ?? $sale->payment_type,
                             'amount' => $paidAmount,
                             'received_amount' => $paidAmount,
                             'change_amount' => 0,
                             'notes' => 'Updated payment record',
                             'created_by' => $sale->created_by,
-                            'user_id' => $sale->user_id,
-                            'user_name' => $sale->user_name ?? $sale->created_by,
-                            'user_role' => $sale->user_role ?? 'Cashier',
+                            'user_id' => $authUser?->id ?? $sale->user_id,
+                            'user_name' => $authUser?->name ?? ($sale->user_name ?? $sale->created_by),
+                            'user_role' => $authUser?->role ?? ($sale->user_role ?? 'Cashier'),
                         ]);
                     } elseif ($existingPayments->count() === 1) {
                         $singlePay = $existingPayments->first();
@@ -3735,9 +3985,9 @@ class SaleController extends Controller
                             'amount' => $paidAmount,
                             'received_amount' => $singleRec,
                             'change_amount' => $singleIsCash ? max(0.0, round($singleRec - $paidAmount, 2)) : 0.0,
-                            'payment_date' => $validated['date'] ?? $singlePay->payment_date,
+                            'payment_date' => isset($validated['date']) ? $validated['date'] : $singlePay->payment_date,
                             'payment_type' => $singlePayType,
-                            'cash_register_id' => $effectiveRegId ?? $singlePay->cash_register_id,
+                            'cash_register_id' => $newPaymentRegId ?? $singlePay->cash_register_id,
                         ]);
                     } else {
                         // Preserve existing split legs: absorb reductions Cash-first or extend Cash/first leg cleanly
@@ -3777,37 +4027,37 @@ class SaleController extends Controller
                 }
             }
 
-            // Synchronize cash register with payment differences while maintaining closed shift immutability
-            $newCashPaid = 0.0;
+            // Synchronize cash registers per payment leg's actual register ID (never mutating closed shifts)
+            $afterCashByReg = [];
             if ($targetStatus === 'Completed') {
                 $updatedPayments = $sale->payments()->get();
-                $newCashPaid = round((float)$updatedPayments->filter(
-                    fn($p) => $accountingService->isCashPaymentType($p->payment_type)
-                )->sum('amount'), 2);
-                if ($newCashPaid <= 0 && $updatedPayments->isEmpty() && $accountingService->isCashPaymentType($validated['payment_type'] ?? $sale->payment_type)) {
-                    $newCashPaid = (float)$paidAmount;
+                if ($updatedPayments->isNotEmpty()) {
+                    foreach ($updatedPayments as $up) {
+                        if ($accountingService->isCashPaymentType($up->payment_type) && (float)$up->amount > 0.001) {
+                            $rId = (int)($up->cash_register_id ?: ($newPaymentRegId ?: 0));
+                            if ($rId > 0) {
+                                $afterCashByReg[$rId] = round(($afterCashByReg[$rId] ?? 0.0) + (float)$up->amount, 2);
+                            }
+                        }
+                    }
+                } elseif ($accountingService->isCashPaymentType($validated['payment_type'] ?? $sale->payment_type) && (float)$paidAmount > 0.001 && $newPaymentRegId) {
+                    $afterCashByReg[(int)$newPaymentRegId] = round((float)$paidAmount, 2);
                 }
             }
 
-            if ($warehouseChanged) {
-                if ($oldCashPaid > 0) {
-                    $this->reconcileRegisterCash($sale, $oldCashPaid, 'decrement', $oldWarehouseName, $oldRegisterId);
-                }
-                $sale->cash_register_id = $effectiveRegId;
-                if ($newCashPaid > 0) {
-                    $this->reconcileRegisterCash($sale, $newCashPaid, 'increment', $newWarehouseName, $effectiveRegId);
-                }
-            } else {
-                $sale->cash_register_id = $effectiveRegId;
-                $cashDiff = round($newCashPaid - $oldCashPaid, 2);
-                if (abs($cashDiff) > 0.001) {
-                    if ($cashDiff > 0) {
-                        $this->reconcileRegisterCash($sale, $cashDiff, 'increment', null, $effectiveRegId);
-                    } else {
-                        $this->reconcileRegisterCash($sale, abs($cashDiff), 'decrement', null, $oldRegisterId);
-                    }
+            if ($errMsg = $accountingService->assertCashRegisterDeltaMutable($beforeCashByReg, $afterCashByReg)) {
+                DB::rollBack();
+                return response()->json(['status' => 'error', 'message' => $errMsg], 422);
+            }
+
+            $allTouchedRegIds = array_unique(array_merge(array_keys($beforeCashByReg), array_keys($afterCashByReg)));
+            foreach ($allTouchedRegIds as $rId) {
+                $delta = round(($afterCashByReg[$rId] ?? 0.0) - ($beforeCashByReg[$rId] ?? 0.0), 2);
+                if (abs($delta) > 0.001) {
+                    $accountingService->adjustOpenRegisterExpectedCash((int)$rId, $delta);
                 }
             }
+            $sale->cash_register_id = $effectiveRegId;
 
             // 3. Customer Total Spend & Visits Reconciliation with Concurrency Locking
             $prevCustomerId = $sale->customer_id;
@@ -3853,12 +4103,22 @@ class SaleController extends Controller
                 : ($validated['payment_type'] ?? null);
 
             $receivedAmount = $targetStatus === 'Completed' && isset($validated['received_amount']) ? (float)$validated['received_amount'] : null;
-            $updateHasCash = $accountingService->isCashPaymentType($derivedUpdatePayType ?? $sale->payment_type);
-            $changeAmount = ($targetStatus !== 'Completed' || !$updateHasCash)
-                ? 0.0
-                : (array_key_exists('change_amount', $validated)
-                    ? (float)$validated['change_amount']
-                    : ($receivedAmount !== null ? max(0.0, round($receivedAmount - $paidAmount, 2)) : null));
+            $legsHaveCash = $finalPayments->contains(fn ($p) => $accountingService->isCashPaymentType($p->payment_type));
+            $updateHasCash = $legsHaveCash || $accountingService->isCashPaymentType($derivedUpdatePayType ?? $sale->payment_type);
+            if ($targetStatus !== 'Completed' || !$updateHasCash) {
+                $changeAmount = 0.0;
+            } elseif ($finalPayments->isNotEmpty()) {
+                $summedLegsChange = round((float)$finalPayments->sum('change_amount'), 2);
+                $changeAmount = $summedLegsChange > 0.001
+                    ? $summedLegsChange
+                    : (array_key_exists('change_amount', $validated)
+                        ? round((float)$validated['change_amount'], 2)
+                        : ($receivedAmount !== null ? max(0.0, round($receivedAmount - $paidAmount, 2)) : 0.0));
+            } else {
+                $changeAmount = array_key_exists('change_amount', $validated)
+                    ? round((float)$validated['change_amount'], 2)
+                    : ($receivedAmount !== null ? max(0.0, round($receivedAmount - $paidAmount, 2)) : null);
+            }
 
             // 4. Update core fields on sale (do not strip explicit null customer_id or cleared cash_register_id)
             $updateData = array_filter([
@@ -4077,7 +4337,8 @@ class SaleController extends Controller
                     ], 422);
                 }
 
-                $this->reconcileRegisterCash($sale, $cashPaid, 'decrement', null, null, true);
+                $sale->voided_by = $voidedBy;
+                $this->reconcileSaleVoidCashByLeg($sale, $existingSalePayments, $accountingService, $authUser ?? null);
             }
 
             // 5. Reopen converted quotation respecting expiry_date
@@ -4092,13 +4353,15 @@ class SaleController extends Controller
             // 6. Remove payment records & void the Sale record
             $sale->payments()->delete();
             $sale->update([
-                'status'        => 'Voided',
-                'paid_amount'   => 0.0,
-                'due_amount'    => 0.0,
-                'change_amount' => 0.0,
-                'void_reason'   => $validated['reason'],
-                'voided_by'     => $voidedBy,
-                'voided_at'     => now(),
+                'status'         => 'Voided',
+                'payment_status' => 'Voided',
+                'paid_amount'    => 0.0,
+                'due_amount'     => 0.0,
+                'change_amount'  => 0.0,
+                'total_cogs'     => 0.0,
+                'void_reason'    => $validated['reason'],
+                'voided_by'      => $voidedBy,
+                'voided_at'      => now(),
             ]);
 
             DB::commit();
@@ -4173,7 +4436,7 @@ class SaleController extends Controller
                     ], 422);
                 }
 
-                $this->reconcileRegisterCash($sale, $cashPaid, 'decrement', null, null, true);
+                $this->reconcileSaleVoidCashByLeg($sale, $existingSalePayments, $accountingService, $authUser ?? null);
             }
 
             if (!empty($sale->quotation_id)) {

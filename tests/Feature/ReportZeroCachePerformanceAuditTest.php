@@ -351,7 +351,7 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
     {
         $outlet = Outlet::create(['name' => 'Audit Outlet', 'is_active' => true]);
         $customer = Customer::create(['name' => 'Walk-in', 'phone' => '09111111']);
-        $user = $this->createAdminUser(['report_cashier_audit.view', 'reports.view']);
+        $user = $this->createAdminUser(['report_cashier_audit.view', 'reports.view', 'cash_register.view_expected']);
         $today = \Carbon\Carbon::today()->toDateString();
 
         // Staff A: 1 Cash Sale of 10,000 + 1 KBZPay Sale Return of 15,000 -> Cash=+10,000, NonCash=-15,000, NetCollected=-5,000

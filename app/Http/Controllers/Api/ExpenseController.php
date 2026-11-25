@@ -9,6 +9,7 @@ use App\Models\ExpenseCategory;
 use App\Models\ExpensePayment;
 use App\Models\Outlet;
 use App\Models\Setting;
+use App\Models\StockTransfer;
 use App\Models\User;
 use App\Services\ProductUnitConversionService;
 use App\Services\PurchaseAccountingService;
@@ -163,13 +164,41 @@ class ExpenseController extends Controller
         return $cand;
     }
 
+    private function normalizeDateTimeString(?string $rawDate, ?string $fallbackTime = null): string
+    {
+        $timezone = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
+        $trimmed = trim((string)($rawDate ?? ''));
+        if ($trimmed === '') {
+            return Carbon::now()->timezone($timezone)->format('Y-m-d H:i:s');
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/', $trimmed)) {
+            return $trimmed;
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $trimmed)) {
+            if (!empty($fallbackTime)) {
+                try {
+                    $parsed = Carbon::parse($trimmed . ' ' . trim($fallbackTime));
+                    return $parsed->format('Y-m-d H:i:s');
+                } catch (\Throwable $e) {
+                }
+            }
+            return $trimmed . ' ' . Carbon::now()->timezone($timezone)->format('H:i:s');
+        }
+        try {
+            return Carbon::parse($trimmed)->format('Y-m-d H:i:s');
+        } catch (\Throwable $e) {
+            return str_contains($trimmed, ':') ? $trimmed : ($trimmed . ' ' . Carbon::now()->timezone($timezone)->format('H:i:s'));
+        }
+    }
+
     private function resolveActiveOpenCashRegisterId(
         ?int $explicitRegId,
         ?int $warehouseId,
         ?string $warehouseName,
         ?int $ownerId,
         ?string $ownerName,
-        bool $requireOpenIfExplicit = true
+        bool $requireOpenIfExplicit = true,
+        ?Request $request = null
     ): ?int {
         if ($explicitRegId) {
             $reg = CashRegister::lockForUpdate()->find($explicitRegId);
@@ -179,8 +208,21 @@ class ExpenseController extends Controller
                 }
                 return $explicitRegId;
             }
+            if ($request && $reg->warehouse_id) {
+                $this->assertExpenseOutletAccess($request, (int)$reg->warehouse_id);
+            }
             if ($warehouseId && $reg->warehouse_id && (int)$reg->warehouse_id !== (int)$warehouseId) {
                 $this->throwValidationError('cash_register_id', 'Selected cash register belongs to a different branch/warehouse.');
+            }
+            if ($request) {
+                $authUser = User::resolveFromRequest($request) ?? $request->user();
+                if ($authUser && !$this->isPrivilegedRegisterActor($authUser)) {
+                    $ownsById = $reg->user_id && (int)$reg->user_id === (int)$authUser->id;
+                    $ownsByName = !$reg->user_id && $reg->user_name && strcasecmp(trim((string)$reg->user_name), trim((string)$authUser->name)) === 0;
+                    if (!$ownsById && !$ownsByName) {
+                        $this->throwValidationError('cash_register_id', 'You cannot post cash transactions against another cashier\'s cash register.');
+                    }
+                }
             }
             return (int)$reg->id;
         }
@@ -193,9 +235,8 @@ class ExpenseController extends Controller
             $owned = (clone $query)->where(function ($q) use ($ownerId, $ownerName) {
                 if ($ownerId) {
                     $q->where('user_id', $ownerId);
-                }
-                if ($ownerName) {
-                    $q->orWhere('user_name', $ownerName);
+                } elseif ($ownerName) {
+                    $q->where('user_name', $ownerName);
                 }
             })->orderByDesc('id')->lockForUpdate()->first();
             if ($owned) {
@@ -203,6 +244,15 @@ class ExpenseController extends Controller
             }
         }
         return null;
+    }
+
+    private function isPrivilegedRegisterActor(?User $user): bool
+    {
+        if (!$user) {
+            return true;
+        }
+        $role = strtolower(trim((string)($user->roleModel?->name ?? $user->role ?? '')));
+        return in_array($role, ['super admin', 'super_admin', 'admin', 'administrator', 'owner', 'manager', 'store manager', 'accountant'], true);
     }
 
     private function extractExpenseCashByRegister(Expense $expense): array
@@ -822,12 +872,20 @@ class ExpenseController extends Controller
             $actor = $this->resolveExpenseActor($request, $validated);
 
             if (!empty($paymentsList)) {
-                $totalPaid = round(array_sum(array_map(static fn($p) => (float)$p['amount'], $paymentsList)), 2);
+                $totalPaid = round(array_sum(array_map(static fn($p) => round((float)$p['amount'], 2), $paymentsList)), 2);
                 if ($totalPaid > $amount + 0.01) {
                     $this->throwValidationError(
                         'payments',
                         'Payment amount (' . number_format($totalPaid, 2) . ') cannot exceed expense amount (' . number_format($amount, 2) . ').'
                     );
+                }
+                // Clamp any sub-cent/1-cent tolerance excess on the last payment leg so paid_amount <= amount strictly
+                // and cash_registers.expected_cash is never over-deducted.
+                if ($totalPaid > $amount) {
+                    $excess = round($totalPaid - $amount, 2);
+                    $lastIdx = count($paymentsList) - 1;
+                    $paymentsList[$lastIdx]['amount'] = max(0.0, round((float)$paymentsList[$lastIdx]['amount'] - $excess, 2));
+                    $totalPaid = $amount;
                 }
                 $dueAmount       = max(0.0, round($amount - $totalPaid, 2));
                 $paymentStatus   = $dueAmount <= 0.001 ? 'Paid' : ($totalPaid > 0.001 ? 'Partial' : 'Unpaid');
@@ -844,6 +902,7 @@ class ExpenseController extends Controller
                             'Paid amount (' . number_format($totalPaid, 2) . ') cannot exceed expense amount (' . number_format($amount, 2) . ').'
                         );
                     }
+                    $totalPaid     = min($totalPaid, $amount);
                     $dueAmount     = max(0.0, round($amount - $totalPaid, 2));
                     $paymentStatus = $totalPaid <= 0.001 ? 'Unpaid' : ($dueAmount <= 0.001 ? 'Paid' : 'Partial');
                 } elseif (isset($validated['payment_status']) && strcasecmp(trim($validated['payment_status']), 'Unpaid') === 0) {
@@ -865,7 +924,7 @@ class ExpenseController extends Controller
                 'reference_no'          => $refNo,
                 'warehouse_id'          => $warehouseId,
                 'warehouse_name'        => $warehouseName,
-                'cash_register_id'      => $headerCashRegId,
+                'cash_register_id'      => null, // Stamped only if an actual Cash tender leg hits an open register
                 'expense_category_id'   => $categoryId,
                 'expense_category_name' => $categoryName,
                 'title'                 => $validated['title'],
@@ -901,15 +960,17 @@ class ExpenseController extends Controller
                             $warehouseName,
                             $actor['user_id'],
                             $actor['user_name'],
-                            true
+                            true,
+                            $request
                         );
                     }
 
+                    $legDate = $this->normalizeDateTimeString($p['payment_date'] ?? $txDate, $p['payment_time'] ?? null);
                     ExpensePayment::create([
                         'expense_id'       => $expense->id,
                         'cash_register_id' => $legRegId,
                         'reference_no'     => $this->generateUniqueExpensePaymentRef($refNo, $pIndex++),
-                        'payment_date'     => $p['payment_date'] ?? $txDate,
+                        'payment_date'     => $legDate,
                         'payment_time'     => $p['payment_time'] ?? date('h:i A'),
                         'payment_type'     => $pType,
                         'amount'           => $pAmount,
@@ -939,7 +1000,8 @@ class ExpenseController extends Controller
                         $warehouseName,
                         $actor['user_id'],
                         $actor['user_name'],
-                        true
+                        true,
+                        $request
                     );
                 }
 
@@ -999,24 +1061,48 @@ class ExpenseController extends Controller
     public function update(Request $request, $id)
     {
         $validated = $request->validate([
-            'reference_no'          => ['sometimes', 'nullable', 'string', 'max:255', Rule::unique('expenses', 'reference_no')->ignore($id)],
-            'warehouse_id'          => 'sometimes|nullable|integer',
-            'warehouse_name'        => 'sometimes|required|string|max:255',
-            'expense_category_id'   => 'nullable|integer',
-            'expense_category_name' => 'sometimes|required|string|max:255',
-            'title'                 => 'sometimes|required|string|max:255',
-            'amount'                => 'sometimes|required|numeric|min:0.01',
-            'payment_method'        => 'sometimes|nullable|string|max:255',
-            'payment_method_id'     => 'sometimes|nullable|integer',
-            'date'                  => 'sometimes|required|string',
-            'details'               => 'nullable|string',
-            'created_by'            => 'sometimes|nullable|string|max:255',
-            'user_name'             => 'sometimes|nullable|string|max:255',
-            'user_role'             => 'sometimes|nullable|string|max:255',
-            'user_id'               => 'sometimes|nullable|integer',
+            'reference_no'               => ['sometimes', 'nullable', 'string', 'max:255', Rule::unique('expenses', 'reference_no')->ignore($id)],
+            'warehouse_id'               => 'sometimes|nullable|integer',
+            'warehouse_name'             => 'sometimes|required|string|max:255',
+            'expense_category_id'        => 'nullable|integer',
+            'expense_category_name'      => 'sometimes|required|string|max:255',
+            'title'                      => 'sometimes|required|string|max:255',
+            'amount'                     => 'sometimes|required|numeric|min:0.01',
+            'payment_method'             => 'sometimes|nullable|string|max:255',
+            'payment_method_id'          => 'sometimes|nullable|integer',
+            'cash_register_id'           => 'sometimes|nullable|integer',
+            'date'                       => 'sometimes|required|string',
+            'details'                    => 'nullable|string',
+            'created_by'                 => 'sometimes|nullable|string|max:255',
+            'user_name'                  => 'sometimes|nullable|string|max:255',
+            'user_role'                  => 'sometimes|nullable|string|max:255',
+            'user_id'                    => 'sometimes|nullable|integer',
+            'payments'                   => 'sometimes|nullable|array',
+            'payments.*.id'              => 'nullable|integer',
+            'payments.*.amount'          => 'nullable|numeric|min:0',
+            'payments.*.payment_type'    => 'nullable|string|max:255',
+            'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.payment_time'    => 'nullable|string',
+            'payments.*.notes'           => 'nullable|string',
+            'payments.*.received_amount' => 'nullable|numeric',
+            'payments.*.change_amount'   => 'nullable|numeric',
+            'payments.*.cash_register_id'=> 'nullable|integer',
         ]);
 
-        $unitService = app(ProductUnitConversionService::class);
+        $unitService       = app(ProductUnitConversionService::class);
+        $accountingService = app(PurchaseAccountingService::class);
+        $hasPaymentsParam  = $request->has('payments') && is_array($request->input('payments'));
+        $submittedPayments = $hasPaymentsParam
+            ? array_values(array_filter(
+                $validated['payments'] ?? [],
+                static fn($p) => !empty($p['amount']) && (float)$p['amount'] > 0.0001
+            ))
+            : [];
+        unset($validated['payments']);
+
+        if (array_key_exists('date', $validated)) {
+            $validated['date'] = $this->normalizeDateTimeString($validated['date']);
+        }
 
         DB::beginTransaction();
         try {
@@ -1048,6 +1134,8 @@ class ExpenseController extends Controller
                 }
             }
 
+            $warehouseChanged = false;
+            $oldWarehouseId   = (int)($expense->warehouse_id ?? 0);
             if (array_key_exists('warehouse_name', $validated) || array_key_exists('warehouse_id', $validated)) {
                 [$wId, $wName] = $this->resolveExpenseWarehouse(
                     $request,
@@ -1055,9 +1143,10 @@ class ExpenseController extends Controller
                     $validated['warehouse_name'] ?? $expense->warehouse_name,
                     $unitService
                 );
-                if ((int)($wId ?? 0) !== (int)($expense->warehouse_id ?? 0)) {
-                    $beforeCashByReg = $this->extractExpenseCashByRegister($expense);
-                    if ($regErr = app(PurchaseAccountingService::class)->assertCashRegisterDeltaMutable($beforeCashByReg, [])) {
+                if ((int)($wId ?? 0) !== $oldWarehouseId) {
+                    $warehouseChanged = true;
+                    $beforeCashByRegCheck = $this->extractExpenseCashByRegister($expense);
+                    if ($regErr = $accountingService->assertCashRegisterDeltaMutable($beforeCashByRegCheck, [])) {
                         $this->throwValidationError('warehouse_id', $regErr);
                     }
                 }
@@ -1075,17 +1164,181 @@ class ExpenseController extends Controller
             }
 
             $allPayments = ExpensePayment::where('expense_id', $expense->id)->lockForUpdate()->get();
-            $totalPaid   = round((float)$allPayments->sum('amount'), 2);
             $newAmount   = array_key_exists('amount', $validated) ? round((float)$validated['amount'], 2) : (float)$expense->amount;
+            $actor       = $this->resolveExpenseActor($request, $validated, $expense);
+            $effectiveWhId   = (int)($validated['warehouse_id'] ?? $expense->warehouse_id ?? 0) ?: null;
+            $effectiveWhName = (string)($validated['warehouse_name'] ?? $expense->warehouse_name ?? '');
+            $headerCashRegId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+            unset($validated['cash_register_id']);
 
-            if ($newAmount < $totalPaid - 0.01) {
-                $this->throwValidationError(
-                    'amount',
-                    'Cannot reduce expense amount below already paid amount (' . number_format($totalPaid, 2) . '). Delete excess payments first.'
-                );
+            if ($hasPaymentsParam) {
+                $beforeCashByReg = $this->extractExpenseCashByRegister($expense);
+                $submittedTotal  = round(array_sum(array_map(static fn($p) => round((float)$p['amount'], 2), $submittedPayments)), 2);
+
+                if ($submittedTotal > $newAmount + 0.01) {
+                    $this->throwValidationError(
+                        'payments',
+                        'Payment amount (' . number_format($submittedTotal, 2) . ') cannot exceed expense amount (' . number_format($newAmount, 2) . ').'
+                    );
+                }
+                if ($submittedTotal > $newAmount && !empty($submittedPayments)) {
+                    $excess  = round($submittedTotal - $newAmount, 2);
+                    $lastIdx = count($submittedPayments) - 1;
+                    $submittedPayments[$lastIdx]['amount'] = max(0.0, round((float)$submittedPayments[$lastIdx]['amount'] - $excess, 2));
+                }
+
+                // Resolve cash registers for new payment legs and verify no closed-shift cash total changes
+                $existingById = $allPayments->keyBy('id');
+                $resolvedLegs = [];
+                $afterCashByReg = [];
+                foreach ($submittedPayments as $idx => $p) {
+                    $pAmt = round((float)$p['amount'], 2);
+                    if ($pAmt <= 0) {
+                        continue;
+                    }
+                    $pType  = $p['payment_type'] ?? 'Cash';
+                    $isCash = $accountingService->isCashPaymentType($pType);
+                    $legRegId = null;
+
+                    if ($isCash) {
+                        $existingLeg = !empty($p['id']) ? $existingById->get((int)$p['id']) : null;
+                        $candidateRegId = !empty($p['cash_register_id'])
+                            ? (int)$p['cash_register_id']
+                            : ($existingLeg && !$warehouseChanged && $existingLeg->cash_register_id ? (int)$existingLeg->cash_register_id : $headerCashRegId);
+
+                        if ($candidateRegId && !$warehouseChanged) {
+                            $existingReg = CashRegister::lockForUpdate()->find($candidateRegId);
+                            if ($existingReg && !in_array(strtolower(trim((string)$existingReg->status)), ['open', 'opened'], true)) {
+                                // Keep closed register ID for delta check below; if total matches, it stays immutable; if changed, delta check rejects.
+                                $legRegId = (int)$existingReg->id;
+                            } else {
+                                $legRegId = $this->resolveActiveOpenCashRegisterId(
+                                    $candidateRegId,
+                                    $effectiveWhId,
+                                    $effectiveWhName,
+                                    $actor['user_id'],
+                                    $actor['user_name'],
+                                    true,
+                                    $request
+                                );
+                            }
+                        } else {
+                            $legRegId = $this->resolveActiveOpenCashRegisterId(
+                                $headerCashRegId,
+                                $effectiveWhId,
+                                $effectiveWhName,
+                                $actor['user_id'],
+                                $actor['user_name'],
+                                true,
+                                $request
+                            );
+                        }
+
+                        if ($legRegId) {
+                            $afterCashByReg[$legRegId] = round(($afterCashByReg[$legRegId] ?? 0.0) + $pAmt, 2);
+                        }
+                    }
+
+                    $resolvedLegs[] = [
+                        'payment_type'     => $pType,
+                        'amount'           => $pAmt,
+                        'received_amount'  => (float)($p['received_amount'] ?? $pAmt),
+                        'change_amount'    => (float)($p['change_amount'] ?? 0),
+                        'payment_date'     => $this->normalizeDateTimeString($p['payment_date'] ?? ($validated['date'] ?? $expense->date), $p['payment_time'] ?? null),
+                        'payment_time'     => $p['payment_time'] ?? date('h:i A'),
+                        'notes'            => $p['notes'] ?? ($validated['details'] ?? $expense->details ?? 'Disbursement tender'),
+                        'cash_register_id' => $legRegId,
+                    ];
+                }
+
+                if ($regErr = $accountingService->assertCashRegisterDeltaMutable($beforeCashByReg, $afterCashByReg)) {
+                    $this->throwValidationError('payments', $regErr);
+                }
+
+                // Replace payment legs atomically and reconcile open cash registers by exact per-register delta
+                ExpensePayment::where('expense_id', $expense->id)->delete();
+                $pIndex = 1;
+                $firstCashRegId = null;
+                foreach ($resolvedLegs as $leg) {
+                    if ($leg['cash_register_id'] && !$firstCashRegId) {
+                        $firstCashRegId = (int)$leg['cash_register_id'];
+                    }
+                    ExpensePayment::create([
+                        'expense_id'       => $expense->id,
+                        'cash_register_id' => $leg['cash_register_id'],
+                        'reference_no'     => $this->generateUniqueExpensePaymentRef($expense->reference_no, $pIndex++),
+                        'payment_date'     => $leg['payment_date'],
+                        'payment_time'     => $leg['payment_time'],
+                        'payment_type'     => $leg['payment_type'],
+                        'amount'           => $leg['amount'],
+                        'received_amount'  => $leg['received_amount'],
+                        'change_amount'    => $leg['change_amount'],
+                        'notes'            => $leg['notes'],
+                        'created_by'       => $actor['user_name'],
+                        'user_id'          => $actor['user_id'],
+                        'user_name'        => $actor['user_name'],
+                        'user_role'        => $actor['user_role'],
+                    ]);
+                }
+
+                $allRegIds = array_unique(array_merge(array_keys($beforeCashByReg), array_keys($afterCashByReg)));
+                foreach ($allRegIds as $rId) {
+                    $delta = round(($beforeCashByReg[$rId] ?? 0.0) - ($afterCashByReg[$rId] ?? 0.0), 2);
+                    if (abs($delta) > 0.001) {
+                        $accountingService->adjustOpenRegisterExpectedCash((int)$rId, $delta);
+                    }
+                }
+
+                $validated['cash_register_id'] = $firstCashRegId;
+                $allPayments = ExpensePayment::where('expense_id', $expense->id)->get();
+                $totalPaid   = round((float)$allPayments->sum('amount'), 2);
+            } else {
+                // Protect legacy payment-less paid expenses from being wiped to 0
+                $totalPaid = $allPayments->isNotEmpty()
+                    ? round((float)$allPayments->sum('amount'), 2)
+                    : round((float)$expense->paid_amount, 2);
+
+                if ($newAmount < $totalPaid - 0.01) {
+                    $this->throwValidationError(
+                        'amount',
+                        'Cannot reduce expense amount below already paid amount (' . number_format($totalPaid, 2) . '). Delete excess payments first.'
+                    );
+                }
+
+                // If warehouse changed on an expense with open-register cash legs, re-attribute registers cleanly
+                if ($warehouseChanged) {
+                    $beforeCashByReg = $this->extractExpenseCashByRegister($expense);
+                    if (!empty($beforeCashByReg)) {
+                        foreach ($beforeCashByReg as $oldRegId => $oldAmt) {
+                            $accountingService->adjustOpenRegisterExpectedCash((int)$oldRegId, $oldAmt);
+                        }
+                        $newWhRegId = $this->resolveActiveOpenCashRegisterId(
+                            null,
+                            $effectiveWhId,
+                            $effectiveWhName,
+                            $actor['user_id'],
+                            $actor['user_name'],
+                            false,
+                            $request
+                        );
+                        $movedCash = 0.0;
+                        foreach ($allPayments as $existingLeg) {
+                            if ($accountingService->isCashPaymentType($existingLeg->payment_type)) {
+                                $existingLeg->update(['cash_register_id' => $newWhRegId]);
+                                $movedCash += round((float)$existingLeg->amount, 2);
+                            }
+                        }
+                        if ($allPayments->isEmpty() && $totalPaid > 0.001 && $accountingService->isCashPaymentType($expense->payment_method)) {
+                            $movedCash = $totalPaid;
+                        }
+                        if ($newWhRegId && $movedCash > 0.001) {
+                            $accountingService->adjustOpenRegisterExpectedCash((int)$newWhRegId, -$movedCash);
+                        }
+                        $validated['cash_register_id'] = $newWhRegId;
+                    }
+                }
             }
 
-            $actor = $this->resolveExpenseActor($request, $validated, $expense);
             $validated['created_by'] = $actor['user_name'];
             $validated['user_name']  = $actor['user_name'];
             $validated['user_role']  = $actor['user_role'];
@@ -1106,6 +1359,10 @@ class ExpenseController extends Controller
                 'payment_status' => $newStatus,
                 'payment_method' => $newPaymentMethod,
             ]);
+
+            if (!empty($expense->transfer_id)) {
+                StockTransfer::where('id', $expense->transfer_id)->update(['updated_at' => now()]);
+            }
 
             DB::commit();
             $this->clearExpenseCache();
@@ -1200,25 +1457,23 @@ class ExpenseController extends Controller
 
         $authUser    = User::resolveFromRequest($request) ?? $request->user();
         $authRole    = $authUser?->roleModel?->name ?? ($authUser?->role ?? null);
-        $userName    = $request->input('user_name') ?? ($authUser?->name ?? 'Super Admin');
-        $userRole    = $request->input('user_role') ?? ($authRole ?? 'Super Admin');
-        $userId      = $request->input('user_id') ?? $authUser?->id;
+        // Trust authenticated user identity first; fall back to request metadata only when unauthenticated.
+        $userName    = $authUser?->name ?? ($request->input('user_name') ?? 'Super Admin');
+        $userRole    = $authRole ?? ($request->input('user_role') ?? 'Super Admin');
+        $userId      = $authUser?->id ?? ($request->input('user_id') ? (int)$request->input('user_id') : null);
 
         $timezone    = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
         $nowTz       = Carbon::now()->timezone($timezone);
-        $defaultDate = $nowTz->format('Y-m-d');
+        $defaultDate = $nowTz->format('Y-m-d H:i:s');
         $defaultTime = $nowTz->format('h:i A');
 
-        $pDate = $validated['payment_date'] ?? $defaultDate;
+        $rawPDate = $validated['payment_date'] ?? $defaultDate;
         $pTime = $request->input('payment_time');
-        if (str_contains((string)$pDate, ' ')) {
-            $parts = explode(' ', trim((string)$pDate), 2);
-            $pDate = $parts[0];
-            if (empty($pTime)) {
-                try {
-                    $pTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
-                } catch (\Throwable $e) {
-                }
+        if (str_contains((string)$rawPDate, ' ') && empty($pTime)) {
+            $parts = explode(' ', trim((string)$rawPDate), 2);
+            try {
+                $pTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
+            } catch (\Throwable $e) {
             }
         }
         if (empty($pTime)) {
@@ -1232,6 +1487,7 @@ class ExpenseController extends Controller
                 }
             }
         }
+        $pDate = $this->normalizeDateTimeString($rawPDate, $pTime);
 
         $totalPaying = 0.0;
         if (!empty($validated['payments']) && is_array($validated['payments'])) {
@@ -1266,8 +1522,29 @@ class ExpenseController extends Controller
 
             $this->assertExpenseOutletAccess($request, $expense->warehouse_id);
 
-            $currentPaid = (float)$expense->paid_amount;
-            $currentDue  = max(0.0, (float)$expense->amount - $currentPaid);
+            // Preserve legacy payment-less paid balance before adding new legs so summing ExpensePayment never wipes it.
+            if ($expense->payments->isEmpty() && (float)$expense->paid_amount > 0.001) {
+                ExpensePayment::create([
+                    'expense_id'       => $expense->id,
+                    'cash_register_id' => $expense->cash_register_id,
+                    'reference_no'     => $this->generateUniqueExpensePaymentRef($expense->reference_no, 1),
+                    'payment_date'     => $this->normalizeDateTimeString($expense->date),
+                    'payment_time'     => $defaultTime,
+                    'payment_type'     => ($expense->payment_method && $expense->payment_method !== 'Unpaid') ? $expense->payment_method : 'Cash',
+                    'amount'           => round((float)$expense->paid_amount, 2),
+                    'received_amount'  => round((float)$expense->paid_amount, 2),
+                    'change_amount'    => 0,
+                    'notes'            => 'Legacy recorded payment preserved',
+                    'created_by'       => $expense->created_by ?: $userName,
+                    'user_id'          => $expense->user_id ?: $userId,
+                    'user_name'        => $expense->user_name ?: $userName,
+                    'user_role'        => $expense->user_role ?: $userRole,
+                ]);
+                $expense->load('payments');
+            }
+
+            $currentPaid = round((float)$expense->payments->sum('amount'), 2);
+            $currentDue  = max(0.0, round((float)$expense->amount - $currentPaid, 2));
 
             if ($totalPaying > $currentDue + 0.01) {
                 DB::rollBack();
@@ -1287,16 +1564,13 @@ class ExpenseController extends Controller
                     if ($pAmount <= 0) {
                         continue;
                     }
-                    $itemDate = !empty($p['payment_date']) ? $p['payment_date'] : $pDate;
-                    $itemTime = !empty($p['payment_time']) ? $p['payment_time'] : $pTime;
-                    if (str_contains((string)$itemDate, ' ')) {
-                        $parts    = explode(' ', trim((string)$itemDate), 2);
-                        $itemDate = $parts[0];
-                        if (empty($p['payment_time'])) {
-                            try {
-                                $itemTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
-                            } catch (\Throwable $e) {
-                            }
+                    $rawItemDate = !empty($p['payment_date']) ? $p['payment_date'] : $pDate;
+                    $itemTime    = !empty($p['payment_time']) ? $p['payment_time'] : $pTime;
+                    if (str_contains((string)$rawItemDate, ' ') && empty($p['payment_time'])) {
+                        $parts = explode(' ', trim((string)$rawItemDate), 2);
+                        try {
+                            $itemTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
+                        } catch (\Throwable $e) {
                         }
                     }
                     try {
@@ -1306,6 +1580,7 @@ class ExpenseController extends Controller
                             $itemTime = $defaultTime;
                         }
                     }
+                    $itemDate = $this->normalizeDateTimeString($rawItemDate, $itemTime);
 
                     $legsToCreate[] = [
                         'payment_type'     => $p['payment_type'] ?? ($p['type'] ?? $fallbackType),
@@ -1315,9 +1590,9 @@ class ExpenseController extends Controller
                         'payment_date'     => $itemDate,
                         'payment_time'     => $itemTime,
                         'notes'            => $p['notes'] ?? ($validated['notes'] ?? null),
-                        'user_name'        => !empty($p['user_name']) ? $p['user_name'] : $userName,
-                        'user_role'        => !empty($p['user_role']) ? $p['user_role'] : $userRole,
-                        'user_id'          => !empty($p['user_id']) ? (int)$p['user_id'] : $userId,
+                        'user_name'        => $authUser ? $userName : (!empty($p['user_name']) ? $p['user_name'] : $userName),
+                        'user_role'        => $authUser ? $userRole : (!empty($p['user_role']) ? $p['user_role'] : $userRole),
+                        'user_id'          => $authUser ? $userId : (!empty($p['user_id']) ? (int)$p['user_id'] : $userId),
                         'cash_register_id' => !empty($p['cash_register_id']) ? (int)$p['cash_register_id'] : $headerCashRegId,
                     ];
                 }
@@ -1338,8 +1613,19 @@ class ExpenseController extends Controller
                 ];
             }
 
+            // Clamp any sub-cent/1-cent tolerance excess on the last leg so paid_amount <= amount strictly
+            $legsSum = round(array_sum(array_column($legsToCreate, 'amount')), 2);
+            if ($legsSum > $currentDue && !empty($legsToCreate)) {
+                $excess = round($legsSum - $currentDue, 2);
+                $lastIdx = count($legsToCreate) - 1;
+                $legsToCreate[$lastIdx]['amount'] = max(0.0, round($legsToCreate[$lastIdx]['amount'] - $excess, 2));
+            }
+
             $seedIndex = ExpensePayment::where('expense_id', $expense->id)->count() + 1;
             foreach ($legsToCreate as $leg) {
+                if ((float)$leg['amount'] <= 0.0001) {
+                    continue;
+                }
                 $isCash   = $accountingService->isCashPaymentType($leg['payment_type'] ?? null);
                 $legRegId = null;
                 if ($isCash) {
@@ -1349,7 +1635,8 @@ class ExpenseController extends Controller
                         $expense->warehouse_name,
                         $leg['user_id'] ? (int)$leg['user_id'] : null,
                         $leg['user_name'],
-                        true
+                        true,
+                        $request
                     );
                 }
 
@@ -1496,11 +1783,16 @@ class ExpenseController extends Controller
                 $newPaymentType = $expense->payment_method;
             }
 
+            $remainingCashRegId = $remainingPayments
+                ->first(fn ($p) => $accountingService->isCashPaymentType($p->payment_type) && !empty($p->cash_register_id))
+                ?->cash_register_id;
+
             $expense->update([
-                'paid_amount'    => $newPaid,
-                'due_amount'     => $newDue,
-                'payment_status' => $newStatus,
-                'payment_method' => $newPaymentType,
+                'paid_amount'      => $newPaid,
+                'due_amount'       => $newDue,
+                'payment_status'   => $newStatus,
+                'payment_method'   => $newPaymentType,
+                'cash_register_id' => $remainingCashRegId ? (int)$remainingCashRegId : null,
             ]);
 
             if (!empty($expense->transfer_id)) {

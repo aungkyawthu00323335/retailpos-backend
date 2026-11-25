@@ -245,17 +245,6 @@ class RoleController extends Controller
                 'special_actions' => [],
             ],
 
-            // 9. Processing
-            [
-                'id' => 'processings',
-                'name' => 'Manage Processing',
-                'module' => 'Processing',
-                'actions' => ['view', 'create', 'update', 'delete'],
-                'special_actions' => [
-                    ['key' => 'export', 'label' => 'Export Processing', 'description' => 'Export stock conversion and repackaging logs'],
-                ],
-            ],
-
             // 10. Peoples
             [
                 'id' => 'customers',

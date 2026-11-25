@@ -86,13 +86,25 @@ class PurchaseAccountingService
             return [];
         }
 
+        // Land the final-line penny residual on the last positive-value line so $0 free/bonus lines stay $0
+        $residualPos = $count - 1;
+        if ($costRatioPool > 0.0001) {
+            for ($i = $count - 1; $i >= 0; $i--) {
+                if ((float)$lineBases[$keys[$i]] > 0.0001) {
+                    $residualPos = $i;
+                    break;
+                }
+            }
+        }
+
         $result = [];
         $allocatedSum = 0.0;
-        $lastPos = $count - 1;
 
         foreach ($keys as $pos => $key) {
             $base = (float)$lineBases[$key];
-            if ($pos === $lastPos) {
+            if ($costRatioPool > 0.0001 && $base <= 0.0001) {
+                $extra = 0.0;
+            } elseif ($pos === $residualPos) {
                 $extra = round($netAdjustment - $allocatedSum, 2);
             } else {
                 $ratio = $costRatioPool > 0.0001 ? ($base / $costRatioPool) : (1.0 / $count);
@@ -443,6 +455,7 @@ class PurchaseAccountingService
             }
         }
 
+        $unitConverter = app(ProductUnitConversionService::class);
         $sanitized = [];
         $sanitizedItemsSubtotal = 0.0;
         foreach ($items as $it) {
@@ -450,9 +463,29 @@ class PurchaseAccountingService
             $codeKey = strtolower(trim((string)($it['product_code'] ?? '')));
             $prod = ($pid !== null && $byId->has($pid)) ? $byId->get($pid) : ($codeKey !== '' ? ($byCode[$codeKey] ?? null) : null);
             $vid = !empty($it['product_variant_id']) ? (int)$it['product_variant_id'] : null;
-            $convRate = (float)($it['conversion_rate'] ?? 1.0);
-            if ($convRate <= 0.0001) {
-                $convRate = 1.0;
+
+            // Never trust client-submitted conversion_rate for cost-blind users; resolve authoritatively from product unit links
+            $convRate = 1.0;
+            if ($prod) {
+                $resolvedUnit = $unitConverter->resolve(
+                    $prod,
+                    'purchase',
+                    isset($it['unit_id']) && $it['unit_id'] !== '' ? (int)$it['unit_id'] : null,
+                    isset($it['unit_name']) ? (string)$it['unit_name'] : null,
+                    $vid
+                );
+                $convRate = (float)($resolvedUnit['conversion_rate'] ?? 1.0);
+                if ($convRate <= 0.0001) {
+                    $convRate = 1.0;
+                }
+                $it['unit_id'] = $resolvedUnit['unit_id'] ?? ($it['unit_id'] ?? null);
+                $it['unit_name'] = $resolvedUnit['unit_name'] ?? ($it['unit_name'] ?? null);
+                $it['conversion_rate'] = $convRate;
+            } else {
+                $convRate = (float)($it['conversion_rate'] ?? 1.0);
+                if ($convRate <= 0.0001) {
+                    $convRate = 1.0;
+                }
             }
 
             $resolvedBase = null;
@@ -517,7 +550,8 @@ class PurchaseAccountingService
                 'tax_rate' => $poTaxRate,
                 'tax_amount' => $proratedFlatTax,
                 'discount' => round(max(0.0, (float)$linkedPo->discount) * $prorationRatio, 2),
-                'shipping' => round(max(0.0, (float)($linkedPo->shipping ?? 0.0)) * $prorationRatio, 2),
+                // Inbound freight on the original PO is non-refundable by default on cost-blind returns
+                'shipping' => 0.0,
             ];
         }
 
@@ -999,7 +1033,8 @@ class PurchaseAccountingService
         ?User $actor,
         ?int $warehouseId,
         ?string $paymentType,
-        ?float $cashPaidAmount = null
+        ?float $cashPaidAmount = null,
+        bool $attachForNonCash = false
     ): array {
         if ($explicitRegisterId !== null && $explicitRegisterId > 0) {
             if (!$this->schemaHasTable('cash_registers')) {
@@ -1025,9 +1060,9 @@ class PurchaseAccountingService
             return ['cash_register_id' => (int)$register->id, 'error' => null];
         }
 
-        $isCashMethod = stripos((string)$paymentType, 'cash') !== false
+        $isCashMethod = $this->isCashPaymentType($paymentType)
             || stripos((string)$paymentType, 'split') !== false;
-        if (!$isCashMethod || ($cashPaidAmount !== null && $cashPaidAmount <= 0.001)) {
+        if ((!$isCashMethod && !$attachForNonCash) || ($cashPaidAmount !== null && $cashPaidAmount <= 0.001)) {
             return ['cash_register_id' => null, 'error' => null];
         }
 
@@ -1093,12 +1128,16 @@ class PurchaseAccountingService
     {
         $trimmed = trim($raw);
         if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $trimmed)) {
-            return $trimmed . ($isEnd ? ' 23:59:59' : ' 00:00:00');
+            return $isEnd ? ($trimmed . ' 23:59:59') : $trimmed;
         }
         try {
-            return Carbon::parse($trimmed)
+            $formatted = Carbon::parse($trimmed)
                 ->setTimezone(config('app.timezone'))
                 ->format('Y-m-d H:i:s');
+            if (!$isEnd && str_ends_with($formatted, ' 00:00:00')) {
+                return substr($formatted, 0, 10);
+            }
+            return $formatted;
         } catch (\Throwable $e) {
             return str_replace('T', ' ', $trimmed);
         }
@@ -1871,9 +1910,12 @@ class PurchaseAccountingService
                 foreach (array_chunk($prIds, 400) as $idChunk) {
                     $prAllocQuery = DB::table('purchase_return_allocations')
                         ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
+                        ->join('purchases', 'purchase_return_allocations.purchase_id', '=', 'purchases.id')
                         ->whereIn('purchase_return_allocations.purchase_return_id', $idChunk)
                         ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
-                        ->where('purchase_returns.date', '<=', $asOfEnd);
+                        ->where('purchase_returns.date', '<=', $asOfEnd)
+                        ->whereIn('purchases.status', ['Received', 'Completed'])
+                        ->where('purchases.date', '<=', $asOfEnd);
                     $activeAsOfFilter($prAllocQuery);
                     foreach ($prAllocQuery
                         ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))
@@ -1886,8 +1928,11 @@ class PurchaseAccountingService
                 $prIdSet = array_flip(array_map('intval', $prIds));
                 $prAllocQuery = DB::table('purchase_return_allocations')
                     ->join('purchase_returns', 'purchase_return_allocations.purchase_return_id', '=', 'purchase_returns.id')
+                    ->join('purchases', 'purchase_return_allocations.purchase_id', '=', 'purchases.id')
                     ->whereIn('purchase_returns.status', self::COMPLETED_RETURN_STATUSES)
-                    ->where('purchase_returns.date', '<=', $asOfEnd);
+                    ->where('purchase_returns.date', '<=', $asOfEnd)
+                    ->whereIn('purchases.status', ['Received', 'Completed'])
+                    ->where('purchases.date', '<=', $asOfEnd);
                 $activeAsOfFilter($prAllocQuery);
                 foreach ($prAllocQuery
                     ->select('purchase_return_allocations.purchase_return_id', DB::raw('SUM(purchase_return_allocations.amount) as alloc_sum'))

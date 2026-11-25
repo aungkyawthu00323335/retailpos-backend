@@ -173,12 +173,19 @@ class Product extends Model
         return $this->hasMany(StockTransferItem::class, 'product_id');
     }
 
+    public function inventoryBatches()
+    {
+        return $this->hasMany(InventoryBatch::class, 'product_id');
+    }
+
     public function getTotalDependenciesAttribute(): int
     {
         return (int) (
             ($this->sale_items_count ?? 0) +
             ($this->purchase_items_count ?? 0) +
-            ($this->stock_adjustment_items_count ?? 0)
+            ($this->stock_adjustment_items_count ?? 0) +
+            ($this->stock_transfer_items_count ?? 0) +
+            ($this->inventory_batches_count ?? 0)
         );
     }
 }

@@ -42,16 +42,18 @@ class QuotationAccountingService
         foreach ($items as $item) {
             $qty = max(0.0, (float) ($item['quantity'] ?? 0));
             $unitPrice = max(0.0, (float) ($item['unit_price'] ?? 0));
-            $itemDiscount = max(0.0, (float) ($item['discount'] ?? 0));
-            $itemTax = max(0.0, (float) ($item['tax'] ?? 0));
+            $grossLine = max(0.0, round($qty * $unitPrice, 2));
+            $itemDiscount = round(min($grossLine, max(0.0, (float) ($item['discount'] ?? 0))), 2);
+            $itemTax = round(max(0.0, (float) ($item['tax'] ?? 0)), 2);
 
-            $grossLine = $qty * $unitPrice;
             $taxExclusiveLine = round(max(0.0, $grossLine - $itemDiscount), 2);
-            $lineSubtotal = round(max(0.0, $grossLine - $itemDiscount + $itemTax), 2);
+            $lineSubtotal = round($taxExclusiveLine + $itemTax, 2);
 
             $itemsSubtotal += $lineSubtotal;
             $taxExclusiveBaseTotal += $taxExclusiveLine;
 
+            $item['discount'] = $itemDiscount;
+            $item['tax'] = $itemTax;
             $item['computed_subtotal'] = $lineSubtotal;
             $item['tax_exclusive_subtotal'] = $taxExclusiveLine;
             $normalizedItems[] = $item;
@@ -60,12 +62,13 @@ class QuotationAccountingService
         $itemsSubtotal = round($itemsSubtotal, 2);
         $taxExclusiveBaseTotal = round($taxExclusiveBaseTotal, 2);
         $rawDiscount = max(0.0, $orderDiscount);
-        $orderDiscount = round(min($rawDiscount, $itemsSubtotal), 2);
-        $taxRate = max(0.0, $taxRate);
-        $shipping = max(0.0, $shipping);
+        // Match SaleController 1:1: order discount applies strictly to the tax-exclusive merchandise base (never eats item tax).
+        $orderDiscount = round(min($rawDiscount, $taxExclusiveBaseTotal), 2);
+        $taxRate = min(100.0, max(0.0, $taxRate));
+        $shipping = round(max(0.0, $shipping), 2);
 
         // Order-level percentage tax applies strictly to the tax-exclusive net base (never compound Tax-on-Tax).
-        $taxableBase = max(0.0, $taxExclusiveBaseTotal - $orderDiscount);
+        $taxableBase = max(0.0, round($taxExclusiveBaseTotal - $orderDiscount, 2));
         $orderTaxAmount = $taxRate > 0
             ? round($taxableBase * ($taxRate / 100.0), 2)
             : (($flatTaxAmount !== null && $flatTaxAmount > 0) ? round($flatTaxAmount, 2) : 0.0);

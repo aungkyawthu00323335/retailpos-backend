@@ -417,7 +417,7 @@ class QuotationController extends Controller
 
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
-            'Content-Disposition' => 'attachment; filename="quotations_export_' . date('Ymd_His') . '.csv"',
+            'Content-Disposition' => 'attachment; filename="quotations_export_' . now()->format('Ymd_His') . '.csv"',
             'X-Accel-Buffering' => 'no',
             'Pragma' => 'no-cache',
             'Cache-Control' => 'no-cache, no-store, must-revalidate',
@@ -479,7 +479,7 @@ class QuotationController extends Controller
 
             // 1. Metadata Header
             fputcsv($file, ['Quotations / Estimates Export']);
-            fputcsv($file, ['Generated At', date('c')]);
+            fputcsv($file, ['Generated At', now()->toIso8601String()]);
             fputcsv($file, ['Warehouse Filter', $sanitizeCsv($warehouseFilter ?: 'All')]);
             fputcsv($file, ['Status Filter', $sanitizeCsv($statusFilter ?: 'All')]);
             if (!empty($customerFilter) && $customerFilter !== 'All') {
@@ -819,9 +819,10 @@ class QuotationController extends Controller
             $unitMeta = $accounting->resolveItemUnitFields($item, $product, $unitService);
             $qty = max(0.0, (float) $item['quantity']);
             $unitPrice = max(0.0, (float) $item['unit_price']);
-            $itemTax = max(0.0, (float) ($item['tax'] ?? 0));
-            $itemDiscount = max(0.0, (float) ($item['discount'] ?? 0));
-            $lineSubtotal = round(max(0.0, ($qty * $unitPrice) - $itemDiscount + $itemTax), 2);
+            $grossLine = max(0.0, round($qty * $unitPrice, 2));
+            $itemTax = round(max(0.0, (float) ($item['tax'] ?? 0)), 2);
+            $itemDiscount = round(min($grossLine, max(0.0, (float) ($item['discount'] ?? 0))), 2);
+            $lineSubtotal = round(max(0.0, $grossLine - $itemDiscount) + $itemTax, 2);
 
             $rows[] = [
                 'quotation_id' => $quotationId,
@@ -1070,6 +1071,20 @@ class QuotationController extends Controller
 
         DB::beginTransaction();
         try {
+            // Re-fetch with pessimistic lock inside transaction to prevent TOCTOU race against convertToSale()
+            $quotation = Quotation::lockForUpdate()->find($quotation->id);
+            if (!$quotation) {
+                DB::rollBack();
+                return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
+            }
+            if ($quotation->status === 'Ordered') {
+                DB::rollBack();
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Cannot update a quotation that has already been converted to an order/sale.',
+                ], 422);
+            }
+
             $expiryDate = array_key_exists('expiry_date', $validated)
                 ? ($validated['expiry_date'] !== '' ? $validated['expiry_date'] : null)
                 : $quotation->expiry_date;
@@ -1193,26 +1208,29 @@ class QuotationController extends Controller
      */
     public function destroy(Request $request, $id)
     {
-        $quotation = Quotation::find($id);
-        if (!$quotation) {
-            return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
-        }
-        $this->purchaseAccounting()->assertOutletAccess(
-            $request,
-            $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
-            $quotation->warehouse_name
-        );
-
-        // Commercial Audit Guard: Prevent deleting already converted quotation
-        if ($quotation->status === 'Ordered') {
-            return response()->json([
-                'status'  => 'error',
-                'message' => 'Cannot delete a quotation that has already been converted to an order/sale.',
-            ], 422);
-        }
-
         DB::beginTransaction();
         try {
+            // Pessimistic lock eliminates TOCTOU race with concurrent convertToSale()
+            $quotation = Quotation::lockForUpdate()->find($id);
+            if (!$quotation) {
+                DB::rollBack();
+                return response()->json(['status' => 'error', 'message' => 'Quotation not found'], 404);
+            }
+            $this->purchaseAccounting()->assertOutletAccess(
+                $request,
+                $quotation->warehouse_id ? (int)$quotation->warehouse_id : null,
+                $quotation->warehouse_name
+            );
+
+            // Commercial Audit Guard: Prevent deleting already converted quotation
+            if ($quotation->status === 'Ordered') {
+                DB::rollBack();
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Cannot delete a quotation that has already been converted to an order/sale.',
+                ], 422);
+            }
+
             $quotation->items()->delete();
             $quotation->delete();
             DB::commit();
@@ -1260,6 +1278,7 @@ class QuotationController extends Controller
             'payments.*.received_amount' => 'nullable|numeric|min:0',
             'payments.*.change_amount'   => 'nullable|numeric|min:0',
             'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.cash_register_id' => 'nullable|integer|min:1',
             'payments.*.notes'           => 'nullable|string',
         ]);
 
@@ -1342,12 +1361,42 @@ class QuotationController extends Controller
             $recalcDiscount = $recalcTotals['discount'];
             $grandTotal = $recalcTotals['grand_total'];
 
-            // Financial Integrity: Overpayment handling, Split Payment reconciliation & non-negative Change Amount
+            // Financial Integrity: Overpayment handling, Non-Cash Cap, Split Payment reconciliation & non-negative Change Amount
             if ($hasPaymentsArray) {
                 $paymentsSum = round(array_sum(array_map(
                     fn ($p) => max(0.0, (float) ($p['amount'] ?? 0)),
                     $paymentsInput
                 )), 2);
+                $nonCashTenderedSum = 0.0;
+                $hasCashTenderLeg = false;
+                foreach ($paymentsInput as $p) {
+                    $pAmt = max(0.0, (float) ($p['amount'] ?? 0));
+                    $pRec = isset($p['received_amount']) ? max($pAmt, (float) $p['received_amount']) : $pAmt;
+                    $pTypeLeg = (string) ($p['payment_type'] ?? $paymentType);
+                    if ($purchaseAccounting->isCashPaymentType($pTypeLeg)) {
+                        $hasCashTenderLeg = true;
+                    } else {
+                        $nonCashTenderedSum += $pRec;
+                    }
+                }
+                if ($nonCashTenderedSum > $grandTotal + 0.01) {
+                    DB::rollBack();
+                    $msg = 'Non-cash payment total (' . number_format($nonCashTenderedSum, 2) . ') cannot exceed the invoice grand total (' . number_format($grandTotal, 2) . ').';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['payments' => [$msg]],
+                    ], 422);
+                }
+                if (!$hasCashTenderLeg && $paymentsSum > $grandTotal + 0.01) {
+                    DB::rollBack();
+                    $msg = 'Non-cash payment total (' . number_format($paymentsSum, 2) . ') cannot exceed the invoice grand total (' . number_format($grandTotal, 2) . ').';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['payments' => [$msg]],
+                    ], 422);
+                }
                 if ($request->filled('paid_amount')) {
                     $explicitPaid = (float) $request->input('paid_amount');
                     $clampedExplicitPaid = min($grandTotal, max(0.0, $explicitPaid));
@@ -1368,6 +1417,19 @@ class QuotationController extends Controller
                 $rawPaid = ($request->has('paid_amount') && $request->input('paid_amount') !== null)
                     ? (float) $request->input('paid_amount')
                     : $grandTotal;
+                $isSingleCash = $purchaseAccounting->isCashPaymentType($paymentType);
+                $explicitReceived = ($request->has('received_amount') && $request->input('received_amount') !== null)
+                    ? (float) $request->input('received_amount')
+                    : $rawPaid;
+                if (!$isSingleCash && ($rawPaid > $grandTotal + 0.01 || $explicitReceived > $grandTotal + 0.01)) {
+                    DB::rollBack();
+                    $msg = 'Non-cash payment cannot exceed the invoice grand total (' . number_format($grandTotal, 2) . ').';
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => $msg,
+                        'errors' => ['paid_amount' => [$msg]],
+                    ], 422);
+                }
             }
             $paidAmount     = min($grandTotal, max(0.0, $rawPaid));
             $receivedAmount = ($request->has('received_amount') && $request->input('received_amount') !== null)
@@ -1409,13 +1471,18 @@ class QuotationController extends Controller
                 ], 422);
             }
 
-            // 🛡️ Guard 2: Customer Credit Limit Guard (locked to prevent concurrent credit limit breaches)
+            // 🛡️ Guard 2: Customer Credit Limit Guard (locked; deducts active return credit notes to match AR ledger)
             if (!$isWalkIn && $cId && $dueAmount > 0.01) {
                 $custObj = Customer::where('id', $cId)->lockForUpdate()->first();
                 if ($custObj && $custObj->credit_limit !== null && (float)$custObj->credit_limit > 0) {
                     $existingDueQuery = Sale::where('customer_id', $custObj->id);
                     Customer::applyReceivableScope($existingDueQuery);
-                    $currentOutstanding = (float)$existingDueQuery->sum('due_amount');
+                    $openReturnCreditQuery = \App\Models\SaleReturn::where('customer_id', $custObj->id);
+                    Customer::applyActiveReturnCreditScope($openReturnCreditQuery);
+                    $currentOutstanding = max(
+                        0.0,
+                        round((float)$existingDueQuery->sum('due_amount') - (float)$openReturnCreditQuery->sum('due_amount'), 2)
+                    );
                     if ($currentOutstanding + $dueAmount > (float)$custObj->credit_limit + 0.001) {
                         $limitStr = number_format((float)$custObj->credit_limit, 2);
                         $currentStr = number_format($currentOutstanding, 2);
@@ -1474,6 +1541,49 @@ class QuotationController extends Controller
                     ->first();
                 if ($userReg) {
                     $cashRegisterId = $userReg->id;
+                }
+            }
+
+            if ($hasPaymentsArray) {
+                $isManagerActorLeg = in_array(strtolower((string)$currentUserRole), ['super admin', 'admin', 'manager'], true)
+                    || ($authUser?->isSuperAdmin() ?? false);
+                $distinctLegRegIds = collect($paymentsInput)
+                    ->pluck('cash_register_id')
+                    ->filter(fn($rid) => !empty($rid))
+                    ->map(fn($rid) => (int)$rid)
+                    ->unique()
+                    ->sort()
+                    ->values()
+                    ->all();
+                foreach ($distinctLegRegIds as $legRegId) {
+                    $legReg = CashRegister::where('id', $legRegId)->lockForUpdate()->first();
+                    if (!$legReg || !in_array(strtolower(trim((string) $legReg->status)), ['open', 'opened'], true)) {
+                        DB::rollBack();
+                        $msg = "Cash register #{$legRegId} on a split payment line is closed or does not exist.";
+                        return response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422);
+                    }
+                    if ($warehouseId && $legReg->warehouse_id && (int)$legReg->warehouse_id !== (int)$warehouseId) {
+                        DB::rollBack();
+                        $msg = "Cash register #{$legRegId} belongs to a different warehouse/branch than the quotation.";
+                        return response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422);
+                    }
+                    if (!$isManagerActorLeg && $legReg->user_id && $currentUserId && (int)$legReg->user_id !== (int)$currentUserId) {
+                        DB::rollBack();
+                        $msg = 'You cannot post split payment lines to another staff member\'s open cash register.';
+                        return response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['payments' => [$msg]],
+                        ], 422);
+                    }
                 }
             }
 
@@ -1663,7 +1773,8 @@ class QuotationController extends Controller
                 }
             }
 
-            // Create Sale record with full traceability & register links
+            // Create Sale record with full traceability & register links (using store timezone now())
+            $saleTimestamp = now()->format('Y-m-d H:i:s');
             $sale = Sale::create([
                 'reference_no'     => $refNo,
                 'quotation_id'     => $quotation->id,
@@ -1671,7 +1782,7 @@ class QuotationController extends Controller
                 'customer_name'    => $quotation->customer_name,
                 'warehouse_id'     => $warehouseId,
                 'warehouse_name'   => $quotation->warehouse_name,
-                'date'             => date('Y-m-d H:i:s'),
+                'date'             => $saleTimestamp,
                 'status'           => 'Completed',
                 'tax_rate'         => (float)$quotation->tax_rate,
                 'tax_amount'       => $recalcTaxAmount,
@@ -1713,7 +1824,10 @@ class QuotationController extends Controller
                 $basePrice = $item->base_unit_price !== null && (float)$item->base_unit_price > 0
                     ? (float)$item->base_unit_price
                     : ($unitPrice / $convRate);
-                $lineSubtotal = round(max(0.0, ($unitPrice * $qty) - (float)$item->discount + (float)$item->tax), 2);
+                $lineGross = max(0.0, round($unitPrice * $qty, 2));
+                $lineDisc = round(min($lineGross, max(0.0, (float)($item->discount ?? 0))), 2);
+                $lineTax = round(max(0.0, (float)($item->tax ?? 0)), 2);
+                $lineSubtotal = round(max(0.0, $lineGross - $lineDisc) + $lineTax, 2);
 
                 $saleItem = SaleItem::create([
                     'sale_id'            => $sale->id,
@@ -1729,35 +1843,16 @@ class QuotationController extends Controller
                     'variant_name'       => $item->variant_name,
                     'unit_price'         => $unitPrice,
                     'quantity'           => $qty,
-                    'tax'                => (float)$item->tax,
-                    'discount'           => (float)$item->discount,
+                    'tax'                => $lineTax,
+                    'discount'           => $lineDisc,
                     'subtotal'           => $lineSubtotal,
                     'base_unit_cost'     => 0,
                     'total_cogs'         => 0,
                 ]);
 
-                // Reduce inventory stock + FIFO tracking for completed sale
+                // FIFO Cost Depletion + Stock Deduction (run FIFO first so StockMovement records authoritative unitCost)
                 if ($product) {
-                    $unitService->applyStock(
-                        product: $product,
-                        warehouseId: $warehouseId,
-                        variantId: $item->product_variant_id,
-                        baseQuantity: $baseQty,
-                        direction: 'out',
-                        movementType: 'sale',
-                        referenceType: 'sale',
-                        referenceId: (string)$sale->id,
-                        note: 'Converted from Quotation ' . $quotation->reference_no,
-                        notifyRestock: true,
-                        allowOverdraft: false,
-                        syncAggregates: false
-                    );
-                    $touchedProductIds[] = $product->id;
-                    if ($item->product_variant_id) {
-                        $touchedVariantIds[] = (int)$item->product_variant_id;
-                    }
-
-                    // FIFO Cost Depletion (Calculates COGS for P&L with variant cost_price and purchase_price fallbacks)
+                    $movementUnitCost = null;
                     if ($warehouseId && $baseQty > 0) {
                         $fallbackCost = 0.0;
                         if ($item->product_variant_id && $product->relationLoaded('variants')) {
@@ -1784,6 +1879,30 @@ class QuotationController extends Controller
                             'total_cogs'     => $depletion['total_cogs'],
                         ]);
                         $totalSaleCogs += (float)$depletion['total_cogs'];
+                        if ((float)$depletion['avg_unit_cost'] > 0) {
+                            $movementUnitCost = (float)$depletion['avg_unit_cost'];
+                        }
+                    }
+
+                    $unitService->applyStock(
+                        product: $product,
+                        warehouseId: $warehouseId,
+                        variantId: $item->product_variant_id,
+                        baseQuantity: $baseQty,
+                        direction: 'out',
+                        movementType: 'sale',
+                        referenceType: 'sale',
+                        referenceId: (string)$sale->id,
+                        note: 'Converted from Quotation ' . $quotation->reference_no,
+                        notifyRestock: true,
+                        allowOverdraft: false,
+                        syncAggregates: false,
+                        unitCost: $movementUnitCost,
+                        movementDate: $sale->date
+                    );
+                    $touchedProductIds[] = $product->id;
+                    if ($item->product_variant_id) {
+                        $touchedVariantIds[] = (int)$item->product_variant_id;
                     }
                 }
             }
@@ -1799,7 +1918,8 @@ class QuotationController extends Controller
             }
 
             // Record Sale Payment transaction(s) — allocate non-cash legs before cash so cash excess never displaces card/digital tenders
-            $cashAddedToRegister = 0.0;
+            $cashAddedByRegister = [];
+            $payStamp = now()->format('YmdHis');
             if ($hasPaymentsArray) {
                 $runningRemainingDue = (float) $grandTotal;
                 $nonCashIndices = [];
@@ -1822,8 +1942,11 @@ class QuotationController extends Controller
                     $netAmount = min($runningRemainingDue, $rawAmount);
                     $runningRemainingDue = max(0.0, round($runningRemainingDue - $netAmount, 2));
                     $pType = (string) ($p['payment_type'] ?? $paymentType);
-                    $recAmt = isset($p['received_amount']) ? max($netAmount, (float) $p['received_amount']) : $rawAmount;
-                    $chgAmt = max(0.0, round($recAmt - $netAmount, 2));
+                    $isCashLeg = $purchaseAccounting->isCashPaymentType($pType);
+                    $recAmt = $isCashLeg && isset($p['received_amount'])
+                        ? max($netAmount, (float) $p['received_amount'])
+                        : ($isCashLeg ? $rawAmount : $netAmount);
+                    $chgAmt = $isCashLeg ? max(0.0, round($recAmt - $netAmount, 2)) : 0.0;
                     if ($netAmount <= 0 && count($paymentsInput) > 1 && $chgAmt <= 0.001) {
                         continue;
                     }
@@ -1841,12 +1964,12 @@ class QuotationController extends Controller
                     $lineIsCash = $purchaseAccounting->isCashPaymentType($line['payment_type']);
                     $lineRegId = !empty($p['cash_register_id'])
                         ? (int)$p['cash_register_id']
-                        : ($lineIsCash ? $cashRegisterId : null);
+                        : $cashRegisterId;
                     SalePayment::create([
                         'sale_id'          => $sale->id,
                         'cash_register_id' => $lineRegId,
-                        'reference_no'     => 'PAY-' . date('YmdHis') . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT) . '-' . ($idx + 1),
-                        'payment_date'     => $p['payment_date'] ?? $sale->date,
+                        'reference_no'     => 'PAY-' . $payStamp . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT) . '-' . ($idx + 1),
+                        'payment_date'     => !empty($p['payment_date']) ? $purchaseAccounting->normalizeTransactionDate($p['payment_date'], $sale->date) : $sale->date,
                         'payment_type'     => $line['payment_type'],
                         'amount'           => $line['amount'],
                         'received_amount'  => $line['received_amount'],
@@ -1858,21 +1981,21 @@ class QuotationController extends Controller
                         'user_role'        => $currentUserRole,
                     ]);
 
-                    if ($lineIsCash) {
-                        $cashAddedToRegister += $line['amount'];
+                    if ($lineIsCash && $line['amount'] > 0.001 && $lineRegId) {
+                        $cashAddedByRegister[$lineRegId] = round(($cashAddedByRegister[$lineRegId] ?? 0.0) + $line['amount'], 2);
                     }
                 }
             } elseif ($paidAmount > 0) {
                 $singleIsCash = $purchaseAccounting->isCashPaymentType($paymentType);
                 SalePayment::create([
                     'sale_id'          => $sale->id,
-                    'cash_register_id' => $singleIsCash ? $cashRegisterId : null,
-                    'reference_no'     => 'PAY-' . date('YmdHis') . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT),
+                    'cash_register_id' => $cashRegisterId,
+                    'reference_no'     => 'PAY-' . $payStamp . '-' . str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT),
                     'payment_date'     => $sale->date,
                     'payment_type'     => $paymentType,
                     'amount'           => $paidAmount,
-                    'received_amount'  => $receivedAmount,
-                    'change_amount'    => $changeAmount,
+                    'received_amount'  => $singleIsCash ? $receivedAmount : $paidAmount,
+                    'change_amount'    => $singleIsCash ? $changeAmount : 0.0,
                     'notes'            => 'Quotation conversion: ' . $quotation->reference_no,
                     'created_by'       => $currentUserName,
                     'user_id'          => $currentUserId,
@@ -1880,16 +2003,22 @@ class QuotationController extends Controller
                     'user_role'        => $currentUserRole,
                 ]);
 
-                if ($singleIsCash) {
-                    $cashAddedToRegister += $paidAmount;
+                if ($singleIsCash && $paidAmount > 0.001 && $cashRegisterId) {
+                    $cashAddedByRegister[$cashRegisterId] = round(($cashAddedByRegister[$cashRegisterId] ?? 0.0) + $paidAmount, 2);
                 }
             }
 
-            // Increment Cash Register strictly by net Cash tender received (never inflated by change or non-cash tenders)
-            if ($cashAddedToRegister > 0.001 && $cashRegisterId) {
-                $register = CashRegister::where('id', $cashRegisterId)->lockForUpdate()->first();
-                if ($register && in_array(strtolower(trim((string) $register->status)), ['open', 'opened'], true)) {
-                    $register->increment('expected_cash', round($cashAddedToRegister, 2));
+            // Increment each distinct Cash Register strictly by its own net Cash tender received (ordered by ID to avoid deadlocks)
+            if (!empty($cashAddedByRegister)) {
+                ksort($cashAddedByRegister);
+                foreach ($cashAddedByRegister as $targetRegId => $cashAmt) {
+                    if ($cashAmt <= 0.001) {
+                        continue;
+                    }
+                    $register = CashRegister::where('id', (int)$targetRegId)->lockForUpdate()->first();
+                    if ($register && in_array(strtolower(trim((string) $register->status)), ['open', 'opened'], true)) {
+                        $register->increment('expected_cash', round($cashAmt, 2));
+                    }
                 }
             }
 

@@ -814,7 +814,7 @@ class PurchaseReturnController extends Controller
                   ->orWhere('purchase_reference_no', $altUnderscore);
             })
             ->when($ignoreReturnId !== null, fn($q) => $q->where('id', '!=', $ignoreReturnId))
-            ->whereIn('status', ['Completed', 'Received'])
+            ->whereIn('status', ['Completed', 'Received', 'Pending'])
             ->lockForUpdate()
             ->get();
 
@@ -905,9 +905,11 @@ class PurchaseReturnController extends Controller
 
         // 4. Verify every item was purchased on this PO and does not exceed remaining quantity
         foreach ($incomingBaseTotals as $key => $incomingQty) {
+            $isSimpleItemKey = str_ends_with((string)$key, '_0');
             $purchasedQty = $purchasedBaseTotals[$key] ?? 0.0;
             $code = $incomingCodes[$key] ?? null;
-            if ($purchasedQty <= 0.0001 && $code && isset($purchasedByCode[$code])) {
+            // Only use product_code fallback for non-variant (simple) items so same-code variants stay strictly isolated
+            if ($isSimpleItemKey && $purchasedQty <= 0.0001 && $code && isset($purchasedByCode[$code])) {
                 $purchasedQty = $purchasedByCode[$code];
             }
             $pName = $productNames[$key] ?? 'Item';
@@ -917,7 +919,7 @@ class PurchaseReturnController extends Controller
             }
 
             $alreadyReturned = $alreadyReturnedBaseTotals[$key] ?? 0.0;
-            if ($alreadyReturned <= 0.0001 && $code && isset($alreadyReturnedByCode[$code])) {
+            if ($isSimpleItemKey && $alreadyReturned <= 0.0001 && $code && isset($alreadyReturnedByCode[$code])) {
                 $alreadyReturned = $alreadyReturnedByCode[$code];
             }
             $remaining = max(0.0, $purchasedQty - $alreadyReturned);
@@ -1904,9 +1906,9 @@ class PurchaseReturnController extends Controller
             } else {
                 $effectivePayType = $validated['payment_type'] ?? 'Cash';
             }
-            if (!empty($validated['payments']) && is_array($validated['payments'])) {
+            if (!empty($financialValidated['payments']) && is_array($financialValidated['payments'])) {
                 $nonCreditLegs = array_values(array_filter(
-                    $validated['payments'],
+                    $financialValidated['payments'],
                     fn($p) => is_array($p) && !$this->isCreditNoteType((string)($p['payment_type'] ?? ''))
                 ));
                 if (!empty($nonCreditLegs)) {
@@ -1915,12 +1917,12 @@ class PurchaseReturnController extends Controller
                         return response()->json(['status' => 'error', 'message' => $splitRegErr], 422);
                     }
                 }
-                $cashTypes = collect($validated['payments'])
+                $cashTypes = collect($financialValidated['payments'])
                     ->filter(fn($p) => !$this->isCreditNoteType($p['payment_type'] ?? null) && (float)($p['amount'] ?? 0) > 0)
                     ->pluck('payment_type')
                     ->filter()
                     ->unique();
-                $allTypes = collect($validated['payments'])->pluck('payment_type')->filter()->unique();
+                $allTypes = collect($financialValidated['payments'])->pluck('payment_type')->filter()->unique();
                 if ($paidAmount > 0.001 && $cashTypes->isNotEmpty()) {
                     $effectivePayType = $cashTypes->count() > 1 ? 'Split Payment' : (string)$cashTypes->first();
                 } elseif ($allTypes->count() === 1) {
@@ -1928,10 +1930,10 @@ class PurchaseReturnController extends Controller
                 }
             }
 
-            $probePayType = (!empty($validated['payments']) && is_array($validated['payments']))
-                ? (collect($validated['payments'])->contains(fn($p) => !$this->isCreditNoteType($p['payment_type'] ?? null) && $accounting->isCashPaymentType($p['payment_type'] ?? null))
+            $probePayType = (!empty($financialValidated['payments']) && is_array($financialValidated['payments']))
+                ? (collect($financialValidated['payments'])->contains(fn($p) => !$this->isCreditNoteType($p['payment_type'] ?? null) && $accounting->isCashPaymentType($p['payment_type'] ?? null))
                     ? 'Cash'
-                    : (string)($validated['payments'][0]['payment_type'] ?? 'Bank Transfer'))
+                    : (string)($financialValidated['payments'][0]['payment_type'] ?? 'Bank Transfer'))
                 : $effectivePayType;
 
             $explicitRegisterId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
@@ -2281,9 +2283,9 @@ class PurchaseReturnController extends Controller
             $cashRegisterId = null;
             $newCashRegisterId = null;
             if ($isPostedNewStatus) {
-                if (!empty($validated['payments']) && is_array($validated['payments'])) {
+                if (!empty($financialValidated['payments']) && is_array($financialValidated['payments'])) {
                     $nonCreditLegs = array_values(array_filter(
-                        $validated['payments'],
+                        $financialValidated['payments'],
                         fn($p) => is_array($p) && !$this->isCreditNoteType((string)($p['payment_type'] ?? ''))
                     ));
                     if (!empty($nonCreditLegs)) {
@@ -2298,12 +2300,24 @@ class PurchaseReturnController extends Controller
                     }
                 }
 
-                $explicitRegisterId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
-                $probePayType = (!empty($validated['payments']) && is_array($validated['payments']))
-                    ? (collect($validated['payments'])->contains(fn($p) => !$this->isCreditNoteType($p['payment_type'] ?? null) && $accounting->isCashPaymentType($p['payment_type'] ?? null))
+                $existingHeaderRegOpen = false;
+                if (!empty($return->cash_register_id) && \Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
+                    $existingReg = \App\Models\CashRegister::find((int)$return->cash_register_id);
+                    $existingHeaderRegOpen = $existingReg && in_array(strtolower((string)$existingReg->status), ['open', 'opened'], true);
+                }
+
+                $rawExplicitRegId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+                $isEchoedClosedHeader = $rawExplicitRegId !== null
+                    && !empty($return->cash_register_id)
+                    && $rawExplicitRegId === (int)$return->cash_register_id
+                    && !$existingHeaderRegOpen;
+                $explicitRegisterId = $isEchoedClosedHeader ? null : $rawExplicitRegId;
+
+                $probePayType = (!empty($financialValidated['payments']) && is_array($financialValidated['payments']))
+                    ? (collect($financialValidated['payments'])->contains(fn($p) => !$this->isCreditNoteType($p['payment_type'] ?? null) && $accounting->isCashPaymentType($p['payment_type'] ?? null))
                         ? 'Cash'
-                        : (string)($validated['payments'][0]['payment_type'] ?? 'Bank Transfer'))
-                    : ($validated['payment_type'] ?? $return->payment_type);
+                        : (string)($financialValidated['payments'][0]['payment_type'] ?? 'Bank Transfer'))
+                    : ($financialValidated['payment_type'] ?? $return->payment_type);
                 $registerCheck = $accounting->resolveCashRegisterId(
                     $explicitRegisterId,
                     $actor['user'],
@@ -2314,12 +2328,6 @@ class PurchaseReturnController extends Controller
                 if ($registerCheck['error']) {
                     DB::rollBack();
                     return response()->json(['status' => 'error', 'message' => $registerCheck['error']], 422);
-                }
-
-                $existingHeaderRegOpen = false;
-                if (!empty($return->cash_register_id) && \Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
-                    $existingReg = \App\Models\CashRegister::find((int)$return->cash_register_id);
-                    $existingHeaderRegOpen = $existingReg && strtolower((string)$existingReg->status) === 'open';
                 }
 
                 if ($explicitRegisterId !== null) {
@@ -2406,6 +2414,7 @@ class PurchaseReturnController extends Controller
                 || $newStatus !== 'Completed'
                 || (int)$oldWarehouseIdForDiff !== (int)$newWarehouseId
                 || trim((string)$newPurchaseRef) !== $oldPurchaseRefForDiff
+                || trim((string)$txDate) !== trim((string)$return->date)
                 || $oldItemsSig !== $newItemsSig;
 
             $ledgerAffectingChanged = !$oldWasCompleted
@@ -2718,7 +2727,7 @@ class PurchaseReturnController extends Controller
                 ];
             }
 
-            // Prevent overpayment
+            // Prevent overpayment (strictly clamp any <= 0.01 rounding tolerance so paid_amount <= grand_total always holds)
             if ($totalIncomingPayment > $priorDue + 0.01) {
                 DB::rollBack();
                 return response()->json([
@@ -2726,8 +2735,15 @@ class PurchaseReturnController extends Controller
                     'message' => "Payment amount ({$totalIncomingPayment}) cannot exceed due balance ({$priorDue}).",
                 ], 422);
             }
+            if ($totalIncomingPayment > $priorDue && !empty($updatedPayments)) {
+                $excess = round($totalIncomingPayment - $priorDue, 2);
+                $lastIdx = count($updatedPayments) - 1;
+                $updatedPayments[$lastIdx]['amount'] = max(0.0, round((float)$updatedPayments[$lastIdx]['amount'] - $excess, 2));
+                $updatedPayments[$lastIdx]['received_amount'] = $updatedPayments[$lastIdx]['amount'];
+                $totalIncomingPayment = $priorDue;
+            }
 
-            $newPaid = round((float)collect($updatedPayments)->sum('amount'), 2);
+            $newPaid = min(round((float)$return->grand_total, 2), round((float)collect($updatedPayments)->sum('amount'), 2));
             $newDue = round(max(0.0, (float)$return->grand_total - $newPaid), 2);
             $newStatus = $accounting->deriveReturnPaymentStatus((float)$return->grand_total, $newPaid, $newDue);
 

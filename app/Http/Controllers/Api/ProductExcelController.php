@@ -84,9 +84,11 @@ class ProductExcelController extends Controller
 
         // 2. Comprehensive Pre-Validation Phase (Zero DB Writes)
         $errors = [];
-        $seenCodesInFile = []; // code => row_number
+        $seenCodesInFile = []; // code => ['row' => row_number, 'is_variation' => bool]
+        $seenVariantCodesInFile = []; // var_code => row_number
         $parsedItems = [];
         $allCodes = [];
+        $allVariantCodes = [];
 
         foreach ($rows as $index => $row) {
             $rowNumber = $index + 2; // 1-indexed Excel row (row 1 is header)
@@ -100,6 +102,7 @@ class ProductExcelController extends Controller
             $code = $cleanBarcode($row[$headerMap['code']] ?? '');
             $name = trim((string)($row[$headerMap['name']] ?? ''));
             $type = isset($headerMap['type']) ? trim((string)($row[$headerMap['type']] ?? 'Single')) : 'Single';
+            $isVariation = in_array(strtolower($type), ['variation', 'variable'], true);
             $altName = isset($headerMap['alt_name']) ? trim((string)($row[$headerMap['alt_name']] ?? '')) : null;
             $category = isset($headerMap['category']) ? trim((string)($row[$headerMap['category']] ?? 'General')) : 'General';
             $brand = isset($headerMap['brand']) ? trim((string)($row[$headerMap['brand']] ?? 'Generic')) : 'Generic';
@@ -131,17 +134,37 @@ class ProductExcelController extends Controller
                 ];
             } else {
                 // Validation Rule 2: In-File Duplicate Code Check
+                // Allow shared parent Product Code across multiple Variation rows of the same variable product.
                 if (isset($seenCodesInFile[$code])) {
-                    $firstRow = $seenCodesInFile[$code];
+                    $firstEntry = $seenCodesInFile[$code];
+                    if (!$isVariation || !$firstEntry['is_variation']) {
+                        $firstRow = $firstEntry['row'];
+                        $errors[] = [
+                            'row' => $rowNumber,
+                            'code' => $code,
+                            'field' => 'Product Code',
+                            'message' => "Row {$rowNumber}: Duplicate Product Code \"{$code}\" found in Excel (already declared at Row {$firstRow}).",
+                        ];
+                    }
+                } else {
+                    $seenCodesInFile[$code] = ['row' => $rowNumber, 'is_variation' => $isVariation];
+                    $allCodes[] = $code;
+                }
+            }
+
+            if ($isVariation && $varCode !== '') {
+                $vKey = strtolower($varCode);
+                if (isset($seenVariantCodesInFile[$vKey])) {
+                    $firstRow = $seenVariantCodesInFile[$vKey];
                     $errors[] = [
                         'row' => $rowNumber,
-                        'code' => $code,
-                        'field' => 'Product Code',
-                        'message' => "Row {$rowNumber}: Duplicate Product Code \"{$code}\" found in Excel (already declared at Row {$firstRow}).",
+                        'code' => $varCode,
+                        'field' => 'Variation Code',
+                        'message' => "Row {$rowNumber}: Duplicate Variation Code \"{$varCode}\" found in Excel (already declared at Row {$firstRow}).",
                     ];
                 } else {
-                    $seenCodesInFile[$code] = $rowNumber;
-                    $allCodes[] = $code;
+                    $seenVariantCodesInFile[$vKey] = $rowNumber;
+                    $allVariantCodes[] = $varCode;
                 }
             }
 
@@ -240,29 +263,44 @@ class ProductExcelController extends Controller
         }
 
         // Validation Rule 9: Database Duplicate Code Check
-        if (!empty($allCodes)) {
-            $existingDbCodes = Product::whereIn('code', $allCodes)
-                ->orWhereIn('sku', $allCodes)
+        $allCodesToCheck = array_values(array_unique(array_merge($allCodes, $allVariantCodes)));
+        if (!empty($allCodesToCheck)) {
+            $existingDbCodes = Product::whereIn('code', $allCodesToCheck)
+                ->orWhereIn('sku', $allCodesToCheck)
                 ->pluck('code')
                 ->map(fn($c) => trim(strtolower($c)))
                 ->flip()
                 ->toArray();
 
-            $existingVariantSkus = ProductVariant::whereIn('sku', $allCodes)
-                ->orWhereIn('barcode', $allCodes)
+            $existingVariantSkus = ProductVariant::whereIn('sku', $allCodesToCheck)
+                ->orWhereIn('barcode', $allCodesToCheck)
                 ->pluck('sku')
                 ->map(fn($c) => trim(strtolower($c)))
                 ->flip()
                 ->toArray();
 
+            $reportedParentDupes = [];
             foreach ($parsedItems as $item) {
                 $cLower = strtolower($item['code']);
-                if (isset($existingDbCodes[$cLower]) || isset($existingVariantSkus[$cLower])) {
+                if (!isset($reportedParentDupes[$cLower]) && (isset($existingDbCodes[$cLower]) || isset($existingVariantSkus[$cLower]))) {
+                    $reportedParentDupes[$cLower] = true;
                     $errors[] = [
                         'row' => $item['row'],
                         'code' => $item['code'],
                         'field' => 'Product Code',
                         'message' => "Row {$item['row']}: Product Code \"{$item['code']}\" already exists in the database.",
+                    ];
+                }
+                $isVarRow = in_array(strtolower((string)($item['type'] ?? 'Single')), ['variation', 'variable'], true);
+                $vCodeLower = strtolower(trim((string)($item['var_code'] ?? '')));
+                if ($isVarRow && $vCodeLower !== '' && $vCodeLower !== $cLower
+                    && (isset($existingDbCodes[$vCodeLower]) || isset($existingVariantSkus[$vCodeLower]))
+                ) {
+                    $errors[] = [
+                        'row' => $item['row'],
+                        'code' => $item['var_code'],
+                        'field' => 'Variation Code',
+                        'message' => "Row {$item['row']}: Variation Code \"{$item['var_code']}\" already exists in the database.",
                     ];
                 }
             }
@@ -303,8 +341,28 @@ class ProductExcelController extends Controller
                     return [strtolower(trim($name)) => $id];
                 })->toArray();
 
+                // Group Variation rows by parent Product Code (including single-row Variation products)
+                $groupedPayloads = [];
+                $variationGroupsByCode = [];
                 foreach ($parsedItems as $item) {
+                    $isVar = in_array(strtolower((string)($item['type'] ?? 'Single')), ['variation', 'variable'], true);
+                    if (!$isVar) {
+                        $groupedPayloads[] = ['is_variation' => false, 'rows' => [$item]];
+                    } else {
+                        $codeKey = strtolower($item['code']);
+                        if (!isset($variationGroupsByCode[$codeKey])) {
+                            $variationGroupsByCode[$codeKey] = count($groupedPayloads);
+                            $groupedPayloads[] = ['is_variation' => true, 'rows' => []];
+                        }
+                        $groupedPayloads[$variationGroupsByCode[$codeKey]]['rows'][] = $item;
+                    }
+                }
+
+                foreach ($groupedPayloads as $group) {
+                    $firstRow = $group['rows'][0];
+                    $item = $firstRow;
                     $item['warehouse_id'] = $warehouseId;
+
                     // Resolve category
                     $catLower = strtolower($item['category_name']);
                     if (!isset($categoriesCache[$catLower])) {
@@ -334,6 +392,66 @@ class ProductExcelController extends Controller
                         $item['purchase_unit_links'],
                         $item['sale_unit_links']
                     );
+
+                    if ($group['is_variation']) {
+                        $item['has_variants'] = true;
+                        $item['stock_quantity'] = 0;
+                        $variants = [];
+                        $openingStocks = [];
+                        foreach ($group['rows'] as $vIdx => $vRow) {
+                            $attrName = trim((string)($vRow['var_name'] ?? ''));
+                            $attrVal = trim((string)($vRow['var_type'] ?? ''));
+                            if ($attrName !== '' && $attrVal !== '') {
+                                $vDisplayName = "{$attrName} - {$attrVal}";
+                            } elseif ($attrVal !== '') {
+                                $vDisplayName = $attrVal;
+                            } elseif ($attrName !== '') {
+                                $vDisplayName = $attrName;
+                            } else {
+                                $vDisplayName = 'Variant ' . ($vIdx + 1);
+                            }
+
+                            $vSku = trim((string)($vRow['var_code'] ?? ''));
+                            if ($vSku === '' || strcasecmp($vSku, (string)$item['code']) === 0) {
+                                $vSku = $item['code'] . '-' . ($vIdx + 1);
+                            }
+
+                            $variants[] = [
+                                'name' => $vDisplayName,
+                                'sku' => $vSku,
+                                'barcode' => $vSku,
+                                'cost_price' => (float)$vRow['cost_price'],
+                                'selling_price' => (float)$vRow['selling_price'],
+                                'retail_prices' => (float)$vRow['selling_price'] > 0 ? [(float)$vRow['selling_price']] : [],
+                                'wholesale_price' => (float)$vRow['wholesale_price'],
+                                'wholesale_prices' => (float)$vRow['wholesale_price'] > 0 ? [(float)$vRow['wholesale_price']] : [],
+                                'is_active' => (bool)$vRow['is_active'],
+                                'sort_order' => $vIdx,
+                                'attribute_values' => [
+                                    [
+                                        'attribute_name' => $attrName !== '' ? $attrName : 'Variation',
+                                        'attribute_value' => $attrVal !== '' ? $attrVal : $vDisplayName,
+                                    ],
+                                ],
+                            ];
+
+                            if ((float)$vRow['stock_quantity'] > 0) {
+                                $openingStocks[] = [
+                                    'warehouse_id' => $warehouseId,
+                                    'variant_sku' => $vSku,
+                                    'quantity' => (float)$vRow['stock_quantity'],
+                                    'unit_type' => 'base',
+                                ];
+                            }
+                        }
+                        $item['variants'] = $variants;
+                        if (!empty($openingStocks)) {
+                            $item['opening_stocks'] = $openingStocks;
+                        }
+                    } else {
+                        $item['has_variants'] = false;
+                        $item['stock_unit_type'] = 'base';
+                    }
 
                     $createService->create($item);
                     $importedCount++;

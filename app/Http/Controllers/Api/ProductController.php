@@ -356,9 +356,10 @@ class ProductController extends Controller
             ? (int)$warehouseParam
             : null;
 
+        $appTz = (string) config('app.timezone', 'UTC');
         $sinceParam = $request->input('updated_since') ?? $request->input('since');
         $cursorParam = trim((string)$request->input('cursor', ''));
-        $limit = max(1, min((int)($request->input('limit', 1000)), 5000));
+        $limit = max(1, min((int)($request->input('limit', 500)), 5000));
         $singleWarehouseOnly = $request->boolean('single_warehouse_only', false);
 
         $query = Product::query()
@@ -401,12 +402,23 @@ class ProductController extends Controller
         $deletedIds = [];
         if (!empty($sinceParam)) {
             try {
-                $since = Carbon::parse($sinceParam);
-                $query->where(function ($q) use ($since) {
-                    $q->where('updated_at', '>=', $since)
-                      ->orWhereHas('variants', function ($vq) use ($since) {
-                          $vq->where('updated_at', '>=', $since);
-                      });
+                // Normalize incoming ISO-8601 timestamps (e.g. Dart UTC "...Z" or "+06:30")
+                // into the database/app timezone so DATETIME comparisons stay exact.
+                $since = Carbon::parse($sinceParam)->setTimezone($appTz);
+
+                // Pre-resolve changed variant parents via idx_pvar_updated_prod instead of
+                // correlated OR EXISTS (orWhereHas), which forced full table scans on products.
+                $variantProductIds = ProductVariant::query()
+                    ->where('updated_at', '>=', $since)
+                    ->distinct()
+                    ->pluck('product_id')
+                    ->all();
+
+                $query->where(function ($q) use ($since, $variantProductIds) {
+                    $q->where('updated_at', '>=', $since);
+                    if (!empty($variantProductIds)) {
+                        $q->orWhereIn('id', $variantProductIds);
+                    }
                 });
 
                 if ($cursorParam === '') {
@@ -424,7 +436,7 @@ class ProductController extends Controller
             $decodedCursor = json_decode(base64_decode($cursorParam, true) ?: '', true);
             if (is_array($decodedCursor) && !empty($decodedCursor['u']) && isset($decodedCursor['i'])) {
                 try {
-                    $cUpdated = Carbon::parse((string)$decodedCursor['u']);
+                    $cUpdated = Carbon::parse((string)$decodedCursor['u'])->setTimezone($appTz);
                     $cId = (int)$decodedCursor['i'];
                     $query->where(function ($q) use ($cUpdated, $cId) {
                         $q->where('updated_at', '>', $cUpdated)
@@ -1205,24 +1217,37 @@ class ProductController extends Controller
 
     public function destroy($id)
     {
-        $product = Product::find($id);
+        $product = Product::withCount([
+            'saleItems',
+            'purchaseItems',
+            'stockAdjustmentItems',
+            'stockTransferItems',
+            'inventoryBatches',
+        ])->find($id);
 
         if (!$product) {
             return response()->json(['success' => false, 'status' => 'error', 'message' => 'Product not found'], 404);
         }
 
-        // 🔒 Senior Accountant Safeguard: Protect inventory capital and audit trails
-        $stockQty = (float)($product->stock_quantity ?? 0);
+        // 🔒 Senior Accountant Safeguard: Protect inventory capital, in-transit goods, and audit trails
+        $stockQty = max(
+            (float)($product->stock_quantity ?? 0),
+            (float)\App\Models\StockBalance::where('product_id', $product->id)->sum('quantity')
+        );
         $totalDependencies = (int)$product->total_dependencies;
+        $hasInTransit = \App\Models\StockTransferItem::where('product_id', $product->id)
+            ->whereHas('transfer', fn ($q) => $q->whereIn('status', ['Sent', 'In Transit']))
+            ->exists();
 
-        if ($stockQty > 0 || $totalDependencies > 0) {
+        if ($stockQty > 0.0001 || $totalDependencies > 0 || $hasInTransit) {
             return response()->json([
                 'success' => false,
                 'status' => 'error',
-                'message' => 'Product cannot be deleted because it has active inventory on hand or is linked to historical sales/purchases/adjustments. Internal accounting controls require preserving inventory ledger history. Please deactivate the product instead.',
+                'message' => 'Product cannot be deleted because it has active inventory on hand, in-transit stock, or is linked to historical sales/purchases/adjustments/transfers. Internal accounting controls require preserving inventory ledger history. Please deactivate the product instead.',
                 'data' => [
                     'stock_quantity' => $stockQty,
                     'total_dependencies' => $totalDependencies,
+                    'has_in_transit' => $hasInTransit,
                 ],
             ], 422);
         }

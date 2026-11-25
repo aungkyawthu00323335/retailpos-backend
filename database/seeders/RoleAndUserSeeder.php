@@ -52,9 +52,6 @@ class RoleAndUserSeeder extends Seeder
             'expenses.view', 'expenses.create', 'expenses.update', 'expenses.delete', 'expenses.pay', 'expenses.export',
             'expense_categories.view', 'expense_categories.create', 'expense_categories.update', 'expense_categories.delete',
 
-            // 9. Processing
-            'processings.view', 'processings.create', 'processings.update', 'processings.delete', 'processings.export',
-
             // 10. Peoples
             'customers.view', 'customers.create', 'customers.update', 'customers.delete', 'customers.export', 'customers.import',
             'customer_groups.view', 'customer_groups.create', 'customer_groups.update', 'customer_groups.delete',
@@ -145,7 +142,6 @@ class RoleAndUserSeeder extends Seeder
             'transfers.view', 'transfers.create', 'transfers.update', 'transfers.delete', 'transfers.receive', 'transfers.pay', 'transfers.export',
             'expenses.view', 'expenses.create', 'expenses.update', 'expenses.pay', 'expenses.export',
             'expense_categories.view', 'expense_categories.create', 'expense_categories.update',
-            'processings.view', 'processings.create', 'processings.update', 'processings.export',
             'customers.view', 'customers.create', 'customers.update', 'customers.delete', 'customers.export', 'customers.import',
             'customer_groups.view', 'customer_groups.create', 'customer_groups.update', 'customer_groups.delete',
             'suppliers.view', 'suppliers.create', 'suppliers.update', 'suppliers.delete', 'suppliers.export', 'suppliers.import',
@@ -202,7 +198,6 @@ class RoleAndUserSeeder extends Seeder
             'units.view', 'units.create', 'units.update',
             'adjustments.view', 'adjustments.create', 'adjustments.update',
             'transfers.view', 'transfers.create', 'transfers.update', 'transfers.receive',
-            'processings.view', 'processings.create', 'processings.update',
             'purchases.view', 'purchases.create', 'purchases.update',
             'purchase_returns.view', 'purchase_returns.create',
             'suppliers.view', 'suppliers.create', 'suppliers.update',

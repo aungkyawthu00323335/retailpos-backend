@@ -1052,6 +1052,7 @@ class AdjustmentController extends Controller
             'items.*.variant_name' => 'nullable|string',
             'items.*.unit_id' => 'nullable|integer',
             'items.*.unit_name' => 'nullable|string|max:100',
+            'items.*.unit_type' => 'nullable|string|in:base,purchase,sale',
             'items.*.conversion_rate' => 'nullable|numeric|min:0.0001',
             'items.*.quantity' => 'required|numeric|min:0.01',
             'items.*.base_quantity' => 'nullable|numeric|min:0',
@@ -1299,6 +1300,20 @@ class AdjustmentController extends Controller
 
                 $resolvedVariantId = $itemData['product_variant_id'] ?? null;
                 $prod = $resolvedProductId ? ($preloadedProducts->get($resolvedProductId) ?? Product::find($resolvedProductId)) : null;
+                if (!$prod) {
+                    $codeLabel = trim((string)($itemData['product_code'] ?? ''));
+                    $nameLabel = trim((string)($itemData['product_name'] ?? 'Unknown'));
+                    $msg = "Cannot record stock adjustment: product '{$nameLabel}'" . ($codeLabel !== '' ? " ({$codeLabel})" : '') . " does not exist in catalog.";
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: \Illuminate\Support\Facades\Validator::make([], []),
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['items' => [$msg]],
+                        ], 422)
+                    );
+                }
+                $resolvedProductId = (int)$prod->id;
                 $conversionRate = $this->resolveItemConversionRate($itemData, $prod, $resolvedVariantId);
                 $quantity = (float)$itemData['quantity'];
                 $unitCost = (float)($itemData['unit_cost'] ?? 0);
@@ -1352,7 +1367,8 @@ class AdjustmentController extends Controller
                         baseQty: (float)$baseQty,
                         referenceNo: (string)$refNo,
                         fallbackCost: (float)$baseCost,
-                        recordedLayers: $recordedLayers
+                        recordedLayers: $recordedLayers,
+                        adjustmentDate: (string)$adjustment->date
                     );
                     $finalSubtotal = $actualLossCost;
                     $finalBaseCost = $baseQty > 0 ? round($actualLossCost / $baseQty, 8) : $baseCost;
@@ -1540,6 +1556,7 @@ class AdjustmentController extends Controller
             'items.*.variant_name' => 'nullable|string',
             'items.*.unit_id' => 'nullable|integer',
             'items.*.unit_name' => 'nullable|string|max:100',
+            'items.*.unit_type' => 'nullable|string|in:base,purchase,sale',
             'items.*.conversion_rate' => 'nullable|numeric|min:0.0001',
             'items.*.quantity' => 'required|numeric|min:0.01',
             'items.*.base_quantity' => 'nullable|numeric|min:0',
@@ -1809,6 +1826,20 @@ class AdjustmentController extends Controller
                 }
                 $resolvedVariantId = $itemData['product_variant_id'] ?? null;
                 $prod = $resolvedProductId ? ($preloadedProducts->get($resolvedProductId) ?? Product::find($resolvedProductId)) : null;
+                if (!$prod) {
+                    $codeLabel = trim((string)($itemData['product_code'] ?? ''));
+                    $nameLabel = trim((string)($itemData['product_name'] ?? 'Unknown'));
+                    $msg = "Cannot record stock adjustment: product '{$nameLabel}'" . ($codeLabel !== '' ? " ({$codeLabel})" : '') . " does not exist in catalog.";
+                    throw new \Illuminate\Validation\ValidationException(
+                        validator: \Illuminate\Support\Facades\Validator::make([], []),
+                        response: response()->json([
+                            'status' => 'error',
+                            'message' => $msg,
+                            'errors' => ['items' => [$msg]],
+                        ], 422)
+                    );
+                }
+                $resolvedProductId = (int)$prod->id;
                 $conversionRate = $this->resolveItemConversionRate($itemData, $prod, $resolvedVariantId);
                 $quantity = (float)$itemData['quantity'];
                 $baseQty = $this->computeAuthoritativeBaseQuantity($quantity, $conversionRate);
@@ -1909,6 +1940,20 @@ class AdjustmentController extends Controller
                 return $a['item_type'] === 'Addition' ? -1 : 1;
             });
 
+            // Normalize incoming transaction date upfront (handles ISO8601 UTC -> store timezone) so consumed Addition batches cannot have their received_date moved across dates
+            $rawDateInput = trim((string)($validated['date'] ?? ''));
+            if ($rawDateInput !== '' && !str_contains($rawDateInput, ':') && !str_contains($rawDateInput, 'T') && $adjustment->date && str_contains((string)$adjustment->date, ':')) {
+                $parts = preg_split('/[T ]/', (string)$adjustment->date);
+                $timePart = end($parts);
+                if (is_string($timePart) && str_contains($timePart, ':')) {
+                    $rawDateInput .= ' ' . $timePart;
+                }
+            }
+            $txDate = app(\App\Services\PurchaseAccountingService::class)->normalizeTransactionDate($rawDateInput, (string)$adjustment->date);
+            $oldDateDay = substr((string)$adjustment->date, 0, 10);
+            $newDateDay = substr((string)$txDate, 0, 10);
+            $adjDateChanged = $rawDateInput !== '' && $newDateDay !== $oldDateDay;
+
             // Claim old Addition batches onto incoming Addition items and validate FIFO invariants
             $claimedOldItemIds = [];
             $retainedBatchIds = [];
@@ -1953,6 +1998,13 @@ class AdjustmentController extends Controller
                                 response: response()->json(['status' => 'error', 'message' => $msg, 'errors' => ['warehouse' => [$msg]]], 422)
                             );
                         }
+                        if ($adjDateChanged) {
+                            $msg = "FIFO စာရင်းထိန်းချုပ်မှုအရ ရက်စွဲပြောင်း၍မရပါ: '{$pName}' ၏ Addition Batch မှ {$consumed} ခုကို ရောင်းချ/အသုံးပြုပြီးဖြစ်သောကြောင့် FIFO received_date ကို ပြင်ဆင်၍မရပါ။";
+                            throw new \Illuminate\Validation\ValidationException(
+                                validator: \Illuminate\Support\Facades\Validator::make([], []),
+                                response: response()->json(['status' => 'error', 'message' => $msg, 'errors' => ['date' => [$msg]]], 422)
+                            );
+                        }
                         if ($prepItem['base_qty'] < $consumed - 0.0001) {
                             $msg = "FIFO စာရင်းထိန်းချုပ်မှုအရ လျှော့ချ၍မရပါ: '{$pName}' မှ {$consumed} ခုကို ရောင်းချ/အသုံးပြုပြီးဖြစ်သောကြောင့် အနည်းဆုံး {$consumed} ခု ရှိရန်လိုအပ်ပါသည်။";
                             throw new \Illuminate\Validation\ValidationException(
@@ -1960,7 +2012,7 @@ class AdjustmentController extends Controller
                                 response: response()->json(['status' => 'error', 'message' => $msg, 'errors' => ['quantity' => [$msg]]], 422)
                             );
                         }
-                        if ($consumed > 0.0001 && abs($prepItem['base_cost'] - (float)$batch->unit_cost) > 0.01) {
+                        if ($consumed > 0.0001 && abs($prepItem['base_cost'] - (float)$batch->unit_cost) > 0.0001) {
                             $msg = "FIFO စာရင်းထိန်းချုပ်မှုအရ ယူနစ်စျေးပြောင်း၍မရပါ: '{$pName}' မှ {$consumed} ခုကို COGS စာရင်းသွင်းပြီးဖြစ်သောကြောင့် မူလတန်ဖိုးကို ပြင်ဆင်၍မရပါ။";
                             throw new \Illuminate\Validation\ValidationException(
                                 validator: \Illuminate\Support\Facades\Validator::make([], []),
@@ -2034,8 +2086,9 @@ class AdjustmentController extends Controller
             InventoryBatch::where('warehouse_id', $oldWarehouseId)
                 ->where('source_type', 'adjustment_addition')
                 ->where(function ($q) use ($adjustment) {
+                    $escapedAdjRef = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], (string)$adjustment->reference_no);
                     $q->where('source_reference', $adjustment->reference_no)
-                      ->orWhere('source_reference', 'like', "{$adjustment->reference_no}#%");
+                      ->orWhereRaw("source_reference LIKE ? ESCAPE '!'", ["{$escapedAdjRef}#%"]);
                 })
                 ->when(!empty($retainedBatchIds), fn($q) => $q->whereNotIn('id', $retainedBatchIds))
                 ->delete();
@@ -2121,16 +2174,6 @@ class AdjustmentController extends Controller
             } elseif ($hasSubtraction) {
                 $adjType = 'Subtraction';
             }
-
-            $rawDateInput = trim($validated['date']);
-            if (!str_contains($rawDateInput, ':') && !str_contains($rawDateInput, 'T') && $adjustment->date && str_contains((string)$adjustment->date, ':')) {
-                $parts = preg_split('/[T ]/', (string)$adjustment->date);
-                $timePart = end($parts);
-                if (is_string($timePart) && str_contains($timePart, ':')) {
-                    $rawDateInput .= ' ' . $timePart;
-                }
-            }
-            $txDate = app(\App\Services\PurchaseAccountingService::class)->normalizeTransactionDate($rawDateInput, (string)$adjustment->date);
 
             $hasReasonInput = array_key_exists('reason_code', $validated);
             $effectiveReasonInput = $hasReasonInput ? $validated['reason_code'] : $adjustment->reason_code;
@@ -2258,7 +2301,8 @@ class AdjustmentController extends Controller
                         baseQty: (float)$baseQty,
                         referenceNo: (string)$adjustment->reference_no,
                         fallbackCost: (float)$baseCost,
-                        recordedLayers: $recordedLayers
+                        recordedLayers: $recordedLayers,
+                        adjustmentDate: (string)$adjustment->date
                     );
                     $finalSubtotal = $actualLossCost;
                     $finalBaseCost = $baseQty > 0 ? round($actualLossCost / $baseQty, 8) : $baseCost;
@@ -2554,8 +2598,9 @@ class AdjustmentController extends Controller
             InventoryBatch::where('warehouse_id', $warehouseId)
                 ->where('source_type', 'adjustment_addition')
                 ->where(function ($q) use ($adjustment) {
+                    $escapedAdjRef = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], (string)$adjustment->reference_no);
                     $q->where('source_reference', $adjustment->reference_no)
-                      ->orWhere('source_reference', 'like', "{$adjustment->reference_no}#%");
+                      ->orWhereRaw("source_reference LIKE ? ESCAPE '!'", ["{$escapedAdjRef}#%"]);
                 })
                 ->delete();
 
@@ -2936,39 +2981,67 @@ class AdjustmentController extends Controller
         $cRate = isset($itemData['conversion_rate']) ? (float)$itemData['conversion_rate'] : 0.0;
         $unitId = isset($itemData['unit_id']) && $itemData['unit_id'] !== '' ? (int)$itemData['unit_id'] : null;
         $unitName = strtolower(trim((string)($itemData['unit_name'] ?? '')));
+        $unitType = strtolower(trim((string)($itemData['unit_type'] ?? '')));
 
         if ($product) {
-            // Check configured active ProductUnitLinks first so stale client conversion_rates cannot corrupt multi-unit ledger math
+            if ($unitType === 'base') {
+                return 1.0;
+            }
+
+            $baseUnitName = strtolower(trim((string)$product->unit_name));
+
+            // Check configured active ProductUnitLinks with strict unit_name/unit_type disambiguation
+            // so cross-table auto-increment unit_id collisions never hijack base/purchase/sale units.
             try {
                 $links = $product->relationLoaded('unitLinks')
                     ? $product->unitLinks
                     : $product->unitLinks()->get();
 
-                $matchingLink = $links
-                    ->filter(function ($l) use ($variantId, $unitId, $unitName) {
-                        if (!$l->is_active || (float)$l->conversion_rate <= 0) {
-                            return false;
-                        }
-                        if ($variantId === null && $l->product_variant_id !== null) {
-                            return false;
-                        }
-                        if ($variantId !== null && $l->product_variant_id !== null && (int)$l->product_variant_id !== (int)$variantId) {
-                            return false;
-                        }
-                        if ($unitId !== null && $l->unit_id !== null && (int)$l->unit_id === $unitId) {
-                            return true;
-                        }
-                        if ($unitName !== '' && strtolower(trim((string)$l->unit_name)) === $unitName) {
-                            return true;
-                        }
+                $eligibleLinks = $links->filter(function ($l) use ($variantId, $unitType) {
+                    if (!$l->is_active || (float)$l->conversion_rate <= 0) {
                         return false;
-                    })
-                    ->sortBy(function ($l) use ($variantId) {
-                        $variantRank = ($variantId !== null && (int)$l->product_variant_id === (int)$variantId) ? 0 : 1;
-                        $typeRank = strtolower((string)$l->unit_type) === 'sale' ? 0 : 1;
-                        return ($variantRank * 10) + $typeRank;
-                    })
-                    ->first();
+                    }
+                    if ($variantId === null && $l->product_variant_id !== null) {
+                        return false;
+                    }
+                    if ($variantId !== null && $l->product_variant_id !== null && (int)$l->product_variant_id !== (int)$variantId) {
+                        return false;
+                    }
+                    if (in_array($unitType, ['purchase', 'sale'], true) && strtolower((string)$l->unit_type) !== $unitType) {
+                        return false;
+                    }
+                    return true;
+                });
+
+                $matchingLink = null;
+                if ($unitName !== '') {
+                    // When unit_name is provided, require exact unit_name match (preferring exact unit_id + variant match).
+                    $matchingLink = $eligibleLinks
+                        ->filter(fn ($l) => strtolower(trim((string)$l->unit_name)) === $unitName)
+                        ->sortBy(function ($l) use ($variantId, $unitId) {
+                            $idRank = ($unitId !== null && $l->unit_id !== null && (int)$l->unit_id === $unitId) ? 0 : 1;
+                            $variantRank = ($variantId !== null && (int)$l->product_variant_id === (int)$variantId) ? 0 : 1;
+                            $typeRank = strtolower((string)$l->unit_type) === 'sale' ? 0 : 1;
+                            return ($idRank * 100) + ($variantRank * 10) + $typeRank;
+                        })
+                        ->first();
+                } elseif ($unitId !== null) {
+                    // Without unit_name, check base_unit_id first unless unit_type explicitly requested purchase/sale.
+                    if (!in_array($unitType, ['purchase', 'sale'], true)
+                        && $product->base_unit_id !== null
+                        && $unitId === (int)$product->base_unit_id
+                    ) {
+                        return 1.0;
+                    }
+                    $matchingLink = $eligibleLinks
+                        ->filter(fn ($l) => $l->unit_id !== null && (int)$l->unit_id === $unitId)
+                        ->sortBy(function ($l) use ($variantId) {
+                            $variantRank = ($variantId !== null && (int)$l->product_variant_id === (int)$variantId) ? 0 : 1;
+                            $typeRank = strtolower((string)$l->unit_type) === 'sale' ? 0 : 1;
+                            return ($variantRank * 10) + $typeRank;
+                        })
+                        ->first();
+                }
 
                 if ($matchingLink) {
                     return (float)$matchingLink->conversion_rate;
@@ -2978,7 +3051,7 @@ class AdjustmentController extends Controller
             }
 
             // Explicit base unit check
-            if ($unitName !== '' && $unitName === strtolower(trim((string)$product->unit_name))) {
+            if ($unitName !== '' && $baseUnitName !== '' && $unitName === $baseUnitName) {
                 return 1.0;
             }
             if ($unitId !== null && $product->base_unit_id !== null && $unitId === (int)$product->base_unit_id && $unitName === '') {
@@ -2990,7 +3063,7 @@ class AdjustmentController extends Controller
                     $conversionService = app(\App\Services\ProductUnitConversionService::class);
                     $resolved = $conversionService->resolve(
                         product: $product,
-                        type: 'sale',
+                        type: in_array($unitType, ['base', 'purchase', 'sale'], true) ? $unitType : 'sale',
                         unitId: $unitId,
                         unitName: $itemData['unit_name'] ?? null,
                         variantId: $variantId

@@ -255,6 +255,8 @@ class InventoryReconciliationService
                 });
             if ($productIds !== null) {
                 $legacyQ->whereIn('p.id', $productIds);
+            } elseif ($productIdsSubQuery !== null) {
+                $legacyQ->whereIn('p.id', clone $productIdsSubQuery);
             }
             $legacyIds = $legacyQ->pluck('p.id')->all();
             if (!empty($legacyIds)) {
@@ -288,6 +290,8 @@ class InventoryReconciliationService
             }
             if ($productIds !== null) {
                 $inTransitQ->whereIn('stock_transfer_items.product_id', $productIds);
+            } elseif ($productIdsSubQuery !== null) {
+                $inTransitQ->whereIn('stock_transfer_items.product_id', clone $productIdsSubQuery);
             }
             $trfAgg = $inTransitQ->selectRaw("
                 COALESCE(SUM(COALESCE(NULLIF(stock_transfer_items.base_quantity, 0), stock_transfer_items.quantity * COALESCE(NULLIF(stock_transfer_items.conversion_rate, 0), 1))), 0) as qty,

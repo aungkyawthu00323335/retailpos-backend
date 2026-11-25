@@ -338,6 +338,22 @@ class RetailPosTest extends TestCase
      */
     public function test_adjustments_and_transfers(): void
     {
+        // Seed catalog product so unresolved-SKU guard passes cleanly
+        Product::create([
+            'code' => '8934567890123',
+            'sku' => '8934567890123',
+            'name' => 'Nike Air Zoom Pegasus 40',
+            'category_name' => 'Footwear & Shoes',
+            'unit_name' => 'Pair',
+            'cost_price' => 65.00,
+            'purchase_price' => 65.00,
+            'selling_price' => 130.00,
+            'retail_price' => 130.00,
+            'stock_quantity' => 20.0,
+            'alert_quantity' => 5.0,
+            'status' => 'Active',
+        ]);
+
         // Stock Adjustment
         $adjRes = $this->postJson('/api/adjustments', [
             'warehouse_name' => 'Main Warehouse Branch',

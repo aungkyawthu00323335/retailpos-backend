@@ -100,9 +100,20 @@ class ProductUnitConversionService
     public function ensureDefaults(Product $product): void
     {
         foreach (['purchase', 'sale'] as $type) {
-            $query = $product->unitLinks()->where('unit_type', $type)->where('is_active', true);
-            if (!$query->where('is_default', true)->exists()) {
-                $query->orderBy('id')->limit(1)->update(['is_default' => true]);
+            $activeLinks = $product->unitLinks()
+                ->where('unit_type', $type)
+                ->where('is_active', true)
+                ->orderBy('id')
+                ->get();
+
+            $grouped = $activeLinks->groupBy(fn (ProductUnitLink $l) => $l->product_variant_id === null ? '__base__' : (string)$l->product_variant_id);
+            foreach ($grouped as $groupLinks) {
+                if (!$groupLinks->contains(fn (ProductUnitLink $l) => (bool)$l->is_default)) {
+                    $first = $groupLinks->first();
+                    if ($first) {
+                        ProductUnitLink::whereKey($first->id)->update(['is_default' => true]);
+                    }
+                }
             }
         }
     }
@@ -167,15 +178,64 @@ class ProductUnitConversionService
                 ->get();
         }
 
-        $match = $links->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
-            if ($unitId !== null && (int)$link->unit_id === $unitId) {
-                return true;
-            }
-            return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
-        });
+        $trimmedName = $unitName !== null ? trim($unitName) : '';
+        $baseUnitName = trim((string)($product->unit_name ?: ''));
+        $isExplicitBaseName = $trimmedName !== '' && $baseUnitName !== '' && strcasecmp($baseUnitName, $trimmedName) === 0;
 
-        // If not found in the requested unit_type, search other active unit links for this product
-        if (!$match && ($unitId !== null || ($unitName !== null && trim($unitName) !== ''))) {
+        $match = null;
+
+        // 1. Requested unit_type links: when unit_name is provided, require matching unit_name
+        // so cross-table auto-increment unit_id collisions (product_units / purchase_units / sale_units)
+        // can never hijack a differently named unit.
+        if ($trimmedName !== '') {
+            if ($unitId !== null) {
+                $match = $links->first(function (ProductUnitLink $link) use ($unitId, $trimmedName) {
+                    return (int)$link->unit_id === $unitId
+                        && strcasecmp(trim((string)$link->unit_name), $trimmedName) === 0;
+                });
+            }
+            if (!$match) {
+                $match = $links->first(function (ProductUnitLink $link) use ($trimmedName) {
+                    return strcasecmp(trim((string)$link->unit_name), $trimmedName) === 0;
+                });
+            }
+            // Explicit base unit name takes precedence before cross-type links so e.g.
+            // unit_id=1, unit_name='Piece' is never hijacked by purchase/sale unit id=1.
+            if (!$match && $isExplicitBaseName) {
+                return [
+                    'id' => null,
+                    'unit_id' => $product->base_unit_id ?: $product->unit_id,
+                    'unit_name' => $baseUnitName ?: 'Piece',
+                    'conversion_rate' => 1.0,
+                    'unit_type' => 'base',
+                    'product_variant_id' => $variantId,
+                ];
+            }
+        } elseif ($unitId !== null) {
+            $match = $links->first(function (ProductUnitLink $link) use ($unitId) {
+                return (int)$link->unit_id === $unitId;
+            });
+        }
+
+        // 2. If not found in the requested unit_type, search other active unit links for this product.
+        // Require unit_name match whenever unit_name is provided; when unit_name is omitted, check
+        // base_unit_id before allowing a cross-type unit_id fallback.
+        if (!$match && ($unitId !== null || $trimmedName !== '')) {
+            $isBaseIdOnly = $trimmedName === '' && $unitId !== null && (
+                ($product->base_unit_id !== null && (int)$product->base_unit_id === $unitId) ||
+                ($product->unit_id !== null && (int)$product->unit_id === $unitId)
+            );
+            if ($isBaseIdOnly) {
+                return [
+                    'id' => null,
+                    'unit_id' => $product->base_unit_id ?: $product->unit_id,
+                    'unit_name' => $baseUnitName ?: 'Piece',
+                    'conversion_rate' => 1.0,
+                    'unit_type' => 'base',
+                    'product_variant_id' => $variantId,
+                ];
+            }
+
             if ($hasPreloaded) {
                 $crossLinks = $allLinks->filter(function ($l) use ($variantId) {
                     if (!$l->is_active) return false;
@@ -208,12 +268,23 @@ class ProductUnitConversionService
                     ->get();
             }
 
-            $match = $crossLinks->first(function (ProductUnitLink $link) use ($unitId, $unitName) {
-                if ($unitId !== null && (int)$link->unit_id === $unitId) {
-                    return true;
+            if ($trimmedName !== '') {
+                if ($unitId !== null) {
+                    $match = $crossLinks->first(function (ProductUnitLink $link) use ($unitId, $trimmedName) {
+                        return (int)$link->unit_id === $unitId
+                            && strcasecmp(trim((string)$link->unit_name), $trimmedName) === 0;
+                    });
                 }
-                return $unitId === null && $unitName !== null && strcasecmp(trim($link->unit_name), trim($unitName)) === 0;
-            });
+                if (!$match) {
+                    $match = $crossLinks->first(function (ProductUnitLink $link) use ($trimmedName) {
+                        return strcasecmp(trim((string)$link->unit_name), $trimmedName) === 0;
+                    });
+                }
+            } elseif ($unitId !== null) {
+                $match = $crossLinks->first(function (ProductUnitLink $link) use ($unitId) {
+                    return (int)$link->unit_id === $unitId;
+                });
+            }
         }
 
         if (($unitId !== null || ($unitName !== null && trim($unitName) !== '')) && !$match) {
@@ -307,7 +378,7 @@ class ProductUnitConversionService
         }
 
         $warehouse = Outlet::where('name', $name)->first()
-            ?? Outlet::where('name', 'LIKE', '%' . $name . '%')->first();
+            ?? Outlet::whereRaw('LOWER(TRIM(name)) = ?', [strtolower($name)])->first();
 
         return $warehouse?->id;
     }

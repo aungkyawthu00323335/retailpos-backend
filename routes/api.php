@@ -11,7 +11,6 @@ use App\Http\Controllers\Api\PurchaseUnitController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\ProductExcelController;
 use App\Http\Controllers\Api\AdjustmentController;
-use App\Http\Controllers\Api\ProcessingController;
 use App\Http\Controllers\Api\TransferController;
 use App\Http\Controllers\Api\PurchaseController;
 use App\Http\Controllers\Api\PurchaseReturnController;
@@ -83,12 +82,12 @@ Route::post('change-password', [AuthController::class, 'changePassword']);
 Route::post('update-profile', [AuthController::class, 'updateProfile']);
 
 // Outlets & Warehouses
-$outletReadPerms = 'dashboard.view,pos.view,cash_register.view,sales.view,sales.create,purchases.view,purchases.create,purchase_returns.view,sale_returns.view,adjustments.view,adjustments.create,transfers.view,transfers.create,processings.view,processings.create,quotations.view,quotations.create,expenses.view,expenses.create,products.view,products.create,products.update,users.view,users.create,users.update,reports.view,report_sales.view,report_purchases.view,report_stock.view,report_stock_alert.view,report_stock_ledger.view,report_profit_loss.view,report_cashier_audit.view,report_expense.view,report_top_selling.view,report_dead_stock.view,report_cash_flow.view,report_register.view,report_z_report.view,report_ar_aging.view,report_ap_aging.view,report_product_margins.view,report_sales_return.view,report_purchase_return.view,report_commercial_tax.view,report_customer.view,report_supplier.view';
+$outletReadPerms = 'dashboard.view,pos.view,cash_register.view,sales.view,sales.create,purchases.view,purchases.create,purchase_returns.view,sale_returns.view,adjustments.view,adjustments.create,transfers.view,transfers.create,quotations.view,quotations.create,expenses.view,expenses.create,products.view,products.create,products.update,users.view,users.create,users.update,reports.view,report_sales.view,report_purchases.view,report_stock.view,report_stock_alert.view,report_stock_ledger.view,report_profit_loss.view,report_cashier_audit.view,report_expense.view,report_top_selling.view,report_dead_stock.view,report_cash_flow.view,report_register.view,report_z_report.view,report_ar_aging.view,report_ap_aging.view,report_product_margins.view,report_sales_return.view,report_purchase_return.view,report_commercial_tax.view,report_customer.view,report_supplier.view';
 $crudResource('outlets', OutletController::class, 'outlets', $outletReadPerms);
 Route::patch('outlets/{id}/toggle-status', [OutletController::class, 'toggleStatus'])->middleware('permission:outlets.update');
 
 // Brands
-$catalogReadPerms = 'products.view,products.create,products.update,pos.view,barcode.view,purchases.create,sales.create,adjustments.create,transfers.create,processings.create,quotations.create,reports.view,report_stock.view,report_stock_alert.view,report_dead_stock.view,report_top_selling.view,report_product_margins.view';
+$catalogReadPerms = 'products.view,products.create,products.update,pos.view,barcode.view,purchases.create,sales.create,adjustments.create,transfers.create,quotations.create,reports.view,report_stock.view,report_stock_alert.view,report_dead_stock.view,report_top_selling.view,report_product_margins.view';
 Route::patch('brands/{id}/toggle-status', [BrandController::class, 'toggleStatus'])->middleware('permission:brands.update');
 $crudResource('brands', BrandController::class, 'brands', $catalogReadPerms);
 
@@ -106,7 +105,7 @@ Route::patch('variations/{id}/toggle-status', [VariationController::class, 'togg
 $crudResource('variations', VariationController::class, 'variations', $catalogReadPerms);
 
 // Products & Barcode
-$productReadPerms = 'pos.view,barcode.view,sales.create,sales.update,purchases.create,purchases.update,sale_returns.create,sale_returns.update,purchase_returns.create,purchase_returns.update,quotations.create,quotations.update,adjustments.create,adjustments.update,transfers.create,transfers.update,processings.create';
+$productReadPerms = 'pos.view,barcode.view,sales.create,sales.update,purchases.create,purchases.update,sale_returns.create,sale_returns.update,purchase_returns.create,purchase_returns.update,quotations.create,quotations.update,adjustments.create,adjustments.update,transfers.create,transfers.update';
 Route::get('products/create-options', [ProductController::class, 'createOptions'])->middleware('permission:products.view,products.create,products.update');
 Route::get('products/check-identifier', [ProductController::class, 'checkIdentifier'])->middleware('permission:products.view,products.create,products.update');
 Route::post('products/generate-sku', [ProductController::class, 'generateSku'])->middleware('permission:products.create,products.update');
@@ -145,11 +144,6 @@ Route::get('transfers/{id}/payments', [TransferController::class, 'getPayments']
 Route::post('transfers/{id}/payments', [TransferController::class, 'addPayment'])->middleware('permission:transfers.pay');
 Route::delete('transfers/{id}/payments/{paymentId}', [TransferController::class, 'deletePayment'])->middleware('permission:transfers.delete');
 $crudResource('transfers', TransferController::class, 'transfers');
-
-// Stock Processing / Repackaging (ထုတ်လုပ်/ခွဲထုတ်ပြုပြင်ခြင်း)
-Route::get('processings/export', [ProcessingController::class, 'export'])->middleware('permission:processings.export');
-Route::get('processings/generate-code', [ProcessingController::class, 'generateCode'])->middleware('permission:processings.create');
-$crudResource('processings', ProcessingController::class, 'processings', '', ['index', 'store', 'show', 'destroy']);
 
 // Purchases & Purchase Returns
 Route::get('purchases/export', [PurchaseController::class, 'export'])->middleware('permission:purchases.export');

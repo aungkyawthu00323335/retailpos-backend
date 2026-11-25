@@ -859,7 +859,8 @@ class TransferController extends Controller
             }
 
             // Resolve authoritative conversion rate from active ProductUnitLink or base unit
-            $resolvedUnit = $this->resolveTransferUnitForProduct($product, $variantId, $unitId, $unitName, $idx, $unitService);
+            $unitType = isset($item['unit_type']) ? trim((string)$item['unit_type']) : null;
+            $resolvedUnit = $this->resolveTransferUnitForProduct($product, $variantId, $unitId, $unitName, $idx, $unitService, $unitType);
             $unitId   = $resolvedUnit['unit_id'];
             $unitName = $resolvedUnit['unit_name'];
             $convRate = $resolvedUnit['conversion_rate'];
@@ -901,15 +902,22 @@ class TransferController extends Controller
         ?int $unitId,
         string $unitName,
         int $idx,
-        ProductUnitConversionService $unitService
+        ProductUnitConversionService $unitService,
+        ?string $unitType = null
     ): array {
         $baseUnitName = trim((string)($product->unit_name ?: 'Pcs'));
         $baseUnitId   = $product->base_unit_id ? (int)$product->base_unit_id : null;
+        $normalizedType = strtolower(trim((string)$unitType));
 
         // 1. Base unit fast-path
         $isExplicitBaseId   = $unitId !== null && $baseUnitId !== null && $unitId === $baseUnitId;
         $isExplicitBaseName = $unitName !== '' && strcasecmp($unitName, $baseUnitName) === 0;
-        if (($unitId === null && $unitName === '') || ($isExplicitBaseId && ($unitName === '' || $isExplicitBaseName)) || ($isExplicitBaseName && $unitId === null)) {
+        if (
+            $normalizedType === 'base' ||
+            ($unitId === null && $unitName === '') ||
+            ($isExplicitBaseId && ($unitName === '' || $isExplicitBaseName) && !in_array($normalizedType, ['purchase', 'sale'], true)) ||
+            ($isExplicitBaseName && !in_array($normalizedType, ['purchase', 'sale'], true))
+        ) {
             return [
                 'unit_id'         => $baseUnitId ?? $unitId,
                 'unit_name'       => $baseUnitName,
@@ -917,9 +925,9 @@ class TransferController extends Controller
             ];
         }
 
-        // 2. Active ProductUnitLinks (purchase or sale packaging units)
+        // 2. Active ProductUnitLinks (purchase or sale packaging units) with unit_name/unit_type disambiguation
         $links = $product->relationLoaded('unitLinks') ? $product->unitLinks : $product->unitLinks()->get();
-        $matchingLink = $links->filter(function ($l) use ($variantId, $unitId, $unitName) {
+        $eligibleLinks = $links->filter(function ($l) use ($variantId, $normalizedType) {
             if (!$l->is_active || (float)$l->conversion_rate <= 0) {
                 return false;
             }
@@ -929,18 +937,34 @@ class TransferController extends Controller
             if ($variantId !== null && $l->product_variant_id !== null && (int)$l->product_variant_id !== $variantId) {
                 return false;
             }
-            if ($unitId !== null && $l->unit_id !== null && (int)$l->unit_id === $unitId) {
-                return true;
+            if (in_array($normalizedType, ['purchase', 'sale'], true) && strtolower((string)$l->unit_type) !== $normalizedType) {
+                return false;
             }
-            if ($unitName !== '' && strcasecmp(trim((string)$l->unit_name), $unitName) === 0) {
-                return true;
-            }
-            return false;
-        })->sortBy(function ($l) use ($variantId) {
-            $vRank = ($variantId !== null && (int)$l->product_variant_id === $variantId) ? 0 : 1;
-            $tRank = strtolower((string)$l->unit_type) === 'purchase' ? 0 : 1;
-            return ($vRank * 10) + $tRank;
-        })->first();
+            return true;
+        });
+
+        $matchingLink = null;
+        if ($unitName !== '') {
+            // Require matching unit_name so cross-table unit_id collisions never pick Carton over Pack
+            $matchingLink = $eligibleLinks
+                ->filter(fn ($l) => strcasecmp(trim((string)$l->unit_name), $unitName) === 0)
+                ->sortBy(function ($l) use ($variantId, $unitId) {
+                    $idRank = ($unitId !== null && $l->unit_id !== null && (int)$l->unit_id === $unitId) ? 0 : 1;
+                    $vRank = ($variantId !== null && (int)$l->product_variant_id === $variantId) ? 0 : 1;
+                    $tRank = strtolower((string)$l->unit_type) === 'purchase' ? 0 : 1;
+                    return ($idRank * 100) + ($vRank * 10) + $tRank;
+                })
+                ->first();
+        } elseif ($unitId !== null) {
+            $matchingLink = $eligibleLinks
+                ->filter(fn ($l) => $l->unit_id !== null && (int)$l->unit_id === $unitId)
+                ->sortBy(function ($l) use ($variantId) {
+                    $vRank = ($variantId !== null && (int)$l->product_variant_id === $variantId) ? 0 : 1;
+                    $tRank = strtolower((string)$l->unit_type) === 'purchase' ? 0 : 1;
+                    return ($vRank * 10) + $tRank;
+                })
+                ->first();
+        }
 
         if ($matchingLink) {
             return [
@@ -950,8 +974,9 @@ class TransferController extends Controller
             ];
         }
 
-        // 3. Fallback to ProductUnitConversionService (checks purchase then sale definitions)
-        foreach (['purchase', 'sale'] as $uType) {
+        // 3. Fallback to ProductUnitConversionService (checks requested type or purchase then sale definitions)
+        $typesToTry = in_array($normalizedType, ['purchase', 'sale'], true) ? [$normalizedType] : ['purchase', 'sale'];
+        foreach ($typesToTry as $uType) {
             try {
                 $resolved = $unitService->resolve(
                     product:   $product,
@@ -1174,6 +1199,9 @@ class TransferController extends Controller
             if ($shippingCharge <= 0.001 && $totalPaid > 0.001) {
                 $this->throwValidationError('payments', 'Cannot attach shipping payments when shipping charge is zero.');
             }
+            if (!in_array($transferStatus, ['Sent', 'Completed'], true) && $totalPaid > 0.001) {
+                $this->throwValidationError('payments', 'Cannot record shipping payments while stock transfer status is Pending. Dispatch or complete the transfer first.');
+            }
             if ($shippingCharge > 0.001 && $totalPaid > $shippingCharge + 0.01) {
                 $this->throwValidationError('payments', 'Shipping payments cannot exceed the total shipping charge.');
             }
@@ -1253,10 +1281,11 @@ class TransferController extends Controller
                 $this->syncTransferMovementUnitCosts($transfer->fresh('items'));
             }
 
-            // Auto-create Expense for Shipping Charge with Multi-Payment & Cash Register tracking
-            if ($shippingCharge > 0.001) {
+            // Auto-create Expense for Shipping Charge ONLY when transfer is dispatched/completed (defer Pending transfers from P&L & Cash Flow)
+            if ($shippingCharge > 0.001 && in_array($transferStatus, ['Sent', 'Completed'], true)) {
                 $shippingPrefix = Setting::get('expense_prefix', 'EXP_');
                 $expenseRef     = $shippingPrefix . 'TRF-' . $refNo;
+                $totalPaid      = min($totalPaid, $shippingCharge);
                 $dueAmount      = max(0.0, round($shippingCharge - $totalPaid, 2));
                 $paymentStatus  = $totalPaid <= 0.001 ? 'Unpaid' : ($dueAmount <= 0.001 ? 'Paid' : 'Partial');
 
@@ -1271,7 +1300,7 @@ class TransferController extends Controller
                     'reference_no'          => $expenseRef,
                     'warehouse_id'          => $fromWarehouseId,
                     'warehouse_name'        => $fromWarehouseName,
-                    'cash_register_id'      => $headerCashRegId,
+                    'cash_register_id'      => null, // Stamped only when an actual Cash leg hits a register
                     'expense_category_name' => 'Transfer Shipping',
                     'title'                 => 'Shipping for Transfer #' . $refNo . ' → ' . $toWarehouseName,
                     'amount'                => $shippingCharge,
@@ -1279,7 +1308,7 @@ class TransferController extends Controller
                     'due_amount'            => $dueAmount,
                     'payment_status'        => $paymentStatus,
                     'payment_method'        => $paymentMethod,
-                    'date'                  => $txDate,
+                    'date'                  => $this->normalizeTransferDateTime($txDate),
                     'details'               => 'Auto-created from Stock Transfer #' . $refNo,
                     'created_by'            => $actor['user_name'],
                     'user_name'             => $actor['user_name'],
@@ -1294,7 +1323,7 @@ class TransferController extends Controller
                         continue;
                     }
                     $pType    = $p['payment_type'] ?? 'Cash';
-                    $isCash   = strtolower(trim((string)$pType)) === 'cash';
+                    $isCash   = $accountingService->isCashPaymentType($pType);
                     $legRegId = null;
                     if ($isCash) {
                         $explicitRegId = !empty($p['cash_register_id']) ? (int)$p['cash_register_id'] : $headerCashRegId;
@@ -1312,7 +1341,7 @@ class TransferController extends Controller
                         'expense_id'       => $expense->id,
                         'cash_register_id' => $legRegId,
                         'reference_no'     => $this->generateUniqueExpensePaymentRef($expenseRef, $pIndex++),
-                        'payment_date'     => $p['payment_date'] ?? $txDate,
+                        'payment_date'     => $this->normalizeTransferDateTime($p['payment_date'] ?? $txDate, $p['payment_time'] ?? null),
                         'payment_time'     => $p['payment_time'] ?? ($validated['transfer_time'] ?? date('h:i A')),
                         'payment_type'     => $pType,
                         'amount'           => $pAmount,
@@ -1355,6 +1384,32 @@ class TransferController extends Controller
         }
     }
 
+    private function normalizeTransferDateTime(?string $rawDate, ?string $fallbackTime = null): string
+    {
+        $timezone = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
+        $trimmed  = trim((string)($rawDate ?? ''));
+        if ($trimmed === '') {
+            return Carbon::now()->timezone($timezone)->format('Y-m-d H:i:s');
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/', $trimmed)) {
+            return $trimmed;
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $trimmed)) {
+            if (!empty($fallbackTime)) {
+                try {
+                    return Carbon::parse($trimmed . ' ' . trim($fallbackTime))->format('Y-m-d H:i:s');
+                } catch (\Throwable $e) {
+                }
+            }
+            return $trimmed . ' ' . Carbon::now()->timezone($timezone)->format('H:i:s');
+        }
+        try {
+            return Carbon::parse($trimmed)->format('Y-m-d H:i:s');
+        } catch (\Throwable $e) {
+            return str_contains($trimmed, ':') ? $trimmed : ($trimmed . ' ' . Carbon::now()->timezone($timezone)->format('H:i:s'));
+        }
+    }
+
     public function update(Request $request, $id)
     {
         $validated = $request->validate([
@@ -1368,10 +1423,19 @@ class TransferController extends Controller
             'shipping_charge'            => 'nullable|numeric|min:0',
             'status'                     => 'nullable|string|in:Sent,Pending,Completed',
             'notes'                      => 'nullable|string',
+            'cash_register_id'           => 'nullable|integer',
             'created_by'                 => 'nullable|string|max:255',
             'user_id'                    => 'nullable|integer',
             'user_name'                  => 'nullable|string|max:255',
             'user_role'                  => 'nullable|string|max:100',
+            'payments'                   => 'sometimes|nullable|array',
+            'payments.*.id'              => 'nullable|integer',
+            'payments.*.amount'          => 'nullable|numeric|min:0',
+            'payments.*.payment_type'    => 'nullable|string|max:100',
+            'payments.*.payment_date'    => 'nullable|string',
+            'payments.*.payment_time'    => 'nullable|string',
+            'payments.*.notes'           => 'nullable|string',
+            'payments.*.cash_register_id'=> 'nullable|integer',
             'items'                      => 'required|array|min:1',
             'items.*.product_id'         => 'nullable|integer',
             'items.*.product_variant_id' => 'nullable|integer',
@@ -1380,6 +1444,7 @@ class TransferController extends Controller
             'items.*.variant_name'       => 'nullable|string|max:255',
             'items.*.unit_id'            => 'nullable|integer',
             'items.*.unit_name'          => 'nullable|string|max:100',
+            'items.*.unit_type'          => 'nullable|string|max:50',
             'items.*.conversion_rate'    => 'nullable|numeric|min:0.0001',
             'items.*.quantity'           => 'required|numeric|min:0.01',
             'items.*.base_quantity'      => 'nullable|numeric|min:0',
@@ -1391,6 +1456,14 @@ class TransferController extends Controller
         $unitService       = app(ProductUnitConversionService::class);
         $fifoService       = app(FifoInventoryService::class);
         $accountingService = app(PurchaseAccountingService::class);
+        $normalizedTxDate  = $this->normalizeTransferDateTime($validated['date'], $validated['transfer_time'] ?? null);
+        $hasPaymentsParam  = $request->has('payments') && is_array($request->input('payments'));
+        $submittedPayments = $hasPaymentsParam
+            ? array_values(array_filter(
+                $validated['payments'] ?? [],
+                static fn($p) => !empty($p['amount']) && (float)$p['amount'] > 0.0001
+            ))
+            : [];
 
         DB::beginTransaction();
         try {
@@ -1430,18 +1503,18 @@ class TransferController extends Controller
 
             $shippingCharge  = round((float)($validated['shipping_charge'] ?? 0), 2);
             $existingExpense = $this->findLinkedShippingExpense($transfer, true);
-            $beforeCashByReg = [];
+            $beforeCashByReg = $existingExpense ? $this->extractExpenseCashByRegister($existingExpense) : [];
             $warehouseChangedForShipping = ((int)$transfer->from_warehouse_id !== (int)$fromWarehouseId);
+            $isPostedTransfer = in_array($newStatus, ['Sent', 'Completed'], true);
             if ($existingExpense) {
                 $existingPaid = round((float)$existingExpense->payments()->sum('amount'), 2);
-                if ($shippingCharge > 0.001 && $shippingCharge < $existingPaid - 0.01) {
+                if (!$hasPaymentsParam && $isPostedTransfer && $shippingCharge > 0.001 && $shippingCharge < $existingPaid - 0.01) {
                     $this->throwValidationError(
                         'shipping_charge',
                         'Cannot reduce shipping charge below already paid amount (' . number_format($existingPaid, 2) . '). Delete payments first.'
                     );
                 }
-                if ($shippingCharge <= 0.001 || $warehouseChangedForShipping) {
-                    $beforeCashByReg = $this->extractExpenseCashByRegister($existingExpense);
+                if (!$isPostedTransfer || $shippingCharge <= 0.001 || $warehouseChangedForShipping) {
                     if ($errMsg = $accountingService->assertCashRegisterDeltaMutable($beforeCashByReg, [])) {
                         DB::rollBack();
                         return response()->json(['status' => 'error', 'message' => $errMsg], 422);
@@ -1450,7 +1523,7 @@ class TransferController extends Controller
             }
 
             // Reverse prior physical stock & FIFO layers
-            $revDate = (string)($validated['date'] ?? $transfer->date ?? now());
+            $revDate = $normalizedTxDate ?: (string)($transfer->date ?? now()->format('Y-m-d H:i:s'));
             if ($transfer->status === 'Completed') {
                 $origFromId = $unitService->warehouseId($transfer->from_warehouse_id, $transfer->from_warehouse);
                 $origToId   = $unitService->warehouseId($transfer->to_warehouse_id, $transfer->to_warehouse);
@@ -1516,7 +1589,7 @@ class TransferController extends Controller
                 'from_warehouse'    => $fromWarehouseName,
                 'to_warehouse_id'   => $toWarehouseId ?? $transfer->to_warehouse_id,
                 'to_warehouse'      => $toWarehouseName,
-                'date'              => $validated['date'],
+                'date'              => $normalizedTxDate,
                 'transfer_time'     => $validated['transfer_time'] ?? $transfer->transfer_time,
                 'items_count'       => count($resolvedLines),
                 'total_quantity'    => round($totalQty, 4),
@@ -1579,33 +1652,20 @@ class TransferController extends Controller
                 $this->syncTransferMovementUnitCosts($transfer->fresh('items'));
             }
 
-            // Synchronize Shipping Operating Expense Record
+            // Synchronize Shipping Operating Expense Record (deferred while Pending)
             $refNo = $transfer->reference_no;
-            if ($shippingCharge > 0.001) {
-                if ($existingExpense) {
-                    $totalPaid     = round((float)$existingExpense->payments()->sum('amount'), 2);
-                    $dueAmount     = max(0.0, round($shippingCharge - $totalPaid, 2));
-                    $paymentStatus = $totalPaid <= 0.001 ? 'Unpaid' : ($dueAmount <= 0.001 ? 'Paid' : 'Partial');
-                    $existingExpense->update([
-                        'transfer_id'    => $transfer->id,
-                        'warehouse_id'   => $fromWarehouseId,
-                        'warehouse_name' => $fromWarehouseName,
-                        'amount'         => $shippingCharge,
-                        'paid_amount'    => $totalPaid,
-                        'due_amount'     => $dueAmount,
-                        'payment_status' => $paymentStatus,
-                        'payment_method' => $totalPaid <= 0.001 ? 'Unpaid' : $existingExpense->payment_method,
-                        'date'           => $validated['date'],
-                        'title'          => 'Shipping for Transfer #' . $refNo . ' → ' . $toWarehouseName,
-                        'details'        => 'Auto-created from Stock Transfer #' . $refNo,
-                    ]);
-                } else {
-                    $shippingPrefix = Setting::get('expense_prefix', 'EXP_');
-                    Expense::create([
+            if ($shippingCharge > 0.001 && $isPostedTransfer) {
+                $shippingPrefix  = Setting::get('expense_prefix', 'EXP_');
+                $expenseRef      = $shippingPrefix . 'TRF-' . $refNo;
+                $headerCashRegId = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+
+                if (!$existingExpense) {
+                    $existingExpense = Expense::create([
                         'transfer_id'           => $transfer->id,
-                        'reference_no'          => $shippingPrefix . 'TRF-' . $refNo,
+                        'reference_no'          => $expenseRef,
                         'warehouse_id'          => $fromWarehouseId,
                         'warehouse_name'        => $fromWarehouseName,
+                        'cash_register_id'      => null,
                         'expense_category_name' => 'Transfer Shipping',
                         'title'                 => 'Shipping for Transfer #' . $refNo . ' → ' . $toWarehouseName,
                         'amount'                => $shippingCharge,
@@ -1613,12 +1673,166 @@ class TransferController extends Controller
                         'due_amount'            => $shippingCharge,
                         'payment_status'        => 'Unpaid',
                         'payment_method'        => 'Unpaid',
-                        'date'                  => $validated['date'],
+                        'date'                  => $normalizedTxDate,
                         'details'               => 'Auto-created from Stock Transfer #' . $refNo,
                         'created_by'            => $actor['user_name'],
                         'user_name'             => $actor['user_name'],
                         'user_role'             => $actor['user_role'],
                         'user_id'               => $actor['user_id'],
+                    ]);
+                }
+
+                if ($hasPaymentsParam) {
+                    $submittedTotal = round(array_sum(array_map(static fn($p) => round((float)$p['amount'], 2), $submittedPayments)), 2);
+                    if ($submittedTotal > $shippingCharge + 0.01) {
+                        $this->throwValidationError(
+                            'payments',
+                            'Total payment (' . number_format($submittedTotal, 2) . ') cannot exceed shipping charge (' . number_format($shippingCharge, 2) . ').'
+                        );
+                    }
+                    if ($submittedTotal > $shippingCharge && !empty($submittedPayments)) {
+                        $excess = round($submittedTotal - $shippingCharge, 2);
+                        $lastIdx = count($submittedPayments) - 1;
+                        $submittedPayments[$lastIdx]['amount'] = max(0.0, round((float)$submittedPayments[$lastIdx]['amount'] - $excess, 2));
+                    }
+
+                    $existingLegsById = ExpensePayment::where('expense_id', $existingExpense->id)->lockForUpdate()->get()->keyBy('id');
+                    $resolvedLegs     = [];
+                    $afterCashByReg   = [];
+                    foreach ($submittedPayments as $p) {
+                        $pAmt = round((float)$p['amount'], 2);
+                        if ($pAmt <= 0) {
+                            continue;
+                        }
+                        $pType    = $p['payment_type'] ?? 'Cash';
+                        $isCash   = $accountingService->isCashPaymentType($pType);
+                        $legRegId = null;
+
+                        if ($isCash) {
+                            $existingLeg = !empty($p['id']) ? $existingLegsById->get((int)$p['id']) : null;
+                            $candRegId   = !empty($p['cash_register_id'])
+                                ? (int)$p['cash_register_id']
+                                : ($existingLeg && !$warehouseChangedForShipping && $existingLeg->cash_register_id ? (int)$existingLeg->cash_register_id : $headerCashRegId);
+                            if ($candRegId && !$warehouseChangedForShipping) {
+                                $regObj = CashRegister::lockForUpdate()->find($candRegId);
+                                if ($regObj && !in_array(strtolower(trim((string)$regObj->status)), ['open', 'opened'], true)) {
+                                    $legRegId = (int)$regObj->id;
+                                } else {
+                                    $legRegId = $this->resolveActiveOpenCashRegisterId($candRegId, $fromWarehouseId, $fromWarehouseName, $actor['user_id'], $actor['user_name'], true);
+                                }
+                            } else {
+                                $legRegId = $this->resolveActiveOpenCashRegisterId($headerCashRegId, $fromWarehouseId, $fromWarehouseName, $actor['user_id'], $actor['user_name'], true);
+                            }
+                            if ($legRegId) {
+                                $afterCashByReg[$legRegId] = round(($afterCashByReg[$legRegId] ?? 0.0) + $pAmt, 2);
+                            }
+                        }
+
+                        $resolvedLegs[] = [
+                            'payment_type'     => $pType,
+                            'amount'           => $pAmt,
+                            'payment_date'     => $this->normalizeTransferDateTime($p['payment_date'] ?? $normalizedTxDate, $p['payment_time'] ?? ($validated['transfer_time'] ?? null)),
+                            'payment_time'     => $p['payment_time'] ?? ($validated['transfer_time'] ?? date('h:i A')),
+                            'notes'            => $p['notes'] ?? ('Shipping freight payment for #' . $refNo),
+                            'cash_register_id' => $legRegId,
+                        ];
+                    }
+
+                    if ($errMsg = $accountingService->assertCashRegisterDeltaMutable($beforeCashByReg, $afterCashByReg)) {
+                        $this->throwValidationError('payments', $errMsg);
+                    }
+
+                    ExpensePayment::where('expense_id', $existingExpense->id)->delete();
+                    $pIndex = 1;
+                    $firstCashRegId = null;
+                    foreach ($resolvedLegs as $leg) {
+                        if ($leg['cash_register_id'] && !$firstCashRegId) {
+                            $firstCashRegId = (int)$leg['cash_register_id'];
+                        }
+                        ExpensePayment::create([
+                            'expense_id'       => $existingExpense->id,
+                            'cash_register_id' => $leg['cash_register_id'],
+                            'reference_no'     => $this->generateUniqueExpensePaymentRef($existingExpense->reference_no, $pIndex++),
+                            'payment_date'     => $leg['payment_date'],
+                            'payment_time'     => $leg['payment_time'],
+                            'payment_type'     => $leg['payment_type'],
+                            'amount'           => $leg['amount'],
+                            'received_amount'  => $leg['amount'],
+                            'change_amount'    => 0.0,
+                            'notes'            => $leg['notes'],
+                            'created_by'       => $actor['user_name'],
+                            'user_id'          => $actor['user_id'],
+                            'user_name'        => $actor['user_name'],
+                            'user_role'        => $actor['user_role'],
+                        ]);
+                    }
+
+                    $allRegIds = array_unique(array_merge(array_keys($beforeCashByReg), array_keys($afterCashByReg)));
+                    foreach ($allRegIds as $rId) {
+                        $delta = round(($beforeCashByReg[$rId] ?? 0.0) - ($afterCashByReg[$rId] ?? 0.0), 2);
+                        if (abs($delta) > 0.001) {
+                            $accountingService->adjustOpenRegisterExpectedCash((int)$rId, $delta);
+                        }
+                    }
+
+                    $allExpPayments = ExpensePayment::where('expense_id', $existingExpense->id)->get();
+                    $totalPaid      = round((float)$allExpPayments->sum('amount'), 2);
+                    $dueAmount      = max(0.0, round($shippingCharge - $totalPaid, 2));
+                    $paymentStatus  = $totalPaid <= 0.001 ? 'Unpaid' : ($dueAmount <= 0.001 ? 'Paid' : 'Partial');
+                    $uniqueTypes    = $allExpPayments->pluck('payment_type')->filter()->unique();
+                    $paymentMethod  = $totalPaid <= 0.001 ? 'Unpaid' : ($uniqueTypes->count() > 1 ? 'Split Payment' : ($uniqueTypes->first() ?: 'Cash'));
+
+                    $existingExpense->update([
+                        'transfer_id'      => $transfer->id,
+                        'warehouse_id'     => $fromWarehouseId,
+                        'warehouse_name'   => $fromWarehouseName,
+                        'cash_register_id' => $firstCashRegId,
+                        'amount'           => $shippingCharge,
+                        'paid_amount'      => $totalPaid,
+                        'due_amount'       => $dueAmount,
+                        'payment_status'   => $paymentStatus,
+                        'payment_method'   => $paymentMethod,
+                        'date'             => $normalizedTxDate,
+                        'title'            => 'Shipping for Transfer #' . $refNo . ' → ' . $toWarehouseName,
+                        'details'          => 'Auto-created from Stock Transfer #' . $refNo,
+                    ]);
+                } else {
+                    // Re-attribute open cash register outflows if source warehouse changed so old branch is never orphaned
+                    $updatedExpRegId = $existingExpense->cash_register_id;
+                    if ($warehouseChangedForShipping && !empty($beforeCashByReg)) {
+                        foreach ($beforeCashByReg as $oldRegId => $oldCashOut) {
+                            $accountingService->adjustOpenRegisterExpectedCash((int)$oldRegId, round((float)$oldCashOut, 2));
+                        }
+                        $newWhRegId = $this->resolveActiveOpenCashRegisterId(null, $fromWarehouseId, $fromWarehouseName, $actor['user_id'], $actor['user_name'], false);
+                        $movedCash  = 0.0;
+                        foreach ($existingExpense->payments()->lockForUpdate()->get() as $ep) {
+                            if ($accountingService->isCashPaymentType($ep->payment_type)) {
+                                $ep->update(['cash_register_id' => $newWhRegId]);
+                                $movedCash += round((float)$ep->amount, 2);
+                            }
+                        }
+                        if ($newWhRegId && $movedCash > 0.001) {
+                            $accountingService->adjustOpenRegisterExpectedCash((int)$newWhRegId, -$movedCash);
+                        }
+                        $updatedExpRegId = $newWhRegId;
+                    }
+
+                    $totalPaid     = round((float)$existingExpense->payments()->sum('amount'), 2);
+                    $dueAmount     = max(0.0, round($shippingCharge - $totalPaid, 2));
+                    $paymentStatus = $totalPaid <= 0.001 ? 'Unpaid' : ($dueAmount <= 0.001 ? 'Paid' : 'Partial');
+                    $existingExpense->update([
+                        'transfer_id'      => $transfer->id,
+                        'warehouse_id'     => $fromWarehouseId,
+                        'warehouse_name'   => $fromWarehouseName,
+                        'cash_register_id' => $updatedExpRegId,
+                        'amount'           => $shippingCharge,
+                        'paid_amount'      => $totalPaid,
+                        'due_amount'       => $dueAmount,
+                        'payment_status'   => $paymentStatus,
+                        'payment_method'   => $totalPaid <= 0.001 ? 'Unpaid' : $existingExpense->payment_method,
+                        'date'             => $normalizedTxDate,
+                        'title'            => 'Shipping for Transfer #' . $refNo . ' → ' . $toWarehouseName,
+                        'details'          => 'Auto-created from Stock Transfer #' . $refNo,
                     ]);
                 }
             } elseif ($existingExpense) {
@@ -1840,7 +2054,8 @@ class TransferController extends Controller
                 $this->assertCumulativeSourceStock((int)$fromWarehouseId, $itemLines);
             }
 
-            $rcvDate = (string)($transfer->date ?? now());
+            $timezone = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
+            $rcvDate  = Carbon::now()->timezone($timezone)->format('Y-m-d H:i:s');
             foreach ($itemLines as $line) {
                 if ($line['base_quantity'] <= 0 || !$line['product']) {
                     continue;
@@ -1887,6 +2102,32 @@ class TransferController extends Controller
                 'received_at'     => now(),
                 'receiving_notes' => $validated['receiving_notes'] ?? null,
             ]);
+
+            // Recognize deferred Pending transfer shipping expense upon completion
+            if ($wasPending && (float)$transfer->shipping_charge > 0.001 && !$this->findLinkedShippingExpense($transfer, true)) {
+                $shippingPrefix = Setting::get('expense_prefix', 'EXP_');
+                $shipAmt        = round((float)$transfer->shipping_charge, 2);
+                Expense::create([
+                    'transfer_id'           => $transfer->id,
+                    'reference_no'          => $shippingPrefix . 'TRF-' . $transfer->reference_no,
+                    'warehouse_id'          => $fromWarehouseId,
+                    'warehouse_name'        => $transfer->from_warehouse,
+                    'cash_register_id'      => null,
+                    'expense_category_name' => 'Transfer Shipping',
+                    'title'                 => 'Shipping for Transfer #' . $transfer->reference_no . ' → ' . $transfer->to_warehouse,
+                    'amount'                => $shipAmt,
+                    'paid_amount'           => 0,
+                    'due_amount'            => $shipAmt,
+                    'payment_status'        => 'Unpaid',
+                    'payment_method'        => 'Unpaid',
+                    'date'                  => $rcvDate,
+                    'details'               => 'Auto-created from Stock Transfer #' . $transfer->reference_no,
+                    'created_by'            => $transfer->created_by ?: $receiverName,
+                    'user_name'             => $transfer->user_name ?: $receiverName,
+                    'user_role'             => $transfer->user_role ?: 'Branch Manager',
+                    'user_id'               => $transfer->user_id ?: ($authUser?->id),
+                ]);
+            }
 
             DB::commit();
             $this->clearTransferCache();
@@ -2018,28 +2259,23 @@ class TransferController extends Controller
 
         $authUser = User::resolveFromRequest($request) ?? $request->user();
         $authRole = $authUser?->roleModel?->name ?? ($authUser?->role ?? null);
-        $userName = $request->input('user_name') ?? ($authUser?->name ?? 'Super Admin');
-        $userRole = $request->input('user_role') ?? ($authRole ?? 'Super Admin');
-        $userId   = $request->input('user_id') ?? $authUser?->id;
+        $userName = $authUser?->name ?? ($request->input('user_name') ?? 'Super Admin');
+        $userRole = $authRole ?? ($request->input('user_role') ?? 'Super Admin');
+        $userId   = $authUser?->id ?? ($request->input('user_id') ? (int)$request->input('user_id') : null);
 
         $timezone    = Setting::get('timezone', config('app.timezone', 'Asia/Yangon'));
         $nowTz       = Carbon::now()->timezone($timezone);
-        $defaultDate = $nowTz->format('Y-m-d');
+        $defaultDate = $nowTz->format('Y-m-d H:i:s');
         $defaultTime = $nowTz->format('h:i A');
 
-        $pDate = $request->input('payment_date');
-        $pTime = $request->input('payment_time');
+        $rawPDate = $request->input('payment_date');
+        $pTime    = $request->input('payment_time');
 
-        if (empty($pDate)) {
-            $pDate = $defaultDate;
-        } elseif (strlen(trim((string)$pDate)) > 10 && str_contains((string)$pDate, ' ')) {
-            $parts = explode(' ', trim((string)$pDate), 2);
-            $pDate = $parts[0];
-            if (empty($pTime)) {
-                try {
-                    $pTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
-                } catch (\Throwable $e) {
-                }
+        if (!empty($rawPDate) && strlen(trim((string)$rawPDate)) > 10 && str_contains((string)$rawPDate, ' ') && empty($pTime)) {
+            $parts = explode(' ', trim((string)$rawPDate), 2);
+            try {
+                $pTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
+            } catch (\Throwable $e) {
             }
         }
 
@@ -2054,6 +2290,7 @@ class TransferController extends Controller
                 }
             }
         }
+        $pDate = $this->normalizeTransferDateTime($rawPDate ?: $defaultDate, $pTime);
 
         $totalPaying = 0.0;
         if (!empty($validated['payments']) && is_array($validated['payments'])) {
@@ -2116,7 +2353,7 @@ class TransferController extends Controller
                     'due_amount'            => (float)$transfer->shipping_charge,
                     'payment_status'        => 'Unpaid',
                     'payment_method'        => 'Unpaid',
-                    'date'                  => $pDate . ' ' . $pTime,
+                    'date'                  => $pDate,
                     'details'               => 'Auto-created from Stock Transfer #' . $transfer->reference_no,
                     'created_by'            => $userName,
                     'user_name'             => $userName,
@@ -2146,17 +2383,14 @@ class TransferController extends Controller
                     if ($pAmount <= 0) {
                         continue;
                     }
-                    $itemDate = !empty($p['payment_date']) ? $p['payment_date'] : $pDate;
-                    $itemTime = !empty($p['payment_time']) ? $p['payment_time'] : $pTime;
+                    $rawItemDate = !empty($p['payment_date']) ? $p['payment_date'] : $pDate;
+                    $itemTime    = !empty($p['payment_time']) ? $p['payment_time'] : $pTime;
 
-                    if (str_contains((string)$itemDate, ' ')) {
-                        $parts    = explode(' ', trim((string)$itemDate), 2);
-                        $itemDate = $parts[0];
-                        if (empty($p['payment_time'])) {
-                            try {
-                                $itemTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
-                            } catch (\Throwable $e) {
-                            }
+                    if (str_contains((string)$rawItemDate, ' ') && empty($p['payment_time'])) {
+                        $parts = explode(' ', trim((string)$rawItemDate), 2);
+                        try {
+                            $itemTime = Carbon::parse($parts[1])->timezone($timezone)->format('h:i A');
+                        } catch (\Throwable $e) {
                         }
                     }
                     try {
@@ -2166,6 +2400,7 @@ class TransferController extends Controller
                             $itemTime = $defaultTime;
                         }
                     }
+                    $itemDate = $this->normalizeTransferDateTime($rawItemDate, $itemTime);
 
                     $legsToCreate[] = [
                         'payment_type'     => $p['payment_type'] ?? ($p['type'] ?? $validated['payment_type']),

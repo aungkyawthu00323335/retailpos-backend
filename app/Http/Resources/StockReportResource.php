@@ -19,6 +19,8 @@ class StockReportResource extends JsonResource
         $canViewCost = is_bool($attrCanViewCost)
             ? $attrCanViewCost
             : app(PurchaseAccountingService::class)->canViewCost($request);
+        $fifoByProduct = $request->attributes->get('_stock_report_fifo_by_product', []);
+        $fifoBySku = $request->attributes->get('_stock_report_fifo_by_sku', []);
         $warehouseParam = $request->input('warehouse_id') ?? $request->input('outlet_id');
         $warehouseId = ($warehouseParam && $warehouseParam !== 'All' && $warehouseParam !== 'all')
             ? (int)$warehouseParam
@@ -81,6 +83,11 @@ class StockReportResource extends JsonResource
                 if ($vCost <= 0.0) {
                     $vCost = $costPrice;
                 }
+                $skuKey = "{$this->id}|{$v->id}";
+                $vMasterVal = round($vStock * $vCost, 2);
+                $vFifoVal = isset($fifoBySku[$skuKey])
+                    ? round((float)$fifoBySku[$skuKey]['effective_valuation'], 2)
+                    : $vMasterVal;
 
                 $variants[] = [
                     'id' => (int)$v->id,
@@ -88,12 +95,23 @@ class StockReportResource extends JsonResource
                     'sku' => (string)($v->sku ?? ''),
                     'cost_price' => $canViewCost ? $vCost : null,
                     'cost_masked' => !$canViewCost,
+                    'stock_value_cost' => $canViewCost ? $vFifoVal : null,
+                    'master_cost_value' => $canViewCost ? $vMasterVal : null,
                     'retail_price' => (float)($v->selling_price ?? 0.0) ?: $retailPrice,
                     'stock_quantity' => $vStock,
                     'values' => $vals,
                 ];
             }
         }
+
+        $pMasterVal = !empty($variants)
+            ? round((float)array_sum(array_map(fn($vr) => (float)($vr['master_cost_value'] ?? 0.0), $variants)), 2)
+            : round($stockQty * $costPrice, 2);
+        $pFifoVal = isset($fifoByProduct[(int)$this->id])
+            ? round((float)$fifoByProduct[(int)$this->id]['effective_valuation'], 2)
+            : (!empty($variants)
+                ? round((float)array_sum(array_map(fn($vr) => (float)($vr['stock_value_cost'] ?? 0.0), $variants)), 2)
+                : $pMasterVal);
 
         return [
             'id' => (int)$this->id,
@@ -105,6 +123,8 @@ class StockReportResource extends JsonResource
             'unit_name' => (string)($this->unit_name ?? ''),
             'cost_price' => $canViewCost ? $costPrice : null,
             'cost_masked' => !$canViewCost,
+            'stock_value_cost' => $canViewCost ? $pFifoVal : null,
+            'master_cost_value' => $canViewCost ? $pMasterVal : null,
             'retail_price' => $retailPrice,
             'stock_quantity' => $stockQty,
             'stockQuantity' => $stockQty,

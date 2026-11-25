@@ -188,8 +188,11 @@ class SaleReturnController extends Controller
 
         $alreadyReturnedBaseBySku = [];
         $priorReturnedGrandTotal = 0.0;
+        $priorReturnedShipping = 0.0;
         foreach ($priorReturns as $pr) {
-            $priorReturnedGrandTotal = round($priorReturnedGrandTotal + max(0.0, (float)$pr->grand_total - (float)$pr->shipping), 2);
+            $prShipping = max(0.0, (float)$pr->shipping);
+            $priorReturnedShipping = round($priorReturnedShipping + $prShipping, 2);
+            $priorReturnedGrandTotal = round($priorReturnedGrandTotal + max(0.0, (float)$pr->grand_total - $prShipping), 2);
             foreach ($pr->items as $pri) {
                 $pId = (int)($pri['product_id'] ?? 0);
                 if ($pId <= 0) continue;
@@ -333,6 +336,7 @@ class SaleReturnController extends Controller
             'tax_exclusive_base'        => round($taxExclusiveBase, 2),
             'sale_tax_exclusive_base'   => round($soldLineTaxExclBase, 2),
             'prior_returned_grand_total'=> $priorReturnedGrandTotal,
+            'prior_returned_shipping'   => $priorReturnedShipping,
             'products_by_id'            => $productsById,
         ];
     }
@@ -932,10 +936,20 @@ class SaleReturnController extends Controller
             ? round(min(max(0.0, (float)$validated['discount']), $computedSubtotal), 2)
             : round(min($computedSubtotal, (float)$linkedSale->discount * $ratio), 2);
 
-        $shipping = max(0.0, (float)($validated['shipping'] ?? 0));
+        $shipping = round(max(0.0, (float)($validated['shipping'] ?? 0)), 2);
+        $saleShipping = round(max(0.0, (float)($linkedSale->shipping ?? 0.0)), 2);
+        $priorReturnedShipping = round(max(0.0, (float)($preparedData['prior_returned_shipping'] ?? 0.0)), 2);
+        $remainingRefundableShipping = max(0.0, round($saleShipping - $priorReturnedShipping, 2));
+        if ($shipping > $remainingRefundableShipping + 0.01) {
+            $this->throwValidationError(
+                'shipping',
+                "Return shipping ({$shipping}) cannot exceed remaining refundable shipping ({$remainingRefundableShipping}) on linked Sale #{$linkedSale->reference_no}."
+            );
+        }
+
         $taxRate = array_key_exists('tax_rate', $validated)
-            ? max(0.0, (float)$validated['tax_rate'])
-            : max(0.0, (float)$linkedSale->tax_rate);
+            ? min(100.0, max(0.0, (float)$validated['tax_rate']))
+            : min(100.0, max(0.0, (float)$linkedSale->tax_rate));
 
         $taxableBase = max(0.0, $returnTaxExclBase - $orderDiscount);
         if ($taxRate > 0) {
@@ -949,11 +963,15 @@ class SaleReturnController extends Controller
         $grandTotal = max(0.0, round($computedSubtotal - $orderDiscount + $orderTaxAmount + $shipping, 2));
         $priorGoodsTotal = (float)$preparedData['prior_returned_grand_total'];
         $currentGoodsTotal = max(0.0, round($grandTotal - $shipping, 2));
-        $saleGoodsMax = max((float)$linkedSale->grand_total, round((float)$linkedSale->grand_total - (float)$linkedSale->shipping, 2));
-        if ($priorGoodsTotal + $currentGoodsTotal > (float)$linkedSale->grand_total + 0.05 || $currentGoodsTotal > $saleGoodsMax + 0.05) {
+        $saleGoodsMax = max(0.0, round((float)$linkedSale->grand_total - $saleShipping, 2));
+        if (
+            $priorGoodsTotal + $currentGoodsTotal > $saleGoodsMax + 0.05 ||
+            $currentGoodsTotal > $saleGoodsMax + 0.05 ||
+            $priorGoodsTotal + $priorReturnedShipping + $grandTotal > (float)$linkedSale->grand_total + 0.05
+        ) {
             $this->throwValidationError(
                 'grand_total',
-                "Total return value exceeds linked Sale #{$linkedSale->reference_no} grand total."
+                "Total return value exceeds linked Sale #{$linkedSale->reference_no} refundable goods/grand total."
             );
         }
 
@@ -1027,15 +1045,25 @@ class SaleReturnController extends Controller
         int $warehouseId,
         string $warehouseName,
         ?int $userId,
-        ?string $userName
+        ?string $userName,
+        array $preservedClosedRegIds = []
     ): void {
         if (!is_array($rawPayments) || empty($rawPayments)) {
             return;
         }
+        $preservedMap = array_flip(array_map('intval', array_filter($preservedClosedRegIds)));
         foreach ($rawPayments as $p) {
             if (is_array($p) && !empty($p['cash_register_id'])) {
+                $legRid = (int)$p['cash_register_id'];
+                if (isset($preservedMap[$legRid])) {
+                    $existingReg = CashRegister::find($legRid);
+                    if ($existingReg && !in_array(strtolower(trim((string)$existingReg->status)), ['open', 'opened'], true)) {
+                        // Allow unchanged historical closed-shift leg; assertCashRegisterDeltaMutable blocks any cash mutation
+                        continue;
+                    }
+                }
                 $this->resolveActiveCashRegisterId(
-                    (int)$p['cash_register_id'],
+                    $legRid,
                     $warehouseId,
                     $warehouseName,
                     $userId,
@@ -1311,7 +1339,7 @@ class SaleReturnController extends Controller
             'warehouse_name'             => 'nullable|string|max:255',
             'cash_register_id'           => 'nullable|integer',
             'date'                       => 'required|string',
-            'tax_rate'                   => 'nullable|numeric|min:0',
+            'tax_rate'                   => 'nullable|numeric|min:0|max:100',
             'tax_amount'                 => 'nullable|numeric|min:0',
             'discount'                   => 'nullable|numeric|min:0',
             'shipping'                   => 'nullable|numeric|min:0',
@@ -1588,7 +1616,7 @@ class SaleReturnController extends Controller
             'warehouse_name'             => 'nullable|string|max:255',
             'cash_register_id'           => 'nullable|integer',
             'date'                       => 'nullable|string',
-            'tax_rate'                   => 'nullable|numeric|min:0',
+            'tax_rate'                   => 'nullable|numeric|min:0|max:100',
             'tax_amount'                 => 'nullable|numeric|min:0',
             'discount'                   => 'nullable|numeric|min:0',
             'shipping'                   => 'nullable|numeric|min:0',
@@ -1688,6 +1716,21 @@ class SaleReturnController extends Controller
             }
 
             if ($targetStatus === 'Voided') {
+                $authUser = User::resolveFromRequest($request) ?? $request->user();
+                if ($authUser !== null
+                    && !(method_exists($authUser, 'isSuperAdmin') && $authUser->isSuperAdmin())
+                    && !$authUser->hasPermission('sale_returns.void')
+                    && !$authUser->hasPermission('sale_returns.delete')
+                    && !$authUser->hasPermission('sales.void')
+                    && !$accountingService->verifyManagerPin($request->input('manager_pin'))
+                ) {
+                    DB::rollBack();
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => 'Unauthorized. Voiding a sale return requires void/delete permission or Manager PIN.',
+                    ], 403);
+                }
+
                 $afterCashByReg = [];
                 if ($errMsg = $accountingService->assertCashRegisterDeltaMutable($beforeCashByReg, $afterCashByReg)) {
                     $this->throwValidationError('cash_register_id', $errMsg);
@@ -1695,6 +1738,9 @@ class SaleReturnController extends Controller
 
                 $return->update([
                     'status'                => 'Voided',
+                    'payment_status'        => 'Voided',
+                    'payment_type'          => 'Voided',
+                    'payments_payload'      => json_encode([]),
                     'paid_amount'           => 0.0,
                     'due_amount'            => 0.0,
                     'applied_credit_amount' => 0.0,
@@ -1753,18 +1799,42 @@ class SaleReturnController extends Controller
             }
 
             $refundTender = $validated['refund_tender'] ?? ($validated['payment_type'] ?? $return->refund_tender ?: 'Cash');
-            $targetRegId = $this->resolveActiveCashRegisterId(
-                isset($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : $return->cash_register_id,
-                $warehouseId,
-                $warehouseName,
-                $return->user_id,
-                $return->user_name,
-                false
-            );
+            $explicitReqRegId = isset($validated['cash_register_id']) && !empty($validated['cash_register_id'])
+                ? (int)$validated['cash_register_id']
+                : null;
+            $existingHeaderRegIsOpen = false;
+            if (!empty($return->cash_register_id)) {
+                $existingHdrReg = CashRegister::find((int)$return->cash_register_id);
+                $existingHeaderRegIsOpen = $existingHdrReg !== null
+                    && in_array(strtolower(trim((string)$existingHdrReg->status)), ['open', 'opened'], true);
+            }
+            $isEchoedClosedHeader = $explicitReqRegId !== null
+                && !empty($return->cash_register_id)
+                && $explicitReqRegId === (int)$return->cash_register_id
+                && !$existingHeaderRegIsOpen;
+            $openActorId = $authUser?->id ?? $return->user_id;
+            $openActorName = $authUser?->name ?? $return->user_name;
+            $newLegDefaultRegId = ($explicitReqRegId !== null && !$isEchoedClosedHeader)
+                ? $this->resolveActiveCashRegisterId($explicitReqRegId, $warehouseId, $warehouseName, $openActorId, $openActorName, true)
+                : ($existingHeaderRegIsOpen
+                    ? (int)$return->cash_register_id
+                    : $this->resolveActiveCashRegisterId(null, $warehouseId, $warehouseName, $openActorId, $openActorName, false));
+            $targetRegId = !empty($beforeCashByReg)
+                ? ($return->cash_register_id ? (int)$return->cash_register_id : $newLegDefaultRegId)
+                : $newLegDefaultRegId;
+
+            $preservedRegIds = collect(is_array($return->payments) ? $return->payments : [])
+                ->pluck('cash_register_id')
+                ->filter()
+                ->map(fn($rid) => (int)$rid)
+                ->all();
+            if (!empty($return->cash_register_id)) {
+                $preservedRegIds[] = (int)$return->cash_register_id;
+            }
 
             $cleanRef = preg_replace('/^#\s*/', '', trim((string)($validated['reference_no'] ?? $return->reference_no)));
             if ($targetStatus === 'Completed' && array_key_exists('payments', $validated) && !empty($validated['payments'])) {
-                $this->validatePaymentLegRegisters($validated['payments'], (int)$warehouseId, $warehouseName, $return->user_id, $return->user_name);
+                $this->validatePaymentLegRegisters($validated['payments'], (int)$warehouseId, $warehouseName, $openActorId, $openActorName, $preservedRegIds);
             }
             $rawPayArg = $targetStatus === 'Completed'
                 ? (array_key_exists('payments', $validated) ? $validated['payments'] : $return->payments)
@@ -1775,7 +1845,7 @@ class SaleReturnController extends Controller
                 $refundTender,
                 $cleanRef,
                 (int)$return->id,
-                $targetRegId,
+                $newLegDefaultRegId,
                 $txDate,
                 $return->user_name ?: ($validated['user_name'] ?? 'Super Admin'),
                 $return->user_role ?: ($validated['user_role'] ?? 'Super Admin'),
@@ -1905,6 +1975,14 @@ class SaleReturnController extends Controller
             $fifoService = app(FifoInventoryService::class);
             $accountingService = app(PurchaseAccountingService::class);
             $accountingService->assertOutletAccess($request, $return->warehouse_id, $return->warehouse_name);
+
+            if (in_array(strtolower(trim((string)$return->status)), ['completed', 'received', 'voided'], true)) {
+                DB::rollBack();
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Completed or Voided sale returns cannot be permanently deleted. Void the sale return instead to preserve the accounting audit trail.',
+                ], 422);
+            }
 
             $linkedSale = $this->resolveLinkedSale($return->sale_id ? (int)$return->sale_id : null, $return->sale_reference_no, true);
             $beforeCashByReg = $return->status === 'Completed'

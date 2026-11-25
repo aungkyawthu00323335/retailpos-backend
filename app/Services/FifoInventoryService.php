@@ -4,9 +4,6 @@ namespace App\Services;
 
 use App\Models\AdjustmentItemCostLayer;
 use App\Models\InventoryBatch;
-use App\Models\Processing;
-use App\Models\ProcessingItem;
-use App\Models\ProcessingItemCostLayer;
 use App\Models\Purchase;
 use App\Models\PurchaseItem;
 use App\Models\PurchaseReturnCostLayer;
@@ -238,27 +235,48 @@ class FifoInventoryService
         float $fallbackCost = 0.0,
         ?int $stockAdjustmentId = null,
         ?int $stockAdjustmentItemId = null,
-        ?array &$recordedLayers = null
+        ?array &$recordedLayers = null,
+        ?string $adjustmentDate = null
     ): float {
         $recordedLayers = [];
         $neededBaseQty = round(max(0.0, $baseQty), 4);
         if ($neededBaseQty <= 0) return 0.0;
 
-        $batchQuery = InventoryBatch::where('warehouse_id', $warehouseId)
+        $baseQuery = InventoryBatch::where('warehouse_id', $warehouseId)
             ->where('product_id', $productId)
             ->where('remaining_quantity', '>', 0.0001)
             ->where('status', 'active');
 
         if ($variantId !== null && $variantId > 0) {
-            $batchQuery->where('product_variant_id', $variantId);
+            $baseQuery->where('product_variant_id', $variantId);
         } else {
-            $batchQuery->whereNull('product_variant_id');
+            $baseQuery->whereNull('product_variant_id');
         }
 
-        $batches = $batchQuery->orderBy('received_date', 'asc')
-            ->orderBy('id', 'asc')
-            ->lockForUpdate()
-            ->get();
+        if ($adjustmentDate !== null && trim($adjustmentDate) !== '') {
+            $cutoff = Carbon::parse($adjustmentDate)->endOfDay();
+            $preCutoff = (clone $baseQuery)
+                ->where(function ($q) use ($cutoff) {
+                    $q->whereNull('received_date')->orWhere('received_date', '<=', $cutoff);
+                })
+                ->orderBy('received_date', 'asc')
+                ->orderBy('id', 'asc')
+                ->lockForUpdate()
+                ->get();
+            $preIds = $preCutoff->pluck('id')->all();
+            $postCutoff = (clone $baseQuery)
+                ->when(!empty($preIds), fn($q) => $q->whereNotIn('id', $preIds))
+                ->orderBy('received_date', 'asc')
+                ->orderBy('id', 'asc')
+                ->lockForUpdate()
+                ->get();
+            $batches = $preCutoff->concat($postCutoff);
+        } else {
+            $batches = $baseQuery->orderBy('received_date', 'asc')
+                ->orderBy('id', 'asc')
+                ->lockForUpdate()
+                ->get();
+        }
 
         $remainingNeeded = $neededBaseQty;
         $totalLossCost = 0.0;
@@ -268,7 +286,7 @@ class FifoInventoryService
 
             $avail = (float)$batch->remaining_quantity;
             $takeQty = round(min($avail, $remainingNeeded), 4);
-            $batchCost = (float)$batch->unit_cost;
+            $batchCost = round((float)$batch->unit_cost, 8);
             $layerTotal = round($takeQty * $batchCost, 4);
             $totalLossCost += $layerTotal;
             $remainingNeeded = round(max(0.0, $remainingNeeded - $takeQty), 4);
@@ -286,14 +304,15 @@ class FifoInventoryService
                 'product_id' => $productId,
                 'product_variant_id' => $variantId,
                 'base_quantity' => $takeQty,
-                'unit_cost' => round($batchCost, 4),
+                'unit_cost' => $batchCost,
                 'total_cost' => $layerTotal,
                 'is_fallback_layer' => false,
             ];
         }
 
         if ($remainingNeeded > 0.0001) {
-            $fallbackLayerCost = round($remainingNeeded * $fallbackCost, 4);
+            $safeFallback = round(max(0.0, $fallbackCost), 8);
+            $fallbackLayerCost = round($remainingNeeded * $safeFallback, 4);
             $totalLossCost += $fallbackLayerCost;
             $recordedLayers[] = [
                 'inventory_batch_id' => null,
@@ -301,17 +320,31 @@ class FifoInventoryService
                 'product_id' => $productId,
                 'product_variant_id' => $variantId,
                 'base_quantity' => round($remainingNeeded, 4),
-                'unit_cost' => round($fallbackCost, 4),
+                'unit_cost' => $safeFallback,
                 'total_cost' => $fallbackLayerCost,
                 'is_fallback_layer' => true,
             ];
+        }
+
+        // Apply 2dp penny-drift plug to final layer so SUM(layer.total_cost) === returned loss
+        $roundedLoss = round($totalLossCost, 2);
+        if (!empty($recordedLayers)) {
+            $lastIdx = count($recordedLayers) - 1;
+            $priorSum = 0.0;
+            for ($i = 0; $i < $lastIdx; $i++) {
+                $priorSum += (float)$recordedLayers[$i]['total_cost'];
+            }
+            $pluggedLast = round(max(0.0, $roundedLoss - $priorSum), 4);
+            if (abs($pluggedLast - (float)$recordedLayers[$lastIdx]['total_cost']) <= 0.05) {
+                $recordedLayers[$lastIdx]['total_cost'] = $pluggedLast;
+            }
         }
 
         if ($stockAdjustmentId !== null && $stockAdjustmentItemId !== null && !empty($recordedLayers)) {
             $this->persistAdjustmentCostLayers($stockAdjustmentId, $stockAdjustmentItemId, $recordedLayers);
         }
 
-        return round($totalLossCost, 2);
+        return $roundedLoss;
     }
 
     /**
@@ -333,7 +366,7 @@ class FifoInventoryService
                 'product_id' => $layer['product_id'] ?? null,
                 'product_variant_id' => $layer['product_variant_id'] ?? null,
                 'base_quantity' => round((float)($layer['base_quantity'] ?? 0), 4),
-                'unit_cost' => round((float)($layer['unit_cost'] ?? 0), 4),
+                'unit_cost' => round((float)($layer['unit_cost'] ?? 0), 8),
                 'total_cost' => round((float)($layer['total_cost'] ?? 0), 4),
                 'is_fallback_layer' => (bool)($layer['is_fallback_layer'] ?? false),
                 'created_at' => $now,
@@ -348,7 +381,7 @@ class FifoInventoryService
      */
     public function reverseSaleFifo(Sale $sale): void
     {
-        $costLayers = SaleItemCostLayer::where('sale_id', $sale->id)->get();
+        $costLayers = SaleItemCostLayer::where('sale_id', $sale->id)->lockForUpdate()->get();
         if ($costLayers->isEmpty()) {
             return;
         }
@@ -359,8 +392,14 @@ class FifoInventoryService
             foreach ($costLayers as $layer) {
                 if ($layer->inventory_batch_id && isset($batches[$layer->inventory_batch_id])) {
                     $batch = $batches[$layer->inventory_batch_id];
-                    $batch->remaining_quantity = round((float)$batch->remaining_quantity + (float)$layer->base_quantity, 4);
-                    $batch->status = 'active';
+                    $restored = round((float)$batch->remaining_quantity + (float)$layer->base_quantity, 4);
+                    if ((float)$batch->initial_quantity > 0) {
+                        $restored = min((float)$batch->initial_quantity, $restored);
+                    }
+                    $batch->remaining_quantity = $restored;
+                    if ($batch->remaining_quantity > 0.0001) {
+                        $batch->status = 'active';
+                    }
                 }
             }
             foreach ($batches as $batch) {
@@ -412,8 +451,9 @@ class FifoInventoryService
                     ->where('product_id', $productId)
                     ->where('source_type', 'adjustment_addition')
                     ->where(function ($q) use ($adjustment) {
+                        $escapedAdjRef = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], (string)$adjustment->reference_no);
                         $q->where('source_reference', $adjustment->reference_no)
-                          ->orWhere('source_reference', 'like', "{$adjustment->reference_no}#%");
+                          ->orWhereRaw("source_reference LIKE ? ESCAPE '!'", ["{$escapedAdjRef}#%"]);
                     });
                 if ($variantId !== null && $variantId > 0) {
                     $fallbackQuery->where('product_variant_id', $variantId);
@@ -491,9 +531,9 @@ class FifoInventoryService
         $batch->source_reference = "{$referenceNo}#{$newAdjItemId}";
         if ($consumedQty <= 0.0001) {
             $batch->unit_cost = round(max(0.0, $newBaseCost), 8);
-        }
-        if ($receivedDate !== null) {
-            $batch->received_date = Carbon::parse($receivedDate);
+            if ($receivedDate !== null) {
+                $batch->received_date = Carbon::parse($receivedDate);
+            }
         }
         if ($notes !== null) {
             $batch->notes = $notes;
@@ -731,7 +771,7 @@ class FifoInventoryService
                     'product_id' => $productId,
                     'product_variant_id' => $variantId,
                     'base_quantity' => $takeQty,
-                    'unit_cost' => round($batchCost, 4),
+                    'unit_cost' => round($batchCost, 8),
                     'total_cost' => $layerTotal,
                     'is_fallback_layer' => false,
                 ];
@@ -789,7 +829,7 @@ class FifoInventoryService
                     'product_id' => $productId,
                     'product_variant_id' => $variantId,
                     'base_quantity' => $takeQty,
-                    'unit_cost' => round($batchCost, 4),
+                    'unit_cost' => round($batchCost, 8),
                     'total_cost' => $layerTotal,
                     'is_fallback_layer' => false,
                 ];
@@ -797,7 +837,8 @@ class FifoInventoryService
         }
 
         if ($remainingNeeded > 0.0001) {
-            $fallbackLayerCost = round($remainingNeeded * $fallbackCost, 4);
+            $safeFallback = round(max(0.0, $fallbackCost), 8);
+            $fallbackLayerCost = round($remainingNeeded * $safeFallback, 4);
             $totalReturnCost += $fallbackLayerCost;
             $recordedLayers[] = [
                 'inventory_batch_id' => null,
@@ -805,7 +846,7 @@ class FifoInventoryService
                 'product_id' => $productId,
                 'product_variant_id' => $variantId,
                 'base_quantity' => round($remainingNeeded, 4),
-                'unit_cost' => round($fallbackCost, 4),
+                'unit_cost' => $safeFallback,
                 'total_cost' => $fallbackLayerCost,
                 'is_fallback_layer' => true,
             ];
@@ -836,7 +877,7 @@ class FifoInventoryService
                 'product_id' => (int)($layer['product_id'] ?? 0),
                 'product_variant_id' => $layer['product_variant_id'] ?? null,
                 'base_quantity' => round((float)($layer['base_quantity'] ?? 0), 4),
-                'unit_cost' => round((float)($layer['unit_cost'] ?? 0), 4),
+                'unit_cost' => round((float)($layer['unit_cost'] ?? 0), 8),
                 'total_cost' => round((float)($layer['total_cost'] ?? 0), 4),
                 'is_fallback_layer' => (bool)($layer['is_fallback_layer'] ?? false),
                 'created_at' => $now,
@@ -1240,7 +1281,7 @@ class FifoInventoryService
                 }
 
                 $takeQty = round(min($remainingToRestore, $layerQty), 4);
-                $unitCost = (float)$sLayer->unit_cost > 0 ? round((float)$sLayer->unit_cost, 4) : round($saleAvgUnitCost, 4);
+                $unitCost = (float)$sLayer->unit_cost > 0 ? round((float)$sLayer->unit_cost, 8) : round($saleAvgUnitCost, 8);
                 $layerTotal = round($takeQty * $unitCost, 4);
 
                 $restoredBatch = $this->recordBatch(
@@ -1275,7 +1316,7 @@ class FifoInventoryService
         }
 
         if ($remainingToRestore > 0.0001) {
-            $fallbackCost = $saleAvgUnitCost > 0 ? round($saleAvgUnitCost, 4) : round(max(0.0, $productFallbackCost), 4);
+            $fallbackCost = $saleAvgUnitCost > 0 ? round($saleAvgUnitCost, 8) : round(max(0.0, $productFallbackCost), 8);
             $layerTotal = round($remainingToRestore * $fallbackCost, 4);
 
             $restoredBatch = $this->recordBatch(
@@ -1307,7 +1348,7 @@ class FifoInventoryService
             $totalRestoredCost = round($totalRestoredCost + $layerTotal, 4);
         }
 
-        $avgCost = $baseQty > 0.0001 ? round($totalRestoredCost / $baseQty, 4) : 0.0;
+        $avgCost = $baseQty > 0.0001 ? round($totalRestoredCost / $baseQty, 8) : 0.0;
         $expectedCost = round($baseQty * $saleAvgUnitCost, 4);
 
         return [
@@ -1400,7 +1441,7 @@ class FifoInventoryService
                 $fallbackCost = (float)($tItem->product->cost_price ?: $tItem->product->purchase_price);
             }
 
-            $batchQuery = InventoryBatch::where('warehouse_id', $fromWarehouseId)
+            $baseBatchQuery = InventoryBatch::where('warehouse_id', $fromWarehouseId)
                 ->where('product_id', $productId)
                 ->where('remaining_quantity', '>', 0.0001)
                 ->where('status', 'active')
@@ -1408,11 +1449,26 @@ class FifoInventoryService
                     $variantId !== null && $variantId > 0,
                     fn($q) => $q->where('product_variant_id', $variantId),
                     fn($q) => $q->whereNull('product_variant_id')
-                )
+                );
+
+            // Prefer chronologically eligible batches (received_date <= transfer date) first
+            $txCutoff = Carbon::parse($txDate)->endOfDay();
+            $preBatches = (clone $baseBatchQuery)
+                ->where(function ($q) use ($txCutoff) {
+                    $q->whereNull('received_date')->orWhere('received_date', '<=', $txCutoff);
+                })
                 ->orderBy('received_date', 'asc')
                 ->orderBy('id', 'asc')
                 ->lockForUpdate()
                 ->get();
+            $preBatchIds = $preBatches->pluck('id')->all();
+            $postBatches = (clone $baseBatchQuery)
+                ->when(!empty($preBatchIds), fn($q) => $q->whereNotIn('id', $preBatchIds))
+                ->orderBy('received_date', 'asc')
+                ->orderBy('id', 'asc')
+                ->lockForUpdate()
+                ->get();
+            $batchQuery = $preBatches->concat($postBatches);
 
             $remainingNeeded = $needed;
             $itemTotalCost = 0.0;
@@ -1423,7 +1479,7 @@ class FifoInventoryService
                 }
                 $avail = (float)$batch->remaining_quantity;
                 $takeQty = round(min($avail, $remainingNeeded), 4);
-                $unitCost = (float)$batch->unit_cost;
+                $unitCost = round((float)$batch->unit_cost, 8);
                 $layerCost = round($takeQty * $unitCost, 4);
 
                 $newRemaining = max(0.0, round($avail - $takeQty, 4));
@@ -1470,11 +1526,12 @@ class FifoInventoryService
             }
 
             if ($remainingNeeded > 0.0001) {
-                $unitCost = round(max(0.0, $fallbackCost), 4);
+                $unitCost = round(max(0.0, $fallbackCost), 8);
                 $layerCost = round($remainingNeeded * $unitCost, 4);
 
+                // Do NOT mint permanent 0.00 active destination batches for unbatched zero-cost fallback transfers
                 $destBatchId = null;
-                if ($createDestinationBatches) {
+                if ($createDestinationBatches && $unitCost > 0.0001) {
                     $destBatch = $this->recordBatch(
                         warehouseId:     $toWarehouseId,
                         productId:       $productId,
@@ -1509,7 +1566,7 @@ class FifoInventoryService
             }
 
             $conv = (float)($tItem->conversion_rate > 0 ? $tItem->conversion_rate : 1.0);
-            $avgBaseCost = $needed > 0.0001 ? round($itemTotalCost / $needed, 4) : 0.0;
+            $avgBaseCost = $needed > 0.0001 ? round($itemTotalCost / $needed, 8) : 0.0;
             $tItem->update([
                 'base_unit_cost' => $avgBaseCost,
                 'unit_cost' => round($avgBaseCost * $conv, 4),
@@ -1538,6 +1595,9 @@ class FifoInventoryService
         if ($layers->isNotEmpty()) {
             foreach ($layers as $layer) {
                 if (!empty($layer->destination_inventory_batch_id)) {
+                    continue;
+                }
+                if ($layer->is_fallback_layer && (float)$layer->unit_cost <= 0.0001) {
                     continue;
                 }
                 $srcDate = $layer->sourceBatch?->received_date?->toDateTimeString() ?? ($transfer->date ?: now()->toDateTimeString());
@@ -1640,7 +1700,7 @@ class FifoInventoryService
      */
     public function rollbackTransferFifo(StockTransfer $transfer, bool $onlyDestination = false): void
     {
-        $layers = StockTransferCostLayer::where('stock_transfer_id', $transfer->id)->get();
+        $layers = StockTransferCostLayer::where('stock_transfer_id', $transfer->id)->lockForUpdate()->get();
 
         $layerDestIds = $layers->pluck('destination_inventory_batch_id')->filter()->unique()->values()->all();
         $legacyDestIds = InventoryBatch::whereIn('source_type', ['transfer', 'stock_transfer'])
@@ -1656,6 +1716,50 @@ class FifoInventoryService
         if ($onlyDestination) {
             StockTransferCostLayer::where('stock_transfer_id', $transfer->id)
                 ->update(['destination_inventory_batch_id' => null]);
+            return;
+        }
+
+        if ($layers->isEmpty()) {
+            // Legacy pre-layer transfer: restore source warehouse batches with headroom (LIFO reverse)
+            $transfer->loadMissing('items');
+            $fromWhId = (int)($transfer->from_warehouse_id ?? 0);
+            if ($fromWhId > 0) {
+                foreach ($transfer->items as $tItem) {
+                    $needRestore = round(max(0.0, (float)($tItem->base_quantity > 0 ? $tItem->base_quantity : $tItem->quantity)), 4);
+                    if ($needRestore <= 0.0001 || !$tItem->product_id) {
+                        continue;
+                    }
+                    $vId = $tItem->product_variant_id ? (int)$tItem->product_variant_id : null;
+                    $candidates = InventoryBatch::where('warehouse_id', $fromWhId)
+                        ->where('product_id', (int)$tItem->product_id)
+                        ->when(
+                            $vId !== null && $vId > 0,
+                            fn($q) => $q->where('product_variant_id', $vId),
+                            fn($q) => $q->whereNull('product_variant_id')
+                        )
+                        ->whereColumn('remaining_quantity', '<', 'initial_quantity')
+                        ->orderByDesc('received_date')
+                        ->orderByDesc('id')
+                        ->lockForUpdate()
+                        ->get();
+                    foreach ($candidates as $cand) {
+                        if ($needRestore <= 0.0001) {
+                            break;
+                        }
+                        $headroom = round(max(0.0, (float)$cand->initial_quantity - (float)$cand->remaining_quantity), 4);
+                        if ($headroom <= 0.0001) {
+                            continue;
+                        }
+                        $add = min($needRestore, $headroom);
+                        $cand->remaining_quantity = round((float)$cand->remaining_quantity + $add, 4);
+                        if ($cand->remaining_quantity > 0.0001) {
+                            $cand->status = 'active';
+                        }
+                        $cand->save();
+                        $needRestore = round(max(0.0, $needRestore - $add), 4);
+                    }
+                }
+            }
             return;
         }
 
@@ -1693,174 +1797,6 @@ class FifoInventoryService
         return SaleItemCostLayer::where('inventory_batch_id', $batchId)->exists()
             || AdjustmentItemCostLayer::where('inventory_batch_id', $batchId)->exists()
             || PurchaseReturnCostLayer::where('inventory_batch_id', $batchId)->exists()
-            || StockTransferCostLayer::where('source_inventory_batch_id', $batchId)->exists()
-            || (Schema::hasTable('processing_item_cost_layers')
-                && ProcessingItemCostLayer::where('inventory_batch_id', $batchId)->exists());
-    }
-
-    /**
-     * Deplete input FIFO batches for a manufacturing/processing ingredient item and persist cost layers.
-     *
-     * @return array{total_cost: float, base_unit_cost: float}
-     */
-    public function depleteProcessingItemFifo(
-        ProcessingItem $procItem,
-        int $warehouseId,
-        ?string $procDate = null,
-        float $fallbackBaseCost = 0.0
-    ): array {
-        $neededBaseQty = round(max(0.0, (float)$procItem->base_quantity), 4);
-        if ($neededBaseQty <= 0) {
-            return ['total_cost' => 0.0, 'base_unit_cost' => 0.0];
-        }
-
-        $txDate = $procDate ? Carbon::parse($procDate) : now();
-        $cutoff = ($procDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', trim($procDate)))
-            ? Carbon::parse($procDate)->endOfDay()
-            : $txDate;
-        $cutoffStr = $cutoff->toDateTimeString();
-
-        $batchQuery = InventoryBatch::where('warehouse_id', $warehouseId)
-            ->where('product_id', $procItem->product_id)
-            ->where('remaining_quantity', '>', 0.0001)
-            ->where('status', 'active')
-            ->where(function ($q) use ($cutoffStr) {
-                $q->whereNull('received_date')
-                    ->orWhere('received_date', '<=', $cutoffStr)
-                    ->orWhere('source_type', 'opening_stock');
-            });
-
-        $variantId = !empty($procItem->product_variant_id) ? (int)$procItem->product_variant_id : null;
-        if ($variantId !== null && $variantId > 0) {
-            $batchQuery->where('product_variant_id', $variantId);
-        } else {
-            $batchQuery->whereNull('product_variant_id');
-        }
-
-        $batches = $batchQuery->orderByRaw('CASE WHEN received_date IS NULL OR received_date <= ? THEN 0 ELSE 1 END ASC', [$cutoffStr])
-            ->orderBy('received_date', 'asc')
-            ->orderBy('id', 'asc')
-            ->lockForUpdate()
-            ->get();
-
-        $remainingNeeded = $neededBaseQty;
-        $totalInputCost = 0.0;
-        $layerRows = [];
-        $now = now();
-
-        foreach ($batches as $batch) {
-            if ($remainingNeeded <= 0.0001) {
-                break;
-            }
-            $avail = (float)$batch->remaining_quantity;
-            $takeQty = round(min($avail, $remainingNeeded), 4);
-            $batchCost = (float)$batch->unit_cost;
-            $layerCost = round($takeQty * $batchCost, 4);
-
-            $newRemaining = max(0.0, round($avail - $takeQty, 4));
-            $batch->remaining_quantity = $newRemaining;
-            if ($newRemaining <= 0.0001) {
-                $batch->status = 'exhausted';
-            }
-            $batch->save();
-
-            $layerRows[] = [
-                'processing_id' => $procItem->processing_id,
-                'processing_item_id' => $procItem->id,
-                'inventory_batch_id' => $batch->id,
-                'warehouse_id' => $warehouseId,
-                'product_id' => $procItem->product_id,
-                'product_variant_id' => $variantId,
-                'base_quantity' => $takeQty,
-                'unit_cost' => round($batchCost, 4),
-                'total_cost' => $layerCost,
-                'is_fallback_layer' => false,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ];
-
-            $totalInputCost += $layerCost;
-            $remainingNeeded = round(max(0.0, $remainingNeeded - $takeQty), 4);
-        }
-
-        if ($remainingNeeded > 0.0001) {
-            $unitCost = max(0.0, $fallbackBaseCost);
-            $fallbackCostTotal = round($remainingNeeded * $unitCost, 4);
-            $layerRows[] = [
-                'processing_id' => $procItem->processing_id,
-                'processing_item_id' => $procItem->id,
-                'inventory_batch_id' => null,
-                'warehouse_id' => $warehouseId,
-                'product_id' => $procItem->product_id,
-                'product_variant_id' => $variantId,
-                'base_quantity' => round($remainingNeeded, 4),
-                'unit_cost' => round($unitCost, 4),
-                'total_cost' => $fallbackCostTotal,
-                'is_fallback_layer' => true,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ];
-            $totalInputCost += $fallbackCostTotal;
-        }
-
-        if (!empty($layerRows) && Schema::hasTable('processing_item_cost_layers')) {
-            ProcessingItemCostLayer::insert($layerRows);
-        }
-
-        $totalInputCost = round($totalInputCost, 2);
-        $baseUnitCost = $neededBaseQty > 0 ? round($totalInputCost / $neededBaseQty, 4) : 0.0;
-
-        return [
-            'total_cost' => $totalInputCost,
-            'base_unit_cost' => $baseUnitCost,
-        ];
-    }
-
-    /**
-     * Reverse a Completed Processing run's FIFO footprint: verify output batch unconsumed,
-     * delete output FIFO batch, and restore depleted ingredient InventoryBatches.
-     */
-    public function reverseProcessingFifo(Processing $processing): ?string
-    {
-        $outputBatches = InventoryBatch::where('source_type', 'processing')
-            ->where('source_reference', $processing->reference_no)
-            ->lockForUpdate()
-            ->get();
-
-        foreach ($outputBatches as $outBatch) {
-            $consumed = max(0.0, round((float)$outBatch->initial_quantity - (float)$outBatch->remaining_quantity, 4));
-            if ($consumed > 0.0001 || $this->hasDownstreamBatchConsumption((int)$outBatch->id)) {
-                return "Cannot delete Processing #{$processing->reference_no}: finished good FIFO batch has already been consumed ({$consumed} base units). Void dependent sales, adjustments, or transfers first.";
-            }
-        }
-
-        if ($outputBatches->isNotEmpty()) {
-            InventoryBatch::whereIn('id', $outputBatches->pluck('id')->all())->delete();
-        }
-
-        if (Schema::hasTable('processing_item_cost_layers')) {
-            $layers = ProcessingItemCostLayer::where('processing_id', $processing->id)->get();
-            $batchIds = $layers->pluck('inventory_batch_id')->filter()->unique()->values()->all();
-            if (!empty($batchIds)) {
-                $batches = InventoryBatch::whereIn('id', $batchIds)->lockForUpdate()->get()->keyBy('id');
-                foreach ($layers as $layer) {
-                    if (!$layer->is_fallback_layer && $layer->inventory_batch_id && isset($batches[$layer->inventory_batch_id])) {
-                        $batch = $batches[$layer->inventory_batch_id];
-                        $restored = round((float)$batch->remaining_quantity + (float)$layer->base_quantity, 4);
-                        if ((float)$batch->initial_quantity > 0) {
-                            $restored = min((float)$batch->initial_quantity, $restored);
-                        }
-                        $batch->remaining_quantity = $restored;
-                        if ($batch->remaining_quantity > 0.0001) {
-                            $batch->status = 'active';
-                        }
-                        $batch->save();
-                    }
-                }
-            }
-            ProcessingItemCostLayer::where('processing_id', $processing->id)->delete();
-        }
-
-        return null;
+            || StockTransferCostLayer::where('source_inventory_batch_id', $batchId)->exists();
     }
 }

@@ -8,8 +8,6 @@ use App\Models\Expense;
 use App\Models\ExpensePayment;
 use App\Models\InventoryBatch;
 use App\Models\Outlet;
-use App\Models\Processing;
-use App\Models\ProcessingItemCostLayer;
 use App\Models\Product;
 use App\Models\Purchase;
 use App\Models\PurchaseItem;
@@ -122,133 +120,6 @@ class ComprehensiveAccountingAuditRegressionTest extends TestCase
             'stock_quantity' => 0,
             'alert_quantity' => 5,
         ]);
-    }
-
-    public function test_processing_fifo_cost_depletion_rollback_guard_outlet_isolation_and_csv_export(): void
-    {
-        $rawProd = $this->createProduct('PROC-RAW-1', 'Bulk Sugar Bag', 1000.0, 1500.0);
-        $rawProd->update(['stock_quantity' => 10, 'quantity' => 10]);
-        $outProd = $this->createProduct('PROC-OUT-1', 'Retail Sugar Pack', 0.0, 1200.0);
-
-        StockBalance::create([
-            'warehouse_id' => $this->wh1->id,
-            'product_id' => $rawProd->id,
-            'quantity' => 10.0,
-        ]);
-        StockBalance::create([
-            'warehouse_id' => $this->wh1->id,
-            'product_id' => $outProd->id,
-            'quantity' => 0.0,
-        ]);
-
-        // Two chronological FIFO batches at distinct costs: 4 @ 1,000 + 6 @ 2,000
-        $batch1 = InventoryBatch::create([
-            'warehouse_id' => $this->wh1->id,
-            'product_id' => $rawProd->id,
-            'initial_quantity' => 4.0,
-            'remaining_quantity' => 4.0,
-            'unit_cost' => 1000.0,
-            'source_type' => 'purchase',
-            'source_reference' => 'PO-PROC-01',
-            'received_date' => Carbon::now()->subDays(5)->toDateTimeString(),
-            'status' => 'active',
-        ]);
-        $batch2 = InventoryBatch::create([
-            'warehouse_id' => $this->wh1->id,
-            'product_id' => $rawProd->id,
-            'initial_quantity' => 6.0,
-            'remaining_quantity' => 6.0,
-            'unit_cost' => 2000.0,
-            'source_type' => 'purchase',
-            'source_reference' => 'PO-PROC-02',
-            'received_date' => Carbon::now()->subDays(3)->toDateTimeString(),
-            'status' => 'active',
-        ]);
-
-        // Spoofed client unit_cost (99999) must be overridden by exact FIFO layers:
-        // (4 * 1000 + 2 * 2000) = 8000 input + 1000 additional = 9000 total / 10 output = 900 unit cost
-        $createRes = $this->withToken($this->admin->api_token)->postJson('/api/processings', [
-            'reference_no' => 'PROC-FIFO-001',
-            'warehouse_id' => $this->wh1->id,
-            'warehouse_name' => $this->wh1->name,
-            'date' => Carbon::now()->toDateTimeString(),
-            'output_product_id' => $outProd->id,
-            'output_product_code' => $outProd->code,
-            'output_product_name' => $outProd->name,
-            'output_unit_name' => 'Pack',
-            'output_conversion_rate' => 1.0,
-            'output_quantity' => 10.0,
-            'output_unit_cost' => 99999.0,
-            'additional_cost' => 1000.0,
-            'status' => 'completed',
-            'notes' => '=HYPERLINK("http://evil")',
-            'items' => [
-                [
-                    'product_id' => $rawProd->id,
-                    'product_code' => $rawProd->code,
-                    'product_name' => $rawProd->name,
-                    'unit_name' => 'Kg',
-                    'conversion_rate' => 1.0,
-                    'quantity' => 6.0,
-                    'unit_cost' => 99999.0,
-                    'subtotal_cost' => 599994.0,
-                ],
-            ],
-        ]);
-
-        $createRes->assertStatus(201);
-        $procId = (int)$createRes->json('data.id');
-        $this->assertEquals(8000.0, (float)$createRes->json('data.total_input_cost'));
-        $this->assertEquals(9000.0, (float)$createRes->json('data.total_cost'));
-        $this->assertEquals(900.0, (float)$createRes->json('data.output_unit_cost'));
-
-        // Batch 1 exhausted (0), Batch 2 has 4 remaining
-        $this->assertEquals(0.0, (float)$batch1->fresh()->remaining_quantity);
-        $this->assertEquals(4.0, (float)$batch2->fresh()->remaining_quantity);
-        $this->assertEquals(2, ProcessingItemCostLayer::where('processing_id', $procId)->count());
-
-        $outBatch = InventoryBatch::where('source_type', 'processing')
-            ->where('source_reference', 'PROC-FIFO-001')
-            ->first();
-        $this->assertNotNull($outBatch);
-        $this->assertEquals(900.0, (float)$outBatch->unit_cost);
-        $this->assertEquals(10.0, (float)$outBatch->remaining_quantity);
-
-        // /api/processings/export returns UTF-8 BOM + neutralized formula note
-        $exportRes = $this->withToken($this->admin->api_token)->get('/api/processings/export');
-        $exportRes->assertStatus(200);
-        $csvContent = $exportRes->streamedContent();
-        $this->assertStringStartsWith("\xEF\xBB\xBF", $csvContent);
-        $this->assertStringContainsString('PROC-FIFO-001', $csvContent);
-        $this->assertStringContainsString("'=HYPERLINK", $csvContent);
-
-        // Outlet isolation: WH2-only user gets 403 on WH1 processing & sees 0 WH1 records
-        $wh2User = $this->makeScopedUser('proc_wh2', [
-            'processings.view',
-            'processings.create',
-            'processings.delete',
-            'processings.export',
-        ], [$this->wh2->id]);
-
-        $this->withToken($wh2User->api_token)->getJson("/api/processings/{$procId}")->assertStatus(403);
-        $this->withToken($wh2User->api_token)->deleteJson("/api/processings/{$procId}")->assertStatus(403);
-        $this->assertCount(0, $this->withToken($wh2User->api_token)->getJson('/api/processings')->json('data'));
-
-        // Consuming 1 unit of finished output batch must block deletion (HTTP 422)
-        $outBatch->update(['remaining_quantity' => 9.0]);
-        $this->withToken($this->admin->api_token)
-            ->deleteJson("/api/processings/{$procId}")
-            ->assertStatus(422);
-
-        // Restoring finished batch remaining_quantity allows atomic FIFO rollback
-        $outBatch->update(['remaining_quantity' => 10.0]);
-        $this->withToken($this->admin->api_token)
-            ->deleteJson("/api/processings/{$procId}")
-            ->assertStatus(200);
-
-        $this->assertEquals(4.0, (float)$batch1->fresh()->remaining_quantity);
-        $this->assertEquals(6.0, (float)$batch2->fresh()->remaining_quantity);
-        $this->assertEquals(0, ProcessingItemCostLayer::where('processing_id', $procId)->count());
     }
 
     public function test_sale_non_posted_statuses_block_cash_and_kpis_plus_void_guard_and_idempotency_rbac(): void
@@ -3405,7 +3276,8 @@ class ComprehensiveAccountingAuditRegressionTest extends TestCase
 
     public function test_cashier_audit_scoped_user_403_and_mixed_closed_open_shift_refund_no_double_subtraction(): void
     {
-        $scopedUser = $this->makeScopedUser('ca-scoped-' . uniqid(), ['report_cashier_audit.view'], [$this->wh1->id]);
+        $blindScopedUser = $this->makeScopedUser('ca-blind-' . uniqid(), ['report_cashier_audit.view'], [$this->wh1->id]);
+        $scopedUser = $this->makeScopedUser('ca-scoped-' . uniqid(), ['report_cashier_audit.view', 'cash_register.view_expected'], [$this->wh1->id]);
         $cust = Customer::create(['name' => 'CA Shift Audit Cust', 'phone' => '0988776655']);
 
         // Closed shift (settled 500 cash refund inside its expected_cash=150) + Open shift (opening=100, open cash sale=80)
@@ -3493,13 +3365,25 @@ class ComprehensiveAccountingAuditRegressionTest extends TestCase
             ->getJson('/api/reports/cashier-audit?warehouse=' . urlencode('UnknownBranch999'))
             ->assertStatus(403);
 
-        // Authorized outlet check: expected_cash = closed(150) + open(100 opening + 80 sale - 0 open refund) = 330.0 (never 300.0!)
+        // Blind-count enforcement: user without cash_register.view_expected gets masked expected_cash/cash_difference
+        $blindRes = $this->withToken($blindScopedUser->api_token)
+            ->getJson("/api/reports/cashier-audit?warehouse={$this->wh1->id}&start_date=2026-11-01&end_date=2026-11-30")
+            ->assertStatus(200);
+        $blindMg = collect($blindRes->json('data'))->firstWhere('cashier_name', 'Maung Maung');
+        $this->assertNotNull($blindMg);
+        $this->assertTrue((bool)$blindMg['blind_count_masked']);
+        $this->assertNull($blindMg['expected_cash']);
+        $this->assertNull($blindMg['counted_cash']);
+        $this->assertNull($blindMg['cash_difference']);
+
+        // Authorized outlet check (with cash_register.view_expected): expected_cash = closed(150) + open(100 opening + 80 sale - 0 open refund) = 330.0 (never 300.0!)
         // net_revenue = 80 sale - 30 return = 50.0, reflected in summary.total_net_revenue
         $res = $this->withToken($scopedUser->api_token)
             ->getJson("/api/reports/cashier-audit?warehouse={$this->wh1->id}&start_date=2026-11-01&end_date=2026-11-30")
             ->assertStatus(200);
         $mg = collect($res->json('data'))->firstWhere('cashier_name', 'Maung Maung');
         $this->assertNotNull($mg);
+        $this->assertFalse((bool)$mg['blind_count_masked']);
         $this->assertEqualsWithDelta(330.0, (float)$mg['expected_cash'], 0.01);
         $this->assertEqualsWithDelta(50.0, (float)$mg['net_revenue'], 0.01);
         $this->assertEqualsWithDelta(50.0, (float)$res->json('summary.total_net_revenue'), 0.01);

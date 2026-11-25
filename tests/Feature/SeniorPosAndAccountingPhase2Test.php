@@ -483,4 +483,79 @@ class SeniorPosAndAccountingPhase2Test extends TestCase
             ]],
         ])->assertStatus(422);
     }
+
+    public function test_products_sync_normalizes_utc_and_offset_updated_since_and_variant_deltas(): void
+    {
+        $prevTz = config('app.timezone');
+        config(['app.timezone' => 'Asia/Yangon']);
+
+        try {
+            $p1 = Product::create([
+                'name' => 'Yangon Time Product 1',
+                'code' => 'PRD-TZ-01',
+                'sku' => 'SKU-TZ-01',
+                'selling_price' => 1500.0,
+                'cost_price' => 900.0,
+                'stock_quantity' => 10.0,
+                'is_active' => true,
+                'status' => 'Active',
+            ]);
+            $p2 = Product::create([
+                'name' => 'Yangon Time Product 2',
+                'code' => 'PRD-TZ-02',
+                'sku' => 'SKU-TZ-02',
+                'selling_price' => 2500.0,
+                'cost_price' => 1400.0,
+                'stock_quantity' => 20.0,
+                'has_variants' => true,
+                'is_active' => true,
+                'status' => 'Active',
+            ]);
+            $variant = ProductVariant::create([
+                'product_id' => $p2->id,
+                'name' => 'Large',
+                'sku' => 'SKU-TZ-02-L',
+                'selling_price' => 2600.0,
+                'cost_price' => 1500.0,
+                'is_active' => true,
+            ]);
+
+            // Both products & variant stored in DB at 17:32:26 Asia/Yangon
+            DB::table('products')->whereIn('id', [$p1->id, $p2->id])->update([
+                'updated_at' => '2026-11-25 17:32:26',
+            ]);
+            DB::table('product_variants')->where('id', $variant->id)->update([
+                'updated_at' => '2026-11-25 17:32:26',
+            ]);
+
+            // 2026-11-25T15:05:38.000Z == 2026-11-25 21:35:38 Asia/Yangon (AFTER 17:32:26!)
+            // Before fix, raw UTC comparison returned ALL products instead of 0.
+            $utcRes = $this->withToken($this->admin->api_token)
+                ->getJson('/api/products/sync?updated_since=' . urlencode('2026-11-25T15:05:38.000Z'))
+                ->assertStatus(200);
+            $this->assertSame(0, (int) $utcRes->json('count'));
+            $this->assertCount(0, $utcRes->json('products'));
+            $this->assertFalse((bool) $utcRes->json('has_more'));
+
+            // Now update only the variant to 21:40:00 Yangon -> delta sync must catch parent $p2 ONLY
+            DB::table('product_variants')->where('id', $variant->id)->update([
+                'updated_at' => '2026-11-25 21:40:00',
+            ]);
+
+            $deltaUtc = $this->withToken($this->admin->api_token)
+                ->getJson('/api/products/sync?updated_since=' . urlencode('2026-11-25T15:05:38.000Z'))
+                ->assertStatus(200);
+            $this->assertSame(1, (int) $deltaUtc->json('count'));
+            $this->assertSame($p2->id, $deltaUtc->json('products.0.id'));
+
+            // Explicit +06:30 offset string must behave identically
+            $deltaOffset = $this->withToken($this->admin->api_token)
+                ->getJson('/api/products/sync?updated_since=' . urlencode('2026-11-25T21:35:38+06:30'))
+                ->assertStatus(200);
+            $this->assertSame(1, (int) $deltaOffset->json('count'));
+            $this->assertSame($p2->id, $deltaOffset->json('products.0.id'));
+        } finally {
+            config(['app.timezone' => $prevTz]);
+        }
+    }
 }

@@ -12,6 +12,10 @@ use App\Models\Outlet;
 use App\Models\Purchase;
 use App\Models\PurchaseItem;
 use App\Models\Setting;
+use App\Models\InventoryBatch;
+use App\Models\SaleItem;
+use App\Models\StockAdjustmentItem;
+use App\Models\StockTransferItem;
 use App\Services\FifoInventoryService;
 use App\Services\ProductUnitConversionService;
 use App\Services\PurchaseAccountingService;
@@ -19,6 +23,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 
 class ProductCreateService
 {
@@ -309,11 +314,18 @@ class ProductCreateService
                         $conversionRate = (float)($resolvedUnit['conversion_rate'] > 0 ? $resolvedUnit['conversion_rate'] : 1.0);
                         $baseQty = $unitService->baseQuantity($qty, $conversionRate);
 
-                        // Determine unit cost
-                        $itemCost = $variantModel && $variantModel->cost_price > 0
-                            ? (float)$variantModel->cost_price
-                            : (float)$costPrice;
-                        $baseUnitCost = $conversionRate > 0 ? $itemCost / $conversionRate : $itemCost;
+                        // Determine base unit cost & packaging unit cost:
+                        // Product/variant cost_price is ALWAYS stored in canonical base unit.
+                        // Never divide base cost_price by conversion_rate (only divide an explicit packaging unit_cost).
+                        if (isset($stockEntry['unit_cost']) && (float)$stockEntry['unit_cost'] > 0) {
+                            $purchaseUnitCost = (float)$stockEntry['unit_cost'];
+                            $baseUnitCost = $conversionRate > 0 ? round($purchaseUnitCost / $conversionRate, 8) : $purchaseUnitCost;
+                        } else {
+                            $baseUnitCost = $variantModel && $variantModel->cost_price > 0
+                                ? (float)$variantModel->cost_price
+                                : (float)$costPrice;
+                            $purchaseUnitCost = round($baseUnitCost * $conversionRate, 4);
+                        }
 
                         if (!isset($warehouseGroups[$wId])) {
                             $warehouseObj = Outlet::find($wId);
@@ -323,6 +335,24 @@ class ProductCreateService
                                 'warehouse_name' => $wName,
                                 'items' => [],
                             ];
+                        }
+
+                        // Create/Update StockBalance in the canonical base unit.
+                        $balance = StockBalance::where('warehouse_id', $wId)
+                            ->where('product_id', $product->id)
+                            ->where('product_variant_id', $vId)
+                            ->first();
+
+                        if ($balance) {
+                            $balance->quantity = round((float)$balance->quantity + $baseQty, 4);
+                            $balance->save();
+                        } else {
+                            $balance = StockBalance::create([
+                                'warehouse_id' => $wId,
+                                'product_id' => $product->id,
+                                'product_variant_id' => $vId,
+                                'quantity' => $baseQty,
+                            ]);
                         }
 
                         $warehouseGroups[$wId]['items'][] = [
@@ -336,28 +366,11 @@ class ProductCreateService
                             'conversion_rate' => $conversionRate,
                             'quantity' => $qty,
                             'base_quantity' => $baseQty,
-                            'unit_cost' => $itemCost,
+                            'unit_cost' => $purchaseUnitCost,
                             'base_unit_cost' => $baseUnitCost,
-                            'subtotal' => $itemCost * $qty,
+                            'subtotal' => round($baseUnitCost * $baseQty, 2),
+                            'balance_after' => (float)$balance->quantity,
                         ];
-
-                        // Create/Update StockBalance in the canonical base unit.
-                        $balance = StockBalance::where('warehouse_id', $wId)
-                            ->where('product_id', $product->id)
-                            ->where('product_variant_id', $vId)
-                            ->first();
-
-                        if ($balance) {
-                            $balance->quantity = (float)$balance->quantity + $baseQty;
-                            $balance->save();
-                        } else {
-                            StockBalance::create([
-                                'warehouse_id' => $wId,
-                                'product_id' => $product->id,
-                                'product_variant_id' => $vId,
-                                'quantity' => $baseQty,
-                            ]);
-                        }
 
                         $totalStock += $baseQty;
                     }
@@ -371,17 +384,18 @@ class ProductCreateService
                         $warehouseObj = Outlet::find($wId);
                         $wName = $data['warehouse_name'] ?? ($warehouseObj?->name ?? 'Main Warehouse');
 
+                        $stockUnitType = strtolower(trim((string)($data['stock_unit_type'] ?? 'base')));
                         $resolvedUnit = $unitService->resolve(
                             $product,
-                            'purchase',
-                            isset($data['purchase_unit_id']) ? (int)$data['purchase_unit_id'] : null,
-                            $data['purchase_unit'] ?? null,
+                            in_array($stockUnitType, ['base', 'purchase', 'sale'], true) ? $stockUnitType : 'base',
+                            $stockUnitType === 'purchase' && isset($data['purchase_unit_id']) ? (int)$data['purchase_unit_id'] : $product->base_unit_id,
+                            $stockUnitType === 'purchase' ? ($data['purchase_unit'] ?? null) : ($product->unit_name ?: 'Piece'),
                             null
                         );
                         $conversionRate = (float)($resolvedUnit['conversion_rate'] > 0 ? $resolvedUnit['conversion_rate'] : 1.0);
                         $baseQty = $unitService->baseQuantity($qty, $conversionRate);
-                        $itemCost = (float)$costPrice;
-                        $baseUnitCost = $conversionRate > 0 ? $itemCost / $conversionRate : $itemCost;
+                        $baseUnitCost = (float)$costPrice;
+                        $purchaseUnitCost = round($baseUnitCost * $conversionRate, 4);
 
                         $warehouseGroups[$wId] = [
                             'warehouse_id' => $wId,
@@ -399,6 +413,8 @@ class ProductCreateService
                                 $vBaseQty = $isLast ? ($baseQty - ($baseQtyPerVar * ($vCount - 1))) : $baseQtyPerVar;
                                 $vQty = $isLast ? ($qty - ($qtyPerVar * ($vCount - 1))) : $qtyPerVar;
                                 $vIdx++;
+                                $vBaseCost = $vModel->cost_price > 0 ? (float)$vModel->cost_price : $baseUnitCost;
+                                $vUnitCost = round($vBaseCost * $conversionRate, 4);
 
                                 $warehouseGroups[$wId]['items'][] = [
                                     'product_id' => $product->id,
@@ -411,9 +427,10 @@ class ProductCreateService
                                     'conversion_rate' => $conversionRate,
                                     'quantity' => $vQty,
                                     'base_quantity' => $vBaseQty,
-                                    'unit_cost' => $itemCost,
-                                    'base_unit_cost' => $baseUnitCost,
-                                    'subtotal' => $itemCost * $vQty,
+                                    'unit_cost' => $vUnitCost,
+                                    'base_unit_cost' => $vBaseCost,
+                                    'subtotal' => round($vBaseCost * $vBaseQty, 2),
+                                    'balance_after' => $vBaseQty,
                                 ];
 
                                 StockBalance::create([
@@ -435,9 +452,10 @@ class ProductCreateService
                                 'conversion_rate' => $conversionRate,
                                 'quantity' => $qty,
                                 'base_quantity' => $baseQty,
-                                'unit_cost' => $itemCost,
+                                'unit_cost' => $purchaseUnitCost,
                                 'base_unit_cost' => $baseUnitCost,
-                                'subtotal' => $itemCost * $qty,
+                                'subtotal' => round($baseUnitCost * $baseQty, 2),
+                                'balance_after' => $baseQty,
                             ];
 
                             StockBalance::create([
@@ -465,13 +483,14 @@ class ProductCreateService
 
                     $supplierName = !empty($product->supplier_name) ? $product->supplier_name : 'Opening Stock';
 
+                    $openingTimestamp = now()->format('Y-m-d H:i:s');
                     $purchase = Purchase::create([
                         'reference_no'   => $refNo,
                         'supplier_id'    => $product->supplier_id,
                         'supplier_name'  => $supplierName,
                         'warehouse_id'   => $wGroup['warehouse_id'],
                         'warehouse_name' => $wGroup['warehouse_name'],
-                        'date'           => date('Y-m-d H:i:s'),
+                        'date'           => $openingTimestamp,
                         'status'         => 'Received',
                         'tax_rate'       => 0.0,
                         'tax_amount'     => 0.0,
@@ -515,7 +534,7 @@ class ProductCreateService
                                 baseUnitCost:    (float)$itemData['base_unit_cost'],
                                 sourceType:      'opening_stock',
                                 sourceReference: $refNo,
-                                receivedDate:    date('Y-m-d H:i:s'),
+                                receivedDate:    $openingTimestamp,
                                 purchaseItemId:  (int)$purchaseItem->id,
                                 createdBy:       auth()->id(),
                                 notes:           'Initial Opening Stock from Product Creation: ' . $product->name
@@ -531,7 +550,7 @@ class ProductCreateService
                             'reference_id'       => (string) $purchase->id,
                             'quantity_in'        => $itemData['base_quantity'],
                             'quantity_out'       => 0.0,
-                            'balance_after'      => $itemData['quantity'],
+                            'balance_after'      => $itemData['balance_after'] ?? $itemData['base_quantity'],
                             'created_by'         => auth()->id(),
                             'note'               => 'Initial Opening Stock from Product Create (PO: ' . $refNo . ')',
                             'created_at'         => now(),
@@ -646,31 +665,9 @@ class ProductCreateService
                 $updates['low_qty'] = $alert;
             }
 
-            if (array_key_exists('stock_quantity', $data) && $data['stock_quantity'] !== null) {
-                $newStock = (float)$data['stock_quantity'];
-                $updates['stock_quantity'] = $newStock;
-
-                $hasVariants = (bool)($data['has_variants'] ?? $product->has_variants);
-                if (!$hasVariants) {
-                    $warehouseId = $data['warehouse_id'] ?? $data['outlet_id'] ?? Outlet::query()->value('id') ?? 1;
-                    $balance = StockBalance::where('product_id', $product->id)
-                        ->whereNull('product_variant_id')
-                        ->first();
-                    if ($balance) {
-                        $balance->quantity = $newStock;
-                        $balance->save();
-                    } else {
-                        StockBalance::create([
-                            'warehouse_id' => $warehouseId,
-                            'product_id' => $product->id,
-                            'product_variant_id' => null,
-                            'quantity' => $newStock,
-                        ]);
-                    }
-                }
-            } else {
-                unset($updates['stock_quantity']);
-            }
+            // Never overwrite authoritative warehouse stock_balances or stock_quantity on product metadata edits.
+            // Stock changes must go through Purchases, Sales, Returns, Adjustments, Transfers, or new-variant opening_stocks.
+            unset($updates['stock_quantity']);
             $updates['updated_by'] = auth()->id() ?? $product->updated_by;
             $product->fill($updates);
             $product->save();
@@ -755,15 +752,33 @@ class ProductCreateService
                     }
                 }
 
-                $staleVariants = $product->variants();
-                if ($hasVariants) {
-                    if ($keptVariantIds) {
-                        $staleVariants->whereNotIn('id', $keptVariantIds)->delete();
-                    } else {
-                        $staleVariants->delete();
+                $staleVariantsQuery = $product->variants();
+                if ($hasVariants && !empty($keptVariantIds)) {
+                    $staleVariantsQuery->whereNotIn('id', $keptVariantIds);
+                }
+                $staleVariantsList = $staleVariantsQuery->get();
+                foreach ($staleVariantsList as $staleVariant) {
+                    $vIdToCheck = (int)$staleVariant->id;
+                    $hasOnHandStock = StockBalance::where('product_variant_id', $vIdToCheck)
+                        ->where('quantity', '>', 0.0001)
+                        ->exists();
+                    $hasActiveBatches = InventoryBatch::where('product_variant_id', $vIdToCheck)
+                        ->where('remaining_quantity', '>', 0.0001)
+                        ->exists();
+                    $hasHistory = SaleItem::where('product_variant_id', $vIdToCheck)->exists()
+                        || PurchaseItem::where('product_variant_id', $vIdToCheck)->exists()
+                        || StockAdjustmentItem::where('product_variant_id', $vIdToCheck)->exists()
+                        || StockTransferItem::where('product_variant_id', $vIdToCheck)->exists()
+                        || StockMovement::where('product_variant_id', $vIdToCheck)->exists();
+
+                    if ($hasOnHandStock || $hasActiveBatches || $hasHistory) {
+                        throw ValidationException::withMessages([
+                            'variants' => [
+                                "Variant '{$staleVariant->name}' ({$staleVariant->sku}) cannot be removed because it has stock on hand, active FIFO batches, or historical transactions. Deactivate it instead.",
+                            ],
+                        ]);
                     }
-                } else {
-                    $staleVariants->delete();
+                    $staleVariant->delete();
                 }
             }
 
@@ -816,10 +831,10 @@ class ProductCreateService
                         ->first();
 
                     if ($balance) {
-                        $balance->quantity = (float)$balance->quantity + $baseQty;
+                        $balance->quantity = round((float)$balance->quantity + $baseQty, 4);
                         $balance->save();
                     } else {
-                        StockBalance::create([
+                        $balance = StockBalance::create([
                             'warehouse_id' => $wId,
                             'product_id' => $product->id,
                             'product_variant_id' => $vId,
@@ -827,12 +842,16 @@ class ProductCreateService
                         ]);
                     }
 
-                    if ($baseQty > 0.0001) {
-                        $unitCost = (float)($variantModel && $variantModel->cost_price > 0
+                    // Product/variant cost_price is always in base units; never divide by conversion_rate.
+                    if (isset($stockEntry['unit_cost']) && (float)$stockEntry['unit_cost'] > 0) {
+                        $baseUnitCost = $conversionRate > 0 ? round((float)$stockEntry['unit_cost'] / $conversionRate, 8) : (float)$stockEntry['unit_cost'];
+                    } else {
+                        $baseUnitCost = (float)($variantModel && $variantModel->cost_price > 0
                             ? $variantModel->cost_price
                             : ($product->cost_price ?: ($product->purchase_price ?: 0.0)));
-                        $baseUnitCost = $conversionRate > 0 ? ($unitCost / $conversionRate) : $unitCost;
+                    }
 
+                    if ($baseQty > 0.0001) {
                         $fifoService->recordBatch(
                             warehouseId:     (int)$wId,
                             productId:       (int)$product->id,
@@ -858,21 +877,22 @@ class ProductCreateService
                         'reference_id' => (string) $product->id,
                         'quantity_in' => $baseQty,
                         'quantity_out' => 0.0,
-                        'balance_after' => $baseQty,
+                        'balance_after' => (float)$balance->quantity,
                         'created_by' => auth()->id(),
                         'note' => 'Opening stock recorded from variant addition',
                         'created_at' => now(),
                     ];
                     if (Schema::hasColumn('stock_movements', 'unit_cost')) {
-                        $smVariantCost = (float)($variantModel && $variantModel->cost_price > 0
-                            ? $variantModel->cost_price
-                            : ($product->cost_price ?: ($product->purchase_price ?: 0.0)));
-                        $smVariantData['unit_cost'] = round($conversionRate > 0 ? ($smVariantCost / $conversionRate) : $smVariantCost, 4);
+                        $smVariantData['unit_cost'] = round($baseUnitCost, 4);
                     }
                     StockMovement::create($smVariantData);
                 }
 
                 if ($recordedVariantOpening) {
+                    $syncedTotal = round((float)StockBalance::where('product_id', $product->id)->sum('quantity'), 4);
+                    $product->stock_quantity = $syncedTotal;
+                    $product->save();
+
                     DB::afterCommit(static function () {
                         app(PurchaseAccountingService::class)->invalidateAllCaches();
                     });

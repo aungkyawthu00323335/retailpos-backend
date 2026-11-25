@@ -53,7 +53,10 @@ class CustomerController extends Controller
 
         $query = Customer::withCount(['sales'])
             ->withSum(['sales as receivable_due_sum' => function ($q) {
-                Customer::applyReceivableScope($q);
+                Customer::applyReceivableScope($q)->where('due_amount', '>', 0);
+            }], 'due_amount')
+            ->withSum(['saleReturns as open_return_credit_sum' => function ($q) {
+                Customer::applyActiveReturnCreditScope($q);
             }], 'due_amount');
 
         if ($request->filled('search')) {
@@ -214,7 +217,14 @@ class CustomerController extends Controller
      */
     public function show($id)
     {
-        $customer = Customer::find($id);
+        $customer = Customer::withCount(['sales'])
+            ->withSum(['sales as receivable_due_sum' => function ($q) {
+                Customer::applyReceivableScope($q)->where('due_amount', '>', 0);
+            }], 'due_amount')
+            ->withSum(['saleReturns as open_return_credit_sum' => function ($q) {
+                Customer::applyActiveReturnCreditScope($q);
+            }], 'due_amount')
+            ->find($id);
 
         if (!$customer) {
             return response()->json([
@@ -423,7 +433,13 @@ class CustomerController extends Controller
      */
     public function export(Request $request)
     {
-        $query = Customer::withCount(['sales'])->withSum('sales as total_due', 'due_amount');
+        $query = Customer::withCount(['sales'])
+            ->withSum(['sales as receivable_due_sum' => function ($q) {
+                Customer::applyReceivableScope($q)->where('due_amount', '>', 0);
+            }], 'due_amount')
+            ->withSum(['saleReturns as open_return_credit_sum' => function ($q) {
+                Customer::applyActiveReturnCreditScope($q);
+            }], 'due_amount');
 
         if ($request->filled('search')) {
             $search = trim($request->input('search'));

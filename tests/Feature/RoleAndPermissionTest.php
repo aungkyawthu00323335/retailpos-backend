@@ -299,7 +299,7 @@ class RoleAndPermissionTest extends TestCase
         $this->assertContains('purchases', $moduleIds);
         $this->assertContains('adjustments', $moduleIds);
         $this->assertContains('transfers', $moduleIds);
-        $this->assertContains('processings', $moduleIds);
+        $this->assertNotContains('processings', $moduleIds);
         $this->assertContains('expenses', $moduleIds);
         $this->assertContains('customers', $moduleIds);
         $this->assertContains('suppliers', $moduleIds);
@@ -549,7 +549,6 @@ class RoleAndPermissionTest extends TestCase
             ['GET', '/api/purchase-returns'],
             ['POST', '/api/adjustments'],
             ['GET', '/api/transfers'],
-            ['GET', '/api/processings'],
             ['GET', '/api/expenses'],
             ['GET', '/api/expense-categories'],
             ['POST', '/api/quotations'],
@@ -620,7 +619,7 @@ class RoleAndPermissionTest extends TestCase
         $role = Role::create([
             'name' => 'Dynamic Tester',
             'slug' => 'dynamic_tester',
-            'permissions' => ['processing:view', 'report_sales.view', 'sale_return.update'],
+            'permissions' => ['outlet:view', 'report_sales.view', 'sale_return.update'],
             'status' => 'active',
         ]);
 
@@ -636,7 +635,7 @@ class RoleAndPermissionTest extends TestCase
         ]);
 
         // Verify colon & singular/plural & report aliases work cleanly
-        $this->assertTrue($user->hasPermission('processings.view'));
+        $this->assertTrue($user->hasPermission('outlets.view'));
         $this->assertTrue($user->hasPermission('reports.sales'));
         $this->assertTrue($user->hasPermission('sale_returns.update'));
         $this->assertFalse($user->hasPermission('transfers.pay'));
@@ -645,7 +644,7 @@ class RoleAndPermissionTest extends TestCase
         $role->update(['permissions' => ['transfers.pay', 'pos.discount']]);
         $user->load('roleModel');
 
-        $this->assertFalse($user->hasPermission('processings.view'));
+        $this->assertFalse($user->hasPermission('outlets.view'));
         $this->assertTrue($user->hasPermission('transfers.pay'));
         $this->assertTrue($user->hasPermission('pos.discount'));
     }
@@ -689,6 +688,6 @@ class RoleAndPermissionTest extends TestCase
         $this->assertContains('transfers.pay', $accountant->permissions ?? []);
         $this->assertContains('sales.pay', $accountant->permissions ?? []);
         $this->assertNotContains('products.view_cost', $inventory->permissions ?? []);
-        $this->assertContains('processings.view', $inventory->permissions ?? []);
+        $this->assertNotContains('processings.view', $inventory->permissions ?? []);
     }
 }

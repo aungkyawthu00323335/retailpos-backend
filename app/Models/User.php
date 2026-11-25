@@ -133,8 +133,6 @@ class User extends Authenticatable
      * @var array<string, string>
      */
     private const MODULE_ALIASES = [
-        'processing' => 'processings',
-        'processings' => 'processing',
         'outlet' => 'outlets',
         'outlets' => 'outlet',
         'currency' => 'currencies',

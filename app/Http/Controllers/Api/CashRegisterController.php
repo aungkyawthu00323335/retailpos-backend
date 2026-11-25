@@ -50,31 +50,90 @@ class CashRegisterController extends Controller
         return null;
     }
 
+    private function isRegisterSupervisor(?User $user): bool
+    {
+        if (!$user) {
+            return true;
+        }
+        if (method_exists($user, 'isSuperAdmin') && $user->isSuperAdmin()) {
+            return true;
+        }
+        $role = strtolower(trim((string)($user->roleModel?->name ?? $user->role ?? '')));
+        if (in_array($role, ['super admin', 'super_admin', 'admin', 'administrator', 'owner', 'manager', 'store manager', 'accountant'], true)) {
+            return true;
+        }
+        return $user->hasPermission('cash_register.manage') || $user->hasPermission('cash_register.view_all');
+    }
+
+    private function assertRegisterAccess(Request $request, ?User $user, CashRegister $register): void
+    {
+        app(PurchaseAccountingService::class)->assertOutletAccess(
+            $request,
+            $register->warehouse_id ? (int)$register->warehouse_id : null,
+            $register->warehouse_name
+        );
+
+        if ($user && !$this->isRegisterSupervisor($user)) {
+            $ownsById = $register->user_id && (int)$register->user_id === (int)$user->id;
+            $ownsByName = !$register->user_id && $register->user_name && strcasecmp(trim((string)$register->user_name), trim((string)$user->name)) === 0;
+            if (!$ownsById && !$ownsByName) {
+                abort(403, 'You do not have permission to access another cashier\'s cash register.');
+            }
+        }
+    }
+
+    private function applyRegisterScopeFilter($query, Request $request, ?User $user, bool $allowRequestUserFilter = true)
+    {
+        $accounting = app(PurchaseAccountingService::class);
+        $allowedOutlets = $accounting->extractAllowedOutletIds($request);
+        if (!empty($allowedOutlets)) {
+            $query->whereIn('warehouse_id', $allowedOutlets);
+        }
+
+        $isSupervisor = $this->isRegisterSupervisor($user);
+        $requestedUserName = trim((string)$request->input('user_name', ''));
+
+        if ($user && !$isSupervisor) {
+            // Strict cashier ownership isolation: ignore spoofable user_name query params
+            $query->where('user_id', $user->id);
+        } elseif ($allowRequestUserFilter && $requestedUserName !== '') {
+            $query->where('user_name', $requestedUserName);
+        } elseif ($user && $user->id) {
+            $query->where('user_id', $user->id);
+        } elseif ($requestedUserName !== '') {
+            $query->where('user_name', $requestedUserName);
+        }
+
+        return $query;
+    }
+
     public function status(Request $request)
     {
         $user = $this->resolveAuthUser($request);
-        $userId = $user?->id;
-        $userName = $request->input('user_name', $user?->name);
+        $explicitRegId = $request->input('cash_register_id') ? (int)$request->input('cash_register_id') : null;
+        $warehouseId = $request->input('warehouse_id') ? (int)$request->input('warehouse_id') : null;
         $warehouse = $request->input('warehouse', $request->input('warehouse_name'));
 
-        $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
-
-        if ($userId) {
-            $query->where(function ($q) use ($userId, $userName) {
-                $q->where('user_id', $userId);
-                if ($userName) {
-                    $q->orWhere('user_name', $userName);
+        if ($explicitRegId) {
+            $register = CashRegister::find($explicitRegId);
+            if ($register) {
+                $this->assertRegisterAccess($request, $user, $register);
+                if (!in_array(strtolower(trim((string)$register->status)), ['open', 'opened'], true)) {
+                    $register = null;
                 }
-            });
-        } elseif ($userName) {
-            $query->where('user_name', $userName);
-        }
+            }
+        } else {
+            $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
+            $this->applyRegisterScopeFilter($query, $request, $user, true);
 
-        if ($warehouse && $warehouse !== 'All') {
-            $query->where('warehouse_name', $warehouse);
-        }
+            if ($warehouseId && $warehouseId > 0) {
+                $query->where('warehouse_id', $warehouseId);
+            } elseif ($warehouse && $warehouse !== 'All') {
+                $query->where('warehouse_name', $warehouse);
+            }
 
-        $register = $query->orderBy('id', 'desc')->first();
+            $register = $query->orderBy('id', 'desc')->first();
+        }
 
         if (!$register) {
             return $this->noStoreJson([
@@ -106,7 +165,7 @@ class CashRegisterController extends Controller
         ]);
 
         $user = $this->resolveAuthUser($request);
-        $isManager = $user && ($user->isSuperAdmin() || in_array(strtolower((string)($user->roleModel?->name ?? $user->role ?? '')), ['super admin', 'admin', 'manager'], true));
+        $isManager = $this->isRegisterSupervisor($user);
         $userId = ($isManager && !empty($validated['user_id'])) ? (int)$validated['user_id'] : ($user?->id ?? ($validated['user_id'] ?? null));
         $userName = ($isManager && !empty($validated['user_name'])) ? $validated['user_name'] : ($user?->name ?? ($validated['user_name'] ?? 'Super Admin'));
 
@@ -124,18 +183,13 @@ class CashRegisterController extends Controller
             $warehouseName = $outlet?->name ?? 'Main Branch Outlet';
         }
 
+        app(PurchaseAccountingService::class)->assertOutletAccess($request, $warehouseId, $warehouseName);
+
         return DB::transaction(function () use ($validated, $user, $userId, $userName, $warehouseId, $warehouseName) {
             // Atomic lock prevents duplicate open shifts on concurrent double-click
             $existing = CashRegister::whereIn('status', self::OPEN_STATUSES)
-                ->where(function ($q) use ($userId, $userName) {
-                    if ($userId) {
-                        $q->where('user_id', $userId);
-                    }
-                    if ($userName) {
-                        $q->orWhere('user_name', $userName);
-                    }
-                })
-                ->where('warehouse_name', $warehouseName)
+                ->when($userId, fn ($q) => $q->where('user_id', $userId), fn ($q) => $q->where('user_name', $userName))
+                ->when($warehouseId, fn ($q) => $q->where('warehouse_id', $warehouseId), fn ($q) => $q->where('warehouse_name', $warehouseName))
                 ->orderByDesc('id')
                 ->lockForUpdate()
                 ->first();
@@ -181,19 +235,12 @@ class CashRegisterController extends Controller
 
         if ($id) {
             $register = CashRegister::find($id);
-        } else {
-            $userId = $user?->id;
-            $userName = $request->input('user_name', $user?->name);
-
-            $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
-            if ($userId) {
-                $query->where(function ($q) use ($userId, $userName) {
-                    $q->where('user_id', $userId);
-                    if ($userName) $q->orWhere('user_name', $userName);
-                });
-            } elseif ($userName) {
-                $query->where('user_name', $userName);
+            if ($register) {
+                $this->assertRegisterAccess($request, $user, $register);
             }
+        } else {
+            $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
+            $this->applyRegisterScopeFilter($query, $request, $user, true);
             $register = $query->orderBy('id', 'desc')->first();
         }
 
@@ -213,7 +260,7 @@ class CashRegisterController extends Controller
     public function close(Request $request, $id = null)
     {
         $validated = $request->validate([
-            'closing_cash' => 'nullable|numeric|min:0',
+            'closing_cash' => 'required|numeric|min:0',
             'closing_notes' => 'nullable|string',
             'denominations' => 'nullable|array',
             'pending_offline_count' => 'nullable|integer|min:0',
@@ -233,19 +280,12 @@ class CashRegisterController extends Controller
         $response = DB::transaction(function () use ($request, $validated, $id, $user, &$telegramPayload) {
             if ($id) {
                 $register = CashRegister::lockForUpdate()->find($id);
-            } else {
-                $userId = $user?->id;
-                $userName = $request->input('user_name', $user?->name);
-
-                $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
-                if ($userId) {
-                    $query->where(function ($q) use ($userId, $userName) {
-                        $q->where('user_id', $userId);
-                        if ($userName) $q->orWhere('user_name', $userName);
-                    });
-                } elseif ($userName) {
-                    $query->where('user_name', $userName);
+                if ($register) {
+                    $this->assertRegisterAccess($request, $user, $register);
                 }
+            } else {
+                $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
+                $this->applyRegisterScopeFilter($query, $request, $user, true);
                 $register = $query->orderBy('id', 'desc')->lockForUpdate()->first();
             }
 
@@ -267,7 +307,7 @@ class CashRegisterController extends Controller
             $register->closed_at = $closedAt;
             $payload = $this->buildRegisterDetailsPayload($register, $user, true);
             $expectedCash = (float)$payload['expected_cash'];
-            $closingCash = isset($validated['closing_cash']) ? round((float)$validated['closing_cash'], 2) : $expectedCash;
+            $closingCash = round((float)$validated['closing_cash'], 2);
             $difference = round($closingCash - $expectedCash, 2);
 
             $closingNotes = $validated['closing_notes'] ?? null;
@@ -295,8 +335,9 @@ class CashRegisterController extends Controller
             $telegramPayload = $payload;
 
             $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
-            $payload['expected_cash'] = $canViewExpected ? round($expectedCash, 2) : null;
-            $payload['difference'] = $canViewExpected ? round($difference, 2) : null;
+            if (!$canViewExpected) {
+                $payload = $this->applyBlindCountMask($payload, false);
+            }
 
             return $this->noStoreJson([
                 'status' => 'success',
@@ -353,21 +394,14 @@ class CashRegisterController extends Controller
             $register = null;
             if (!empty($validated['cash_register_id'])) {
                 $register = CashRegister::lockForUpdate()->find($validated['cash_register_id']);
+                if ($register) {
+                    $this->assertRegisterAccess($request, $user, $register);
+                }
             }
 
             if (!$register) {
-                $userId = $user?->id;
-                $userName = $request->input('user_name', $user?->name);
-
                 $query = CashRegister::whereIn('status', self::OPEN_STATUSES);
-                if ($userId) {
-                    $query->where(function ($q) use ($userId, $userName) {
-                        $q->where('user_id', $userId);
-                        if ($userName) $q->orWhere('user_name', $userName);
-                    });
-                } elseif ($userName) {
-                    $query->where('user_name', $userName);
-                }
+                $this->applyRegisterScopeFilter($query, $request, $user, true);
                 $register = $query->orderBy('id', 'desc')->lockForUpdate()->first();
             }
 
@@ -382,11 +416,15 @@ class CashRegisterController extends Controller
             $currentPayload = $this->buildRegisterDetailsPayload($register, $user, true);
             $currentExpectedCash = (float)($currentPayload['expected_cash'] ?? 0);
             $txAmount = round((float)$validated['amount'], 2);
+            $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
 
             if ($validated['type'] === 'drop' && $txAmount > $currentExpectedCash + 0.005) {
+                $dropErrMsg = $canViewExpected
+                    ? ('Safe drop amount (' . number_format($txAmount) . ' Ks) cannot exceed current drawer cash (' . number_format($currentExpectedCash) . ' Ks).')
+                    : 'Safe drop amount exceeds available drawer cash.';
                 return response()->json([
                     'status' => 'error',
-                    'message' => 'Safe drop amount (' . number_format($txAmount) . ' Ks) cannot exceed current drawer cash (' . number_format($currentExpectedCash) . ' Ks).',
+                    'message' => $dropErrMsg,
                 ], 422);
             }
 
@@ -411,10 +449,12 @@ class CashRegisterController extends Controller
                 $currentPayload['cash_drops'] = $newDrops;
                 $currentPayload['safe_drops'] = $newDrops;
             }
-            $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : false;
-            $currentPayload['expected_cash'] = $canViewExpected ? $newExpectedCash : null;
+            $currentPayload['expected_cash'] = $newExpectedCash;
             $currentPayload['closing_cash'] = $newExpectedCash;
-            $currentPayload['difference'] = $canViewExpected ? 0.0 : null;
+            $currentPayload['difference'] = 0.0;
+            if (!$canViewExpected) {
+                $currentPayload = $this->applyBlindCountMask($currentPayload, true);
+            }
             $existingTxList = is_iterable($currentPayload['register_transactions'] ?? null)
                 ? collect($currentPayload['register_transactions'])->all()
                 : [];
@@ -477,6 +517,8 @@ class CashRegisterController extends Controller
         $userName = $register->user_name ?? ($user?->name ?? 'Super Admin');
         $userRole = $user?->role ?? ($user?->roleModel?->name ?? 'Lead Cashier');
         $openingCash = (float)$register->opening_cash;
+        $canViewExpected = $user ? $user->hasPermission('cash_register.view_expected') : true;
+        $hideExpected = !$canViewExpected;
 
         return [
             'id' => (int)$register->id,
@@ -506,9 +548,10 @@ class CashRegisterController extends Controller
             'floats_in' => 0.0,
             'cash_drops' => 0.0,
             'safe_drops' => 0.0,
-            'expected_cash' => $openingCash,
-            'closing_cash' => $openingCash,
-            'difference' => 0.0,
+            'expected_cash' => $hideExpected ? null : $openingCash,
+            'closing_cash' => $hideExpected ? null : $openingCash,
+            'difference' => $hideExpected ? null : 0.0,
+            'blind_count_masked' => $hideExpected,
             'status' => 'Open',
             'primary_payment_type' => 'Cash',
             'notes' => (string)($register->opening_notes ?? ''),
@@ -549,7 +592,11 @@ class CashRegisterController extends Controller
         $unlinkedSales = DB::table('sales')
             ->whereNull('cash_register_id')
             ->where('pos_flag', true)
-            ->where('warehouse_name', $register->warehouse_name)
+            ->when(
+                $register->warehouse_id,
+                fn ($q) => $q->where('warehouse_id', $register->warehouse_id),
+                fn ($q) => $q->where('warehouse_name', $register->warehouse_name)
+            )
             ->whereBetween('created_at', [$openedAt, $closedAt])
             ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
             ->whereNotIn('status', ['Voided', 'Cancelled', 'Draft', 'Pending', 'Ordered'])
@@ -716,7 +763,11 @@ class CashRegisterController extends Controller
             $unlinkedReturns = DB::table('sale_returns')
                 ->where('status', 'Completed')
                 ->whereNull('cash_register_id')
-                ->where('warehouse_name', $register->warehouse_name)
+                ->when(
+                    $register->warehouse_id,
+                    fn ($q) => $q->where('warehouse_id', $register->warehouse_id),
+                    fn ($q) => $q->where('warehouse_name', $register->warehouse_name)
+                )
                 ->whereBetween('created_at', [$openedAt, $closedAt])
                 ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
                 ->get($retCols);
@@ -726,7 +777,11 @@ class CashRegisterController extends Controller
         } else {
             $unlinkedReturns = DB::table('sale_returns')
                 ->where('status', 'Completed')
-                ->where('warehouse_name', $register->warehouse_name)
+                ->when(
+                    $register->warehouse_id,
+                    fn ($q) => $q->where('warehouse_id', $register->warehouse_id),
+                    fn ($q) => $q->where('warehouse_name', $register->warehouse_name)
+                )
                 ->whereBetween('created_at', [$openedAt, $closedAt])
                 ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
                 ->get($retCols);
@@ -774,16 +829,17 @@ class CashRegisterController extends Controller
                 }
 
                 if ($belongsToThisReg) {
-                    $totalRefunds += ($matchedLegTotal > 0 ? $matchedLegTotal : $retTotal);
+                    $totalRefunds += $matchedLegTotal;
                     $cashRefunds += $matchedCash;
                 }
             } else {
                 if (!empty($r->cash_register_id) && (int)$r->cash_register_id !== (int)$register->id) {
                     continue;
                 }
-                $totalRefunds += $retTotal;
                 $tender = (string)($r->refund_tender ?? $r->payment_type ?? 'Cash');
                 $paidOut = max(0.0, (float)($r->paid_amount ?? 0));
+                // Only count actual disbursed refund payouts (exclude 100% AR credit offsets with paid_amount == 0)
+                $totalRefunds += $paidOut;
                 if ($paidOut > 0 && $accounting->isCashPaymentType($tender)) {
                     $cashRefunds += $paidOut;
                 }
@@ -837,7 +893,11 @@ class CashRegisterController extends Controller
                 ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt])
                 ->whereNull('expense_payments.cash_register_id')
                 ->when($hasExpRegCol, fn ($q) => $q->whereNull('expenses.cash_register_id'))
-                ->where('expenses.warehouse_name', $register->warehouse_name)
+                ->when(
+                    $register->warehouse_id,
+                    fn ($q) => $q->where('expenses.warehouse_id', $register->warehouse_id),
+                    fn ($q) => $q->where('expenses.warehouse_name', $register->warehouse_name)
+                )
                 ->when($register->user_id, fn ($q) => $q->where('expense_payments.user_id', $register->user_id))
                 ->tap($applyActiveExpenseFilter)
                 ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
@@ -851,7 +911,11 @@ class CashRegisterController extends Controller
             $expensePaymentRows = DB::table('expense_payments')
                 ->join('expenses', 'expense_payments.expense_id', '=', 'expenses.id')
                 ->whereBetween('expense_payments.created_at', [$openedAt, $closedAt])
-                ->where('expenses.warehouse_name', $register->warehouse_name)
+                ->when(
+                    $register->warehouse_id,
+                    fn ($q) => $q->where('expenses.warehouse_id', $register->warehouse_id),
+                    fn ($q) => $q->where('expenses.warehouse_name', $register->warehouse_name)
+                )
                 ->when($register->user_id, fn ($q) => $q->where('expense_payments.user_id', $register->user_id))
                 ->tap($applyActiveExpenseFilter)
                 ->get(['expense_payments.id', 'expense_payments.amount', 'expense_payments.payment_type']);
@@ -891,7 +955,11 @@ class CashRegisterController extends Controller
         foreach (
             DB::table('expenses')
                 ->when($hasExpRegCol, fn ($q) => $q->whereNull('cash_register_id'))
-                ->where('warehouse_name', $register->warehouse_name)
+                ->when(
+                    $register->warehouse_id,
+                    fn ($q) => $q->where('warehouse_id', $register->warehouse_id),
+                    fn ($q) => $q->where('warehouse_name', $register->warehouse_name)
+                )
                 ->whereBetween('created_at', [$openedAt, $closedAt])
                 ->when($register->user_id, fn ($q) => $q->where('user_id', $register->user_id))
                 ->where('paid_amount', '>', 0)
@@ -962,15 +1030,15 @@ class CashRegisterController extends Controller
                 ->get(['id', 'sale_reference_no', 'sale_grand_total', 'cash_amount', 'non_cash_amount', 'sale_date', 'synced_at', 'reason', 'status'])
             : collect();
 
-        // ACC-04: Blind Cash Reconciliation - hide expected cash & variance from cashiers on open shifts
+        // ACC-04: True Blind Cash Reconciliation — never leak expected_cash via closing_cash or raw cash flow scalars on open shifts
         $canViewExpected = $forInternalCalculation || ($user ? $user->hasPermission('cash_register.view_expected') : false);
         $hideExpected = (!$isClosedReg && !$canViewExpected);
 
         $paymentBreakdown = [];
-        // Cash is always listed first
+        // Cash is always listed first (masked during blind open shift)
         $paymentBreakdown[] = [
             'method' => 'Cash',
-            'amount' => round($cashSales, 2),
+            'amount' => $hideExpected ? null : round($cashSales, 2),
             'count' => (int)($tenderCounts['Cash'] ?? 0),
         ];
 
@@ -1003,27 +1071,28 @@ class CashRegisterController extends Controller
             'total_transactions' => $txCount,
             'opening_cash' => $openingCash,
             'total_sales' => round($totalSales, 2),
-            'cash_sales' => round($cashSales, 2),
+            'cash_sales' => $hideExpected ? null : round($cashSales, 2),
             'cheque_sales' => round($chequeSales, 2),
             'bank_transfer_sales' => round($bankTransferSales, 2),
             'card_sales' => round($cardSales, 2),
             'digital_sales' => round($digitalSales, 2),
             'other_sales' => round($otherSales, 2),
-            'total_collections' => $totalCollections,
-            'total_payment' => $totalPayment,
-            'total_refunds' => round($totalRefunds, 2),
-            'cash_refunds' => round($cashRefunds, 2),
-            'cash_purchases_paid' => round($cashPurchasesPaid, 2),
-            'cash_purchase_refunds' => round($cashPurchaseRefunds, 2),
-            'total_expenses' => round($totalExpenses, 2),
-            'cash_expenses' => round($cashExpenses, 2),
+            'total_collections' => $hideExpected ? null : $totalCollections,
+            'total_payment' => $hideExpected ? null : $totalPayment,
+            'total_refunds' => $hideExpected ? null : round($totalRefunds, 2),
+            'cash_refunds' => $hideExpected ? null : round($cashRefunds, 2),
+            'cash_purchases_paid' => $hideExpected ? null : round($cashPurchasesPaid, 2),
+            'cash_purchase_refunds' => $hideExpected ? null : round($cashPurchaseRefunds, 2),
+            'total_expenses' => $hideExpected ? null : round($totalExpenses, 2),
+            'cash_expenses' => $hideExpected ? null : round($cashExpenses, 2),
             'digital_expenses' => round($digitalExpenses, 2),
-            'floats_in' => round($floatsIn, 2),
-            'cash_drops' => round($cashDrops, 2),
-            'safe_drops' => round($cashDrops, 2),
+            'floats_in' => $hideExpected ? null : round($floatsIn, 2),
+            'cash_drops' => $hideExpected ? null : round($cashDrops, 2),
+            'safe_drops' => $hideExpected ? null : round($cashDrops, 2),
             'expected_cash' => $hideExpected ? null : round($expectedCash, 2),
-            'closing_cash' => round($closingCash, 2),
+            'closing_cash' => $hideExpected ? null : round($closingCash, 2),
             'difference' => $hideExpected ? null : round($difference, 2),
+            'blind_count_masked' => $hideExpected,
             'status' => ucfirst($register->status),
             'primary_payment_type' => 'Cash',
             'notes' => (string)($register->opening_notes ?? $register->closing_notes ?? ''),
@@ -1058,5 +1127,47 @@ class CashRegisterController extends Controller
                 ];
             })->values(),
         ];
+    }
+
+    /**
+     * ACC-04 Blind Cash Count masking: redact expected_cash AND all cash-flow scalars
+     * that can reconstruct expected_cash on endpoints where caller lacks cash_register.view_expected.
+     */
+    private function applyBlindCountMask(array $payload, bool $maskClosingCash = true): array
+    {
+        $maskedFields = [
+            'cash_sales',
+            'total_collections',
+            'total_payment',
+            'total_refunds',
+            'cash_refunds',
+            'cash_purchases_paid',
+            'cash_purchase_refunds',
+            'total_expenses',
+            'cash_expenses',
+            'floats_in',
+            'cash_drops',
+            'safe_drops',
+            'expected_cash',
+            'difference',
+        ];
+        if ($maskClosingCash) {
+            $maskedFields[] = 'closing_cash';
+        }
+        foreach ($maskedFields as $field) {
+            if (array_key_exists($field, $payload)) {
+                $payload[$field] = null;
+            }
+        }
+        if (isset($payload['payment_breakdown']) && is_array($payload['payment_breakdown'])) {
+            foreach ($payload['payment_breakdown'] as &$pb) {
+                if (is_array($pb) && strcasecmp(trim((string)($pb['method'] ?? '')), 'Cash') === 0) {
+                    $pb['amount'] = null;
+                }
+            }
+            unset($pb);
+        }
+        $payload['blind_count_masked'] = true;
+        return $payload;
     }
 }

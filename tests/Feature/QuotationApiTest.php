@@ -1799,9 +1799,11 @@ class QuotationApiTest extends TestCase
         $this->assertEquals(2, \App\Models\SalePayment::where('sale_id', $sale1Id)->count());
 
         // P0: Dashboard cache MUST already reflect new sale WITHOUT force_refresh!
+        // GAAP tax-exclusive total_sales = 500.0 (560.0 gross_invoiced_sales - 60.0 commercial tax)
         $afterDash = $this->getJson("/api/reports/dashboard-summary?date_filter=custom&start_date={$today}&end_date={$today}");
         $afterDash->assertStatus(200);
-        $this->assertEquals(560.0, (float) $afterDash->json('data.total_sales'));
+        $this->assertEquals(500.0, (float) $afterDash->json('data.total_sales'));
+        $this->assertEquals(560.0, (float) $afterDash->json('data.gross_invoiced_sales'));
 
         // P2: Commercial Tax Report includes BOTH order tax (50) and line item tax (10) = 60, taxable sales = 500
         $taxRes = $this->getJson("/api/reports/commercial-tax?start_date={$today}&end_date={$today}&force_refresh=1");

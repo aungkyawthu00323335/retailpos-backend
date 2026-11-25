@@ -904,7 +904,7 @@ class PurchaseController extends Controller
                 'subtotal' => (float)$item['subtotal'],
             ]);
 
-            if ($status === 'Received' && $product) {
+            if (in_array($status, ['Received', 'Completed'], true) && $product) {
                 $precomputedLandedTotal = (float)($landedMap[$idx]['landed_total'] ?? $lineBases[$idx]);
                 $this->applyReceivedItemStockCostAndBatch(
                     $purchase,
@@ -1067,7 +1067,7 @@ class PurchaseController extends Controller
         $grandTotal = $totals['grand_total'];
 
         $status = $validated['status'] ?? 'Received';
-        $isReceivedStatus = ($status === 'Received');
+        $isReceivedStatus = in_array($status, ['Received', 'Completed'], true);
 
         // Draft/Ordered POs (not yet Received) and users without pay permission must never record cash movements
         $hasPaymentsArray = $isReceivedStatus && $canPay && !empty($validated['payments']) && is_array($validated['payments']);
@@ -1169,7 +1169,7 @@ class PurchaseController extends Controller
             );
 
             // Accounts Payable recognition occurs strictly when goods are Received (not on Pending/Ordered POs)
-            if ($purchase->status === 'Received') {
+            if (in_array($purchase->status, ['Received', 'Completed'], true)) {
                 $this->syncSupplierBalanceDue(
                     null,
                     0.0,
@@ -1340,7 +1340,8 @@ class PurchaseController extends Controller
                 $consumed = max(0.0, round((float)$batch->initial_quantity - (float)$batch->remaining_quantity, 4));
                 $hasLayers = \App\Models\SaleItemCostLayer::where('inventory_batch_id', $batch->id)->exists()
                     || \App\Models\AdjustmentItemCostLayer::where('inventory_batch_id', $batch->id)->exists()
-                    || \App\Models\PurchaseReturnCostLayer::where('inventory_batch_id', $batch->id)->exists();
+                    || \App\Models\PurchaseReturnCostLayer::where('inventory_batch_id', $batch->id)->exists()
+                    || \App\Models\StockTransferCostLayer::where('source_inventory_batch_id', $batch->id)->exists();
                 $consumedByItemId[$exItem->id] = $consumed;
                 $hasLayersByItemId[$exItem->id] = $hasLayers;
                 if ($consumed > 0.0001 || $hasLayers) {
@@ -1492,12 +1493,18 @@ class PurchaseController extends Controller
                     $pName = $oldItem->product_name ?: ('Product #' . $oldItem->product_id);
                     return "Cannot reduce quantity of '{$pName}' below {$consumed} base units because that quantity has already been sold, adjusted, or returned from this FIFO batch.";
                 }
-                if ($canViewCost && $batch) {
-                    $oldUnitCost = (float)$oldItem->unit_cost;
-                    $newUnitCost = (float)$inc['raw']['unit_cost'];
-                    if (abs($newUnitCost - $oldUnitCost) > 0.01) {
+                if ($batch) {
+                    $oldConv = max(1.0, (float)($oldItem->conversion_rate ?: 1.0));
+                    $oldBaseUnitCost = (float)($oldItem->base_unit_cost > 0 ? $oldItem->base_unit_cost : ((float)$oldItem->unit_cost / $oldConv));
+                    $oldBatchLandedCost = (float)$batch->unit_cost;
+                    $newBaseUnitCost = (float)$inc['base_unit_cost'];
+                    $newLandedBaseCost = (float)$inc['landed_base_unit_cost'];
+                    if (
+                        abs($newBaseUnitCost - $oldBaseUnitCost) > 0.0001
+                        || abs($newLandedBaseCost - $oldBatchLandedCost) > 0.0001
+                    ) {
                         $pName = $oldItem->product_name ?: ('Product #' . $oldItem->product_id);
-                        return "Cannot modify unit cost of '{$pName}' on Purchase #{$purchase->reference_no} because FIFO layers from this batch have already been consumed.";
+                        return "Cannot modify unit cost, unit conversion, or landed cost allocation of '{$pName}' on Purchase #{$purchase->reference_no} because FIFO layers from this batch have already been consumed.";
                     }
                 }
             }
@@ -1577,16 +1584,17 @@ class PurchaseController extends Controller
 
                 $batch = $batchByItemId[$oldItem->id] ?? null;
                 $consumed = $consumedByItemId[$oldItem->id] ?? 0.0;
+                $hasLayers = $hasLayersByItemId[$oldItem->id] ?? false;
                 if ($batch) {
                     $newRemaining = max(0.0, round($baseQty - $consumed, 4));
                     $batchUpdates = [
                         'initial_quantity' => $baseQty,
                         'remaining_quantity' => $newRemaining,
                         'status' => $newRemaining > 0.0001 ? 'active' : 'exhausted',
-                        'received_date' => $receivedDate,
                     ];
-                    if ($consumed <= 0.0001) {
+                    if ($consumed <= 0.0001 && !$hasLayers) {
                         $batchUpdates['unit_cost'] = $landedCost;
+                        $batchUpdates['received_date'] = $receivedDate;
                     }
                     $batch->update($batchUpdates);
                 } else {
@@ -1893,7 +1901,7 @@ class PurchaseController extends Controller
                         $regIdsToCheck = collect($normalizedOld)->pluck('cash_register_id')->filter()->unique()->values()->all();
                         if (!empty($regIdsToCheck) && \Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
                             $openRegIds = \App\Models\CashRegister::whereIn('id', $regIdsToCheck)
-                                ->whereRaw("LOWER(COALESCE(status, '')) = 'open'")
+                                ->whereRaw("LOWER(COALESCE(status, '')) IN ('open', 'opened')")
                                 ->pluck('id')
                                 ->flip()
                                 ->all();
@@ -2046,6 +2054,7 @@ class PurchaseController extends Controller
         $unitService = app(ProductUnitConversionService::class);
         $fifoService = app(FifoInventoryService::class);
         $canViewCost = $accounting->canViewCost($request);
+        $canPay = $accounting->canRecordPayment($request, 'purchases.pay');
 
         DB::beginTransaction();
         try {
@@ -2082,8 +2091,9 @@ class PurchaseController extends Controller
 
             $oldStatus = $purchase->status;
             $newStatus = $validated['status'] ?? $oldStatus;
+            $wasReceived = in_array($oldStatus, ['Received', 'Completed'], true);
             $oldDue = (float)$purchase->due_amount;
-            $oldApDue = in_array($oldStatus, ['Received', 'Completed'], true) ? $oldDue : 0.0;
+            $oldApDue = $wasReceived ? $oldDue : 0.0;
 
             $oldSupplierId = $purchase->supplier_id ? (int)$purchase->supplier_id : null;
             $newSupplierId = array_key_exists('supplier_id', $validated)
@@ -2114,7 +2124,7 @@ class PurchaseController extends Controller
                         'message' => 'Cannot reassign supplier on Purchase #' . $purchase->reference_no . ' because active Purchase Return(s) or credit note offsets are linked to it. Void or delete those Purchase Returns first.',
                     ], 422);
                 }
-                if ($oldStatus === 'Received' && (in_array($newStatus, ['Pending', 'Ordered'], true) || $warehouseChanged)) {
+                if ($wasReceived && (in_array($newStatus, ['Pending', 'Ordered'], true) || $warehouseChanged)) {
                     DB::rollBack();
                     return response()->json([
                         'status' => 'error',
@@ -2123,7 +2133,7 @@ class PurchaseController extends Controller
                 }
             }
 
-            if ($oldStatus === 'Received' && (in_array($newStatus, ['Pending', 'Ordered']) || ($newStatus === 'Received' && $warehouseChanged))) {
+            if ($wasReceived && (in_array($newStatus, ['Pending', 'Ordered']) || (in_array($newStatus, ['Received', 'Completed'], true) && $warehouseChanged))) {
                 $batchBlockMsg = $fifoService->assertPurchaseBatchesCanModifyOrDelete($purchase, null, true);
                 if ($batchBlockMsg !== null) {
                     DB::rollBack();
@@ -2219,11 +2229,11 @@ class PurchaseController extends Controller
                 ], 422);
             }
 
-            $beforeCashByReg = $accounting->extractDocumentCashByRegister($purchase, ['Received']);
+            $beforeCashByReg = $accounting->extractDocumentCashByRegister($purchase, ['Received', 'Completed']);
             $actor = $accounting->resolveActorForUpdate($request, $validated, $purchase);
-            $isNewStatusReceived = ($newStatus === 'Received');
+            $isNewStatusReceived = in_array($newStatus, ['Received', 'Completed'], true);
 
-            $hasPaymentsInput = $isNewStatusReceived && $canViewCost && !empty($validated['payments']) && is_array($validated['payments']);
+            $hasPaymentsInput = $isNewStatusReceived && $canPay && !empty($validated['payments']) && is_array($validated['payments']);
             if ($hasPaymentsInput) {
                 $splitRegErr = $accounting->validateSplitTenderCashRegisters(
                     $validated['payments'],
@@ -2242,15 +2252,27 @@ class PurchaseController extends Controller
                         $validated['payments'],
                         $validated['payment_type'] ?? ($purchase->payment_type ?: 'Cash')
                     )
-                    : ($canViewCost
+                    : ($canPay
                         ? ($validated['payment_type'] ?? ($purchase->payment_type ?: 'Cash'))
                         : ($purchase->payment_type ?: 'N/A')));
-            $probeRegAmount = ($isNewStatusReceived && !$canViewCost) ? 0.0 : null;
+            $probeRegAmount = ($isNewStatusReceived && !$canPay) ? 0.0 : null;
 
             $cashRegisterId = null;
             $newCashRegisterId = null;
             if ($isNewStatusReceived) {
-                $explicitRegInput = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+                $existingHeaderRegOpen = false;
+                if (!empty($purchase->cash_register_id) && \Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
+                    $existingReg = \App\Models\CashRegister::find((int)$purchase->cash_register_id);
+                    $existingHeaderRegOpen = $existingReg && in_array(strtolower((string)$existingReg->status), ['open', 'opened'], true);
+                }
+
+                $rawExplicitRegInput = !empty($validated['cash_register_id']) ? (int)$validated['cash_register_id'] : null;
+                $isEchoedClosedHeader = $rawExplicitRegInput !== null
+                    && !empty($purchase->cash_register_id)
+                    && $rawExplicitRegInput === (int)$purchase->cash_register_id
+                    && !$existingHeaderRegOpen;
+                $explicitRegInput = $isEchoedClosedHeader ? null : $rawExplicitRegInput;
+
                 $probePayType = $hasPaymentsInput
                     ? (collect($validated['payments'])->contains(fn($t) => $accounting->isCashPaymentType($t['payment_type'] ?? null))
                         ? 'Cash'
@@ -2266,12 +2288,6 @@ class PurchaseController extends Controller
                 if ($registerCheck['error']) {
                     DB::rollBack();
                     return response()->json(['status' => 'error', 'message' => $registerCheck['error']], 422);
-                }
-
-                $existingHeaderRegOpen = false;
-                if (!empty($purchase->cash_register_id) && \Illuminate\Support\Facades\Schema::hasTable('cash_registers')) {
-                    $existingReg = \App\Models\CashRegister::find((int)$purchase->cash_register_id);
-                    $existingHeaderRegOpen = $existingReg && strtolower((string)$existingReg->status) === 'open';
                 }
 
                 if ($explicitRegInput !== null) {
@@ -2309,7 +2325,7 @@ class PurchaseController extends Controller
                 || (!$isTaxRecoverable && abs((float)$purchase->tax_amount - (float)$taxAmount) > 0.01)
                 || $dateChanged;
 
-            if ($oldStatus === 'Received' && $newStatus === 'Received' && !$hasItemsPayload && !$warehouseChanged && $headerCostOrDateChanged) {
+            if ($wasReceived && $isNewStatusReceived && !$warehouseChanged && ($dateChanged || (!$hasItemsPayload && $headerCostOrDateChanged))) {
                 $batchBlockMsg = $fifoService->assertPurchaseBatchesCanModifyOrDelete($purchase, null, true);
                 if ($batchBlockMsg !== null) {
                     DB::rollBack();
@@ -2326,7 +2342,7 @@ class PurchaseController extends Controller
                     'payments_payload' => json_encode([]),
                 ];
             } else {
-                $paymentInputForSync = $canViewCost
+                $paymentInputForSync = $canPay
                     ? $validated
                     : collect($validated)->except(['payments', 'paid_amount', 'payment_type'])->all();
                 $paymentSync = $this->resolveUpdatedPayments(
@@ -2347,7 +2363,7 @@ class PurchaseController extends Controller
                 'payment_type' => $paymentSync['payment_type'],
                 'paid_amount' => $paymentSync['paid_amount'],
                 'payments_payload' => $paymentSync['payments_payload'],
-            ], ['Received']);
+            ], ['Received', 'Completed']);
             $regDeltaErr = $accounting->assertCashRegisterDeltaMutable($beforeCashByReg, $afterCashByReg);
             if ($regDeltaErr !== null) {
                 DB::rollBack();
@@ -2363,7 +2379,7 @@ class PurchaseController extends Controller
 
             // Stock and FIFO inventory reconciliation
             if ($hasItemsPayload) {
-                if ($oldStatus === 'Received' && $newStatus === 'Received' && !$warehouseChanged) {
+                if ($wasReceived && $isNewStatusReceived && !$warehouseChanged) {
                     $reconcileErr = $this->reconcileUpdatedReceivedPurchaseItems(
                         $purchase,
                         $totals['items'],
@@ -2381,7 +2397,7 @@ class PurchaseController extends Controller
                         return response()->json(['status' => 'error', 'message' => $reconcileErr], 422);
                     }
                 } else {
-                    if ($oldStatus === 'Received') {
+                    if ($wasReceived) {
                         $this->revertPurchaseStockAndBatches(
                             $purchase,
                             $oldWarehouseId,
@@ -2405,7 +2421,7 @@ class PurchaseController extends Controller
                         $isTaxRecoverable
                     );
                 }
-            } elseif ($oldStatus === 'Received' && in_array($newStatus, ['Pending', 'Ordered'])) {
+            } elseif ($wasReceived && in_array($newStatus, ['Pending', 'Ordered'])) {
                 $this->revertPurchaseStockAndBatches(
                     $purchase,
                     $oldWarehouseId,
@@ -2413,7 +2429,7 @@ class PurchaseController extends Controller
                     'purchase_reversion',
                     'Revert stock: status changed to ' . $newStatus
                 );
-            } elseif ($oldStatus !== 'Received' && $newStatus === 'Received') {
+            } elseif (!$wasReceived && $isNewStatusReceived) {
                 $this->applyExistingItemsToWarehouse(
                     $purchase,
                     $newWarehouseId,
@@ -2425,7 +2441,7 @@ class PurchaseController extends Controller
                     "Purchase #{$purchase->reference_no} status changed to Received",
                     $isTaxRecoverable
                 );
-            } elseif ($oldStatus === 'Received' && $newStatus === 'Received') {
+            } elseif ($wasReceived && $isNewStatusReceived) {
                 if ($warehouseChanged) {
                     $this->revertPurchaseStockAndBatches(
                         $purchase,
@@ -2469,13 +2485,16 @@ class PurchaseController extends Controller
                         if (!$batch) {
                             continue;
                         }
-                        $updateBatch = ['received_date' => $txDate];
+                        $updateBatch = [];
                         if ((float)$batch->remaining_quantity >= (float)$batch->initial_quantity - 0.0001) {
                             $baseQty = (float)($item->base_quantity ?: $item->quantity);
                             $landedTotal = (float)($landedMap[$idx]['landed_total'] ?? $lineBases[$idx]);
                             $updateBatch['unit_cost'] = $baseQty > 0.0001 ? round($landedTotal / $baseQty, 8) : (float)$item->base_unit_cost;
+                            $updateBatch['received_date'] = $txDate;
                         }
-                        $batch->update($updateBatch);
+                        if (!empty($updateBatch)) {
+                            $batch->update($updateBatch);
+                        }
                         if (isset($updateBatch['unit_cost']) && (float)$updateBatch['unit_cost'] > 0.0001 && !empty($item->product_id)) {
                             $hasNewerBatch = \App\Models\InventoryBatch::where('product_id', $item->product_id)
                                 ->when(
@@ -2534,8 +2553,8 @@ class PurchaseController extends Controller
             ];
             $purchase->update($updateFields);
 
-            // Reconcile Supplier balance_due atomically under lock (only Received POs carry AP)
-            $newApDue = ($newStatus === 'Received') ? $dueAmount : 0.0;
+            // Reconcile Supplier balance_due atomically under lock (only Received/Completed POs carry AP)
+            $newApDue = $isNewStatusReceived ? $dueAmount : 0.0;
             $this->syncSupplierBalanceDue($oldSupplierId, $oldApDue, $newSupplierId, $newApDue);
 
             DB::commit();
@@ -2645,7 +2664,7 @@ class PurchaseController extends Controller
             }
 
             // Guard 3: Closed CashRegister audit immutability
-            $beforeCashByReg = $accounting->extractDocumentCashByRegister($purchase, ['Received']);
+            $beforeCashByReg = $accounting->extractDocumentCashByRegister($purchase, ['Received', 'Completed']);
             $regErr = $accounting->assertCashRegisterDeltaMutable($beforeCashByReg, []);
             if ($regErr !== null) {
                 DB::rollBack();
@@ -2654,7 +2673,7 @@ class PurchaseController extends Controller
 
             $affectedProducts = [];
             $affectedCostKeys = [];
-            if ($purchase->status === 'Received') {
+            if (in_array($purchase->status, ['Received', 'Completed'], true)) {
                 $unitService = app(ProductUnitConversionService::class);
                 $warehouseId = $unitService->warehouseId($purchase->warehouse_id, $purchase->warehouse_name);
                 $batchesByItem = \App\Models\InventoryBatch::whereIn('purchase_item_id', $purchase->items->pluck('id'))
@@ -2802,7 +2821,7 @@ class PurchaseController extends Controller
                 ], 422);
             }
 
-            if ($purchase->status !== 'Received') {
+            if (!in_array($purchase->status, ['Received', 'Completed'], true)) {
                 DB::rollBack();
                 return response()->json([
                     'status'  => 'error',
@@ -2864,12 +2883,18 @@ class PurchaseController extends Controller
             $nextPaymentId = $accounting->nextPaymentId($updatedPayments);
             $cleanRef = preg_replace('/^#\s*/', '', trim((string)$purchase->reference_no));
 
+            $remainingToCap = round(max(0.0, $priorDue), 2);
             if (!empty($validated['payments']) && is_array($validated['payments'])) {
                 foreach ($validated['payments'] as $tender) {
-                    $pAmt = round((float)$tender['amount'], 2);
+                    $rawPAmt = round((float)$tender['amount'], 2);
+                    $pAmt = round(min($rawPAmt, $remainingToCap), 2);
+                    if ($pAmt <= 0.0001) {
+                        continue;
+                    }
+                    $remainingToCap = round(max(0.0, $remainingToCap - $pAmt), 2);
                     $newPaymentId = $nextPaymentId++;
                     $paymentRef = 'PAY-' . ($cleanRef ?: $purchase->id) . '-' . time() . '-' . rand(100, 999);
-                    $receivedAmt = !empty($tender['received_amount']) ? round((float)$tender['received_amount'], 2) : $pAmt;
+                    $receivedAmt = !empty($tender['received_amount']) ? round((float)$tender['received_amount'], 2) : $rawPAmt;
                     $changeAmt = !empty($tender['change_amount']) ? round((float)$tender['change_amount'], 2) : round(max(0.0, $receivedAmt - $pAmt), 2);
                     $rawPayDate = !empty($tender['payment_date']) ? $tender['payment_date'] : ($validated['payment_date'] ?? null);
                     $row = [
@@ -2893,15 +2918,16 @@ class PurchaseController extends Controller
             } else {
                 $newPaymentId = $nextPaymentId++;
                 $paymentRef = 'PAY-' . ($cleanRef ?: $purchase->id) . '-' . time() . '-' . rand(100, 999);
-                $pAmt = round($payingAmount, 2);
+                $rawPAmt = round($payingAmount, 2);
+                $pAmt = round(min($rawPAmt, $remainingToCap), 2);
                 $row = [
                     'id'              => $newPaymentId,
                     'reference_no'    => $paymentRef,
                     'payment_date'    => $accounting->normalizeTransactionDate($validated['payment_date'] ?? null),
                     'payment_type'    => $validated['payment_type'],
                     'amount'          => $pAmt,
-                    'received_amount' => $pAmt,
-                    'change_amount'   => 0.0,
+                    'received_amount' => $rawPAmt,
+                    'change_amount'   => round(max(0.0, $rawPAmt - $pAmt), 2),
                     'user_name'       => $actor['user_name'],
                     'user_role'       => $actor['user_role'],
                     'notes'           => $validated['notes'] ?? '',
@@ -2909,7 +2935,9 @@ class PurchaseController extends Controller
                 if ($defaultRegisterId !== null && $accounting->isCashPaymentType($validated['payment_type'] ?? null)) {
                     $row['cash_register_id'] = $defaultRegisterId;
                 }
-                $updatedPayments[] = $row;
+                if ($pAmt > 0.0001) {
+                    $updatedPayments[] = $row;
+                }
             }
 
             $rawNewPaid = (float)collect($updatedPayments)->sum('amount');
@@ -2929,8 +2957,8 @@ class PurchaseController extends Controller
             }
             $purchase->update($purchaseUpdate);
 
-            // Reconcile Supplier balance_due under lock (only Received POs carry AP)
-            if ($purchase->status === 'Received') {
+            // Reconcile Supplier balance_due under lock (only Received/Completed POs carry AP)
+            if (in_array($purchase->status, ['Received', 'Completed'], true)) {
                 $this->syncSupplierBalanceDue(
                     !empty($purchase->supplier_id) ? (int)$purchase->supplier_id : null,
                     $priorDue,
@@ -3068,7 +3096,7 @@ class PurchaseController extends Controller
                 return response()->json(['status' => 'error', 'message' => 'Payment record not found'], 404);
             }
 
-            if ($purchase->status === 'Received' && is_array($deletedPayment)) {
+            if (in_array($purchase->status, ['Received', 'Completed'], true) && is_array($deletedPayment)) {
                 $legRegId = isset($deletedPayment['cash_register_id']) ? (int)$deletedPayment['cash_register_id'] : null;
                 $docRegId = $purchase->cash_register_id ? (int)$purchase->cash_register_id : null;
                 $legErr = $accounting->assertPaymentLegRegisterMutable(
@@ -3099,8 +3127,8 @@ class PurchaseController extends Controller
                 'payment_type'     => $newPaymentType,
             ]);
 
-            // Restore Supplier balance_due atomically under lock (only Received POs carry AP)
-            if ($purchase->status === 'Received') {
+            // Restore Supplier balance_due atomically under lock (only Received/Completed POs carry AP)
+            if (in_array($purchase->status, ['Received', 'Completed'], true)) {
                 $this->syncSupplierBalanceDue(
                     !empty($purchase->supplier_id) ? (int)$purchase->supplier_id : null,
                     $oldDue,
