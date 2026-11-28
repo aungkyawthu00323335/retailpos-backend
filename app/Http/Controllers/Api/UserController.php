@@ -46,7 +46,8 @@ class UserController extends Controller
     {
         if ($request->boolean('compact')) {
             $users = User::query()
-                ->select(['id', 'user_id', 'name', 'role', 'branch', 'status'])
+                ->with('roleModel:id,slug')
+                ->select(['id', 'user_id', 'name', 'role_id', 'role', 'branch', 'status'])
                 ->when($request->filled('search'), function ($q) use ($request) {
                     $search = $request->input('search');
                     $q->where(function ($sub) use ($search) {
@@ -58,12 +59,37 @@ class UserController extends Controller
                 ->when($request->filled('role'), fn ($q) => $q->where('role', $request->input('role')))
                 ->when($request->filled('branch'), fn ($q) => $q->where('branch', $request->input('branch')))
                 ->orderBy('id', 'asc')
-                ->get();
+                ->get()
+                ->map(fn (User $u) => [
+                    'id' => $u->id,
+                    'user_id' => $u->user_id,
+                    'name' => $u->name,
+                    'role' => $u->role,
+                    'role_id' => $u->role_id,
+                    'branch' => $u->branch,
+                    'status' => $u->status,
+                    'is_super_admin' => (bool) $u->isSuperAdmin(),
+                ]);
 
             return response()->json([
                 'status' => 'success',
                 'data' => $users,
             ])->header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        }
+
+        $caller = User::resolveFromRequest($request);
+        if (!$caller) {
+            return response()->json([
+                'status' => 'error',
+                'code' => 'UNAUTHENTICATED',
+                'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
+            ], 401);
+        }
+        if (!$caller->isSuperAdmin() && !$caller->hasPermission('users.view')) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Access Denied: You do not have permission (users.view) to access this resource.',
+            ], 403);
         }
 
         $query = User::with(['roleModel', 'outlets'])
@@ -90,7 +116,6 @@ class UserController extends Controller
         }
 
         $users = $query->orderBy('id', 'asc')->get()->map(function ($u) {
-            $u->is_super_admin = $u->isSuperAdmin();
             $u->outlet_ids = $u->outlets->pluck('id')->toArray();
             $u->total_dependencies = (int) (
                 ($u->sales_count ?? 0) +
@@ -106,9 +131,9 @@ class UserController extends Controller
             'status' => 'success',
             'summary' => [
                 'total_users' => $users->count(),
-                'active_users' => $users->where('status', 'Active')->count(),
-                'super_admins' => $users->filter(fn($u) => $u->is_super_admin)->count(),
-                'cashiers' => $users->filter(fn($u) => str_contains(strtolower($u->role), 'cashier'))->count(),
+                'active_users' => $users->filter(fn($u) => $u->isActive())->count(),
+                'super_admins' => $users->filter(fn($u) => $u->isSuperAdmin())->count(),
+                'cashiers' => $users->filter(fn($u) => str_contains(strtolower((string)$u->role), 'cashier'))->count(),
             ],
             'data' => $users,
         ]);
@@ -150,32 +175,59 @@ class UserController extends Controller
             $userId = (string)(($maxNum && (int)$maxNum >= 100000) ? (int)$maxNum + 1 : 100001);
         }
 
-        $roleName = $validated['role'] ?? 'Cashier';
-        $roleId = $validated['role_id'] ?? null;
+        $caller = User::resolveFromRequest($request);
 
-        if (!$roleId && !empty($roleName)) {
-            $matchedRole = Role::where('name', $roleName)->first();
-            if ($matchedRole) {
-                $roleId = $matchedRole->id;
+        $roleId = $validated['role_id'] ?? null;
+        $roleName = isset($validated['role']) ? trim((string) $validated['role']) : '';
+        $assignedRole = null;
+
+        if ($roleId) {
+            $assignedRole = Role::find($roleId);
+            if ($assignedRole) {
+                $roleName = $assignedRole->name;
+            }
+        } elseif ($roleName !== '') {
+            $assignedRole = Role::whereRaw('LOWER(name) = ?', [strtolower($roleName)])->first();
+            if ($assignedRole) {
+                $roleId = $assignedRole->id;
+                $roleName = $assignedRole->name;
+            }
+        }
+
+        if ($roleName === '') {
+            $roleName = 'Cashier';
+            $assignedRole = Role::whereRaw('LOWER(name) = ?', ['cashier'])->first();
+            if ($assignedRole) {
+                $roleId = $assignedRole->id;
+                $roleName = $assignedRole->name;
             }
         }
 
         // SEC-03: Privilege escalation prevention - only Super Admin can create Super Admin accounts
-        $targetIsSuper = (strtolower(trim((string)$roleName)) === 'super admin');
-        if (!$targetIsSuper && $roleId) {
-            $assignedRole = Role::find($roleId);
-            if ($assignedRole && ($assignedRole->slug === 'super_admin' || strtolower($assignedRole->name) === 'super admin')) {
-                $targetIsSuper = true;
-            }
+        $targetIsSuper = (strtolower(trim($roleName)) === 'super admin')
+            || ($assignedRole && ($assignedRole->slug === 'super_admin' || strtolower(trim((string) $assignedRole->name)) === 'super admin'));
+
+        if ($targetIsSuper && (!$caller || !$caller->isSuperAdmin())) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Only Super Admin can create Super Admin accounts.',
+            ], 403);
         }
 
-        if ($targetIsSuper) {
-            $caller = User::resolveFromRequest($request);
-            if (!$caller || !$caller->isSuperAdmin()) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'Unauthorized. Only Super Admin can create Super Admin accounts.',
-                ], 403);
+        // R1.10: Non-Super-Admin cannot assign a role containing wildcard or unpossessed permissions
+        if ($caller && !$caller->isSuperAdmin() && $assignedRole) {
+            $rolePerms = is_array($assignedRole->permissions) ? $assignedRole->permissions : [];
+            foreach ($rolePerms as $perm) {
+                $permStr = trim((string) $perm);
+                if ($permStr === '') {
+                    continue;
+                }
+                if ($permStr === '*' || !$caller->hasPermission($permStr)) {
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => "Unauthorized. You cannot assign a role containing permission '{$permStr}' which you do not possess.",
+                    ], 403);
+                }
             }
         }
 
@@ -212,7 +264,6 @@ class UserController extends Controller
         }
 
         $user->load(['roleModel', 'outlets']);
-        $user->is_super_admin = $user->isSuperAdmin();
         $user->outlet_ids = $user->outlets->pluck('id')->toArray();
 
         return response()->json([
@@ -238,7 +289,6 @@ class UserController extends Controller
             ], 404);
         }
 
-        $user->is_super_admin = $user->isSuperAdmin();
         $user->outlet_ids = $user->outlets->pluck('id')->toArray();
         $user->total_dependencies = (int) (
             ($user->sales_count ?? 0) +
@@ -259,7 +309,7 @@ class UserController extends Controller
      */
     public function update(Request $request, $id)
     {
-        $user = User::find($id);
+        $user = User::with('roleModel')->find($id);
 
         if (!$user) {
             return response()->json([
@@ -293,35 +343,116 @@ class UserController extends Controller
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
 
+        // R1.10: Non-Super-Admin cannot reset password or email on a user whose existing role has permissions caller lacks
+        if ($caller && !$caller->isSuperAdmin()) {
+            $changingCredentials = !empty($validated['password'])
+                || (array_key_exists('email', $validated) && strcasecmp(trim((string) $validated['email']), trim((string) $user->email)) !== 0);
+            if ($changingCredentials && $user->roleModel) {
+                $existingPerms = is_array($user->roleModel->permissions) ? $user->roleModel->permissions : [];
+                foreach ($existingPerms as $perm) {
+                    $permStr = trim((string) $perm);
+                    if ($permStr === '') {
+                        continue;
+                    }
+                    if ($permStr === '*' || !$caller->hasPermission($permStr)) {
+                        return response()->json([
+                            'status' => 'error',
+                            'message' => "Unauthorized. You cannot modify credentials for a user holding permission '{$permStr}' which you do not possess.",
+                        ], 403);
+                    }
+                }
+            }
+        }
+
         if (isset($validated['password']) && !empty($validated['password'])) {
             $validated['password'] = Hash::make($validated['password']);
         } else {
             unset($validated['password']);
         }
 
-        if (isset($validated['role']) && !isset($validated['role_id'])) {
-            $matchedRole = Role::where('name', $validated['role'])->first();
+        // Sync role_id <-> role BEFORE escalation and sole-Super-Admin guards
+        $targetRoleModel = $user->roleModel;
+        if (array_key_exists('role_id', $validated) && $validated['role_id'] !== null) {
+            $matchedRole = Role::find($validated['role_id']);
             if ($matchedRole) {
+                $targetRoleModel = $matchedRole;
+                $validated['role'] = $matchedRole->name;
+            }
+        } elseif (array_key_exists('role', $validated) && trim((string) $validated['role']) !== '') {
+            $trimmedRole = trim((string) $validated['role']);
+            $matchedRole = Role::whereRaw('LOWER(name) = ?', [strtolower($trimmedRole)])->first();
+            if ($matchedRole) {
+                $targetRoleModel = $matchedRole;
                 $validated['role_id'] = $matchedRole->id;
+                $validated['role'] = $matchedRole->name;
+            } else {
+                $targetRoleModel = null;
+                $validated['role_id'] = null;
+                $validated['role'] = $trimmedRole;
             }
         }
 
+        $finalRoleName = array_key_exists('role', $validated) ? (string) $validated['role'] : (string) $user->role;
+        $willBeSuperAdmin = (strtolower(trim($finalRoleName)) === 'super admin')
+            || ($targetRoleModel && ($targetRoleModel->slug === 'super_admin' || strtolower(trim((string) $targetRoleModel->name)) === 'super admin'));
+
         // SEC-03: Privilege escalation prevention - only Super Admin can assign Super Admin role
-        $elevatingToSuper = false;
-        if (isset($validated['role']) && strtolower(trim((string)$validated['role'])) === 'super admin') {
-            $elevatingToSuper = true;
-        }
-        if (isset($validated['role_id'])) {
-            $r = Role::find($validated['role_id']);
-            if ($r && ($r->slug === 'super_admin' || strtolower($r->name) === 'super admin')) {
-                $elevatingToSuper = true;
-            }
-        }
-        if ($elevatingToSuper && (!$caller || !$caller->isSuperAdmin())) {
+        if ($willBeSuperAdmin && !$user->isSuperAdmin() && (!$caller || !$caller->isSuperAdmin())) {
             return response()->json([
                 'status' => 'error',
                 'message' => 'Unauthorized. Only Super Admin can assign the Super Admin role.',
             ], 403);
+        }
+
+        // R1.10: Non-Super-Admin cannot assign a role containing wildcard or unpossessed permissions
+        if ((array_key_exists('role_id', $validated) || array_key_exists('role', $validated))
+            && $caller
+            && !$caller->isSuperAdmin()
+            && $targetRoleModel
+        ) {
+            $targetPerms = is_array($targetRoleModel->permissions) ? $targetRoleModel->permissions : [];
+            foreach ($targetPerms as $perm) {
+                $permStr = trim((string) $perm);
+                if ($permStr === '') {
+                    continue;
+                }
+                if ($permStr === '*' || !$caller->hasPermission($permStr)) {
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => "Unauthorized. You cannot assign a role containing permission '{$permStr}' which you do not possess.",
+                    ], 403);
+                }
+            }
+        }
+
+        // R1.5: Sole active Super Admin protection (cannot deactivate or demote the last active Super Admin)
+        $wasActiveSuperAdmin = $user->isSuperAdmin() && $user->isActive();
+        $finalStatus = $validated['status'] ?? $user->status;
+        $willBeActive = strcasecmp(trim((string) $finalStatus), 'active') === 0;
+        if ($wasActiveSuperAdmin && (!$willBeActive || !$willBeSuperAdmin)) {
+            $otherActiveSuperAdmins = User::where('id', '!=', $user->id)
+                ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                ->where(function ($q) {
+                    $q->whereRaw("LOWER(COALESCE(role, '')) = 'super admin'")
+                      ->orWhereHas('roleModel', function ($rq) {
+                          $rq->where('slug', 'super_admin')
+                             ->whereRaw("LOWER(COALESCE(status, '')) = 'active'");
+                      });
+                })
+                ->count();
+
+            if ($otherActiveSuperAdmins === 0) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Cannot deactivate or demote the sole active Super Admin account. At least one active Super Admin is required.',
+                ], 422);
+            }
+        }
+
+        // R1.2: Revoke active session token on deactivation
+        if (array_key_exists('status', $validated) && strcasecmp(trim((string) $validated['status']), 'active') !== 0) {
+            $validated['api_token'] = null;
+            $validated['api_token_created_at'] = null;
         }
 
         if (array_key_exists('outlet_ids', $validated)) {
@@ -358,7 +489,6 @@ class UserController extends Controller
         }
 
         $user->load(['roleModel', 'outlets']);
-        $user->is_super_admin = $user->isSuperAdmin();
         $user->outlet_ids = $user->outlets->pluck('id')->toArray();
 
         return response()->json([
@@ -373,7 +503,7 @@ class UserController extends Controller
      */
     public function toggleStatus(Request $request, $id)
     {
-        $user = User::find($id);
+        $user = User::with('roleModel')->find($id);
 
         if (!$user) {
             return response()->json([
@@ -382,13 +512,28 @@ class UserController extends Controller
             ], 404);
         }
 
+        $caller = User::resolveFromRequest($request);
+        if ($user->isSuperAdmin() && (!$caller || !$caller->isSuperAdmin())) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Only Super Admin can change the status of Super Admin accounts.',
+            ], 403);
+        }
+
         // Prevent deactivating the only active Super Admin
-        if ($user->isSuperAdmin() && $user->status === 'Active') {
-            $activeSuperAdmins = User::where('role', 'Super Admin')
-                ->orWhereHas('roleModel', fn($q) => $q->where('slug', 'super_admin'))
-                ->where('status', 'Active')
+        $isCurrentlyActive = $user->isActive();
+        if ($user->isSuperAdmin() && $isCurrentlyActive) {
+            $otherActiveSuperAdmins = User::where('id', '!=', $user->id)
+                ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                ->where(function ($q) {
+                    $q->whereRaw("LOWER(COALESCE(role, '')) = 'super admin'")
+                      ->orWhereHas('roleModel', function ($rq) {
+                          $rq->where('slug', 'super_admin')
+                             ->whereRaw("LOWER(COALESCE(status, '')) = 'active'");
+                      });
+                })
                 ->count();
-            if ($activeSuperAdmins <= 1) {
+            if ($otherActiveSuperAdmins === 0) {
                 return response()->json([
                     'status' => 'error',
                     'message' => 'Cannot deactivate the primary Super Admin account. At least one active Super Admin is required.',
@@ -396,12 +541,15 @@ class UserController extends Controller
             }
         }
 
-        $newStatus = ($user->status === 'Active') ? 'Inactive' : 'Active';
+        $newStatus = $isCurrentlyActive ? 'Inactive' : 'Active';
         $user->status = $newStatus;
+        if ($newStatus === 'Inactive') {
+            $user->api_token = null;
+            $user->api_token_created_at = null;
+        }
         $user->save();
 
         $user->load(['roleModel', 'outlets']);
-        $user->is_super_admin = $user->isSuperAdmin();
         $user->outlet_ids = $user->outlets->pluck('id')->toArray();
 
         return response()->json([

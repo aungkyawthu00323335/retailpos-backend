@@ -20,10 +20,19 @@ class Role extends Model
         'status',
     ];
 
+    protected $attributes = [
+        'status' => 'Active',
+    ];
+
     protected $casts = [
         'permissions' => 'array',
         'is_default' => 'boolean',
     ];
+
+    public function isActive(): bool
+    {
+        return strcasecmp(trim((string) ($this->status ?? '')), 'active') === 0;
+    }
 
     public function users(): HasMany
     {

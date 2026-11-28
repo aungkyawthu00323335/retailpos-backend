@@ -208,6 +208,7 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
         $customer = Customer::create(['name' => 'Walk-in', 'phone' => '09111111']);
         $expCat = ExpenseCategory::create(['name' => 'Utilities']);
         $user = $this->createAdminUser(['report_z_report.view', 'reports.view']);
+        $user->outlets()->sync([$outlet->id]);
 
         $saleOld = Sale::create([
             'reference_no' => 'SA-OLD',
@@ -352,6 +353,7 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
         $outlet = Outlet::create(['name' => 'Audit Outlet', 'is_active' => true]);
         $customer = Customer::create(['name' => 'Walk-in', 'phone' => '09111111']);
         $user = $this->createAdminUser(['report_cashier_audit.view', 'reports.view', 'cash_register.view_expected']);
+        $user->outlets()->sync([$outlet->id]);
         $today = \Carbon\Carbon::today()->toDateString();
 
         // Staff A: 1 Cash Sale of 10,000 + 1 KBZPay Sale Return of 15,000 -> Cash=+10,000, NonCash=-15,000, NetCollected=-5,000
@@ -427,6 +429,7 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
     {
         $outlet = Outlet::create(['name' => 'DeadStock Branch', 'is_active' => true]);
         $user = $this->createAdminUser(['report_dead_stock.view', 'reports.view', 'products.view_cost']);
+        $user->outlets()->sync([$outlet->id]);
 
         $prod = Product::create([
             'code' => 'P-DEAD-FIFO',
@@ -466,5 +469,127 @@ class ReportZeroCachePerformanceAuditTest extends TestCase
         $this->assertNotNull($item);
         $this->assertEquals(7000.0, (float)$item['tied_up_capital']); // 5 * 1400 FIFO cost
         $this->assertEquals(7000.0, (float)$res->json('summary.total_tied_up_capital'));
+    }
+
+    public function test_stock_ledger_returns_all_time_movements_when_no_date_filter_is_supplied(): void
+    {
+        $outlet = Outlet::create(['name' => 'Ledger Branch', 'is_active' => true]);
+        $customer = Customer::create(['name' => 'Walk-in', 'phone' => '09111111']);
+        $user = $this->createAdminUser(['report_stock_ledger.view', 'reports.view', 'products.view_cost']);
+        $user->outlets()->sync([$outlet->id]);
+
+        $prod = Product::create([
+            'code' => 'P-LEDGER-ALL',
+            'name' => 'Historical Ledger Item',
+            'cost_price' => 500.0,
+            'purchase_price' => 500.0,
+            'selling_price' => 800.0,
+            'stock_quantity' => 8,
+            'product_unit' => 'Pc',
+            'barcode_symbol' => 'CODE128',
+        ]);
+        DB::table('stock_balances')->insert([
+            'warehouse_id' => $outlet->id,
+            'product_id' => $prod->id,
+            'quantity' => 8,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        // Seed a purchase and a sale strictly in a prior month (outside Carbon::now()->startOfMonth())
+        $oldDate = now()->subMonths(2)->startOfMonth()->addDays(5)->format('Y-m-d H:i:s');
+        $purchaseId = DB::table('purchases')->insertGetId([
+            'reference_no' => 'PO-HIST-001',
+            'supplier_name' => 'Test Supplier',
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'date' => $oldDate,
+            'status' => 'Received',
+            'grand_total' => 5000.0,
+            'paid_amount' => 5000.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+            'created_by' => 'Admin',
+            'created_at' => $oldDate,
+            'updated_at' => $oldDate,
+        ]);
+        DB::table('purchase_items')->insert([
+            'purchase_id' => $purchaseId,
+            'product_id' => $prod->id,
+            'product_code' => $prod->code,
+            'product_name' => $prod->name,
+            'unit_cost' => 500.0,
+            'base_unit_cost' => 500.0,
+            'quantity' => 10,
+            'base_quantity' => 10,
+            'conversion_rate' => 1,
+            'subtotal' => 5000.0,
+            'created_at' => $oldDate,
+            'updated_at' => $oldDate,
+        ]);
+
+        $sale = Sale::create([
+            'reference_no' => 'SA-HIST-001',
+            'customer_id' => $customer->id,
+            'customer_name' => $customer->name,
+            'warehouse_id' => $outlet->id,
+            'warehouse_name' => $outlet->name,
+            'date' => $oldDate,
+            'status' => 'Completed',
+            'grand_total' => 1600.0,
+            'paid_amount' => 1600.0,
+            'due_amount' => 0.0,
+            'payment_status' => 'Paid',
+            'payment_type' => 'Cash',
+        ]);
+        DB::table('sale_items')->insert([
+            'sale_id' => $sale->id,
+            'product_id' => $prod->id,
+            'product_code' => $prod->code,
+            'product_name' => $prod->name,
+            'unit_price' => 800.0,
+            'quantity' => 2,
+            'base_quantity' => 2,
+            'conversion_rate' => 1,
+            'subtotal' => 1600.0,
+            'total_cogs' => 1000.0,
+            'created_at' => $oldDate,
+            'updated_at' => $oldDate,
+        ]);
+
+        // 1. Default All Dates (no start_date/end_date) MUST return prior-month movements
+        $journalRes = $this->withToken($user->api_token)
+            ->getJson('/api/reports/stock-ledger?section=journal&page=1&per_page=50')
+            ->assertStatus(200);
+        $this->assertEquals(2, (int)$journalRes->json('summary.total_movements'));
+        $this->assertCount(2, $journalRes->json('movements'));
+        $this->assertEquals(10.0, (float)$journalRes->json('summary.total_inflow_qty'));
+        $this->assertEquals(2.0, (float)$journalRes->json('summary.total_outflow_qty'));
+
+        // 2. Empty string start_date/end_date MUST behave identically (All Dates)
+        $emptyDateRes = $this->withToken($user->api_token)
+            ->getJson('/api/reports/stock-ledger?section=journal&start_date=&end_date=&page=1&per_page=50')
+            ->assertStatus(200);
+        $this->assertEquals(2, (int)$emptyDateRes->json('summary.total_movements'));
+
+        // 3. Default All Dates Bin Card MUST include full historical inflow/outflow and exact closing stock
+        $binRes = $this->withToken($user->api_token)
+            ->getJson('/api/reports/stock-ledger?section=bin_card&page=1&bin_page=1&per_page=50')
+            ->assertStatus(200);
+        $binRow = collect($binRes->json('data'))->firstWhere('product_id', $prod->id);
+        $this->assertNotNull($binRow);
+        $this->assertEquals(10.0, (float)$binRow['purchases_in']);
+        $this->assertEquals(2.0, (float)$binRow['sales_out']);
+        $this->assertEquals(8.0, (float)$binRow['closing_stock']);
+        $this->assertEquals(0.0, (float)$binRow['opening_stock']);
+
+        // 4. Explicit current-month date filter still scopes strictly to current month (0 prior-month movements)
+        $curStart = now()->startOfMonth()->toDateString();
+        $curEnd = now()->toDateString();
+        $scopedRes = $this->withToken($user->api_token)
+            ->getJson("/api/reports/stock-ledger?section=journal&start_date={$curStart}&end_date={$curEnd}")
+            ->assertStatus(200);
+        $this->assertEquals(0, (int)$scopedRes->json('summary.total_movements'));
     }
 }

@@ -763,18 +763,21 @@ class TransferController extends Controller
         bool $allowEither = false
     ): void {
         $allowed = app(PurchaseAccountingService::class)->extractAllowedOutletIds($request);
-        if (empty($allowed)) {
+        if ($allowed === null) {
             return;
+        }
+        if (empty($allowed) || in_array(-1, $allowed, true)) {
+            abort(403, 'Unauthorized warehouse access.');
         }
         if ($allowEither) {
             $fromOk = $fromWarehouseId && in_array((int)$fromWarehouseId, $allowed, true);
             $toOk   = $toWarehouseId && in_array((int)$toWarehouseId, $allowed, true);
-            if (!$fromOk && !$toOk && ($fromWarehouseId || $toWarehouseId)) {
+            if (!$fromOk && !$toOk) {
                 abort(403, 'Unauthorized warehouse access.');
             }
             return;
         }
-        if ($fromWarehouseId && !in_array((int)$fromWarehouseId, $allowed, true)) {
+        if (!$fromWarehouseId || !in_array((int)$fromWarehouseId, $allowed, true)) {
             abort(403, 'Unauthorized source warehouse access.');
         }
     }

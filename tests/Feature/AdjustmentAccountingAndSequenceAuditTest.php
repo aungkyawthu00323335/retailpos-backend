@@ -229,6 +229,7 @@ class AdjustmentAccountingAndSequenceAuditTest extends TestCase
             'role' => 'Senior Auditor',
             'status' => 'active',
         ]);
+        $clerk->outlets()->sync([$outlet->id]);
 
         $adj = StockAdjustment::create([
             'reference_no' => 'ADJ-EXP-001',

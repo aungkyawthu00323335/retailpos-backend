@@ -111,7 +111,7 @@ Route::get('products/check-identifier', [ProductController::class, 'checkIdentif
 Route::post('products/generate-sku', [ProductController::class, 'generateSku'])->middleware('permission:products.create,products.update');
 Route::post('products/generate-barcode', [ProductController::class, 'generateBarcode'])->middleware('permission:products.create,products.update');
 Route::post('products/upload-image', [ProductController::class, 'uploadImage'])->middleware('permission:products.create,products.update,brands.create,brands.update,product_categories.create,product_categories.update,users.create,users.update,payment_methods.create,payment_methods.update,general_settings.update');
-Route::post('upload-image', [ProductController::class, 'uploadImage'])->middleware('permission:products.create,products.update,brands.create,brands.update,product_categories.create,product_categories.update,users.create,users.update,payment_methods.create,payment_methods.update,general_settings.update');
+Route::post('upload-image', [ProductController::class, 'uploadImage'])->middleware('permission');
 Route::get('products/template', [ProductController::class, 'downloadTemplate'])->middleware('permission:products.import');
 Route::get('products/export', [ProductController::class, 'export'])->middleware('permission:products.export');
 Route::post('products/bulk-import', [ProductController::class, 'bulkImport'])->middleware('permission:products.import');
@@ -222,7 +222,7 @@ $crudResource('supplier-categories', SupplierCategoryController::class, 'supplie
 // Users & RBAC Roles
 Route::get('users/generate-id', [UserController::class, 'generateUserId'])->middleware('permission:users.create,users.view');
 Route::patch('users/{id}/toggle-status', [UserController::class, 'toggleStatus'])->middleware('permission:users.update');
-Route::get('users', [UserController::class, 'index'])->middleware('permission:users.view');
+Route::get('users', [UserController::class, 'index'])->middleware('permission');
 Route::post('users', [UserController::class, 'store'])->middleware('permission:users.create');
 Route::get('users/{id}', [UserController::class, 'show'])->middleware('permission:users.view');
 Route::put('users/{id}', [UserController::class, 'update'])->middleware('permission:users.update');
@@ -231,7 +231,7 @@ Route::delete('users/{id}', [UserController::class, 'destroy'])->middleware('per
 
 Route::get('roles/permissions', [RoleController::class, 'getAvailablePermissions'])->middleware('permission:roles.view,roles.create,roles.update');
 Route::get('permissions', [RoleController::class, 'getAvailablePermissions'])->middleware('permission:roles.view,roles.create,roles.update');
-Route::get('roles', [RoleController::class, 'index'])->middleware('permission:roles.view');
+Route::get('roles', [RoleController::class, 'index'])->middleware('permission:roles.view,users.create,users.update');
 Route::post('roles', [RoleController::class, 'store'])->middleware('permission:roles.create');
 Route::get('roles/{id}', [RoleController::class, 'show'])->middleware('permission:roles.view');
 Route::put('roles/{id}', [RoleController::class, 'update'])->middleware('permission:roles.update');

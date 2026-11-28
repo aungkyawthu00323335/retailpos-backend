@@ -1081,6 +1081,7 @@ class PurchaseSeniorAccountingTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'receiving_clerk_token_123',
         ]);
+        $clerk->outlets()->sync([$this->warehouse->id]);
 
         $this->withToken($this->admin->api_token)->postJson('/api/purchases', [
             'reference_no' => 'PO-MSK-01',
@@ -1718,6 +1719,7 @@ class PurchaseSeniorAccountingTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'no_cost_export_token_123',
         ]);
+        $noCostUser->outlets()->sync([$this->warehouse->id]);
         $maskedCsv = $this->withToken($noCostUser->api_token)
             ->get('/api/purchases/export?search=PO-P2-HDR-01')
             ->assertStatus(200)
@@ -2954,6 +2956,7 @@ class PurchaseSeniorAccountingTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'no_cost_reporter_token_001',
         ]);
+        $noCostUser->outlets()->sync([$this->warehouse->id]);
 
         $withCostRole = Role::create([
             'name' => 'Report With Cost Viewer',
@@ -2979,6 +2982,7 @@ class PurchaseSeniorAccountingTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'with_cost_reporter_token_001',
         ]);
+        $withCostUser->outlets()->sync([$this->warehouse->id]);
 
         // 1. Warm report caches as non-cost viewer (NO force_refresh)
         $noCostPo = $this->withToken($noCostUser->api_token)
@@ -4078,6 +4082,7 @@ class PurchaseSeniorAccountingTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'cost_blind_p2_3_token',
         ]);
+        $blindUser->outlets()->sync([$this->warehouse->id]);
 
         $poRes = $this->withToken($this->admin->api_token)->postJson('/api/purchases', [
             'reference_no' => 'PO-P2-3-RBAC',

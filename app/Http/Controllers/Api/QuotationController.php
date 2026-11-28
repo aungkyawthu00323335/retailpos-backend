@@ -115,7 +115,6 @@ class QuotationController extends Controller
                       ->orWhere(function ($sub) use ($todayDate) {
                           $sub->whereNotIn('quotations.status', ['Ordered', 'Declined', 'Expired'])
                               ->whereNotNull('quotations.expiry_date')
-                              ->where('quotations.expiry_date', '!=', '')
                               ->where('quotations.expiry_date', '<', $todayDate);
                       });
                 });
@@ -123,7 +122,6 @@ class QuotationController extends Controller
                 $query->where('quotations.status', $statusParam)
                       ->where(function ($q) use ($todayDate) {
                           $q->whereNull('quotations.expiry_date')
-                            ->orWhere('quotations.expiry_date', '')
                             ->orWhere('quotations.expiry_date', '>=', $todayDate);
                       });
             } else {
@@ -915,7 +913,7 @@ class QuotationController extends Controller
                 ->normalizeTransactionDate($validated['date']);
 
             // Determine status — if expiry_date is in the past, set to Expired automatically
-            $expiryDate  = $validated['expiry_date'] ?? null;
+            $expiryDate  = !empty($validated['expiry_date']) ? $validated['expiry_date'] : null;
             $autoStatus  = $validated['status'] ?? 'Sent';
             if ($expiryDate && \Carbon\Carbon::parse($expiryDate)->endOfDay()->isPast()) {
                 $autoStatus = 'Expired';

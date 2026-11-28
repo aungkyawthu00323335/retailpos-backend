@@ -31,13 +31,13 @@ class CheckPermission
                 User::attachResolvedToRequest($request, $user);
                 return $next($request);
             }
-            if ($user === null) {
+            if ($user === null && $request->user() === null) {
                 $ephemeral = new User([
                     'user_id' => 'USR-TEST-ADMIN',
                     'name'    => 'Super Admin',
                     'email'   => 'test_super_admin@retailpos.local',
                     'role'    => 'Super Admin',
-                    'status'  => 'active',
+                    'status'  => 'Active',
                 ]);
                 User::attachResolvedToRequest($request, $ephemeral);
                 return $next($request);
@@ -87,7 +87,7 @@ class CheckPermission
         if ($token) {
             $user = User::with('roleModel')->where('api_token', $token)->first();
             if ($user) {
-                if ($user->isApiTokenExpired()) {
+                if ($user->isApiTokenExpired() || !$user->isAccountAndRoleActive()) {
                     $user->api_token = null;
                     $user->api_token_created_at = null;
                     $user->save();
@@ -98,7 +98,8 @@ class CheckPermission
         }
 
         if ($request->user()) {
-            return $request->user()->loadMissing('roleModel');
+            $reqUser = $request->user()->loadMissing('roleModel');
+            return $reqUser->isAccountAndRoleActive() ? $reqUser : null;
         }
 
         return null;

@@ -1413,6 +1413,7 @@ class QuotationApiTest extends TestCase
             'password' => bcrypt('secret123'),
             'api_token' => 'converter_token_12345',
         ]);
+        $converterUser->outlets()->sync([$warehouse->id]);
 
         $register = \App\Models\CashRegister::create([
             'reference_no' => 'CR-TEST-01',
@@ -1479,6 +1480,7 @@ class QuotationApiTest extends TestCase
             'password' => bcrypt('secret123'),
             'api_token' => 'cost_viewer_token_12345',
         ]);
+        $costViewer->outlets()->sync([$warehouse->id]);
         $adminShowRes = $this->withToken($costViewer->api_token)->getJson("/api/quotations/{$quo->id}");
         $adminShowRes->assertStatus(200);
         $this->assertEquals(450.0, (float) $adminShowRes->json('data.items.0.product.cost_price'));
@@ -1901,6 +1903,7 @@ class QuotationApiTest extends TestCase
             'status' => 'active',
             'api_token' => 'p2_5_real_sales_tok',
         ]);
+        $salesUser->outlets()->sync([$warehouse->id]);
         $approverUser = \App\Models\User::create([
             'name' => 'Real Approver',
             'email' => 'approver-p2-5@test.local',
@@ -1910,6 +1913,7 @@ class QuotationApiTest extends TestCase
             'status' => 'active',
             'api_token' => 'p2_5_real_approver_tok',
         ]);
+        $approverUser->outlets()->sync([$warehouse->id]);
 
         $storeRes = $this->withToken($salesUser->api_token)->postJson('/api/quotations', [
             'customer_id' => $customer->id,
@@ -2045,6 +2049,7 @@ class QuotationApiTest extends TestCase
             'role_id' => $otherRole->id,
             'status' => 'active',
         ]);
+        $otherCashier->outlets()->sync([$warehouse->id]);
         $converterRole = \App\Models\Role::create([
             'name' => 'Converter User',
             'slug' => 'converter_user_q',
@@ -2058,6 +2063,7 @@ class QuotationApiTest extends TestCase
             'role_id' => $converterRole->id,
             'status' => 'active',
         ]);
+        $converter->outlets()->sync([$warehouse->id]);
 
         // Open register belongs strictly to otherCashier (NOT converter)
         $otherReg = \App\Models\CashRegister::create([
@@ -2129,5 +2135,87 @@ class QuotationApiTest extends TestCase
         $this->assertNull($sale->cash_register_id);
         $this->assertEqualsWithDelta(100.0, (float)$otherReg->fresh()->expected_cash, 0.01);
         $this->assertArrayNotHasKey('total_cogs', $convRes->json('data.sale'));
+    }
+
+    /**
+     * Regression guard for MySQL 8.0+ Error 1525 (Incorrect DATE value: ''):
+     * Native DATE column `quotations.expiry_date` must NEVER be compared against empty string `''`
+     * in summary stats, status filters, or the auto-expire artisan command.
+     */
+    public function test_quotation_queries_never_compare_date_column_to_empty_string(): void
+    {
+        Quotation::create([
+            'reference_no' => 'QT-M8-OPEN',
+            'customer_name' => 'Alpha Co',
+            'warehouse_name' => 'Main Warehouse',
+            'date' => now()->toDateTimeString(),
+            'expiry_date' => null,
+            'grand_total' => 1000.0,
+            'status' => 'Sent',
+        ]);
+        Quotation::create([
+            'reference_no' => 'QT-M8-FUTURE',
+            'customer_name' => 'Beta Co',
+            'warehouse_name' => 'Main Warehouse',
+            'date' => now()->toDateTimeString(),
+            'expiry_date' => now()->addDays(5)->toDateString(),
+            'grand_total' => 2500.0,
+            'status' => 'Pending',
+        ]);
+        Quotation::create([
+            'reference_no' => 'QT-M8-PAST',
+            'customer_name' => 'Gamma Co',
+            'warehouse_name' => 'Main Warehouse',
+            'date' => now()->subDays(10)->toDateTimeString(),
+            'expiry_date' => now()->subDays(2)->toDateString(),
+            'grand_total' => 500.0,
+            'status' => 'Sent',
+        ]);
+
+        \Illuminate\Support\Facades\DB::flushQueryLog();
+        \Illuminate\Support\Facades\DB::enableQueryLog();
+
+        $indexRes = $this->getJson('/api/quotations?page=1&per_page=50&no_items=1&sort_by=date&sort_order=desc');
+        $indexRes->assertStatus(200);
+        $this->assertEquals(3, $indexRes->json('summary.total_records'));
+        $this->assertEquals(2, $indexRes->json('summary.pipeline_count'));
+        $this->assertEqualsWithDelta(3500.0, (float) $indexRes->json('summary.pipeline_total'), 0.01);
+        $this->assertEquals(1, $indexRes->json('summary.lost_count'));
+        $this->assertEqualsWithDelta(500.0, (float) $indexRes->json('summary.lost_total'), 0.01);
+
+        $expiredRes = $this->getJson('/api/quotations?status=Expired&page=1&per_page=50&no_items=1');
+        $expiredRes->assertStatus(200);
+        $this->assertCount(1, $expiredRes->json('data'));
+        $this->assertSame('QT-M8-PAST', $expiredRes->json('data.0.reference_no'));
+
+        $sentRes = $this->getJson('/api/quotations?status=Sent&page=1&per_page=50&no_items=1');
+        $sentRes->assertStatus(200);
+        $this->assertCount(1, $sentRes->json('data'));
+        $this->assertSame('QT-M8-OPEN', $sentRes->json('data.0.reference_no'));
+
+        $this->artisan('quotations:expire')->assertExitCode(0);
+        $this->assertSame('Expired', Quotation::where('reference_no', 'QT-M8-PAST')->value('status'));
+
+        $queries = \Illuminate\Support\Facades\DB::getQueryLog();
+        \Illuminate\Support\Facades\DB::disableQueryLog();
+
+        foreach ($queries as $entry) {
+            $sql = strtolower((string) ($entry['query'] ?? ''));
+            $bindings = $entry['bindings'] ?? [];
+            if (str_contains($sql, 'expiry_date')) {
+                $this->assertDoesNotMatchRegularExpression(
+                    '/expiry_date[`"\s]*(!?=|<>)\s*\'\'/',
+                    $sql,
+                    "Unsafe MySQL 8 DATE comparison against empty string in SQL: {$sql}"
+                );
+                foreach ($bindings as $binding) {
+                    $this->assertNotSame(
+                        '',
+                        $binding,
+                        "Unsafe empty-string binding on expiry_date query: {$sql}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -295,6 +295,7 @@ class AccountingReportsIntegrityTest extends TestCase
             'status' => 'active',
             'api_token' => 'cash_admin_p2_tok',
         ]);
+        $admin->outlets()->sync([$outlet->id]);
 
         $register = \App\Models\CashRegister::create([
             'reference_no' => 'CR-SHORT-1',

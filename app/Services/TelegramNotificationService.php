@@ -154,13 +154,14 @@ class TelegramNotificationService
     public function buildDailyBusinessSummary(
         string $date,
         ?int $outletId = null,
-        array $allowedOutletIds = [],
+        ?array $allowedOutletIds = null,
         bool $canViewCost = true,
         bool $includeProfit = true,
         bool $includeRegisters = true,
         string $lang = 'my',
         string $triggeredBy = 'System'
     ): array {
+        $allowedOutletIds = $allowedOutletIds ?? [];
         $meta = $this->getStoreMeta();
         $tz = $meta['timezone'];
         $dateStr = Carbon::parse($date, $tz)->toDateString();
@@ -1479,7 +1480,7 @@ class TelegramNotificationService
     public function sendDailySummary(
         string $date,
         ?int $requestedOutletId,
-        array $allowedOutletIds,
+        ?array $allowedOutletIds,
         bool $canViewCost,
         string $triggeredBy,
         ?array $recipientIds = null,
@@ -1487,6 +1488,7 @@ class TelegramNotificationService
         ?bool $overrideIncludeRegisters = null,
         ?string $overrideLang = null
     ): array {
+        $allowedOutletIds = $allowedOutletIds ?? [];
         $setting = TelegramSetting::current();
         $botToken = $setting->getPlainBotToken();
         if ($botToken === '') {

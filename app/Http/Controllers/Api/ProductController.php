@@ -14,6 +14,7 @@ use App\Models\PurchaseUnit;
 use App\Models\Variation;
 use App\Models\Outlet;
 use App\Models\Supplier;
+use App\Models\User;
 use App\Http\Requests\StoreProductRequest;
 use App\Http\Resources\ProductResource;
 use App\Http\Resources\ProductListResource;
@@ -1043,9 +1044,48 @@ class ProductController extends Controller
         $validated = $request->validate([
             'image' => ['required', 'file', 'image', 'mimes:jpeg,png,jpg,webp,gif', 'max:5120'],
             'folder' => ['nullable', 'string', 'in:products,brands,categories,company,users,avatars,settings,payment_methods,payments'],
+            'self_avatar' => ['nullable', 'boolean'],
         ]);
 
+        $caller = User::resolveFromRequest($request);
+        if (!$caller) {
+            return response()->json([
+                'status' => 'error',
+                'code' => 'UNAUTHENTICATED',
+                'message' => 'Unauthenticated session. Please provide a valid Bearer token.',
+            ], 401);
+        }
+
         $folder = $validated['folder'] ?? 'products';
+        if ($request->boolean('self_avatar')) {
+            $folder = 'avatars';
+        }
+
+        if ($folder !== 'avatars' && !$caller->isSuperAdmin()) {
+            $folderPermissions = match ($folder) {
+                'products' => ['products.create', 'products.update'],
+                'brands' => ['brands.create', 'brands.update'],
+                'categories' => ['product_categories.create', 'product_categories.update', 'sub_categories.create', 'sub_categories.update'],
+                'company', 'settings' => ['general_settings.update'],
+                'users' => ['users.create', 'users.update'],
+                'payment_methods', 'payments' => ['payment_methods.create', 'payment_methods.update'],
+                default => [],
+            };
+            $authorized = false;
+            foreach ($folderPermissions as $perm) {
+                if ($caller->hasPermission($perm)) {
+                    $authorized = true;
+                    break;
+                }
+            }
+            if (!$authorized) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => "Access Denied: You do not have permission to upload images to '{$folder}'.",
+                ], 403);
+            }
+        }
+
         $file = $request->file('image');
 
         // Store file in storage/app/public/{folder}

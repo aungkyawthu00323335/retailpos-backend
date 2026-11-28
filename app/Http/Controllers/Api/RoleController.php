@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Role;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class RoleController extends Controller
@@ -35,7 +36,7 @@ class RoleController extends Controller
             'status' => 'success',
             'summary' => [
                 'total_roles' => $roles->count(),
-                'active_roles' => $roles->where('status', 'Active')->count(),
+                'active_roles' => $roles->filter(fn ($r) => $r->isActive())->count(),
             ],
             'data' => $roles,
         ]);
@@ -631,7 +632,7 @@ class RoleController extends Controller
      */
     public function show($id)
     {
-        $role = Role::with('users')->withCount('users')->find($id);
+        $role = Role::with(['users.roleModel'])->withCount('users')->find($id);
 
         if (!$role) {
             return response()->json([
@@ -669,7 +670,8 @@ class RoleController extends Controller
         }
 
         // SEC-03: Prevent non-super-admins from editing Super Admin role
-        if ($role->slug === 'super_admin' || strtolower($role->name) === 'super admin') {
+        $isSuperAdminRole = ($role->slug === 'super_admin' || strtolower(trim((string) $role->name)) === 'super admin');
+        if ($isSuperAdminRole) {
             if (!$caller || !$caller->isSuperAdmin()) {
                 return response()->json([
                     'status' => 'error',
@@ -685,6 +687,13 @@ class RoleController extends Controller
             'permissions' => 'nullable|array',
             'status' => 'nullable|string|in:Active,Inactive',
         ]);
+
+        if ($isSuperAdminRole && isset($validated['status']) && strcasecmp(trim((string) $validated['status']), 'active') !== 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Super Admin role cannot be deactivated.',
+            ], 422);
+        }
 
         if (isset($validated['name']) && Role::where('name', trim($validated['name']))->where('id', '!=', $id)->exists()) {
             return response()->json([
@@ -723,7 +732,21 @@ class RoleController extends Controller
             }
         }
 
-        $role->update($validated);
+        DB::transaction(function () use ($role, $validated) {
+            $oldName = $role->name;
+            $role->update($validated);
+
+            if ($oldName !== $role->name) {
+                User::where('role_id', $role->id)->update(['role' => $role->name]);
+            }
+
+            if (isset($validated['status']) && strcasecmp(trim((string) $validated['status']), 'active') !== 0) {
+                User::where('role_id', $role->id)->update([
+                    'api_token' => null,
+                    'api_token_created_at' => null,
+                ]);
+            }
+        });
 
         return response()->json([
             'status' => 'success',

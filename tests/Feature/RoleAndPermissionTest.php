@@ -71,6 +71,7 @@ class RoleAndPermissionTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'cashier_test_token_secret_67890',
         ]);
+        $this->cashier->outlets()->sync([$this->outlet->id]);
     }
 
     public function test_super_admin_has_unrestricted_access_to_guarded_routes(): void

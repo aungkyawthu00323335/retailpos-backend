@@ -169,12 +169,12 @@ class QuotationAccountingService
         $agg = $aggQuery->toBase()->selectRaw(
             "COUNT(*) as total_records, " .
             "MAX(quotations.updated_at) as max_updated, " .
-            "COALESCE(SUM(CASE WHEN quotations.status IN ('Sent', 'Pending', 'Accepted') AND (quotations.expiry_date IS NULL OR quotations.expiry_date = '' OR quotations.expiry_date >= ?) THEN quotations.grand_total ELSE 0 END), 0) as pipeline_total, " .
-            "SUM(CASE WHEN quotations.status IN ('Sent', 'Pending', 'Accepted') AND (quotations.expiry_date IS NULL OR quotations.expiry_date = '' OR quotations.expiry_date >= ?) THEN 1 ELSE 0 END) as pipeline_count, " .
+            "COALESCE(SUM(CASE WHEN quotations.status IN ('Sent', 'Pending', 'Accepted') AND (quotations.expiry_date IS NULL OR quotations.expiry_date >= ?) THEN quotations.grand_total ELSE 0 END), 0) as pipeline_total, " .
+            "SUM(CASE WHEN quotations.status IN ('Sent', 'Pending', 'Accepted') AND (quotations.expiry_date IS NULL OR quotations.expiry_date >= ?) THEN 1 ELSE 0 END) as pipeline_count, " .
             "COALESCE(SUM(CASE WHEN quotations.status = 'Ordered' THEN quotations.grand_total ELSE 0 END), 0) as converted_total, " .
             "SUM(CASE WHEN quotations.status = 'Ordered' THEN 1 ELSE 0 END) as converted_count, " .
-            "COALESCE(SUM(CASE WHEN quotations.status IN ('Declined', 'Expired') OR (quotations.status IN ('Sent', 'Pending', 'Accepted') AND quotations.expiry_date IS NOT NULL AND quotations.expiry_date != '' AND quotations.expiry_date < ?) THEN quotations.grand_total ELSE 0 END), 0) as lost_total, " .
-            "SUM(CASE WHEN quotations.status IN ('Declined', 'Expired') OR (quotations.status IN ('Sent', 'Pending', 'Accepted') AND quotations.expiry_date IS NOT NULL AND quotations.expiry_date != '' AND quotations.expiry_date < ?) THEN 1 ELSE 0 END) as lost_count, " .
+            "COALESCE(SUM(CASE WHEN quotations.status IN ('Declined', 'Expired') OR (quotations.status IN ('Sent', 'Pending', 'Accepted') AND quotations.expiry_date IS NOT NULL AND quotations.expiry_date < ?) THEN quotations.grand_total ELSE 0 END), 0) as lost_total, " .
+            "SUM(CASE WHEN quotations.status IN ('Declined', 'Expired') OR (quotations.status IN ('Sent', 'Pending', 'Accepted') AND quotations.expiry_date IS NOT NULL AND quotations.expiry_date < ?) THEN 1 ELSE 0 END) as lost_count, " .
             "COALESCE(SUM(quotations.grand_total), 0) as gross_total",
             [$todayDate, $todayDate, $todayDate, $todayDate]
         )->first();

@@ -1136,6 +1136,7 @@ class FullAccountingRemediationP0P1P2Test extends TestCase
             'status' => 'active',
             'api_token' => 'blind_strict_tok_' . uniqid(),
         ]);
+        $cashier->outlets()->sync([$this->wh1->id]);
 
         $reg = CashRegister::create([
             'reference_no' => 'CR-BLIND-STRICT-1',

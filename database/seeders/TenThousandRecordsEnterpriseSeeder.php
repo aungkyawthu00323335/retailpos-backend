@@ -2,8 +2,10 @@
 
 namespace Database\Seeders;
 
+use App\Services\InventoryLedgerRepairService;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
@@ -89,11 +91,16 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
         echo "   -> 10,000 Stock Transfers generated!\n";
 
         // 11. Seed 10,000 Expenses with Expense Payments
-        echo "\n[11/11] Generating exactly 10,000 Expenses with Expense Payments...\n";
+        echo "\n[11/12] Generating exactly 10,000 Expenses with Expense Payments...\n";
         $this->seedExpenses($master);
         echo "   -> 10,000 Expenses generated!\n";
 
         DB::statement('SET FOREIGN_KEY_CHECKS=1;');
+
+        // 12. Backfill Return Stock Movements & Reconcile Perpetual Inventory Balances
+        echo "\n[12/12] Backfilling return movements & reconciling perpetual stock balances...\n";
+        app(InventoryLedgerRepairService::class)->repairAll(true);
+        echo "   -> Inventory ledger reconciled with 0.0000 drift!\n";
 
         $elapsed = round(microtime(true) - $startTime, 2);
         echo "\n========================================================================\n";
@@ -378,13 +385,18 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             'product_variant_values',
             'product_variants',
             'product_unit_links',
+            'inventory_batches',
+            'sale_return_cost_layers',
+            'purchase_return_cost_layers',
             'stock_balances',
             'stock_movements',
             'products',
         ];
 
         foreach ($tables as $t) {
-            DB::table($t)->truncate();
+            if (Schema::hasTable($t)) {
+                DB::table($t)->truncate();
+            }
         }
     }
 
@@ -535,11 +547,14 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
 
         $variantIdCounter = 1;
         $totalProducts = 10000;
+        $catalog = [];
 
         for ($i = 1; $i <= $totalProducts; $i++) {
             $code = 'PRD-' . str_pad($i, 6, '0', STR_PAD_LEFT);
             $sku = 'SKU-' . str_pad($i, 6, '0', STR_PAD_LEFT);
             $barcode = '893' . str_pad($i, 10, '0', STR_PAD_LEFT);
+            $firstVariantId = null;
+            $firstVariantName = null;
 
             $brand = $brands[($i - 1) % count($brands)];
             $supplier = $suppliers[($i - 1) % count($suppliers)];
@@ -609,6 +624,10 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 $productStock = 0.0;
                 foreach ($varList as $k => $varValue) {
                     $vId = $variantIdCounter++;
+                    if ($firstVariantId === null) {
+                        $firstVariantId = $vId;
+                        $firstVariantName = "{$attributeName}: {$varValue}";
+                    }
                     $vSku = $sku . '-' . Str::slug($varValue);
                     $vBarcode = '894' . str_pad($vId, 10, '0', STR_PAD_LEFT);
                     $vCost = $cost + ($k * 500);
@@ -798,6 +817,17 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 'updated_at' => $now,
             ];
 
+            $catalog[$i] = [
+                'name' => $name,
+                'code' => $code,
+                'cost' => $cost,
+                'sell' => $sell,
+                'unit_id' => $baseUnit->id,
+                'unit_name' => $baseUnit->name,
+                'variant_id' => $firstVariantId,
+                'variant_name' => $firstVariantName,
+            ];
+
             // Chunk insert Products & related rows every 500 items safely
             if (count($productsBatch) >= 500) {
                 $this->safeBatchInsert('products', $productsBatch, 250);
@@ -819,6 +849,7 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
 
         return [
             'total' => 10000,
+            'catalog' => $catalog,
         ];
     }
 
@@ -848,10 +879,11 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $outlet = $outlets[($i - 1) % count($outlets)];
             $supplier = $suppliers[($i - 1) % count($suppliers)];
 
-            // Select 1 to 2 products for purchase
+            // Select product from catalog with real cost, unit, and variant metadata
             $prodId1 = (($i * 7 + 11) % 10000) + 1;
+            $meta1 = $prodMeta['catalog'][$prodId1] ?? null;
             $qty1 = (float)(10 + (($i * 5) % 50));
-            $unitCost1 = (float)(3500 + (($prodId1 * 13) % 25000));
+            $unitCost1 = (float)($meta1['cost'] ?? (3500 + (($prodId1 * 13) % 25000)));
             $subtotal1 = $qty1 * $unitCost1;
 
             $grandTotal = $subtotal1;
@@ -904,13 +936,13 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $purchaseItemsBatch[] = [
                 'purchase_id' => $i,
                 'product_id' => $prodId1,
-                'product_variant_id' => null,
-                'unit_id' => 1,
-                'unit_name' => 'ခု',
+                'product_variant_id' => $meta1['variant_id'] ?? null,
+                'unit_id' => $meta1['unit_id'] ?? 1,
+                'unit_name' => $meta1['unit_name'] ?? 'ခု',
                 'conversion_rate' => 1.0,
-                'product_code' => 'PRD-' . str_pad($prodId1, 6, '0', STR_PAD_LEFT),
-                'product_name' => "Retail Product #{$prodId1}",
-                'variant_name' => null,
+                'product_code' => $meta1['code'] ?? ('PRD-' . str_pad($prodId1, 6, '0', STR_PAD_LEFT)),
+                'product_name' => $meta1['name'] ?? ("Product #{$prodId1}"),
+                'variant_name' => $meta1['variant_name'] ?? null,
                 'unit_cost' => $unitCost1,
                 'base_unit_cost' => $unitCost1,
                 'quantity' => $qty1,
@@ -975,23 +1007,29 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $customer = $customers[($i - 1) % count($customers)];
             $payMethod = $payMethods[($i - 1) % count($payMethods)];
 
-            // Select 1 to 2 products for sale
+            // Select 1 to 2 products for sale using canonical catalog prices/costs
             $prodId1 = (($i * 13 + 7) % 10000) + 1;
+            $meta1 = $prodMeta['catalog'][$prodId1] ?? null;
             $qty1 = (float)(1 + (($i * 3) % 6));
-            $cost1 = (float)(3000 + (($prodId1 * 11) % 20000));
-            $price1 = round($cost1 * 1.45, 0);
+            $cost1 = (float)($meta1['cost'] ?? (3000 + (($prodId1 * 11) % 20000)));
+            $price1 = (float)($meta1['sell'] ?? round($cost1 * 1.45, 0));
             $subtotal1 = $qty1 * $price1;
             $cogs1 = $qty1 * $cost1;
 
             $hasSecondItem = ($i % 3 === 0);
             $subtotal = $subtotal1;
             $totalCogs = $cogs1;
+            $meta2 = null;
 
             if ($hasSecondItem) {
                 $prodId2 = (($i * 23 + 17) % 10000) + 1;
+                if ($prodId2 === $prodId1) {
+                    $prodId2 = ($prodId2 % 10000) + 1;
+                }
+                $meta2 = $prodMeta['catalog'][$prodId2] ?? null;
                 $qty2 = (float)(1 + (($i * 7) % 4));
-                $cost2 = (float)(2500 + (($prodId2 * 17) % 18000));
-                $price2 = round($cost2 * 1.4, 0);
+                $cost2 = (float)($meta2['cost'] ?? (2500 + (($prodId2 * 17) % 18000)));
+                $price2 = (float)($meta2['sell'] ?? round($cost2 * 1.4, 0));
                 $subtotal2 = $qty2 * $price2;
                 $cogs2 = $qty2 * $cost2;
 
@@ -1043,13 +1081,13 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $saleItemsBatch[] = [
                 'sale_id' => $i,
                 'product_id' => $prodId1,
-                'product_variant_id' => null,
-                'unit_id' => 1,
-                'unit_name' => 'ခု',
+                'product_variant_id' => $meta1['variant_id'] ?? null,
+                'unit_id' => $meta1['unit_id'] ?? 1,
+                'unit_name' => $meta1['unit_name'] ?? 'ခု',
                 'conversion_rate' => 1.0,
-                'product_code' => 'PRD-' . str_pad($prodId1, 6, '0', STR_PAD_LEFT),
-                'product_name' => "Retail Product #{$prodId1}",
-                'variant_name' => null,
+                'product_code' => $meta1['code'] ?? ('PRD-' . str_pad($prodId1, 6, '0', STR_PAD_LEFT)),
+                'product_name' => $meta1['name'] ?? ("Product #{$prodId1}"),
+                'variant_name' => $meta1['variant_name'] ?? null,
                 'unit_price' => $price1,
                 'base_unit_price' => $price1,
                 'base_unit_cost' => $cost1,
@@ -1067,13 +1105,13 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 $saleItemsBatch[] = [
                     'sale_id' => $i,
                     'product_id' => $prodId2,
-                    'product_variant_id' => null,
-                    'unit_id' => 1,
-                    'unit_name' => 'ခု',
+                    'product_variant_id' => $meta2['variant_id'] ?? null,
+                    'unit_id' => $meta2['unit_id'] ?? 1,
+                    'unit_name' => $meta2['unit_name'] ?? 'ခု',
                     'conversion_rate' => 1.0,
-                    'product_code' => 'PRD-' . str_pad($prodId2, 6, '0', STR_PAD_LEFT),
-                    'product_name' => "Retail Product #{$prodId2}",
-                    'variant_name' => null,
+                    'product_code' => $meta2['code'] ?? ('PRD-' . str_pad($prodId2, 6, '0', STR_PAD_LEFT)),
+                    'product_name' => $meta2['name'] ?? ("Product #{$prodId2}"),
+                    'variant_name' => $meta2['variant_name'] ?? null,
                     'unit_price' => $price2,
                     'base_unit_price' => $price2,
                     'base_unit_cost' => $cost2,
@@ -1168,6 +1206,7 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
 
             $reason = $reasons[($i - 1) % count($reasons)];
             $prodId = $sale['prod_id'];
+            $meta = $prodMeta['catalog'][$prodId] ?? null;
             $unitPrice = $sale['unit_price'];
             $returnQty = 1.0;
             $grandTotal = $unitPrice * $returnQty;
@@ -1182,8 +1221,11 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 [
                     'id' => 1,
                     'product_id' => $prodId,
-                    'product_name' => "Retail Product #{$prodId}",
-                    'product_code' => 'PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT),
+                    'product_variant_id' => $meta['variant_id'] ?? null,
+                    'variant_name' => $meta['variant_name'] ?? null,
+                    'unit_name' => $meta['unit_name'] ?? 'ခု',
+                    'product_name' => $meta['name'] ?? ("Product #{$prodId}"),
+                    'product_code' => $meta['code'] ?? ('PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT)),
                     'unit_price' => $unitPrice,
                     'quantity' => $returnQty,
                     'subtotal' => $grandTotal,
@@ -1280,6 +1322,7 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
 
             $reason = $reasons[($i - 1) % count($reasons)];
             $prodId = $purchase['prod_id'];
+            $meta = $prodMeta['catalog'][$prodId] ?? null;
             $unitCost = $purchase['unit_cost'];
             $returnQty = (float)(2 + ($i % 5));
             $grandTotal = $unitCost * $returnQty;
@@ -1294,8 +1337,11 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
                 [
                     'id' => 1,
                     'product_id' => $prodId,
-                    'product_name' => "Retail Product #{$prodId}",
-                    'product_code' => 'PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT),
+                    'product_variant_id' => $meta['variant_id'] ?? null,
+                    'variant_name' => $meta['variant_name'] ?? null,
+                    'unit_name' => $meta['unit_name'] ?? 'ခု',
+                    'product_name' => $meta['name'] ?? ("Product #{$prodId}"),
+                    'product_code' => $meta['code'] ?? ('PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT)),
                     'unit_cost' => $unitCost,
                     'quantity' => $returnQty,
                     'subtotal' => $grandTotal,
@@ -1387,8 +1433,9 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $status = $statuses[($i - 1) % count($statuses)];
 
             $prodId = (($i * 17 + 23) % 10000) + 1;
+            $meta = $prodMeta['catalog'][$prodId] ?? null;
             $qty = (float)(2 + ($i % 10));
-            $unitPrice = (float)(4500 + (($prodId * 29) % 35000));
+            $unitPrice = (float)($meta['sell'] ?? (4500 + (($prodId * 29) % 35000)));
             $subtotal = $qty * $unitPrice;
 
             $taxRate = ($i % 4 === 0) ? 5.0 : 0.0;
@@ -1422,13 +1469,13 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $quotationItemsBatch[] = [
                 'quotation_id' => $i,
                 'product_id' => $prodId,
-                'product_variant_id' => null,
-                'unit_id' => 1,
-                'unit_name' => 'ခု',
+                'product_variant_id' => $meta['variant_id'] ?? null,
+                'unit_id' => $meta['unit_id'] ?? 1,
+                'unit_name' => $meta['unit_name'] ?? 'ခု',
                 'conversion_rate' => 1.0,
-                'product_code' => 'PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT),
-                'product_name' => "Retail Product #{$prodId}",
-                'variant_name' => null,
+                'product_code' => $meta['code'] ?? ('PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT)),
+                'product_name' => $meta['name'] ?? ("Product #{$prodId}"),
+                'variant_name' => $meta['variant_name'] ?? null,
                 'unit_price' => $unitPrice,
                 'base_unit_price' => $unitPrice,
                 'quantity' => $qty,
@@ -1485,8 +1532,9 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $note = $reasons[($i - 1) % count($reasons)];
 
             $prodId = (($i * 31 + 47) % 10000) + 1;
+            $meta = $prodMeta['catalog'][$prodId] ?? null;
             $qty = (float)(1 + ($i % 5));
-            $unitCost = (float)(3500 + (($prodId * 17) % 20000));
+            $unitCost = (float)($meta['cost'] ?? (3500 + (($prodId * 17) % 20000)));
             $subtotal = $qty * $unitCost;
 
             $adjBatch[] = [
@@ -1510,12 +1558,12 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $adjItemsBatch[] = [
                 'stock_adjustment_id' => $i,
                 'product_id' => $prodId,
-                'product_variant_id' => null,
-                'product_code' => 'PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT),
-                'product_name' => "Retail Product #{$prodId}",
-                'variant_name' => null,
-                'unit_id' => 1,
-                'unit_name' => 'ခု',
+                'product_variant_id' => $meta['variant_id'] ?? null,
+                'product_code' => $meta['code'] ?? ('PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT)),
+                'product_name' => $meta['name'] ?? ("Product #{$prodId}"),
+                'variant_name' => $meta['variant_name'] ?? null,
+                'unit_id' => $meta['unit_id'] ?? 1,
+                'unit_name' => $meta['unit_name'] ?? 'ခု',
                 'conversion_rate' => 1.0,
                 'quantity' => $qty,
                 'base_quantity' => $qty,
@@ -1565,8 +1613,9 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $status = ($i % 15 === 0) ? 'Pending' : (($i % 10 === 0) ? 'Sent' : 'Completed');
 
             $prodId = (($i * 37 + 59) % 10000) + 1;
+            $meta = $prodMeta['catalog'][$prodId] ?? null;
             $qty = (float)(5 + ($i % 25));
-            $unitCost = (float)(3200 + (($prodId * 23) % 25000));
+            $unitCost = (float)($meta['cost'] ?? (3200 + (($prodId * 23) % 25000)));
             $subtotal = $qty * $unitCost;
 
             $transfersBatch[] = [
@@ -1597,13 +1646,13 @@ class TenThousandRecordsEnterpriseSeeder extends Seeder
             $transferItemsBatch[] = [
                 'stock_transfer_id' => $i,
                 'product_id' => $prodId,
-                'product_variant_id' => null,
-                'unit_id' => 1,
-                'unit_name' => 'ခု',
+                'product_variant_id' => $meta['variant_id'] ?? null,
+                'unit_id' => $meta['unit_id'] ?? 1,
+                'unit_name' => $meta['unit_name'] ?? 'ခု',
                 'conversion_rate' => 1.0,
-                'product_code' => 'PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT),
-                'product_name' => "Retail Product #{$prodId}",
-                'variant_name' => null,
+                'product_code' => $meta['code'] ?? ('PRD-' . str_pad($prodId, 6, '0', STR_PAD_LEFT)),
+                'product_name' => $meta['name'] ?? ("Product #{$prodId}"),
+                'variant_name' => $meta['variant_name'] ?? null,
                 'quantity' => $qty,
                 'base_quantity' => $qty,
                 'unit_cost' => $unitCost,

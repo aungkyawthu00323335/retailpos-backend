@@ -52,7 +52,7 @@ class ReportController extends Controller
         return min($perPage, $max);
     }
 
-    private function extractAllowedOutletIds(Request $request): array
+    private function extractAllowedOutletIds(Request $request): ?array
     {
         return $this->accounting()->extractAllowedOutletIds($request);
     }
@@ -156,7 +156,7 @@ class ReportController extends Controller
         ?string $endDate,
         ?string $warehouse,
         ?int $warehouseId,
-        array $allowedOutlets,
+        ?array $allowedOutlets,
         bool $groupByMonthWarehouse = false,
         bool $groupByMonthOnly = false
     ): array {
@@ -401,7 +401,7 @@ class ReportController extends Controller
         ?string $endDate,
         ?string $warehouse,
         ?int $warehouseId,
-        array $allowedOutlets,
+        ?array $allowedOutlets,
         bool $groupByMonthWarehouse = false,
         bool $groupByMonthOnly = false
     ): array {
@@ -485,7 +485,7 @@ class ReportController extends Controller
      * IAS 1.32 Per-Customer Net AR calculation: never nets Customer A's open return credit
      * against Customer B's open receivable balance.
      */
-    private function computePerCustomerNetAr(?string $warehouse, ?int $warehouseId, array $allowedOutlets): array
+    private function computePerCustomerNetAr(?string $warehouse, ?int $warehouseId, ?array $allowedOutlets): array
     {
         $salesQ = DB::table('sales');
         $this->applyActiveDocumentFilter($salesQ, 'status');
@@ -667,12 +667,22 @@ class ReportController extends Controller
      * Single-pass per-product base-unit stock inflows & outflows for both
      * the reporting window [fromDateTime, toDateTime] and post-cutoff rollback (toDateTime, now].
      */
+    /**
+     * Resolve canonical display name for transaction line items: preserves legitimate
+     * historical custom names while automatically replacing blank or seeded placeholder
+     * snapshots ("Retail Product #...") with the authoritative products.name.
+     */
+    private function canonicalProductNameSql(string $itemNameCol, string $masterNameCol = 'products.name'): string
+    {
+        return "CASE WHEN {$itemNameCol} IS NULL OR TRIM({$itemNameCol}) = '' OR {$itemNameCol} LIKE 'Retail Product #%' THEN COALESCE(NULLIF({$masterNameCol}, ''), {$itemNameCol}) ELSE {$itemNameCol} END";
+    }
+
     private function aggregateBinCardMovementsByProduct(
-        string $fromDateTime,
+        ?string $fromDateTime,
         ?string $toDateTime,
         string $warehouse,
         bool $fromInclusive = true,
-        array $allowedOutlets = [],
+        ?array $allowedOutlets = null,
         ?array $productIds = null,
         bool $includePostWindow = false
     ): array {
@@ -680,6 +690,7 @@ class ReportController extends Controller
             'purchases' => [], 'sale_returns' => [], 'transfers_in' => [], 'adjust_in' => [],
             'sales' => [], 'purchase_returns' => [], 'transfers_out' => [], 'adjust_out' => [],
         ];
+        $hasPostSplit = $includePostWindow && $toDateTime !== null;
         if ($includePostWindow) {
             $emptyCombined = ['period' => $emptyResult, 'post' => $emptyResult];
             if ($productIds !== null && empty($productIds)) {
@@ -717,13 +728,15 @@ class ReportController extends Controller
             }
         }
 
-        $applyWindow = function ($q, string $dateCol) use ($fromDateTime, $toDateTime, $fromInclusive, $includePostWindow) {
-            if ($fromInclusive) {
-                $q->where($dateCol, '>=', $fromDateTime);
-            } else {
-                $q->where($dateCol, '>', $fromDateTime);
+        $applyWindow = function ($q, string $dateCol) use ($fromDateTime, $toDateTime, $fromInclusive, $hasPostSplit) {
+            if ($fromDateTime !== null) {
+                if ($fromInclusive) {
+                    $q->where($dateCol, '>=', $fromDateTime);
+                } else {
+                    $q->where($dateCol, '>', $fromDateTime);
+                }
             }
-            if (!$includePostWindow && $toDateTime !== null) {
+            if (!$hasPostSplit && $toDateTime !== null) {
                 $q->where($dateCol, '<=', $toDateTime);
             }
             return $q;
@@ -735,10 +748,10 @@ class ReportController extends Controller
         $effAdjTypeSql = $this->effectiveAdjustmentTypeSql();
         $accounting = $this->accounting();
 
-        $extractMaps = function ($rows, array &$periodMap, array &$postMap) use ($includePostWindow) {
+        $extractMaps = function ($rows, array &$periodMap, array &$postMap) use ($hasPostSplit) {
             foreach ($rows as $row) {
                 $pid = (int)$row->product_id;
-                if ($includePostWindow) {
+                if ($hasPostSplit) {
                     $pVal = (float)($row->period_qty ?? 0);
                     $qVal = (float)($row->post_qty ?? 0);
                     if ($pVal != 0.0) $periodMap[$pid] = $pVal;
@@ -764,7 +777,7 @@ class ReportController extends Controller
             $purchQ->where('purchases.warehouse_name', $warehouse);
         }
         if ($filterProducts) $purchQ->whereIn('purchase_items.product_id', $productIds);
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $purchRows = $purchQ->selectRaw("purchase_items.product_id, SUM(CASE WHEN purchases.date <= ? THEN {$purchQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN purchases.date > ? THEN {$purchQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                 ->groupBy('purchase_items.product_id')->get();
             $extractMaps($purchRows, $period['purchases'], $post['purchases']);
@@ -785,7 +798,7 @@ class ReportController extends Controller
             $salesQ->where('sales.warehouse_name', $warehouse);
         }
         if ($filterProducts) $salesQ->whereIn('sale_items.product_id', $productIds);
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $saleRows = $salesQ->selectRaw("sale_items.product_id, SUM(CASE WHEN sales.date <= ? THEN {$saleQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN sales.date > ? THEN {$saleQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                 ->groupBy('sale_items.product_id')->get();
             $extractMaps($saleRows, $period['sales'], $post['sales']);
@@ -805,7 +818,7 @@ class ReportController extends Controller
             $adjBaseQ->where('stock_adjustments.warehouse_name', $warehouse);
         }
         if ($filterProducts) $adjBaseQ->whereIn('stock_adjustment_items.product_id', $productIds);
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $adjRows = $adjBaseQ->selectRaw("
                 stock_adjustment_items.product_id,
                 SUM(CASE WHEN stock_adjustments.date <= ? AND {$effAdjTypeSql} = 'addition' THEN {$adjQtySql} ELSE 0 END) as p_in,
@@ -846,7 +859,7 @@ class ReportController extends Controller
             $trfOutQ->where('stock_transfers.from_warehouse', $warehouse);
         }
         if ($filterProducts) $trfOutQ->whereIn('stock_transfer_items.product_id', $productIds);
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $extractMaps(
                 $trfOutQ->selectRaw("stock_transfer_items.product_id, SUM(CASE WHEN stock_transfers.date <= ? THEN {$trfQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN stock_transfers.date > ? THEN {$trfQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                     ->groupBy('stock_transfer_items.product_id')->get(),
@@ -869,7 +882,7 @@ class ReportController extends Controller
             $trfInQ->where('stock_transfers.to_warehouse', $warehouse);
         }
         if ($filterProducts) $trfInQ->whereIn('stock_transfer_items.product_id', $productIds);
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $extractMaps(
                 $trfInQ->selectRaw("stock_transfer_items.product_id, SUM(CASE WHEN stock_transfers.date <= ? THEN {$trfQtySql} ELSE 0 END) as period_qty, SUM(CASE WHEN stock_transfers.date > ? THEN {$trfQtySql} ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                     ->groupBy('stock_transfer_items.product_id')->get(),
@@ -881,20 +894,24 @@ class ReportController extends Controller
                 ->groupBy('stock_transfer_items.product_id')->pluck('qty', 'product_id')->all();
         }
 
+        $isSqliteDriver = DB::connection()->getDriverName() === 'sqlite';
+        $refIdIntExpr = $isSqliteDriver
+            ? 'CAST(stock_movements.reference_id AS INTEGER)'
+            : 'CAST(stock_movements.reference_id AS UNSIGNED)';
+
         $srQ = DB::table('stock_movements')
-            ->leftJoin('sale_returns', function ($join) {
-                $join->on('stock_movements.reference_id', '=', 'sale_returns.id')
-                     ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(sale_returns.id AS CHAR)'));
-            })
+            ->leftJoin('sale_returns', DB::raw($refIdIntExpr), '=', 'sale_returns.id')
             ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
             ->whereIn('stock_movements.movement_type', ['sale_return', 'sale_return_void', 'sale_return_edit_reverse']);
         $srDateExpr = "CASE WHEN stock_movements.movement_type IN ('sale_return_void', 'sale_return_edit_reverse') THEN stock_movements.created_at ELSE COALESCE(sale_returns.date, stock_movements.created_at) END";
-        if ($fromInclusive) {
-            $srQ->whereRaw("{$srDateExpr} >= ?", [$fromDateTime]);
-        } else {
-            $srQ->whereRaw("{$srDateExpr} > ?", [$fromDateTime]);
+        if ($fromDateTime !== null) {
+            if ($fromInclusive) {
+                $srQ->whereRaw("{$srDateExpr} >= ?", [$fromDateTime]);
+            } else {
+                $srQ->whereRaw("{$srDateExpr} > ?", [$fromDateTime]);
+            }
         }
-        if (!$includePostWindow && $toDateTime !== null) {
+        if (!$hasPostSplit && $toDateTime !== null) {
             $srQ->whereRaw("{$srDateExpr} <= ?", [$toDateTime]);
         }
         if (!empty($allowedOutlets)) {
@@ -909,7 +926,7 @@ class ReportController extends Controller
             $srQ->whereIn('stock_movements.product_id', $productIds);
         }
         $srNetExpr = 'stock_movements.quantity_in - stock_movements.quantity_out';
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $extractMaps(
                 $srQ->selectRaw("stock_movements.product_id, SUM(CASE WHEN {$srDateExpr} <= ? THEN ({$srNetExpr}) ELSE 0 END) as period_qty, SUM(CASE WHEN {$srDateExpr} > ? THEN ({$srNetExpr}) ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                     ->groupBy('stock_movements.product_id')->get(),
@@ -922,19 +939,18 @@ class ReportController extends Controller
         }
 
         $prQ = DB::table('stock_movements')
-            ->leftJoin('purchase_returns', function ($join) {
-                $join->on('stock_movements.reference_id', '=', 'purchase_returns.id')
-                     ->orOn('stock_movements.reference_id', '=', DB::raw('CAST(purchase_returns.id AS CHAR)'));
-            })
+            ->leftJoin('purchase_returns', DB::raw($refIdIntExpr), '=', 'purchase_returns.id')
             ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
             ->whereIn('stock_movements.movement_type', ['purchase_return', 'purchase_return_void']);
         $prDateExpr = "CASE WHEN stock_movements.movement_type = 'purchase_return_void' THEN stock_movements.created_at ELSE COALESCE(purchase_returns.date, stock_movements.created_at) END";
-        if ($fromInclusive) {
-            $prQ->whereRaw("{$prDateExpr} >= ?", [$fromDateTime]);
-        } else {
-            $prQ->whereRaw("{$prDateExpr} > ?", [$fromDateTime]);
+        if ($fromDateTime !== null) {
+            if ($fromInclusive) {
+                $prQ->whereRaw("{$prDateExpr} >= ?", [$fromDateTime]);
+            } else {
+                $prQ->whereRaw("{$prDateExpr} > ?", [$fromDateTime]);
+            }
         }
-        if (!$includePostWindow && $toDateTime !== null) {
+        if (!$hasPostSplit && $toDateTime !== null) {
             $prQ->whereRaw("{$prDateExpr} <= ?", [$toDateTime]);
         }
         if (!empty($allowedOutlets)) {
@@ -949,7 +965,7 @@ class ReportController extends Controller
             $prQ->whereIn('stock_movements.product_id', $productIds);
         }
         $prNetExpr = 'stock_movements.quantity_out - stock_movements.quantity_in';
-        if ($includePostWindow) {
+        if ($hasPostSplit) {
             $extractMaps(
                 $prQ->selectRaw("stock_movements.product_id, SUM(CASE WHEN {$prDateExpr} <= ? THEN ({$prNetExpr}) ELSE 0 END) as period_qty, SUM(CASE WHEN {$prDateExpr} > ? THEN ({$prNetExpr}) ELSE 0 END) as post_qty", [$toDateTime, $toDateTime])
                     ->groupBy('stock_movements.product_id')->get(),
@@ -979,7 +995,7 @@ class ReportController extends Controller
             if ($filterProducts) {
                 $opUpdQ->whereIn('stock_movements.product_id', $productIds);
             }
-            if ($includePostWindow) {
+            if ($hasPostSplit) {
                 $opRows = $opUpdQ->selectRaw(
                     'stock_movements.product_id, SUM(CASE WHEN stock_movements.created_at <= ? THEN stock_movements.quantity_in ELSE 0 END) as period_qty, SUM(CASE WHEN stock_movements.created_at > ? THEN stock_movements.quantity_in ELSE 0 END) as post_qty',
                     [$toDateTime, $toDateTime]
@@ -1098,7 +1114,7 @@ class ReportController extends Controller
 
         // Always query live DB (invalidateDashboardCache is a no-op in zero-cache mode)
         $useShortCache = false;
-        $scopeCacheKey = md5($warehouse . '|' . implode(',', $allowedOutlets) . '|' . ($canViewCost ? '1' : '0'));
+        $scopeCacheKey = md5($warehouse . '|' . ($allowedOutlets === null ? 'all' : implode(',', $allowedOutlets)) . '|' . ($canViewCost ? '1' : '0'));
 
         // 1. Base query scopes
         $salesBaseQuery = DB::table('sales');
@@ -5235,7 +5251,7 @@ class ReportController extends Controller
         ]);
     }
 
-    private function applyStockStatusFilter($query, string $stockStatus, ?int $warehouseId, array $allowedOutlets): void
+    private function applyStockStatusFilter($query, string $stockStatus, ?int $warehouseId, ?array $allowedOutlets): void
     {
         if ($stockStatus === '' || $stockStatus === 'All') {
             return;
@@ -7352,11 +7368,15 @@ class ReportController extends Controller
         $mapRow = function ($item, bool $isCostMovement = false) use ($fallbackItemName, $canViewCost) {
             $dateVal = $item->date ?? $item->created_at ?? date('Y-m-d H:i:s');
             $createdOn = (string)$dateVal;
+            $rawName = trim((string)($item->product_name ?? ''));
+            $resolvedName = ($rawName === '' || str_starts_with($rawName, 'Retail Product #'))
+                ? $fallbackItemName
+                : $rawName;
             return [
                 'id' => (int)($item->transaction_id ?? $item->id ?? 0),
                 'created_on' => $createdOn,
                 'reference' => (string)($item->reference_no ?? '—'),
-                'name' => (string)($item->product_name ?? $fallbackItemName),
+                'name' => $resolvedName,
                 'party_name' => (string)($item->party_name ?? '—'),
                 'warehouse_name' => (string)($item->warehouse_name ?? '—'),
                 'quantity' => (float)($item->quantity ?? 0),
@@ -7963,6 +7983,23 @@ class ReportController extends Controller
         $page = max(1, (int)$request->input('page', 1));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
         $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
+        if ($allowedOutlets !== null && (empty($allowedOutlets) || in_array(-1, $allowedOutlets, true))) {
+            return $this->noStoreJson([
+                'status' => 'success',
+                'data' => [
+                    'threshold' => $threshold,
+                    'total' => 0,
+                    'items' => [],
+                    'pagination' => [
+                        'current_page' => $page,
+                        'per_page' => $perPage,
+                        'total' => 0,
+                        'last_page' => 1,
+                        'has_more' => false,
+                    ],
+                ],
+            ]);
+        }
         $scopeWhIds = $warehouseId !== null ? [$warehouseId] : $allowedOutlets;
         $hasVariantsTable = $this->accounting()->schemaHasTable('product_variants');
         $varNameExpr = DB::connection()->getDriverName() === 'sqlite'
@@ -10294,9 +10331,9 @@ class ReportController extends Controller
         $search = trim((string)$request->query('search', ''));
         $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $knownTotal = $request->has('known_total') ? max(0, (int)$request->query('known_total')) : null;
+        $cursorRaw = trim((string)($request->query('cursor') ?? ''));
         $page = max(1, (int)($request->input('page') ?? $request->query('page', 1)));
         $perPage = $this->resolveReportPerPage($request, 50, 10000);
-        $skipSummary = $request->boolean('skip_summary') || $request->query('skip_summary') === '1';
         $canViewCost = $accounting->canViewCost($request);
         $allowedOutlets = $this->extractAllowedOutletIds($request);
         $allowedOutletNames = !empty($allowedOutlets)
@@ -10374,9 +10411,9 @@ class ReportController extends Controller
         $accountedSaleIds = [];
         $items = [];
         $realRegIds = [];
+        $maxRealRegId = 0;
         $skippedRealRegsCount = 0;
         $hasSpTable = $accounting->schemaHasTable('sale_payments');
-        $hasRegTxTable = $accounting->schemaHasTable('cash_register_transactions');
 
         // 1. Process Real Cash Registers (Separated index-seeking queries — zero OR full-table scans)
         if ($accounting->schemaHasTable('cash_registers')) {
@@ -10410,30 +10447,11 @@ class ReportController extends Controller
 
             $realRegs = $regQuery->orderByDesc('id')->get();
             $realRegIds = $realRegs->pluck('id')->map(fn($v) => (int)$v)->all();
+            $maxRealRegId = !empty($realRegIds) ? max($realRegIds) : 0;
 
-            // Fast-path for Page 2+ (skip_summary=1 & offset >= real register count): only collect accounted sale IDs cleanly
-            $offset = ($page - 1) * $perPage;
-            $canSkipRealRegHydration = $skipSummary
-                && $knownTotal !== null
-                && $registerFilter === 'All'
-                && $paymentTypeFilter === 'All'
-                && strtolower(trim((string)$discrepancyFilter)) === 'all'
-                && $search === ''
-                && !in_array(strtolower($statusFilter), ['open', 'active'], true)
-                && $offset >= $realRegs->count();
-
-            if ($canSkipRealRegHydration) {
-                $skippedRealRegsCount = $realRegs->count();
-                if (!empty($realRegIds)) {
-                    foreach (array_chunk($realRegIds, 400) as $idChunk) {
-                        foreach (DB::table('sales')->whereIn('cash_register_id', $idChunk)->pluck('id') as $sid) {
-                            $accountedSaleIds[(int)$sid] = true;
-                        }
-                    }
-                }
-                $realRegs = collect();
-                $realRegIds = [];
-            }
+            // Skip all real-register hydration & schema checks when no real registers exist
+            if (!$realRegs->isEmpty()) {
+            $hasRegTxTable = $accounting->schemaHasTable('cash_register_transactions');
 
             // Pre-fetch drawer transactions (float_in, drop, void_refund) in SQL SUM per chunk
             $regTxAgg = [];
@@ -11050,192 +11068,309 @@ class ReportController extends Controller
                     'payment_breakdown' => $paymentBreakdown,
                 ];
             }
+            }
         }
 
-        // 2. Process Legacy Sales (Single-pass streaming + selective sale_payments tender resolution — zero multi-pass GROUP BY temp tables!)
-        $applyLegacyScope = function ($q) use ($allowedOutlets, $allowedOutletNames, $targetWarehouseId, $targetWarehouseName, $cashier, $startDate, $endDate) {
-            $this->applyActiveDocumentFilter($q, 'status');
+        // 2. Process Legacy Sales (Deterministic SQL-aggregated tenders + keyset cursor fast path)
+        // Legacy shifts are always Closed and Balanced (variance = 0.0)
+        $legacyEligible = !in_array(strtolower($statusFilter), ['open', 'active'], true)
+            && $matchesDiscrepancy(0.0, (string)$discrepancyFilter);
+        $hasLateOfflineCol = $legacyEligible && $accounting->schemaHasColumn('sales', 'late_offline_reconciliation');
+
+        // Fast index-only existence probes (~1-2ms total). When zero inactive/late-offline sales exist in the table,
+        // omitting those redundant WHERE predicates lets MySQL use sales_date_index backward scans (~3ms vs 130ms filesort)
+        // and clean sequential scans (~55ms vs 158ms random PK lookups via idx_sales_late_status).
+        $hasInactiveSales = false;
+        $hasLateOfflineSales = false;
+        if ($legacyEligible) {
+            $hasInactiveSales = DB::table('sales')
+                ->whereIn('status', [
+                    'Voided', 'voided', 'VOIDED',
+                    'Cancelled', 'cancelled', 'CANCELLED',
+                    'Canceled', 'canceled', 'CANCELED',
+                    'Draft', 'draft', 'DRAFT',
+                    'Pending', 'pending', 'PENDING',
+                    'Ordered', 'ordered', 'ORDERED',
+                ])
+                ->exists();
+            $hasLateOfflineSales = $hasLateOfflineCol
+                && DB::table('sales')->where('late_offline_reconciliation', '>', 0)->exists();
+        }
+
+        $applyLegacyScope = function ($q, string $prefix = '') use ($allowedOutlets, $allowedOutletNames, $targetWarehouseId, $targetWarehouseName, $cashier, $startDate, $endDate, $hasLateOfflineCol, $hasInactiveSales, $hasLateOfflineSales): void {
+            if ($hasInactiveSales) {
+                $this->applyActiveDocumentFilter($q, $prefix . 'status');
+            }
+            if ($hasLateOfflineCol && $hasLateOfflineSales) {
+                $q->where(function ($sub) use ($prefix) {
+                    $sub->whereNull($prefix . 'late_offline_reconciliation')
+                        ->orWhere($prefix . 'late_offline_reconciliation', 0);
+                });
+            }
             if (!empty($allowedOutlets)) {
-                $q->where(function ($sub) use ($allowedOutlets, $allowedOutletNames) {
-                    $sub->whereIn('warehouse_id', $allowedOutlets);
+                $q->where(function ($sub) use ($allowedOutlets, $allowedOutletNames, $prefix) {
+                    $sub->whereIn($prefix . 'warehouse_id', $allowedOutlets);
                     if (!empty($allowedOutletNames)) {
-                        $sub->orWhere(function ($inner) use ($allowedOutletNames) {
-                            $inner->whereNull('warehouse_id')->whereIn('warehouse_name', $allowedOutletNames);
+                        $sub->orWhere(function ($inner) use ($allowedOutletNames, $prefix) {
+                            $inner->whereNull($prefix . 'warehouse_id')->whereIn($prefix . 'warehouse_name', $allowedOutletNames);
                         });
                     }
                 });
             }
             if ($targetWarehouseId !== null && $targetWarehouseName !== null) {
-                $q->where(function ($sub) use ($targetWarehouseId, $targetWarehouseName) {
-                    $sub->where('warehouse_id', $targetWarehouseId)
-                        ->orWhere(function ($inner) use ($targetWarehouseName) {
-                            $inner->whereNull('warehouse_id')->where('warehouse_name', $targetWarehouseName);
+                $q->where(function ($sub) use ($targetWarehouseId, $targetWarehouseName, $prefix) {
+                    $sub->where($prefix . 'warehouse_id', $targetWarehouseId)
+                        ->orWhere(function ($inner) use ($targetWarehouseName, $prefix) {
+                            $inner->whereNull($prefix . 'warehouse_id')->where($prefix . 'warehouse_name', $targetWarehouseName);
                         });
                 });
             } elseif ($targetWarehouseId !== null) {
-                $q->where('warehouse_id', $targetWarehouseId);
+                $q->where($prefix . 'warehouse_id', $targetWarehouseId);
             } elseif ($targetWarehouseName !== null) {
-                $q->where('warehouse_name', $targetWarehouseName);
+                $q->where($prefix . 'warehouse_name', $targetWarehouseName);
             }
             if ($cashier !== 'All' && !empty($cashier)) {
-                $q->where('created_by', 'like', "%{$cashier}%");
+                $q->where($prefix . 'created_by', 'like', "%{$cashier}%");
             }
-            $this->applyReportDateRange($q, $startDate !== '' ? $startDate : null, $endDate !== '' ? $endDate : null, 'date');
+            $this->applyReportDateRange($q, $startDate !== '' ? $startDate : null, $endDate !== '' ? $endDate : null, $prefix . 'date');
         };
 
-        $canSliceLegacyBeforeTenders = $skipSummary
-            && $knownTotal !== null
-            && $registerFilter === 'All'
+        $isStandardNoPostFilter = $registerFilter === 'All'
             && $paymentTypeFilter === 'All'
-            && strtolower(trim((string)$discrepancyFilter)) === 'all'
-            && $search === ''
-            && !in_array(strtolower($statusFilter), ['open', 'active'], true);
+            && $search === '';
+        $legacyIdBase = $maxRealRegId > 0 ? ($maxRealRegId + 100000) : 0;
 
-        $legacySalesQuery = DB::table('sales');
-        $applyLegacyScope($legacySalesQuery);
-        if ($accounting->schemaHasColumn('sales', 'late_offline_reconciliation')) {
-            $legacySalesQuery->where(function ($sub) {
-                $sub->whereNull('late_offline_reconciliation')->orWhere('late_offline_reconciliation', false);
-            });
-        }
-
-        $groupedMap = [];
-        $legacySalesMeta = [];
-        foreach ($legacySalesQuery->select(['id', 'date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total', 'paid_amount', 'payment_type'])->cursor() as $lsRow) {
-            $sid = (int)$lsRow->id;
-            if (isset($accountedSaleIds[$sid])) {
-                continue;
+        // Compact legacy group tuple:
+        // [0: session_date, 1: opened_at_raw, 2: closed_at_raw, 3: w_id, 4: w_name, 5: raw_cashier, 6: tx_count, 7: total_sales]
+        $compareLegacyGroup = static function (array $a, array $b): int {
+            $cmp = strcmp($b[1], $a[1]);
+            if ($cmp !== 0) {
+                return $cmp;
             }
-            $sDate = substr((string)$lsRow->date, 0, 10);
-            $wId = (int)($lsRow->warehouse_id ?? 1);
-            $wName = (string)($lsRow->warehouse_name ?: 'Main Branch Outlet');
-            $cName = (string)($lsRow->created_by ?: 'Super Admin');
-            $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
-            if (!isset($groupedMap[$gKey])) {
-                $groupedMap[$gKey] = (object)[
-                    'session_date' => $sDate,
-                    'opened_at_raw' => (string)$lsRow->date,
-                    'closed_at_raw' => (string)$lsRow->date,
-                    'w_id' => $wId,
-                    'w_name' => $wName,
-                    'cashier_name' => $cName,
-                    'tx_count' => 0,
-                    'total_sales' => 0.0,
-                    'cash_sales' => 0.0,
-                    'card_sales' => 0.0,
-                    'digital_sales' => 0.0,
-                    'tender_totals' => [],
-                    'tender_counts' => [],
-                ];
+            $cmp = $b[3] <=> $a[3];
+            if ($cmp !== 0) {
+                return $cmp;
             }
-            $grp = $groupedMap[$gKey];
-            $grp->tx_count++;
-            $grp->total_sales += (float)$lsRow->grand_total;
-            if ((string)$lsRow->date < $grp->opened_at_raw) $grp->opened_at_raw = (string)$lsRow->date;
-            if ((string)$lsRow->date > $grp->closed_at_raw) $grp->closed_at_raw = (string)$lsRow->date;
-
-            $legacySalesMeta[$sid] = [
-                'gKey' => $gKey,
-                'paid' => (float)$lsRow->paid_amount,
-                'pt' => trim((string)($lsRow->payment_type ?: 'Cash')) ?: 'Cash',
-            ];
-        }
-
-        // Sort legacy groups newest date first before optional skip_summary slice
-        $legacyGroupsList = array_values($groupedMap);
-        usort($legacyGroupsList, fn ($a, $b) => strcmp((string)$b->session_date, (string)$a->session_date));
-
-        $legacySliceOffset = 0;
-        if ($canSliceLegacyBeforeTenders && !empty($legacyGroupsList)) {
-            $neededStart = max(0, (($page - 1) * $perPage) - (count($items) + $skippedRealRegsCount));
-            $neededLen = $perPage + 10;
-            $legacySliceOffset = $neededStart;
-            $legacyGroupsList = array_slice($legacyGroupsList, $neededStart, $neededLen);
-        }
-
-        // Map kept group keys so we ONLY resolve sale_payments for groups we will actually process
-        $keptGroupKeys = [];
-        foreach ($legacyGroupsList as $lg) {
-            $keptKey = $lg->session_date . '|' . $lg->w_id . '|' . $lg->w_name . '|' . $lg->cashier_name;
-            $keptGroupKeys[$keptKey] = $lg;
-        }
-        $keptSaleMeta = [];
-        foreach ($legacySalesMeta as $sid => $meta) {
-            if (isset($keptGroupKeys[$meta['gKey']])) {
-                $keptSaleMeta[$sid] = $meta;
+            $cmp = strcmp($a[4], $b[4]);
+            if ($cmp !== 0) {
+                return $cmp;
             }
-        }
-        unset($legacySalesMeta);
-
-        $accumulateLegacyTenderRow = function (object $grp, string $rawType, int $cnt, float $amt) use ($accounting): void {
-            if ($amt <= 0.0001 && $cnt <= 0) {
-                return;
-            }
-            $mName = $this->normalizePaymentMethodName($rawType !== '' ? $rawType : 'Cash');
-            $grp->tender_totals[$mName] = ($grp->tender_totals[$mName] ?? 0.0) + $amt;
-            $grp->tender_counts[$mName] = ($grp->tender_counts[$mName] ?? 0) + $cnt;
-            $mLower = strtolower($mName);
-            if ($accounting->isCashPaymentType($mName)) {
-                $grp->cash_sales = (float)$grp->cash_sales + $amt;
-            } elseif (str_contains($mLower, 'card') || in_array($mLower, ['visa', 'mastercard'], true)) {
-                $grp->card_sales = (float)$grp->card_sales + $amt;
-            } else {
-                $grp->digital_sales = (float)$grp->digital_sales + $amt;
-            }
+            return strcmp($a[5], $b[5]);
         };
 
-        $salesWithSpRows = [];
-        if ($hasSpTable && !empty($keptSaleMeta)) {
-            $keptIds = array_keys($keptSaleMeta);
-            if (count($keptIds) <= 2000) {
-                foreach (array_chunk($keptIds, 500) as $idChunk) {
-                    foreach (DB::table('sale_payments')->whereIn('sale_id', $idChunk)->select(['sale_id', 'payment_type', 'amount'])->get() as $sp) {
-                        $sid = (int)$sp->sale_id;
-                        $salesWithSpRows[$sid] = true;
-                        $grp = $keptGroupKeys[$keptSaleMeta[$sid]['gKey']];
-                        $accumulateLegacyTenderRow($grp, trim((string)($sp->payment_type ?? '')) ?: 'Cash', 1, max(0.0, (float)$sp->amount));
-                    }
+        $decodeCursor = static function (string $raw): ?array {
+            if ($raw === '') {
+                return null;
+            }
+            $decoded = base64_decode($raw, true);
+            if ($decoded === false) {
+                return null;
+            }
+            $arr = json_decode($decoded, true);
+            if (!is_array($arr) || ($arr['v'] ?? null) !== 1 || empty($arr['o']) || !isset($arr['s'])) {
+                return null;
+            }
+            return [
+                'o' => (string)$arr['o'],
+                'w' => (int)($arr['w'] ?? 1),
+                'wn' => (string)($arr['wn'] ?? 'Main Branch Outlet'),
+                'c' => (string)($arr['c'] ?? 'Super Admin'),
+                's' => (int)$arr['s'],
+            ];
+        };
+
+        $encodeCursor = static function (array $g, int $seq): string {
+            return base64_encode((string)json_encode([
+                'v' => 1,
+                'o' => $g[1],
+                'w' => $g[3],
+                'wn' => $g[4],
+                'c' => $g[5],
+                's' => $seq,
+            ]));
+        };
+
+        $fetchRawRows = static function ($query): array {
+            $conn = DB::connection();
+            $sql = $query->toSql();
+            $bindings = $conn->prepareBindings($query->getBindings());
+            $stmt = $conn->getPdo()->prepare($sql);
+            $conn->bindValues($stmt, $bindings);
+            $stmt->execute();
+            return $stmt->fetchAll(\PDO::FETCH_NUM);
+        };
+
+        $resolveTendersForGroups = function (array $targetKeys, ?array $dateBounds = null) use (
+            $applyLegacyScope,
+            $accountedSaleIds,
+            $hasSpTable,
+            $fetchRawRows
+        ): array {
+            if (empty($targetKeys)) {
+                return [];
+            }
+            $tendersByKey = [];
+            $accountedCount = count($accountedSaleIds);
+            $accountedKeys = $accountedCount > 0 ? array_keys($accountedSaleIds) : [];
+
+            $addTender = function (string $gKey, string $rawPt, int $cnt, float $amt) use (&$tendersByKey, $targetKeys): void {
+                if (!isset($targetKeys[$gKey]) || ($amt <= 0.0001 && $cnt <= 0)) {
+                    return;
                 }
-            } else {
-                foreach (DB::table('sale_payments')->select(['sale_id', 'payment_type', 'amount'])->cursor() as $sp) {
-                    $sid = (int)$sp->sale_id;
-                    if (!isset($keptSaleMeta[$sid])) {
+                $mName = $this->normalizePaymentMethodName($rawPt !== '' ? $rawPt : 'Cash');
+                if (!isset($tendersByKey[$gKey])) {
+                    $tendersByKey[$gKey] = ['totals' => [], 'counts' => []];
+                }
+                $tendersByKey[$gKey]['totals'][$mName] = ($tendersByKey[$gKey]['totals'][$mName] ?? 0.0) + $amt;
+                $tendersByKey[$gKey]['counts'][$mName] = ($tendersByKey[$gKey]['counts'][$mName] ?? 0) + $cnt;
+            };
+
+            // Fast single-query LEFT JOIN path for bounded page date windows (~2ms, zero temp/filesort, zero NOT EXISTS)
+            if ($dateBounds !== null && $hasSpTable) {
+                $ljQ = DB::table('sales as s')
+                    ->leftJoin('sale_payments as sp', 'sp.sale_id', '=', 's.id');
+                $applyLegacyScope($ljQ, 's.');
+                $ljQ->where('s.date', '>=', $dateBounds[0])
+                    ->where('s.date', '<=', $dateBounds[1]);
+                if ($accountedCount > 0 && $accountedCount <= 400) {
+                    $ljQ->whereNotIn('s.id', $accountedKeys);
+                }
+                $ljQ->select([
+                    's.id',
+                    's.date',
+                    's.warehouse_id',
+                    's.warehouse_name',
+                    's.created_by',
+                    's.paid_amount',
+                    's.payment_type',
+                    'sp.sale_id',
+                    'sp.payment_type',
+                    'sp.amount',
+                ]);
+                foreach ($fetchRawRows($ljQ) as $row) {
+                    if ($accountedCount > 400 && isset($accountedSaleIds[(int)$row[0]])) {
                         continue;
                     }
-                    $salesWithSpRows[$sid] = true;
-                    $grp = $keptGroupKeys[$keptSaleMeta[$sid]['gKey']];
-                    $accumulateLegacyTenderRow($grp, trim((string)($sp->payment_type ?? '')) ?: 'Cash', 1, max(0.0, (float)$sp->amount));
+                    $sDate = substr((string)$row[1], 0, 10);
+                    $wId = (int)($row[2] ?? 1);
+                    $wName = ($row[3] !== null && $row[3] !== '') ? (string)$row[3] : 'Main Branch Outlet';
+                    $cName = ($row[4] !== null && $row[4] !== '') ? (string)$row[4] : 'Super Admin';
+                    $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
+                    if (!isset($targetKeys[$gKey])) {
+                        continue;
+                    }
+                    if ($row[7] !== null) {
+                        $addTender($gKey, trim((string)($row[8] ?? '')), 1, max(0.0, (float)($row[9] ?? 0)));
+                    } else {
+                        $paidAmt = (float)($row[5] ?? 0);
+                        if ($paidAmt > 0.0001) {
+                            $addTender($gKey, trim((string)($row[6] ?? '')), 1, $paidAmt);
+                        }
+                    }
+                }
+                return $tendersByKey;
+            }
+
+            if ($hasSpTable) {
+                $spQ = DB::table('sales as s')
+                    ->join('sale_payments as sp', 'sp.sale_id', '=', 's.id');
+                $applyLegacyScope($spQ, 's.');
+                if ($dateBounds !== null) {
+                    $spQ->where('s.date', '>=', $dateBounds[0])->where('s.date', '<=', $dateBounds[1]);
+                }
+                if ($accountedCount > 0 && $accountedCount <= 400) {
+                    $spQ->whereNotIn('s.id', $accountedKeys);
+                }
+                if ($accountedCount > 400) {
+                    foreach ($spQ->select(['s.id', 's.date', 's.warehouse_id', 's.warehouse_name', 's.created_by', 'sp.payment_type', 'sp.amount'])->cursor() as $row) {
+                        if (isset($accountedSaleIds[(int)$row->id])) {
+                            continue;
+                        }
+                        $gKey = substr((string)$row->date, 0, 10) . '|' . (int)($row->warehouse_id ?? 1) . '|' . (string)($row->warehouse_name ?: 'Main Branch Outlet') . '|' . (string)($row->created_by ?: 'Super Admin');
+                        $addTender($gKey, trim((string)($row->payment_type ?? '')), 1, max(0.0, (float)$row->amount));
+                    }
+                } else {
+                    $rows = $spQ->selectRaw("
+                        SUBSTR(s.date, 1, 10) as session_date,
+                        s.warehouse_id as w_id,
+                        s.warehouse_name as w_name,
+                        s.created_by as cashier_name,
+                        sp.payment_type as pt,
+                        COUNT(*) as cnt,
+                        SUM(CASE WHEN sp.amount > 0 THEN sp.amount ELSE 0 END) as amt
+                    ")
+                    ->groupByRaw("SUBSTR(s.date, 1, 10), s.warehouse_id, s.warehouse_name, s.created_by, sp.payment_type")
+                    ->get();
+                    foreach ($rows as $row) {
+                        $wId = (int)($row->w_id ?? 1);
+                        $wName = ($row->w_name !== null && $row->w_name !== '') ? (string)$row->w_name : 'Main Branch Outlet';
+                        $cName = ($row->cashier_name !== null && $row->cashier_name !== '') ? (string)$row->cashier_name : 'Super Admin';
+                        $gKey = $row->session_date . '|' . $wId . '|' . $wName . '|' . $cName;
+                        $addTender($gKey, trim((string)($row->pt ?? '')), (int)$row->cnt, (float)$row->amt);
+                    }
                 }
             }
-        }
-        foreach ($keptSaleMeta as $sid => $meta) {
-            if (isset($salesWithSpRows[$sid])) {
-                continue;
+
+            // Fallback: paid legacy sales that do NOT have sale_payments rows
+            $fbQ = DB::table('sales as s')->where('s.paid_amount', '>', 0.0001);
+            $applyLegacyScope($fbQ, 's.');
+            if ($dateBounds !== null) {
+                $fbQ->where('s.date', '>=', $dateBounds[0])->where('s.date', '<=', $dateBounds[1]);
             }
-            if ($meta['paid'] > 0.0001) {
-                $accumulateLegacyTenderRow($keptGroupKeys[$meta['gKey']], $meta['pt'], 1, $meta['paid']);
+            if ($hasSpTable) {
+                $fbQ->whereNotExists(function ($sub) {
+                    $sub->select(DB::raw(1))
+                        ->from('sale_payments as sp')
+                        ->whereColumn('sp.sale_id', 's.id');
+                });
             }
-        }
-        unset($keptSaleMeta, $salesWithSpRows);
+            if ($accountedCount > 0 && $accountedCount <= 400) {
+                $fbQ->whereNotIn('s.id', $accountedKeys);
+            }
+            if ($accountedCount > 400) {
+                foreach ($fbQ->select(['s.id', 's.date', 's.warehouse_id', 's.warehouse_name', 's.created_by', 's.payment_type', 's.paid_amount'])->cursor() as $row) {
+                    if (isset($accountedSaleIds[(int)$row->id])) {
+                        continue;
+                    }
+                    $gKey = substr((string)$row->date, 0, 10) . '|' . (int)($row->warehouse_id ?? 1) . '|' . (string)($row->warehouse_name ?: 'Main Branch Outlet') . '|' . (string)($row->created_by ?: 'Super Admin');
+                    $addTender($gKey, trim((string)($row->payment_type ?? '')), 1, max(0.0, (float)$row->paid_amount));
+                }
+            } else {
+                $fbRows = $fbQ->selectRaw("
+                    SUBSTR(s.date, 1, 10) as session_date,
+                    s.warehouse_id as w_id,
+                    s.warehouse_name as w_name,
+                    s.created_by as cashier_name,
+                    s.payment_type as pt,
+                    COUNT(*) as cnt,
+                    SUM(CASE WHEN s.paid_amount > 0 THEN s.paid_amount ELSE 0 END) as amt
+                ")
+                ->groupByRaw("SUBSTR(s.date, 1, 10), s.warehouse_id, s.warehouse_name, s.created_by, s.payment_type")
+                ->get();
+                foreach ($fbRows as $row) {
+                    $wId = (int)($row->w_id ?? 1);
+                    $wName = ($row->w_name !== null && $row->w_name !== '') ? (string)$row->w_name : 'Main Branch Outlet';
+                    $cName = ($row->cashier_name !== null && $row->cashier_name !== '') ? (string)$row->cashier_name : 'Super Admin';
+                    $gKey = $row->session_date . '|' . $wId . '|' . $wName . '|' . $cName;
+                    $addTender($gKey, trim((string)($row->pt ?? '')), (int)$row->cnt, (float)$row->amt);
+                }
+            }
 
-        $realItemsCount = count($items) + $skippedRealRegsCount;
-        $seq = $realItemsCount + 1 + $legacySliceOffset;
-        foreach ($legacyGroupsList as $lg) {
-            $sDate = $lg->session_date;
-            $cName = trim(explode('(', (string)($lg->cashier_name ?: 'Super Admin'))[0]) ?: 'Super Admin';
-            $refNo = 'REG-' . str_replace('-', '', $sDate) . '-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-            $regName = 'Register ' . str_pad(($seq % 3) + 1, 2, '0', STR_PAD_LEFT);
-            $curSeq = $seq++;
+            return $tendersByKey;
+        };
 
-            $availRegisters[$regName] = true;
-            $availCashiers[$cName] = true;
+        $buildLegacyItem = function (array $g, int $curSeq, array $tenderInfo) use ($accounting, $legacyIdBase): array {
+            $sDate = $g[0];
+            $cName = trim(explode('(', $g[5])[0]) ?: 'Super Admin';
+            $refNo = 'REG-' . str_replace('-', '', $sDate) . '-' . str_pad((string)$curSeq, 3, '0', STR_PAD_LEFT);
+            $regName = 'Register ' . str_pad((string)(($curSeq % 3) + 1), 2, '0', STR_PAD_LEFT);
 
-            $cSales = (float)$lg->cash_sales;
-            $cdSales = (float)$lg->card_sales;
-            $dgSales = (float)$lg->digital_sales;
-            $totSales = (float)$lg->total_sales;
-            $tTotals = is_array($lg->tender_totals ?? null) ? $lg->tender_totals : [];
-            $tCounts = is_array($lg->tender_counts ?? null) ? $lg->tender_counts : [];
+            $tTotals = $tenderInfo['totals'] ?? [];
+            $tCounts = $tenderInfo['counts'] ?? [];
+            $cSales = 0.0;
+            $cdSales = 0.0;
+            $dgSales = 0.0;
+            $totSales = (float)$g[7];
 
             $paymentBreakdown = [];
             $topMethod = 'Cash';
@@ -11244,13 +11379,20 @@ class ReportController extends Controller
             foreach ($tTotals as $m => $amt) {
                 $fAmt = round((float)$amt, 2);
                 $cnt = (int)($tCounts[$m] ?? 0);
+                $mLower = strtolower((string)$m);
+                if ($accounting->isCashPaymentType((string)$m)) {
+                    $cSales += (float)$amt;
+                } elseif (str_contains($mLower, 'card') || in_array($mLower, ['visa', 'mastercard'], true)) {
+                    $cdSales += (float)$amt;
+                } else {
+                    $dgSales += (float)$amt;
+                }
                 if ($fAmt > 0.009 || $cnt > 0) {
                     $paymentBreakdown[] = [
                         'method' => (string)$m,
                         'amount' => $fAmt,
                         'count' => $cnt,
                     ];
-                    $availPayTypes[(string)$m] = true;
                     if ($fAmt > 0.009) {
                         $nonZeroMethods++;
                         if ($fAmt > $topAmt) {
@@ -11261,39 +11403,29 @@ class ReportController extends Controller
                 }
             }
             if (empty($paymentBreakdown)) {
-                $paymentBreakdown[] = ['method' => 'Cash', 'amount' => round($cSales, 2), 'count' => (int)$lg->tx_count];
+                $paymentBreakdown[] = ['method' => 'Cash', 'amount' => 0.0, 'count' => 0];
             }
-            $prim = $nonZeroMethods > 1 ? 'Split Payment' : ($topAmt > 0 ? $topMethod : 'Cash');
-
-            if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($regName, $registerFilter) !== 0) continue;
-            if ($statusFilter !== 'All' && !empty($statusFilter)) {
-                $normFilter = strtolower($statusFilter) === 'active' ? 'open' : strtolower($statusFilter);
-                if ($normFilter !== 'closed') continue;
-            }
-            if (!$matchesDiscrepancy(0.0, (string)$discrepancyFilter)) continue;
-            if (!$matchesPaymentFilter($prim, $paymentBreakdown, (string)$paymentTypeFilter)) continue;
-
-            if (!empty($search)) {
-                $q = strtolower($search);
-                $m = str_contains(strtolower($refNo), $q) || str_contains(strtolower($regName), $q) || str_contains(strtolower((string)$lg->w_name), $q) || str_contains(strtolower($cName), $q) || str_contains($sDate, $q);
-                if (!$m) continue;
-            }
+            $prim = $nonZeroMethods > 1
+                ? 'Split Payment'
+                : ($topAmt > 0 ? $topMethod : ($totSales > 0.009 ? 'Credit' : 'Cash'));
 
             $openCash = 0.00;
             $expCash = max(0.0, $openCash + $cSales);
             $closeCash = $expCash;
-            $var = 0.00;
+            $userRole = (stripos($cName, 'admin') !== false)
+                ? 'Super Admin'
+                : ((stripos($cName, 'manager') !== false) ? 'Branch Manager' : 'Lead Cashier');
 
-            $items[] = [
-                'id' => $curSeq,
+            return [
+                'id' => $legacyIdBase + $curSeq,
                 'reference_no' => $refNo,
                 'register_id' => $regName,
-                'warehouse_id' => (int)$lg->w_id,
-                'warehouse_name' => $lg->w_name,
+                'warehouse_id' => (int)$g[3],
+                'warehouse_name' => $g[4],
                 'date' => $sDate,
-                'opened_at' => (string)$lg->opened_at_raw,
-                'closed_at' => (string)$lg->closed_at_raw,
-                'total_transactions' => (int)$lg->tx_count,
+                'opened_at' => $g[1],
+                'closed_at' => $g[2],
+                'total_transactions' => (int)$g[6],
                 'opening_cash' => $openCash,
                 'total_sales' => round($totSales, 2),
                 'cash_sales' => round($cSales, 2),
@@ -11310,30 +11442,24 @@ class ReportController extends Controller
                 'cash_purchase_refunds' => 0.0,
                 'expected_cash' => round($expCash, 2),
                 'closing_cash' => round($closeCash, 2),
-                'difference' => $var,
+                'difference' => 0.00,
                 'status' => 'Closed',
                 'primary_payment_type' => $prim,
                 'notes' => 'Legacy POS shift historical balance.',
                 'created_by' => $cName,
                 'cashier_name' => $cName,
                 'user_name' => $cName,
-                'user_role' => 'Lead Cashier',
+                'user_role' => $userRole,
                 'payment_breakdown' => $paymentBreakdown,
             ];
-        }
+        };
 
-        // Sort all items by opened_at descending, tiebreak by id descending
-        usort($items, function ($a, $b) {
-            $aKey = (string)($a['opened_at'] ?: ($a['date'] ?? ''));
-            $bKey = (string)($b['opened_at'] ?: ($b['date'] ?? ''));
-            $cmp = strcmp($bKey, $aKey);
-            if ($cmp === 0) {
-                return ((int)($b['id'] ?? 0)) <=> ((int)($a['id'] ?? 0));
-            }
-            return $cmp;
-        });
+        $offset = ($page - 1) * $perPage;
+        $nextCursor = null;
+        $pagedRaw = [];
+        $totalSessions = 0;
 
-        // Calculate summary and drawer flow aggregates (skippable when skip_summary=1 & known_total given)
+        // Summary accumulators
         $totalShiftSales = 0.0;
         $totalOpeningCash = 0.0;
         $totalCashSales = 0.0;
@@ -11354,68 +11480,573 @@ class ReportController extends Controller
         $closedSessionsCount = 0;
         $discrepancySessionsCount = 0;
         $byPaymentTender = [];
+        $tenderAgg = [];
 
-        if (!$skipSummary) {
-            $tenderAgg = [];
-            foreach ($items as $item) {
-                $totalShiftSales += (float)$item['total_sales'];
-                $totalOpeningCash += (float)$item['opening_cash'];
-                $totalCashSales += (float)$item['cash_sales'];
-                $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
-                $totalRefundsSum += (float)$item['total_refunds'];
-                $totalCashRefundsSum += (float)($item['cash_refunds'] ?? 0.0);
-                $totalExpensesSum += (float)$item['total_expenses'];
-                $totalCashExpensesSum += (float)($item['cash_expenses'] ?? 0.0);
-                $totalFloatsInSum += (float)($item['floats_in'] ?? 0.0);
-                $totalCashDropsSum += (float)($item['cash_drops'] ?? 0.0);
-                $totalCashPurchasesPaidSum += (float)($item['cash_purchases_paid'] ?? 0.0);
-                $totalCashPurchaseRefundsSum += (float)($item['cash_purchase_refunds'] ?? 0.0);
-                $totalExpectedCash += (float)$item['expected_cash'];
-                $totalClosingCash += (float)$item['closing_cash'];
-                $totalVariance += (float)$item['difference'];
-                $totalTxSum += (int)$item['total_transactions'];
+        $accumulateSummaryItem = static function (array $item) use (
+            &$totalShiftSales,
+            &$totalOpeningCash,
+            &$totalCashSales,
+            &$totalNonCashSales,
+            &$totalRefundsSum,
+            &$totalCashRefundsSum,
+            &$totalExpensesSum,
+            &$totalCashExpensesSum,
+            &$totalFloatsInSum,
+            &$totalCashDropsSum,
+            &$totalCashPurchasesPaidSum,
+            &$totalCashPurchaseRefundsSum,
+            &$totalExpectedCash,
+            &$totalClosingCash,
+            &$totalVariance,
+            &$totalTxSum,
+            &$openSessionsCount,
+            &$closedSessionsCount,
+            &$discrepancySessionsCount,
+            &$tenderAgg
+        ): void {
+            $totalShiftSales += (float)$item['total_sales'];
+            $totalOpeningCash += (float)$item['opening_cash'];
+            $totalCashSales += (float)$item['cash_sales'];
+            $totalNonCashSales += ((float)$item['card_sales'] + (float)$item['digital_sales']);
+            $totalRefundsSum += (float)$item['total_refunds'];
+            $totalCashRefundsSum += (float)($item['cash_refunds'] ?? 0.0);
+            $totalExpensesSum += (float)$item['total_expenses'];
+            $totalCashExpensesSum += (float)($item['cash_expenses'] ?? 0.0);
+            $totalFloatsInSum += (float)($item['floats_in'] ?? 0.0);
+            $totalCashDropsSum += (float)($item['cash_drops'] ?? 0.0);
+            $totalCashPurchasesPaidSum += (float)($item['cash_purchases_paid'] ?? 0.0);
+            $totalCashPurchaseRefundsSum += (float)($item['cash_purchase_refunds'] ?? 0.0);
+            $totalExpectedCash += (float)$item['expected_cash'];
+            $totalClosingCash += (float)$item['closing_cash'];
+            $totalVariance += (float)$item['difference'];
+            $totalTxSum += (int)$item['total_transactions'];
 
-                if (strtolower($item['status']) === 'open' || strtolower($item['status']) === 'active') {
-                    $openSessionsCount++;
-                } else {
-                    $closedSessionsCount++;
+            if (strtolower($item['status']) === 'open' || strtolower($item['status']) === 'active') {
+                $openSessionsCount++;
+            } else {
+                $closedSessionsCount++;
+            }
+            if (abs((float)$item['difference']) > 0.009) {
+                $discrepancySessionsCount++;
+            }
+
+            if (!empty($item['payment_breakdown']) && is_array($item['payment_breakdown'])) {
+                foreach ($item['payment_breakdown'] as $pb) {
+                    $m = trim((string)($pb['method'] ?? 'Other'));
+                    if ($m === '') {
+                        $m = 'Other';
+                    }
+                    if (!isset($tenderAgg[$m])) {
+                        $tenderAgg[$m] = ['count' => 0, 'total_amount' => 0.0];
+                    }
+                    $tenderAgg[$m]['count'] += (int)($pb['count'] ?? 0);
+                    $tenderAgg[$m]['total_amount'] += (float)($pb['amount'] ?? 0.0);
                 }
-                if (abs((float)$item['difference']) > 0.009) {
-                    $discrepancySessionsCount++;
-                }
+            }
+        };
 
-                if (!empty($item['payment_breakdown']) && is_array($item['payment_breakdown'])) {
-                    foreach ($item['payment_breakdown'] as $pb) {
-                        $m = trim((string)($pb['method'] ?? 'Other'));
-                        if (empty($m)) $m = 'Other';
-                        if (!isset($tenderAgg[$m])) {
-                            $tenderAgg[$m] = ['count' => 0, 'total_amount' => 0.0];
-                        }
-                        $tenderAgg[$m]['count'] += (int)($pb['count'] ?? 0);
-                        $tenderAgg[$m]['total_amount'] += (float)($pb['amount'] ?? 0.0);
-                    }
+        $usedCursorFastPath = false;
+        $cursorPayload = ($legacyEligible && $isStandardNoPostFilter && $skipSummary && $knownTotal !== null && empty($items) && empty($accountedSaleIds))
+            ? $decodeCursor($cursorRaw)
+            : null;
+
+        $dbDriver = DB::getDriverName();
+        $isMysqlLike = in_array($dbDriver, ['mysql', 'mariadb'], true);
+        $hasSalesDateIdx = false;
+        $hasSalesLateIdx = false;
+        if ($legacyEligible && $isMysqlLike && ($hasInactiveSales || $hasLateOfflineSales)) {
+            $dbName = (string)(DB::getDatabaseName() ?? 'default');
+            $idxFlags = Cache::remember("pos_sales_reg_idx_v1:{$dbName}", 3600, static function () {
+                $rows = DB::select("SHOW INDEX FROM `sales` WHERE Key_name IN ('sales_date_index', 'idx_sales_late_status')");
+                $found = [];
+                foreach ($rows as $r) {
+                    $found[(string)($r->Key_name ?? '')] = true;
+                }
+                return [
+                    'date' => isset($found['sales_date_index']),
+                    'late' => isset($found['idx_sales_late_status']),
+                ];
+            });
+            $hasSalesDateIdx = !empty($idxFlags['date']);
+            $hasSalesLateIdx = !empty($idxFlags['late']);
+        }
+
+        // 2A. Keyset Cursor Fast Path (Page 2+ skip_summary=1 with cursor & no real registers -> ~10ms!)
+        if ($cursorPayload !== null) {
+            $cursorDayEnd = substr($cursorPayload['o'], 0, 10) . ' 23:59:59';
+            $fetchLimit = max(800, $perPage * 16);
+            $useDateIdxHint = $hasSalesDateIdx
+                && ($hasInactiveSales || $hasLateOfflineSales)
+                && empty($allowedOutlets)
+                && $targetWarehouseId === null
+                && $targetWarehouseName === null
+                && ($cashier === 'All' || $cashier === '');
+            $cq = $useDateIdxHint
+                ? DB::table(DB::raw('`sales` FORCE INDEX (`sales_date_index`)'))
+                : DB::table('sales');
+            $applyLegacyScope($cq);
+            $cq->where('date', '<=', $cursorDayEnd)
+                ->orderByDesc('date')
+                ->limit($fetchLimit)
+                ->select(['date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total']);
+            $rawChunk = $fetchRawRows($cq);
+            $hitLimit = count($rawChunk) >= $fetchLimit;
+            $dropDate = $hitLimit ? substr((string)$rawChunk[count($rawChunk) - 1][0], 0, 10) : null;
+
+            $chunkGroups = [];
+            foreach ($rawChunk as $r) {
+                $d = (string)$r[0];
+                $sDate = substr($d, 0, 10);
+                if ($dropDate !== null && $sDate === $dropDate) {
+                    continue;
+                }
+                $wId = (int)($r[1] ?? 1);
+                $wName = ($r[2] !== null && $r[2] !== '') ? (string)$r[2] : 'Main Branch Outlet';
+                $cName = ($r[3] !== null && $r[3] !== '') ? (string)$r[3] : 'Super Admin';
+                $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
+                $gt = (float)$r[4];
+                if (!isset($chunkGroups[$gKey])) {
+                    $chunkGroups[$gKey] = [$sDate, $d, $d, $wId, $wName, $cName, 1, $gt];
                 } else {
-                    if ((float)$item['cash_sales'] > 0) {
-                        $tenderAgg['Cash'] = [
-                            'count' => ($tenderAgg['Cash']['count'] ?? 0) + (int)$item['total_transactions'],
-                            'total_amount' => ($tenderAgg['Cash']['total_amount'] ?? 0.0) + (float)$item['cash_sales'],
-                        ];
-                    }
-                    if ((float)$item['card_sales'] > 0) {
-                        $tenderAgg['Card'] = [
-                            'count' => ($tenderAgg['Card']['count'] ?? 0) + 1,
-                            'total_amount' => ($tenderAgg['Card']['total_amount'] ?? 0.0) + (float)$item['card_sales'],
-                        ];
-                    }
-                    if ((float)$item['digital_sales'] > 0) {
-                        $tenderAgg['Digital'] = [
-                            'count' => ($tenderAgg['Digital']['count'] ?? 0) + 1,
-                            'total_amount' => ($tenderAgg['Digital']['total_amount'] ?? 0.0) + (float)$item['digital_sales'],
-                        ];
-                    }
+                    $g = &$chunkGroups[$gKey];
+                    $g[6]++;
+                    $g[7] += $gt;
+                    if ($d < $g[1]) $g[1] = $d;
+                    if ($d > $g[2]) $g[2] = $d;
+                    unset($g);
+                }
+            }
+            $chunkList = array_values($chunkGroups);
+            usort($chunkList, $compareLegacyGroup);
+
+            $cursorTuple = [
+                substr($cursorPayload['o'], 0, 10),
+                $cursorPayload['o'],
+                $cursorPayload['o'],
+                $cursorPayload['w'],
+                $cursorPayload['wn'],
+                $cursorPayload['c'],
+                0,
+                0.0,
+            ];
+            $afterCursor = [];
+            foreach ($chunkList as $g) {
+                // Strictly after cursor in descending sort order
+                if ($compareLegacyGroup($cursorTuple, $g) < 0) {
+                    $afterCursor[] = $g;
                 }
             }
 
+            if (count($afterCursor) >= $perPage || !$hitLimit) {
+                $usedCursorFastPath = true;
+                $pageGroups = array_slice($afterCursor, 0, $perPage);
+                $targetKeys = [];
+                $minD = null;
+                $maxD = null;
+                foreach ($pageGroups as $g) {
+                    $gKey = $g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5];
+                    $targetKeys[$gKey] = true;
+                    if ($minD === null || $g[0] < $minD) $minD = $g[0];
+                    if ($maxD === null || $g[0] > $maxD) $maxD = $g[0];
+                }
+                $dateBounds = ($minD !== null && $maxD !== null) ? [$minD . ' 00:00:00', $maxD . ' 23:59:59'] : null;
+                $pageTenders = $resolveTendersForGroups($targetKeys, $dateBounds);
+
+                $seqCursor = $cursorPayload['s'];
+                foreach ($pageGroups as $g) {
+                    $seqCursor++;
+                    $gKey = $g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5];
+                    $pagedRaw[] = $buildLegacyItem($g, $seqCursor, $pageTenders[$gKey] ?? []);
+                }
+                $totalSessions = $knownTotal;
+                $hasMore = ($offset + count($pagedRaw)) < $totalSessions && !empty($pageGroups);
+                if ($hasMore) {
+                    $nextCursor = $encodeCursor($pageGroups[count($pageGroups) - 1], $seqCursor);
+                }
+            }
+        }
+
+        // 2B. Standard Fast Path (Page 1 full summary OR offset without cursor) & 2C. Post-Filter Path
+        if (!$usedCursorFastPath) {
+            $legacyGroupsList = [];
+            $legacyTotalSales = 0.0;
+            $legacyTotalTx = 0;
+            $legacyTotalPaid = 0.0;
+            $legacyPaidSalesCount = 0;
+
+            if ($legacyEligible) {
+                $hasAccounted = !empty($accountedSaleIds);
+                $ignoreLateIdxHint = $hasSalesLateIdx
+                    && $hasLateOfflineSales
+                    && empty($allowedOutlets)
+                    && $targetWarehouseId === null
+                    && $targetWarehouseName === null
+                    && ($cashier === 'All' || $cashier === '')
+                    && $startDate === ''
+                    && $endDate === '';
+                $lq = $ignoreLateIdxHint
+                    ? DB::table(DB::raw('`sales` IGNORE INDEX (`idx_sales_late_status`)'))
+                    : DB::table('sales');
+                $applyLegacyScope($lq);
+                $lq->select($hasAccounted
+                    ? ['date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total', 'paid_amount', 'id']
+                    : ['date', 'warehouse_id', 'warehouse_name', 'created_by', 'grand_total', 'paid_amount']);
+
+                $rawSales = $fetchRawRows($lq);
+                $groupedMap = [];
+                foreach ($rawSales as $r) {
+                    if ($hasAccounted && isset($accountedSaleIds[(int)$r[6]])) {
+                        continue;
+                    }
+                    $d = (string)$r[0];
+                    $sDate = substr($d, 0, 10);
+                    $wId = (int)($r[1] ?? 1);
+                    $wName = ($r[2] !== null && $r[2] !== '') ? (string)$r[2] : 'Main Branch Outlet';
+                    $cName = ($r[3] !== null && $r[3] !== '') ? (string)$r[3] : 'Super Admin';
+                    $gKey = $sDate . '|' . $wId . '|' . $wName . '|' . $cName;
+                    $gt = (float)$r[4];
+                    $paidAmt = max(0.0, (float)($r[5] ?? 0));
+                    $legacyTotalSales += $gt;
+                    $legacyTotalTx++;
+                    if ($paidAmt > 0.0001) {
+                        $legacyTotalPaid += $paidAmt;
+                        $legacyPaidSalesCount++;
+                    }
+
+                    if (!isset($groupedMap[$gKey])) {
+                        $groupedMap[$gKey] = [$sDate, $d, $d, $wId, $wName, $cName, 1, $gt];
+                        $cleanCashier = trim(explode('(', $cName)[0]) ?: 'Super Admin';
+                        $availCashiers[$cleanCashier] = true;
+                    } else {
+                        $g = &$groupedMap[$gKey];
+                        $g[6]++;
+                        $g[7] += $gt;
+                        if ($d < $g[1]) $g[1] = $d;
+                        if ($d > $g[2]) $g[2] = $d;
+                        unset($g);
+                    }
+                }
+                unset($rawSales);
+
+                $legacyGroupsList = array_values($groupedMap);
+                unset($groupedMap);
+                usort($legacyGroupsList, $compareLegacyGroup);
+            }
+
+            $realItemsCount = count($items);
+            $legacyCount = count($legacyGroupsList);
+
+            if ($isStandardNoPostFilter) {
+                // Register names for legacy shifts cycle deterministically over Register 01..03
+                $regLimit = min(3, $legacyCount);
+                for ($ri = 0; $ri < $regLimit; $ri++) {
+                    $rSeq = $realItemsCount + 1 + $ri;
+                    $availRegisters['Register ' . str_pad((string)(($rSeq % 3) + 1), 2, '0', STR_PAD_LEFT)] = true;
+                }
+
+                // Merge real registers + lightweight legacy descriptors in unified deterministic order (opened_at DESC, id DESC)
+                $totalSessions = ($skipSummary && $knownTotal !== null) ? $knownTotal : ($realItemsCount + $legacyCount);
+
+                $pageLegacyEntries = [];
+                $pageSlots = [];
+
+                if ($realItemsCount === 0) {
+                    $slicedLegacy = array_slice($legacyGroupsList, $offset, $perPage);
+                    foreach ($slicedLegacy as $i => $g) {
+                        $curSeq = $offset + 1 + $i;
+                        $pageSlots[] = ['is_legacy' => true, 'g' => $g, 'seq' => $curSeq];
+                        $pageLegacyEntries[] = [$g, $curSeq];
+                    }
+                } else {
+                    $mergedIndex = [];
+                    foreach ($items as $idx => $it) {
+                        $mergedIndex[] = [
+                            'is_legacy' => false,
+                            'idx' => $idx,
+                            'opened_at' => (string)($it['opened_at'] ?: ($it['date'] ?? '')),
+                            'id' => (int)($it['id'] ?? 0),
+                        ];
+                    }
+                    foreach ($legacyGroupsList as $idx => $g) {
+                        $curSeq = $realItemsCount + 1 + $idx;
+                        $mergedIndex[] = [
+                            'is_legacy' => true,
+                            'idx' => $idx,
+                            'seq' => $curSeq,
+                            'opened_at' => $g[1],
+                            'id' => $legacyIdBase + $curSeq,
+                        ];
+                    }
+                    usort($mergedIndex, static function (array $a, array $b): int {
+                        $cmp = strcmp($b['opened_at'], $a['opened_at']);
+                        return $cmp !== 0 ? $cmp : ($b['id'] <=> $a['id']);
+                    });
+                    $slicedSlots = array_slice($mergedIndex, $offset, $perPage);
+                    foreach ($slicedSlots as $slot) {
+                        if ($slot['is_legacy']) {
+                            $g = $legacyGroupsList[$slot['idx']];
+                            $pageSlots[] = ['is_legacy' => true, 'g' => $g, 'seq' => $slot['seq']];
+                            $pageLegacyEntries[] = [$g, $slot['seq']];
+                        } else {
+                            $pageSlots[] = ['is_legacy' => false, 'item' => $items[$slot['idx']]];
+                        }
+                    }
+                }
+
+                // Resolve tenders ONLY for the <= 50 legacy rows displayed on this page!
+                $pageTenders = [];
+                if (!empty($pageLegacyEntries)) {
+                    $targetKeys = [];
+                    $minD = null;
+                    $maxD = null;
+                    foreach ($pageLegacyEntries as [$g, $curSeq]) {
+                        $gKey = $g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5];
+                        $targetKeys[$gKey] = true;
+                        if ($minD === null || $g[0] < $minD) $minD = $g[0];
+                        if ($maxD === null || $g[0] > $maxD) $maxD = $g[0];
+                    }
+                    $dateBounds = ($minD !== null && $maxD !== null) ? [$minD . ' 00:00:00', $maxD . ' 23:59:59'] : null;
+                    $pageTenders = $resolveTendersForGroups($targetKeys, $dateBounds);
+                }
+
+                foreach ($pageSlots as $slot) {
+                    if ($slot['is_legacy']) {
+                        $g = $slot['g'];
+                        $gKey = $g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5];
+                        $pagedRaw[] = $buildLegacyItem($g, $slot['seq'], $pageTenders[$gKey] ?? []);
+                    } else {
+                        $pagedRaw[] = $slot['item'];
+                    }
+                }
+
+                $hasMore = ($offset + count($pagedRaw)) < $totalSessions;
+                if ($hasMore && $realItemsCount === 0 && !empty($pageLegacyEntries)) {
+                    [$lastG, $lastSeq] = $pageLegacyEntries[count($pageLegacyEntries) - 1];
+                    $nextCursor = $encodeCursor($lastG, $lastSeq);
+                }
+
+                // Compute exact global summary via fast SQL tender aggregation (zero PHP streaming of 9,500 payments!)
+                if (!$skipSummary) {
+                    foreach ($items as $realItem) {
+                        $accumulateSummaryItem($realItem);
+                    }
+
+                    if ($legacyCount > 0) {
+                        $totalShiftSales += $legacyTotalSales;
+                        $totalTxSum += $legacyTotalTx;
+                        $closedSessionsCount += $legacyCount;
+
+                        $legacyGlobalCash = 0.0;
+                        $legacyGlobalNonCash = 0.0;
+                        $addGlobalTender = function (string $rawPt, int $cnt, float $amt) use (
+                            $accounting,
+                            &$tenderAgg,
+                            &$legacyGlobalCash,
+                            &$legacyGlobalNonCash,
+                            &$availPayTypes
+                        ): void {
+                            if ($amt <= 0.0001 && $cnt <= 0) {
+                                return;
+                            }
+                            $mName = $this->normalizePaymentMethodName($rawPt !== '' ? $rawPt : 'Cash');
+                            if (!isset($tenderAgg[$mName])) {
+                                $tenderAgg[$mName] = ['count' => 0, 'total_amount' => 0.0];
+                            }
+                            $tenderAgg[$mName]['count'] += $cnt;
+                            $tenderAgg[$mName]['total_amount'] += $amt;
+                            $availPayTypes[$mName] = true;
+                            if ($accounting->isCashPaymentType($mName)) {
+                                $legacyGlobalCash += $amt;
+                            } else {
+                                $legacyGlobalNonCash += $amt;
+                            }
+                        };
+
+                        $isCompletelyUnfiltered = empty($allowedOutlets)
+                            && $targetWarehouseId === null
+                            && $targetWarehouseName === null
+                            && ($cashier === 'All' || $cashier === '')
+                            && $startDate === ''
+                            && $endDate === ''
+                            && empty($accountedSaleIds);
+
+                        $canUsePureSpIndex = false;
+                        $spGlobalTotalAmt = 0.0;
+                        if ($hasSpTable) {
+                            if ($isCompletelyUnfiltered) {
+                                $canUsePureSpIndex = !$hasInactiveSales && !$hasLateOfflineSales;
+                            }
+
+                            if ($canUsePureSpIndex) {
+                                // 100% covering index scan on idx_sp_pt_amt_sale (direct column GROUP BY — zero temp table!)
+                                $globalSpRows = DB::table('sale_payments')
+                                    ->selectRaw("
+                                        payment_type as pt,
+                                        COUNT(*) as cnt,
+                                        SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as amt
+                                    ")
+                                    ->groupBy('payment_type')
+                                    ->get();
+                                foreach ($globalSpRows as $gr) {
+                                    $amt = (float)$gr->amt;
+                                    $spGlobalTotalAmt += $amt;
+                                    $addGlobalTender(trim((string)($gr->pt ?? '')), (int)$gr->cnt, $amt);
+                                }
+                            } else {
+                                $accountedCount = count($accountedSaleIds);
+                                $gSpQ = DB::table('sale_payments as sp')
+                                    ->join('sales as s', 's.id', '=', 'sp.sale_id');
+                                $applyLegacyScope($gSpQ, 's.');
+                                if ($accountedCount > 0 && $accountedCount <= 400) {
+                                    $gSpQ->whereNotIn('s.id', array_keys($accountedSaleIds));
+                                }
+                                if ($accountedCount > 400) {
+                                    foreach ($gSpQ->select(['s.id', 'sp.payment_type', 'sp.amount'])->cursor() as $gr) {
+                                        if (isset($accountedSaleIds[(int)$gr->id])) {
+                                            continue;
+                                        }
+                                        $amt = max(0.0, (float)$gr->amount);
+                                        $spGlobalTotalAmt += $amt;
+                                        $addGlobalTender(trim((string)($gr->payment_type ?? '')), 1, $amt);
+                                    }
+                                } else {
+                                    $globalSpRows = $gSpQ->selectRaw("
+                                        sp.payment_type as pt,
+                                        COUNT(*) as cnt,
+                                        SUM(CASE WHEN sp.amount > 0 THEN sp.amount ELSE 0 END) as amt
+                                    ")
+                                    ->groupBy('sp.payment_type')
+                                    ->get();
+                                    foreach ($globalSpRows as $gr) {
+                                        $amt = (float)$gr->amt;
+                                        $spGlobalTotalAmt += $amt;
+                                        $addGlobalTender(trim((string)($gr->pt ?? '')), (int)$gr->cnt, $amt);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Fallback: legacy sales with paid_amount > 0 and no sale_payments rows.
+                        // Skip the expensive NOT EXISTS anti-join when 0 paid sales exist OR when
+                        // pure sale_payments already reconciles 100% of paid_amount AND paid sale count.
+                        $skipFbGlobal = ($legacyPaidSalesCount === 0);
+                        if (!$skipFbGlobal && $hasSpTable && $canUsePureSpIndex && abs($legacyTotalPaid - $spGlobalTotalAmt) <= 0.01) {
+                            $spDistinctPaidSales = (int)DB::table('sale_payments')
+                                ->where('amount', '>', 0.0001)
+                                ->distinct()
+                                ->count('sale_id');
+                            if ($spDistinctPaidSales >= $legacyPaidSalesCount) {
+                                $skipFbGlobal = true;
+                            }
+                        }
+
+                        if (!$skipFbGlobal) {
+                            $fbGlobalQ = DB::table('sales as s')->where('s.paid_amount', '>', 0.0001);
+                            $applyLegacyScope($fbGlobalQ, 's.');
+                            if ($hasSpTable) {
+                                $fbGlobalQ->whereNotExists(function ($sub) {
+                                    $sub->select(DB::raw(1))
+                                        ->from('sale_payments as sp')
+                                        ->whereColumn('sp.sale_id', 's.id');
+                                });
+                            }
+                            $accountedCount = count($accountedSaleIds);
+                            if ($accountedCount > 0 && $accountedCount <= 400) {
+                                $fbGlobalQ->whereNotIn('s.id', array_keys($accountedSaleIds));
+                            }
+                            if ($accountedCount > 400) {
+                                foreach ($fbGlobalQ->select(['s.id', 's.payment_type', 's.paid_amount'])->cursor() as $fr) {
+                                    if (isset($accountedSaleIds[(int)$fr->id])) {
+                                        continue;
+                                    }
+                                    $addGlobalTender(trim((string)($fr->payment_type ?? '')), 1, max(0.0, (float)$fr->paid_amount));
+                                }
+                            } else {
+                                $fbGlobalRows = $fbGlobalQ->selectRaw("
+                                    s.payment_type as pt,
+                                    COUNT(*) as cnt,
+                                    SUM(CASE WHEN s.paid_amount > 0 THEN s.paid_amount ELSE 0 END) as amt
+                                ")
+                                ->groupBy('s.payment_type')
+                                ->get();
+                                foreach ($fbGlobalRows as $fr) {
+                                    $addGlobalTender(trim((string)($fr->pt ?? '')), (int)$fr->cnt, (float)$fr->amt);
+                                }
+                            }
+                        }
+
+                        $totalCashSales += $legacyGlobalCash;
+                        $totalNonCashSales += $legacyGlobalNonCash;
+                        $totalExpectedCash += $legacyGlobalCash;
+                        $totalClosingCash += $legacyGlobalCash;
+                    }
+                }
+            } else {
+                // 2C. Post-Group Filtered Path (register / payment_type / search filter active)
+                $allTargetKeys = [];
+                foreach ($legacyGroupsList as $g) {
+                    $allTargetKeys[$g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5]] = true;
+                }
+                $allTenders = $resolveTendersForGroups($allTargetKeys, null);
+
+                $seq = $realItemsCount + 1;
+                foreach ($legacyGroupsList as $g) {
+                    $curSeq = $seq++;
+                    $gKey = $g[0] . '|' . $g[3] . '|' . $g[4] . '|' . $g[5];
+                    $built = $buildLegacyItem($g, $curSeq, $allTenders[$gKey] ?? []);
+
+                    $availRegisters[$built['register_id']] = true;
+                    $availCashiers[$built['cashier_name']] = true;
+                    foreach ($built['payment_breakdown'] as $pb) {
+                        if (!empty($pb['method']) && ((float)($pb['amount'] ?? 0) > 0 || (int)($pb['count'] ?? 0) > 0)) {
+                            $availPayTypes[(string)$pb['method']] = true;
+                        }
+                    }
+
+                    if ($registerFilter !== 'All' && !empty($registerFilter) && strcasecmp($built['register_id'], $registerFilter) !== 0) {
+                        continue;
+                    }
+                    if (!$matchesPaymentFilter($built['primary_payment_type'], $built['payment_breakdown'], (string)$paymentTypeFilter)) {
+                        continue;
+                    }
+                    if ($search !== '') {
+                        $q = strtolower($search);
+                        $matched = str_contains(strtolower($built['reference_no']), $q)
+                            || str_contains(strtolower($built['register_id']), $q)
+                            || str_contains(strtolower((string)$built['warehouse_name']), $q)
+                            || str_contains(strtolower($built['cashier_name']), $q)
+                            || str_contains((string)$built['date'], $q);
+                        if (!$matched) {
+                            continue;
+                        }
+                    }
+
+                    $items[] = $built;
+                }
+
+                usort($items, static function (array $a, array $b): int {
+                    $aKey = (string)($a['opened_at'] ?: ($a['date'] ?? ''));
+                    $bKey = (string)($b['opened_at'] ?: ($b['date'] ?? ''));
+                    $cmp = strcmp($bKey, $aKey);
+                    if ($cmp === 0) {
+                        return ((int)($b['id'] ?? 0)) <=> ((int)($a['id'] ?? 0));
+                    }
+                    return $cmp;
+                });
+
+                if (!$skipSummary) {
+                    foreach ($items as $item) {
+                        $accumulateSummaryItem($item);
+                    }
+                }
+
+                $totalSessions = ($skipSummary && $knownTotal !== null) ? $knownTotal : count($items);
+                $pagedRaw = array_slice($items, $offset, $perPage);
+                $hasMore = ($offset + count($pagedRaw)) < $totalSessions;
+            }
+        }
+
+        if (!$skipSummary) {
             $totalTenderCollected = array_sum(array_column($tenderAgg, 'total_amount'));
             foreach ($tenderAgg as $method => $tData) {
                 if ($tData['total_amount'] > 0 || $tData['count'] > 0) {
@@ -11456,13 +12087,7 @@ class ReportController extends Controller
             'total_variance' => $canViewCost ? round($totalVariance, 2) : 0.0,
         ];
 
-        $totalSessions = ($skipSummary && $knownTotal !== null) ? $knownTotal : count($items);
-        $offset = ($page - 1) * $perPage;
-        $sliceOffset = $canSliceLegacyBeforeTenders ? max(0, $offset - $skippedRealRegsCount - $legacySliceOffset) : $offset;
-        $pagedRaw = array_slice($items, $sliceOffset, $perPage);
-        $hasMore = ($offset + count($pagedRaw)) < $totalSessions;
-
-        // Only mask the 50 paged items (not all 3,200!)
+        // Only mask the <= 50 paged items (not all 3,200!)
         $pagedSessions = !$canViewCost
             ? array_map(function ($row) {
                 $masked = $this->maskAssocNumericKeys(
@@ -11482,8 +12107,12 @@ class ReportController extends Controller
         $availableCashiers = [];
         $availablePaymentTypes = [];
         if (!$skipSummary && $page === 1) {
-            $availableRegisters = array_keys($availRegisters);
-            if ($accounting->schemaHasTable('cash_registers')) {
+            $realRegsAlreadyUnfiltered = ($targetWarehouseId === null
+                && $targetWarehouseName === null
+                && ($cashier === 'All' || $cashier === '')
+                && $startDate === ''
+                && $endDate === '');
+            if (!$realRegsAlreadyUnfiltered && $accounting->schemaHasTable('cash_registers')) {
                 foreach (DB::table('cash_registers')
                     ->when(!empty($allowedOutlets), fn ($q) => $q->whereIn('warehouse_id', $allowedOutlets))
                     ->whereNotNull('register_name')->where('register_name', '!=', '')
@@ -11558,6 +12187,7 @@ class ReportController extends Controller
                 'total' => $totalSessions,
                 'last_page' => max(1, (int)ceil($totalSessions / max(1, $perPage))),
                 'has_more' => $hasMore,
+                'next_cursor' => $nextCursor,
             ],
         ]);
     }
@@ -13956,8 +14586,10 @@ class ReportController extends Controller
     public function stockLedgerReport(Request $request)
     {
         $warehouse = $request->input('warehouse_name') ?? $request->input('warehouse', 'All');
-        $startDate = $request->input('start_date') ?? $request->input('from_date', Carbon::now()->startOfMonth()->toDateString());
-        $endDate = $request->input('end_date') ?? $request->input('to_date', Carbon::now()->toDateString());
+        $rawStart = $request->input('start_date') ?? $request->input('from_date');
+        $rawEnd = $request->input('end_date') ?? $request->input('to_date');
+        $startDate = is_scalar($rawStart) ? trim((string)$rawStart) : '';
+        $endDate = is_scalar($rawEnd) ? trim((string)$rawEnd) : '';
         $movementTypeRaw = trim((string)$request->input('movement_type', 'All'));
         $movementTypeLower = strtolower($movementTypeRaw);
         $movementType = ($movementTypeLower === '' || $movementTypeLower === 'all') ? 'All' : $movementTypeLower;
@@ -13983,8 +14615,8 @@ class ReportController extends Controller
             }
         }
 
-        $fromDateTime = $accounting->normalizeFilterBoundaryDate((string)$startDate, false);
-        $toDateTime = $accounting->normalizeFilterBoundaryDate((string)$endDate, true);
+        $fromDateTime = $startDate !== '' ? $accounting->normalizeFilterBoundaryDate($startDate, false) : null;
+        $toDateTime = $endDate !== '' ? $accounting->normalizeFilterBoundaryDate($endDate, true) : null;
 
         $effAdjTypeSql = $this->effectiveAdjustmentTypeSql();
         $saleBaseQtySql = 'COALESCE(NULLIF(sale_items.base_quantity, 0), sale_items.quantity * COALESCE(NULLIF(sale_items.conversion_rate, 0), 1))';
@@ -14041,7 +14673,9 @@ class ReportController extends Controller
                 $q->where(function ($sub) use ($like, $prodNameCol, $prodCodeCol, $refCol, $whNameCol, $createdByCol, $userNameCol) {
                     $sub->where($refCol, 'like', $like)
                         ->orWhere($prodNameCol, 'like', $like)
+                        ->orWhere('products.name', 'like', $like)
                         ->orWhere($prodCodeCol, 'like', $like)
+                        ->orWhere('products.code', 'like', $like)
                         ->orWhere('products.alternative_name', 'like', $like)
                         ->orWhere($whNameCol, 'like', $like);
                     if ($createdByCol !== null) {
@@ -14088,18 +14722,40 @@ class ReportController extends Controller
             $adjVariantExpr = $hasAdjVariantCol ? 'stock_adjustment_items.product_variant_id as variant_id' : 'NULL as variant_id';
             $trfVariantExpr = $hasTrfVariantCol ? 'stock_transfer_items.product_variant_id as variant_id' : 'NULL as variant_id';
 
+            $hasPurchaseItemBatches = $wantPurchase
+                && $canViewCost
+                && $accounting->schemaHasTable('inventory_batches')
+                && DB::table('inventory_batches')->whereNotNull('purchase_item_id')->exists();
+            $hasSaleReturnCostLayers = $wantSaleReturn
+                && $canViewCost
+                && $accounting->schemaHasTable('sale_return_cost_layers')
+                && DB::table('sale_return_cost_layers')->exists();
+            $hasPurchReturnCostLayers = $wantPurchReturn
+                && $canViewCost
+                && $accounting->schemaHasTable('purchase_return_cost_layers')
+                && DB::table('purchase_return_cost_layers')->exists();
+            $hasPrVoidBatches = $hasSmPurchRetVoid
+                && $canViewCost
+                && $accounting->schemaHasTable('inventory_batches')
+                && DB::table('inventory_batches')->where('source_type', 'purchase_return_void')->exists();
+
             $branches = [];
 
             if ($wantSale) {
                 $saleUnitCostExpr = "CASE WHEN {$saleBaseQtySql} > 0 AND COALESCE(sale_items.total_cogs, 0) > 0 THEN sale_items.total_cogs / {$saleBaseQtySql} ELSE COALESCE(NULLIF(product_variants.cost_price, 0), products.cost_price, products.purchase_price, 0) END";
+                $saleProdNameSql = $this->canonicalProductNameSql('sale_items.product_name');
                 $buildSalesQ = function (bool $forSummary) use (
                     $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
                     $saleBaseQtySql, $saleUnitCostExpr, $canViewCost, $hasCategory, $hasSearch
                 ) {
                     $q = DB::table('sale_items')
-                        ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-                        ->where('sales.date', '>=', $fromDateTime)
-                        ->where('sales.date', '<=', $toDateTime);
+                        ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
+                    if ($fromDateTime !== null) {
+                        $q->where('sales.date', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->where('sales.date', '<=', $toDateTime);
+                    }
                     $this->applyActiveDocumentFilter($q, 'sales.status');
                     $applyWhScope($q, 'sales.warehouse_name', 'sales.warehouse_id');
                     if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
@@ -14125,7 +14781,7 @@ class ReportController extends Controller
                         DB::raw("'sale' as movement_type"),
                         DB::raw("'Sale Out' as type_label"),
                         'sale_items.product_id',
-                        'sale_items.product_name',
+                        DB::raw("{$saleProdNameSql} as product_name"),
                         'sale_items.product_code',
                         DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
                         'products.category_name',
@@ -14147,9 +14803,10 @@ class ReportController extends Controller
             }
 
             if ($wantPurchase) {
-                $purchBatchCostSub = $accounting->schemaHasTable('inventory_batches')
+                $purchBatchCostSub = $hasPurchaseItemBatches
                     ? "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.purchase_item_id = purchase_items.id), 0), "
                     : '';
+                $purchProdNameSql = $this->canonicalProductNameSql('purchase_items.product_name');
                 $purchUnitCostExpr = "COALESCE("
                     . $purchBatchCostSub
                     . "NULLIF(purchase_items.base_unit_cost, 0), "
@@ -14160,9 +14817,13 @@ class ReportController extends Controller
                     $movementType, $canViewCost, $hasCategory, $hasSearch
                 ) {
                     $q = DB::table('purchase_items')
-                        ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
-                        ->where('purchases.date', '>=', $fromDateTime)
-                        ->where('purchases.date', '<=', $toDateTime);
+                        ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id');
+                    if ($fromDateTime !== null) {
+                        $q->where('purchases.date', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->where('purchases.date', '<=', $toDateTime);
+                    }
                     if ($exactStatus !== null) {
                         $q->where('purchases.status', $exactStatus);
                     } else {
@@ -14187,7 +14848,7 @@ class ReportController extends Controller
                     DB::raw("'purchase' as movement_type"),
                     DB::raw("CASE WHEN COALESCE(LOWER(TRIM(purchases.payment_type)), '') = 'opening stock' THEN 'Opening Stock In' ELSE 'Purchase In' END as type_label"),
                     'purchase_items.product_id',
-                    'purchase_items.product_name',
+                    DB::raw("{$purchProdNameSql} as product_name"),
                     'purchase_items.product_code',
                     DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
                     'products.category_name',
@@ -14226,9 +14887,13 @@ class ReportController extends Controller
                         ->leftJoin('product_variants', 'stock_movements.product_variant_id', '=', 'product_variants.id')
                         ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
                         ->where('stock_movements.movement_type', 'opening_stock')
-                        ->where('stock_movements.reference_type', 'product_update')
-                        ->where('stock_movements.created_at', '>=', $fromDateTime)
-                        ->where('stock_movements.created_at', '<=', $toDateTime);
+                        ->where('stock_movements.reference_type', 'product_update');
+                    if ($fromDateTime !== null) {
+                        $opUpdQ->where('stock_movements.created_at', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $opUpdQ->where('stock_movements.created_at', '<=', $toDateTime);
+                    }
                     if (!empty($allowedOutlets)) {
                         $opUpdQ->whereIn('stock_movements.warehouse_id', $allowedOutlets);
                     }
@@ -14259,7 +14924,7 @@ class ReportController extends Controller
                         'unitCostExpr' => $opUnitCostExpr,
                         'rowQuery' => (clone $opUpdQ)->select([
                             'stock_movements.id as source_id',
-                            DB::raw('0 as item_row_id'),
+                            DB::raw('stock_movements.id as item_row_id'),
                             'stock_movements.product_variant_id as variant_id',
                             DB::raw("{$opRefExpr} as reference_no"),
                             DB::raw("'opening_stock' as movement_type"),
@@ -14289,6 +14954,7 @@ class ReportController extends Controller
 
             if ($wantAdjust) {
                 $adjUnitCostExpr = 'COALESCE(NULLIF(stock_adjustment_items.base_unit_cost, 0), CASE WHEN COALESCE(stock_adjustment_items.conversion_rate, 1) > 0 THEN stock_adjustment_items.unit_cost / stock_adjustment_items.conversion_rate ELSE stock_adjustment_items.unit_cost END, products.cost_price, 0)';
+                $adjProdNameSql = $this->canonicalProductNameSql('stock_adjustment_items.product_name');
                 $adjInFilter = ($wantInOnly || $movementType === 'adjustment_in');
                 $adjOutFilter = ($wantOutOnly || $movementType === 'adjustment_out');
                 $adjQtyInExpr = "CASE WHEN {$effAdjTypeSql} = 'addition' THEN {$adjBaseQtySql} ELSE 0 END";
@@ -14299,9 +14965,13 @@ class ReportController extends Controller
                     $effAdjTypeSql, $adjInFilter, $adjOutFilter, $canViewCost, $hasCategory, $hasSearch
                 ) {
                     $q = DB::table('stock_adjustment_items')
-                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-                        ->where('stock_adjustments.date', '>=', $fromDateTime)
-                        ->where('stock_adjustments.date', '<=', $toDateTime);
+                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
+                    if ($fromDateTime !== null) {
+                        $q->where('stock_adjustments.date', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->where('stock_adjustments.date', '<=', $toDateTime);
+                    }
                     if ($adjInFilter && !$adjOutFilter) {
                         $q->whereRaw("{$effAdjTypeSql} = 'addition'");
                     } elseif ($adjOutFilter && !$adjInFilter) {
@@ -14315,20 +14985,70 @@ class ReportController extends Controller
                     return $q;
                 };
 
+                // Indexed header-first top-N fetcher: avoids MariaDB/MySQL scanning all
+                // stock_adjustment_items + filesort (~220ms -> ~2ms) when no item-level filter applies.
+                $adjFastRowFetcher = (!$hasCategory && !$hasSearch && !$adjInFilter && !$adjOutFilter)
+                    ? function (int $limit) use ($fromDateTime, $toDateTime, $applyWhScope, $buildAdjQ, $adjVariantExpr, $effAdjTypeSql, $adjProdNameSql, $adjQtyInExpr, $adjQtyOutExpr, $adjUnitCostExpr) {
+                        $hdrQ = DB::table('stock_adjustments')->select('id');
+                        if ($fromDateTime !== null) {
+                            $hdrQ->where('date', '>=', $fromDateTime);
+                        }
+                        if ($toDateTime !== null) {
+                            $hdrQ->where('date', '<=', $toDateTime);
+                        }
+                        $applyWhScope($hdrQ, 'warehouse_name', 'warehouse_id');
+                        $topIds = $hdrQ->orderByDesc('date')->orderByDesc('id')->limit($limit)->pluck('id')->all();
+                        if (empty($topIds)) {
+                            return collect();
+                        }
+                        return $buildAdjQ(false)
+                            ->whereIn('stock_adjustment_items.stock_adjustment_id', $topIds)
+                            ->select([
+                                'stock_adjustments.id as source_id',
+                                DB::raw('stock_adjustment_items.id as item_row_id'),
+                                DB::raw($adjVariantExpr),
+                                'stock_adjustments.reference_no as reference_no',
+                                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'adjustment_in' ELSE 'adjustment_out' END as movement_type"),
+                                DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'Adjust In' ELSE 'Adjust Out' END as type_label"),
+                                'stock_adjustment_items.product_id',
+                                DB::raw("{$adjProdNameSql} as product_name"),
+                                'stock_adjustment_items.product_code',
+                                DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                                'products.category_name',
+                                'stock_adjustments.warehouse_name',
+                                'stock_adjustments.warehouse_id',
+                                DB::raw("{$adjQtyInExpr} as quantity_in"),
+                                DB::raw("{$adjQtyOutExpr} as quantity_out"),
+                                DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                                DB::raw("{$adjUnitCostExpr} as unit_cost"),
+                                'stock_adjustments.created_by',
+                                'stock_adjustments.user_name',
+                                'stock_adjustments.user_role',
+                                'stock_adjustments.date as date',
+                            ])
+                            ->orderByDesc('stock_adjustments.date')
+                            ->orderByDesc('stock_adjustments.id')
+                            ->orderByDesc('stock_adjustment_items.id')
+                            ->limit($limit)
+                            ->get();
+                    }
+                    : null;
+
                 $branches[] = [
                     'sumQuery' => $buildAdjQ(true),
                     'qtyInExpr' => $adjQtyInExpr,
                     'qtyOutExpr' => $adjQtyOutExpr,
                     'unitCostExpr' => $adjUnitCostExpr,
+                    'fastRowFetcher' => $adjFastRowFetcher,
                     'rowQuery' => $buildAdjQ(false)->select([
                         'stock_adjustments.id as source_id',
-                        DB::raw('0 as item_row_id'),
+                        DB::raw('stock_adjustment_items.id as item_row_id'),
                         DB::raw($adjVariantExpr),
                         'stock_adjustments.reference_no as reference_no',
                         DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'adjustment_in' ELSE 'adjustment_out' END as movement_type"),
                         DB::raw("CASE WHEN {$effAdjTypeSql} = 'addition' THEN 'Adjust In' ELSE 'Adjust Out' END as type_label"),
                         'stock_adjustment_items.product_id',
-                        'stock_adjustment_items.product_name',
+                        DB::raw("{$adjProdNameSql} as product_name"),
                         'stock_adjustment_items.product_code',
                         DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
                         'products.category_name',
@@ -14351,14 +15071,19 @@ class ReportController extends Controller
 
             if ($wantTransferOut) {
                 $trfUnitCostExpr = 'COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0)';
+                $trfProdNameSql = $this->canonicalProductNameSql('stock_transfer_items.product_name');
                 $buildTrfOutQ = function (bool $forSummary, ?string $exactStatus = null) use (
                     $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
                     $canViewCost, $hasCategory, $hasSearch
                 ) {
                     $q = DB::table('stock_transfer_items')
-                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                        ->where('stock_transfers.date', '>=', $fromDateTime)
-                        ->where('stock_transfers.date', '<=', $toDateTime);
+                        ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id');
+                    if ($fromDateTime !== null) {
+                        $q->where('stock_transfers.date', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->where('stock_transfers.date', '<=', $toDateTime);
+                    }
                     if ($exactStatus !== null) {
                         $q->where('stock_transfers.status', $exactStatus);
                     } else {
@@ -14374,13 +15099,13 @@ class ReportController extends Controller
 
                 $trfOutSelect = [
                     'stock_transfers.id as source_id',
-                    DB::raw('0 as item_row_id'),
+                    DB::raw('stock_transfer_items.id as item_row_id'),
                     DB::raw($trfVariantExpr),
                     'stock_transfers.reference_no as reference_no',
                     DB::raw("'transfer' as movement_type"),
                     DB::raw("'Transfer Out' as type_label"),
                     'stock_transfer_items.product_id',
-                    'stock_transfer_items.product_name',
+                    DB::raw("{$trfProdNameSql} as product_name"),
                     'stock_transfer_items.product_code',
                     DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
                     'products.category_name',
@@ -14413,15 +15138,20 @@ class ReportController extends Controller
 
             if ($wantTransferIn) {
                 $trfUnitCostExpr = 'COALESCE(NULLIF(stock_transfer_items.base_unit_cost, 0), stock_transfer_items.unit_cost, products.cost_price, 0)';
+                $trfProdNameSql = $this->canonicalProductNameSql('stock_transfer_items.product_name');
                 $buildTrfInQ = function (bool $forSummary) use (
                     $fromDateTime, $toDateTime, $applyWhScope, $applyBranchCatSearch,
                     $canViewCost, $hasCategory, $hasSearch
                 ) {
                     $q = DB::table('stock_transfer_items')
                         ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                        ->where('stock_transfers.status', 'Completed')
-                        ->where('stock_transfers.date', '>=', $fromDateTime)
-                        ->where('stock_transfers.date', '<=', $toDateTime);
+                        ->where('stock_transfers.status', 'Completed');
+                    if ($fromDateTime !== null) {
+                        $q->where('stock_transfers.date', '>=', $fromDateTime);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->where('stock_transfers.date', '<=', $toDateTime);
+                    }
                     $applyWhScope($q, 'stock_transfers.to_warehouse', 'stock_transfers.to_warehouse_id');
                     if (!$forSummary || $hasCategory || $hasSearch || $canViewCost) {
                         $q->leftJoin('products', 'stock_transfer_items.product_id', '=', 'products.id');
@@ -14437,13 +15167,13 @@ class ReportController extends Controller
                     'unitCostExpr' => $trfUnitCostExpr,
                     'rowQuery' => $buildTrfInQ(false)->select([
                         'stock_transfers.id as source_id',
-                        DB::raw('0 as item_row_id'),
+                        DB::raw('stock_transfer_items.id as item_row_id'),
                         DB::raw($trfVariantExpr),
                         'stock_transfers.reference_no as reference_no',
                         DB::raw("'transfer' as movement_type"),
                         DB::raw("'Transfer In' as type_label"),
                         'stock_transfer_items.product_id',
-                        'stock_transfer_items.product_name',
+                        DB::raw("{$trfProdNameSql} as product_name"),
                         'stock_transfer_items.product_code',
                         DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
                         'products.category_name',
@@ -14465,10 +15195,11 @@ class ReportController extends Controller
             }
 
             if ($wantSaleReturn && ($hasSmSaleRet || $hasSmSaleRetVoid)) {
-                $srHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
-                    . "NULLIF((SELECT SUM(srcl.total_cost) / NULLIF(SUM(srcl.base_quantity), 0) FROM sale_return_cost_layers srcl WHERE srcl.sale_return_id = sale_returns.id AND srcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR srcl.product_variant_id = stock_movements.product_variant_id)), 0), "
-                    . "NULLIF((SELECT SUM(srcl2.total_cost) / NULLIF(SUM(srcl2.base_quantity), 0) FROM sale_return_cost_layers srcl2 WHERE srcl2.sale_return_id = sale_returns.id AND srcl2.product_id = stock_movements.product_id), 0), "
-                    . "products.cost_price, products.purchase_price, 0)";
+                $srLayerSub = $hasSaleReturnCostLayers
+                    ? "NULLIF((SELECT SUM(srcl.total_cost) / NULLIF(SUM(srcl.base_quantity), 0) FROM sale_return_cost_layers srcl WHERE srcl.sale_return_id = sale_returns.id AND srcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR srcl.product_variant_id = stock_movements.product_variant_id)), 0), "
+                      . "NULLIF((SELECT SUM(srcl2.total_cost) / NULLIF(SUM(srcl2.base_quantity), 0) FROM sale_return_cost_layers srcl2 WHERE srcl2.sale_return_id = sale_returns.id AND srcl2.product_id = stock_movements.product_id), 0), "
+                    : '';
+                $srHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}{$srLayerSub}products.cost_price, products.purchase_price, 0)";
 
                 $applySmSrFilters = function ($q, array $types, bool $useCreatedAt = false) use (
                     $refIntCast, $srRefFallback, $fromDateTime, $toDateTime,
@@ -14478,9 +15209,13 @@ class ReportController extends Controller
                     $q->leftJoin('sale_returns', DB::raw($refIntCast), '=', 'sale_returns.id')
                         ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
                         ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                        ->whereIn('stock_movements.movement_type', $types)
-                        ->whereRaw("{$dtExpr} >= ?", [$fromDateTime])
-                        ->whereRaw("{$dtExpr} <= ?", [$toDateTime]);
+                        ->whereIn('stock_movements.movement_type', $types);
+                    if ($fromDateTime !== null) {
+                        $q->whereRaw("{$dtExpr} >= ?", [$fromDateTime]);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->whereRaw("{$dtExpr} <= ?", [$toDateTime]);
+                    }
                     if (!empty($allowedOutlets)) {
                         $q->whereRaw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
                     }
@@ -14511,34 +15246,104 @@ class ReportController extends Controller
 
                 if ($hasSmSaleRet) {
                     $srQ = $applySmSrFilters(DB::table('stock_movements'), ['sale_return']);
+                    $srSelect = [
+                        DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
+                        DB::raw('stock_movements.id as item_row_id'),
+                        'stock_movements.product_variant_id as variant_id',
+                        DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
+                        DB::raw("'sale_return' as movement_type"),
+                        DB::raw("'Return In' as type_label"),
+                        'stock_movements.product_id',
+                        'products.name as product_name',
+                        'products.code as product_code',
+                        DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                        'products.category_name',
+                        DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                        DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                        'stock_movements.quantity_in as quantity_in',
+                        DB::raw('0 as quantity_out'),
+                        DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                        DB::raw("{$srHistUnitCostExpr} as unit_cost"),
+                        DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
+                        DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
+                        DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
+                        DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
+                    ];
+
+                    $canLeanSrSum = ($fromDateTime === null && $toDateTime === null && $warehouse === 'All' && empty($allowedOutlets) && !$hasCategory && !$hasSearch && !$hasSaleReturnCostLayers);
+                    $srSumQ = $canLeanSrSum
+                        ? DB::table('stock_movements')
+                            ->where('stock_movements.movement_type', 'sale_return')
+                            ->when($canViewCost, fn($q) => $q->leftJoin('products', 'stock_movements.product_id', '=', 'products.id'))
+                        : (clone $srQ);
+
+                    $srFastRowFetcher = (!$hasCategory && !$hasSearch)
+                        ? function (int $limit) use ($srQ, $srSelect, $fromDateTime, $toDateTime, $allowedOutlets, $warehouse, $warehouseId) {
+                            $smIdsQ = DB::table('stock_movements')
+                                ->where('movement_type', 'sale_return')
+                                ->select('id');
+                            if ($fromDateTime !== null) {
+                                $smIdsQ->where('created_at', '>=', $fromDateTime);
+                            }
+                            if ($toDateTime !== null) {
+                                $smIdsQ->where('created_at', '<=', $toDateTime);
+                            }
+                            if (!empty($allowedOutlets)) {
+                                $smIdsQ->whereIn('warehouse_id', $allowedOutlets);
+                            }
+                            if ($warehouse !== 'All' && !empty($warehouse) && $warehouseId !== null) {
+                                $smIdsQ->where('warehouse_id', $warehouseId);
+                            }
+                            $topSmIds = $smIdsQ->orderByDesc('created_at')->orderByDesc('id')->limit($limit)->pluck('id')->all();
+
+                            $hdrQ = DB::table('sale_returns')->select('id');
+                            if ($fromDateTime !== null) {
+                                $hdrQ->where('date', '>=', $fromDateTime);
+                            }
+                            if ($toDateTime !== null) {
+                                $hdrQ->where('date', '<=', $toDateTime);
+                            }
+                            if (!empty($allowedOutlets)) {
+                                $hdrQ->whereIn('warehouse_id', $allowedOutlets);
+                            }
+                            if ($warehouse !== 'All' && !empty($warehouse)) {
+                                if ($warehouseId !== null) {
+                                    $hdrQ->where('warehouse_id', $warehouseId);
+                                } else {
+                                    $hdrQ->where('warehouse_name', $warehouse);
+                                }
+                            }
+                            $topHdrRefIds = $hdrQ->orderByDesc('date')->orderByDesc('id')->limit($limit)->pluck('id')->map(fn($v) => (string)$v)->all();
+                            $hdrSmIds = !empty($topHdrRefIds)
+                                ? DB::table('stock_movements')
+                                    ->where('movement_type', 'sale_return')
+                                    ->whereIn('reference_id', $topHdrRefIds)
+                                    ->pluck('id')
+                                    ->all()
+                                : [];
+
+                            $candidateIds = array_values(array_unique(array_merge($topSmIds, $hdrSmIds)));
+                            if (empty($candidateIds)) {
+                                return collect();
+                            }
+
+                            return (clone $srQ)
+                                ->whereIn('stock_movements.id', $candidateIds)
+                                ->select($srSelect)
+                                ->orderByDesc(DB::raw('COALESCE(sale_returns.date, stock_movements.created_at)'))
+                                ->orderByDesc('stock_movements.id')
+                                ->limit($limit)
+                                ->get();
+                        }
+                        : null;
+
                     $branches[] = [
-                        'sumQuery' => clone $srQ,
+                        'sumQuery' => $srSumQ,
                         'qtyInExpr' => 'stock_movements.quantity_in',
                         'qtyOutExpr' => '0',
                         'unitCostExpr' => $srHistUnitCostExpr,
-                        'rowQuery' => (clone $srQ)->select([
-                            DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
-                            DB::raw('0 as item_row_id'),
-                            'stock_movements.product_variant_id as variant_id',
-                            DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
-                            DB::raw("'sale_return' as movement_type"),
-                            DB::raw("'Return In' as type_label"),
-                            'stock_movements.product_id',
-                            'products.name as product_name',
-                            'products.code as product_code',
-                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                            'products.category_name',
-                            DB::raw("COALESCE(sale_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                            DB::raw('COALESCE(sale_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                            'stock_movements.quantity_in as quantity_in',
-                            DB::raw('0 as quantity_out'),
-                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                            DB::raw("{$srHistUnitCostExpr} as unit_cost"),
-                            DB::raw("COALESCE(sale_returns.created_by, 'System') as created_by"),
-                            DB::raw("COALESCE(sale_returns.user_name, sale_returns.created_by, 'System') as user_name"),
-                            DB::raw("COALESCE(sale_returns.user_role, '') as user_role"),
-                            DB::raw('COALESCE(sale_returns.date, stock_movements.created_at) as date'),
-                        ]),
+                        'fastRowFetcher' => $srFastRowFetcher,
+                        'rowQuery' => (clone $srQ)->select($srSelect),
                         'dateCol' => DB::raw('COALESCE(sale_returns.date, stock_movements.created_at)'),
                         'statusSplit' => null,
                         'statusCol' => null,
@@ -14554,7 +15359,7 @@ class ReportController extends Controller
                         'unitCostExpr' => $srHistUnitCostExpr,
                         'rowQuery' => (clone $srvQ)->select([
                             DB::raw("COALESCE(sale_returns.id, {$refIntCast}, 0) as source_id"),
-                            DB::raw('0 as item_row_id'),
+                            DB::raw('stock_movements.id as item_row_id'),
                             'stock_movements.product_variant_id as variant_id',
                             DB::raw("COALESCE(sale_returns.reference_no, {$srRefFallback}) as reference_no"),
                             DB::raw("'sale_return_void' as movement_type"),
@@ -14583,16 +15388,28 @@ class ReportController extends Controller
             }
 
             if ($wantPurchReturn && ($hasSmPurchRet || $hasSmPurchRetVoid)) {
-                $prHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
-                    . "NULLIF((SELECT SUM(prcl.total_cost) / NULLIF(SUM(prcl.base_quantity), 0) FROM purchase_return_cost_layers prcl WHERE prcl.purchase_return_id = purchase_returns.id AND prcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR prcl.product_variant_id = stock_movements.product_variant_id)), 0), "
-                    . "NULLIF((SELECT SUM(prcl2.total_cost) / NULLIF(SUM(prcl2.base_quantity), 0) FROM purchase_return_cost_layers prcl2 WHERE prcl2.purchase_return_id = purchase_returns.id AND prcl2.product_id = stock_movements.product_id), 0), "
-                    . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_out), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_out) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
-                    . "products.cost_price, products.purchase_price, 0)";
+                $prLayerSub = $hasPurchReturnCostLayers
+                    ? "NULLIF((SELECT SUM(prcl.total_cost) / NULLIF(SUM(prcl.base_quantity), 0) FROM purchase_return_cost_layers prcl WHERE prcl.purchase_return_id = purchase_returns.id AND prcl.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR prcl.product_variant_id = stock_movements.product_variant_id)), 0), "
+                      . "NULLIF((SELECT SUM(prcl2.total_cost) / NULLIF(SUM(prcl2.base_quantity), 0) FROM purchase_return_cost_layers prcl2 WHERE prcl2.purchase_return_id = purchase_returns.id AND prcl2.product_id = stock_movements.product_id), 0), "
+                    : '';
+                $hasPrReturnCostTotal = $canViewCost
+                    && $accounting->schemaHasColumn('purchase_returns', 'return_cost_total')
+                    && DB::table('purchase_returns')->where('return_cost_total', '>', 0)->exists();
+                $prRetCostFallback = $hasPrReturnCostTotal
+                    ? "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_out), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_out) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
+                    : '';
+                $prHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}{$prLayerSub}{$prRetCostFallback}products.cost_price, products.purchase_price, 0)";
 
+                $prVoidBatchSub = $hasPrVoidBatches
+                    ? "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.source_type = 'purchase_return_void' AND ib.source_reference = purchase_returns.reference_no AND ib.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR ib.product_variant_id = stock_movements.product_variant_id)), 0), "
+                    : '';
+                $prVoidCostFallback = $hasPrReturnCostTotal
+                    ? "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_in), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_in) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
+                    : '';
                 $prVoidHistUnitCostExpr = "COALESCE({$smUnitCostPrefix}"
-                    . "NULLIF((SELECT CASE WHEN SUM(ib.initial_quantity) > 0 THEN SUM(ib.initial_quantity * ib.unit_cost) / SUM(ib.initial_quantity) ELSE MAX(ib.unit_cost) END FROM inventory_batches ib WHERE ib.source_type = 'purchase_return_void' AND ib.source_reference = purchase_returns.reference_no AND ib.product_id = stock_movements.product_id AND (stock_movements.product_variant_id IS NULL OR ib.product_variant_id = stock_movements.product_variant_id)), 0), "
+                    . $prVoidBatchSub
                     . ($hasMovementUnitCost ? "NULLIF((SELECT smOrig.unit_cost FROM stock_movements smOrig WHERE smOrig.movement_type = 'purchase_return' AND smOrig.reference_id = stock_movements.reference_id AND smOrig.product_id = stock_movements.product_id ORDER BY smOrig.id DESC LIMIT 1), 0), " : "")
-                    . "NULLIF(CASE WHEN COALESCE(purchase_returns.return_cost_total, 0) > 0 AND (SELECT COALESCE(SUM(sm2.quantity_in), 0) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) > 0 THEN purchase_returns.return_cost_total / (SELECT SUM(sm2.quantity_in) FROM stock_movements sm2 WHERE sm2.movement_type = 'purchase_return_void' AND sm2.reference_id = stock_movements.reference_id) ELSE 0 END, 0), "
+                    . $prVoidCostFallback
                     . "products.cost_price, products.purchase_price, 0)";
 
                 $applySmPrFilters = function ($q, string $type, bool $useCreatedAt = false) use (
@@ -14603,9 +15420,13 @@ class ReportController extends Controller
                     $q->leftJoin('purchase_returns', DB::raw($refIntCast), '=', 'purchase_returns.id')
                         ->leftJoin('outlets', 'stock_movements.warehouse_id', '=', 'outlets.id')
                         ->leftJoin('products', 'stock_movements.product_id', '=', 'products.id')
-                        ->where('stock_movements.movement_type', $type)
-                        ->whereRaw("{$dtExpr} >= ?", [$fromDateTime])
-                        ->whereRaw("{$dtExpr} <= ?", [$toDateTime]);
+                        ->where('stock_movements.movement_type', $type);
+                    if ($fromDateTime !== null) {
+                        $q->whereRaw("{$dtExpr} >= ?", [$fromDateTime]);
+                    }
+                    if ($toDateTime !== null) {
+                        $q->whereRaw("{$dtExpr} <= ?", [$toDateTime]);
+                    }
                     if (!empty($allowedOutlets)) {
                         $q->whereRaw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id) IN (' . implode(',', array_map('intval', $allowedOutlets)) . ')');
                     }
@@ -14636,34 +15457,104 @@ class ReportController extends Controller
 
                 if ($hasSmPurchRet) {
                     $prQ = $applySmPrFilters(DB::table('stock_movements'), 'purchase_return');
+                    $prSelect = [
+                        DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
+                        DB::raw('stock_movements.id as item_row_id'),
+                        'stock_movements.product_variant_id as variant_id',
+                        DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
+                        DB::raw("'purchase_return' as movement_type"),
+                        DB::raw("'Return Out' as type_label"),
+                        'stock_movements.product_id',
+                        'products.name as product_name',
+                        'products.code as product_code',
+                        DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
+                        'products.category_name',
+                        DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
+                        DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
+                        DB::raw('0 as quantity_in'),
+                        'stock_movements.quantity_out as quantity_out',
+                        DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
+                        DB::raw("{$prHistUnitCostExpr} as unit_cost"),
+                        DB::raw("COALESCE(purchase_returns.created_by, '') as created_by"),
+                        DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, '') as user_name"),
+                        DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
+                        DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
+                    ];
+
+                    $canLeanPrSum = ($fromDateTime === null && $toDateTime === null && $warehouse === 'All' && empty($allowedOutlets) && !$hasCategory && !$hasSearch && !$hasPurchReturnCostLayers && !$hasPrReturnCostTotal);
+                    $prSumQ = $canLeanPrSum
+                        ? DB::table('stock_movements')
+                            ->where('stock_movements.movement_type', 'purchase_return')
+                            ->when($canViewCost, fn($q) => $q->leftJoin('products', 'stock_movements.product_id', '=', 'products.id'))
+                        : (clone $prQ);
+
+                    $prFastRowFetcher = (!$hasCategory && !$hasSearch)
+                        ? function (int $limit) use ($prQ, $prSelect, $fromDateTime, $toDateTime, $allowedOutlets, $warehouse, $warehouseId) {
+                            $smIdsQ = DB::table('stock_movements')
+                                ->where('movement_type', 'purchase_return')
+                                ->select('id');
+                            if ($fromDateTime !== null) {
+                                $smIdsQ->where('created_at', '>=', $fromDateTime);
+                            }
+                            if ($toDateTime !== null) {
+                                $smIdsQ->where('created_at', '<=', $toDateTime);
+                            }
+                            if (!empty($allowedOutlets)) {
+                                $smIdsQ->whereIn('warehouse_id', $allowedOutlets);
+                            }
+                            if ($warehouse !== 'All' && !empty($warehouse) && $warehouseId !== null) {
+                                $smIdsQ->where('warehouse_id', $warehouseId);
+                            }
+                            $topSmIds = $smIdsQ->orderByDesc('created_at')->orderByDesc('id')->limit($limit)->pluck('id')->all();
+
+                            $hdrQ = DB::table('purchase_returns')->select('id');
+                            if ($fromDateTime !== null) {
+                                $hdrQ->where('date', '>=', $fromDateTime);
+                            }
+                            if ($toDateTime !== null) {
+                                $hdrQ->where('date', '<=', $toDateTime);
+                            }
+                            if (!empty($allowedOutlets)) {
+                                $hdrQ->whereIn('warehouse_id', $allowedOutlets);
+                            }
+                            if ($warehouse !== 'All' && !empty($warehouse)) {
+                                if ($warehouseId !== null) {
+                                    $hdrQ->where('warehouse_id', $warehouseId);
+                                } else {
+                                    $hdrQ->where('warehouse_name', $warehouse);
+                                }
+                            }
+                            $topHdrRefIds = $hdrQ->orderByDesc('date')->orderByDesc('id')->limit($limit)->pluck('id')->map(fn($v) => (string)$v)->all();
+                            $hdrSmIds = !empty($topHdrRefIds)
+                                ? DB::table('stock_movements')
+                                    ->where('movement_type', 'purchase_return')
+                                    ->whereIn('reference_id', $topHdrRefIds)
+                                    ->pluck('id')
+                                    ->all()
+                                : [];
+
+                            $candidateIds = array_values(array_unique(array_merge($topSmIds, $hdrSmIds)));
+                            if (empty($candidateIds)) {
+                                return collect();
+                            }
+
+                            return (clone $prQ)
+                                ->whereIn('stock_movements.id', $candidateIds)
+                                ->select($prSelect)
+                                ->orderByDesc(DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at)'))
+                                ->orderByDesc('stock_movements.id')
+                                ->limit($limit)
+                                ->get();
+                        }
+                        : null;
+
                     $branches[] = [
-                        'sumQuery' => clone $prQ,
+                        'sumQuery' => $prSumQ,
                         'qtyInExpr' => '0',
                         'qtyOutExpr' => 'stock_movements.quantity_out',
                         'unitCostExpr' => $prHistUnitCostExpr,
-                        'rowQuery' => (clone $prQ)->select([
-                            DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
-                            DB::raw('0 as item_row_id'),
-                            'stock_movements.product_variant_id as variant_id',
-                            DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
-                            DB::raw("'purchase_return' as movement_type"),
-                            DB::raw("'Return Out' as type_label"),
-                            'stock_movements.product_id',
-                            'products.name as product_name',
-                            'products.code as product_code',
-                            DB::raw("COALESCE(products.alternative_name, '') as alternative_name"),
-                            'products.category_name',
-                            DB::raw("COALESCE(purchase_returns.warehouse_name, outlets.name, '') as warehouse_name"),
-                            DB::raw('COALESCE(purchase_returns.warehouse_id, stock_movements.warehouse_id, 1) as warehouse_id'),
-                            DB::raw('0 as quantity_in'),
-                            'stock_movements.quantity_out as quantity_out',
-                            DB::raw('COALESCE(products.stock_quantity, 0) as balance_qty'),
-                            DB::raw("{$prHistUnitCostExpr} as unit_cost"),
-                            DB::raw("COALESCE(purchase_returns.created_by, '') as created_by"),
-                            DB::raw("COALESCE(purchase_returns.user_name, purchase_returns.created_by, '') as user_name"),
-                            DB::raw("COALESCE(purchase_returns.user_role, '') as user_role"),
-                            DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at) as date'),
-                        ]),
+                        'fastRowFetcher' => $prFastRowFetcher,
+                        'rowQuery' => (clone $prQ)->select($prSelect),
                         'dateCol' => DB::raw('COALESCE(purchase_returns.date, stock_movements.created_at)'),
                         'statusSplit' => null,
                         'statusCol' => null,
@@ -14679,7 +15570,7 @@ class ReportController extends Controller
                         'unitCostExpr' => $prVoidHistUnitCostExpr,
                         'rowQuery' => (clone $prvQ)->select([
                             DB::raw("COALESCE(purchase_returns.id, {$refIntCast}, 0) as source_id"),
-                            DB::raw('0 as item_row_id'),
+                            DB::raw('stock_movements.id as item_row_id'),
                             'stock_movements.product_variant_id as variant_id',
                             DB::raw("COALESCE(purchase_returns.reference_no, {$prRefFallback}) as reference_no"),
                             DB::raw("'purchase_return_void' as movement_type"),
@@ -14732,7 +15623,12 @@ class ReportController extends Controller
                     }
 
                     $dateCol = $br['dateCol'];
-                    if (!empty($br['statusSplit']) && !empty($br['rowBuilder'])) {
+                    if (!empty($br['fastRowFetcher'])) {
+                        $fetcher = $br['fastRowFetcher'];
+                        foreach ($fetcher($needTopN) as $r) {
+                            $allCandidates[] = $r;
+                        }
+                    } elseif (!empty($br['statusSplit']) && !empty($br['rowBuilder'])) {
                         $builder = $br['rowBuilder'];
                         foreach ($br['statusSplit'] as $st) {
                             foreach ($builder($st)->orderByDesc($dateCol)->limit($needTopN)->get() as $r) {
@@ -14749,7 +15645,26 @@ class ReportController extends Controller
                     $totalMovements = $knownTotal;
                 }
 
-                usort($allCandidates, static fn ($a, $b) => strcmp((string)$b->date, (string)$a->date));
+                // Deterministic multi-key descending sort prevents pagination drift across equal-timestamp rows
+                usort($allCandidates, static function ($a, $b): int {
+                    $cmp = strcmp((string)$b->date, (string)$a->date);
+                    if ($cmp !== 0) {
+                        return $cmp;
+                    }
+                    $cmp = ((int)($b->source_id ?? 0)) <=> ((int)($a->source_id ?? 0));
+                    if ($cmp !== 0) {
+                        return $cmp;
+                    }
+                    $cmp = ((int)($b->item_row_id ?? 0)) <=> ((int)($a->item_row_id ?? 0));
+                    if ($cmp !== 0) {
+                        return $cmp;
+                    }
+                    $cmp = strcmp((string)($b->type_label ?? ''), (string)($a->type_label ?? ''));
+                    if ($cmp !== 0) {
+                        return $cmp;
+                    }
+                    return ((int)($b->warehouse_id ?? 0)) <=> ((int)($a->warehouse_id ?? 0));
+                });
                 $hasMoreMovements = count($allCandidates) > ($offset + $perPage) || ($offset + $perPage) < $totalMovements;
                 $pageMvRows = collect(array_slice($allCandidates, $offset, $perPage));
 
@@ -14853,15 +15768,20 @@ class ReportController extends Controller
                         $liveStockByMvProd[$mpid] = (float)($prodLiveFallback[$mpid] ?? 0.0);
                     }
                 }
-                $postOnlyMovs = $this->aggregateBinCardMovementsByProduct(
-                    $toDateTime,
-                    null,
-                    (string)$warehouse,
-                    false,
-                    $allowedOutlets,
-                    $mvProdIds,
-                    false
-                );
+                $postOnlyMovs = $toDateTime !== null
+                    ? $this->aggregateBinCardMovementsByProduct(
+                        $toDateTime,
+                        null,
+                        (string)$warehouse,
+                        false,
+                        $allowedOutlets,
+                        $mvProdIds,
+                        false
+                    )
+                    : [
+                        'purchases' => [], 'sale_returns' => [], 'transfers_in' => [], 'adjust_in' => [],
+                        'sales' => [], 'purchase_returns' => [], 'transfers_out' => [], 'adjust_out' => [],
+                    ];
                 $runningByProd = [];
                 foreach ($mvProdIds as $mpid) {
                     $postIn = (float)($postOnlyMovs['purchases'][$mpid] ?? 0)
@@ -14911,6 +15831,7 @@ class ReportController extends Controller
                     : (float)$row->balance_qty);
             return [
                 'id' => (int)($row->source_id ?? ($offset + $idx + 1)),
+                'item_row_id' => (int)($row->item_row_id ?? 0),
                 'reference_no' => (string)($row->reference_no ?? 'REF-' . ($offset + $idx + 1)),
                 'movement_type' => (string)$row->movement_type,
                 'type_label' => (string)$row->type_label,
@@ -14980,7 +15901,7 @@ class ReportController extends Controller
             }
 
             $preCutoffBatchesByProduct = collect();
-            if (!empty($productsNeedingPreBatches)) {
+            if (!empty($productsNeedingPreBatches) && $toDateTime !== null) {
                 foreach (array_chunk($productsNeedingPreBatches, 400) as $idChunk) {
                     $preCutoffBatchesQuery = DB::table('inventory_batches')
                         ->whereIn('status', ['active', 'exhausted'])
@@ -15180,8 +16101,10 @@ class ReportController extends Controller
 
                 $purchCatalogQ = DB::table('purchase_items')
                     ->join('purchases', 'purchase_items.purchase_id', '=', 'purchases.id')
-                    ->whereIn('purchases.status', ['Received', 'Completed'])
-                    ->where('purchases.date', '>=', $fromDateTime);
+                    ->whereIn('purchases.status', ['Received', 'Completed']);
+                if ($fromDateTime !== null) {
+                    $purchCatalogQ->where('purchases.date', '>=', $fromDateTime);
+                }
                 $applyWhScope($purchCatalogQ, 'purchases.warehouse_name', 'purchases.warehouse_id');
                 if ($filterByProductSubset) {
                     $purchCatalogQ->join('products', 'purchase_items.product_id', '=', 'products.id');
@@ -15192,13 +16115,20 @@ class ReportController extends Controller
                     $pCostSql = $hasVariantsTbl
                         ? 'COALESCE(NULLIF(pv.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)'
                         : 'COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)';
-                    $purchRow = $purchCatalogQ->selectRaw(
-                        "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END), 0) as period_qty, "
-                        . "COALESCE(SUM(CASE WHEN purchases.date > ? THEN {$purchBaseQtySql} ELSE 0 END), 0) as post_qty, "
-                        . "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN ({$purchBaseQtySql}) * {$pCostSql} ELSE 0 END), 0) as period_cost, "
-                        . "COALESCE(SUM(CASE WHEN purchases.date > ? THEN ({$purchBaseQtySql}) * {$pCostSql} ELSE 0 END), 0) as post_cost",
-                        [$toDateTime, $toDateTime, $toDateTime, $toDateTime]
-                    )->first();
+                    $purchRow = $toDateTime !== null
+                        ? $purchCatalogQ->selectRaw(
+                            "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END), 0) as period_qty, "
+                            . "COALESCE(SUM(CASE WHEN purchases.date > ? THEN {$purchBaseQtySql} ELSE 0 END), 0) as post_qty, "
+                            . "COALESCE(SUM(CASE WHEN purchases.date <= ? THEN ({$purchBaseQtySql}) * {$pCostSql} ELSE 0 END), 0) as period_cost, "
+                            . "COALESCE(SUM(CASE WHEN purchases.date > ? THEN ({$purchBaseQtySql}) * {$pCostSql} ELSE 0 END), 0) as post_cost",
+                            [$toDateTime, $toDateTime, $toDateTime, $toDateTime]
+                        )->first()
+                        : $purchCatalogQ->selectRaw(
+                            "COALESCE(SUM({$purchBaseQtySql}), 0) as period_qty, "
+                            . "0 as post_qty, "
+                            . "COALESCE(SUM(({$purchBaseQtySql}) * {$pCostSql}), 0) as period_cost, "
+                            . "0 as post_cost"
+                        )->first();
                     $purchStats = [
                         'period_qty' => (float)($purchRow->period_qty ?? 0),
                         'post_qty' => (float)($purchRow->post_qty ?? 0),
@@ -15206,19 +16136,30 @@ class ReportController extends Controller
                         'post_cost' => (float)($purchRow->post_cost ?? 0),
                     ];
                 } else {
-                    $purchCatalogQ->selectRaw(
-                        "purchase_items.product_id, purchase_items.product_variant_id, "
-                        . "SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END) as period_qty, "
-                        . "SUM(CASE WHEN purchases.date > ? THEN {$purchBaseQtySql} ELSE 0 END) as post_qty",
-                        [$toDateTime, $toDateTime]
-                    )->groupBy('purchase_items.product_id', 'purchase_items.product_variant_id');
+                    if ($toDateTime !== null) {
+                        $purchCatalogQ->selectRaw(
+                            "purchase_items.product_id, purchase_items.product_variant_id, "
+                            . "SUM(CASE WHEN purchases.date <= ? THEN {$purchBaseQtySql} ELSE 0 END) as period_qty, "
+                            . "SUM(CASE WHEN purchases.date > ? THEN {$purchBaseQtySql} ELSE 0 END) as post_qty",
+                            [$toDateTime, $toDateTime]
+                        );
+                    } else {
+                        $purchCatalogQ->selectRaw(
+                            "purchase_items.product_id, purchase_items.product_variant_id, "
+                            . "SUM({$purchBaseQtySql}) as period_qty, "
+                            . "0 as post_qty"
+                        );
+                    }
+                    $purchCatalogQ->groupBy('purchase_items.product_id', 'purchase_items.product_variant_id');
                     $purchStats = $sumGroupedCostDelta($purchCatalogQ);
                 }
                 $totalPurchasesIn = $purchStats['period_qty'];
 
                 $salesCatalogQ = DB::table('sale_items')
-                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id')
-                    ->where('sales.date', '>=', $fromDateTime);
+                    ->join('sales', 'sale_items.sale_id', '=', 'sales.id');
+                if ($fromDateTime !== null) {
+                    $salesCatalogQ->where('sales.date', '>=', $fromDateTime);
+                }
                 $this->applyActiveDocumentFilter($salesCatalogQ, 'sales.status');
                 $applyWhScope($salesCatalogQ, 'sales.warehouse_name', 'sales.warehouse_id');
                 if ($filterByProductSubset) {
@@ -15230,13 +16171,20 @@ class ReportController extends Controller
                     $sCostSql = $hasVariantsTbl
                         ? 'COALESCE(NULLIF(pv.cost_price, 0), NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)'
                         : 'COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)';
-                    $salesRow = $salesCatalogQ->selectRaw(
-                        "COALESCE(SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END), 0) as period_qty, "
-                        . "COALESCE(SUM(CASE WHEN sales.date > ? THEN {$saleBaseQtySql} ELSE 0 END), 0) as post_qty, "
-                        . "COALESCE(SUM(CASE WHEN sales.date <= ? THEN ({$saleBaseQtySql}) * {$sCostSql} ELSE 0 END), 0) as period_cost, "
-                        . "COALESCE(SUM(CASE WHEN sales.date > ? THEN ({$saleBaseQtySql}) * {$sCostSql} ELSE 0 END), 0) as post_cost",
-                        [$toDateTime, $toDateTime, $toDateTime, $toDateTime]
-                    )->first();
+                    $salesRow = $toDateTime !== null
+                        ? $salesCatalogQ->selectRaw(
+                            "COALESCE(SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END), 0) as period_qty, "
+                            . "COALESCE(SUM(CASE WHEN sales.date > ? THEN {$saleBaseQtySql} ELSE 0 END), 0) as post_qty, "
+                            . "COALESCE(SUM(CASE WHEN sales.date <= ? THEN ({$saleBaseQtySql}) * {$sCostSql} ELSE 0 END), 0) as period_cost, "
+                            . "COALESCE(SUM(CASE WHEN sales.date > ? THEN ({$saleBaseQtySql}) * {$sCostSql} ELSE 0 END), 0) as post_cost",
+                            [$toDateTime, $toDateTime, $toDateTime, $toDateTime]
+                        )->first()
+                        : $salesCatalogQ->selectRaw(
+                            "COALESCE(SUM({$saleBaseQtySql}), 0) as period_qty, "
+                            . "0 as post_qty, "
+                            . "COALESCE(SUM(({$saleBaseQtySql}) * {$sCostSql}), 0) as period_cost, "
+                            . "0 as post_cost"
+                        )->first();
                     $salesStats = [
                         'period_qty' => (float)($salesRow->period_qty ?? 0),
                         'post_qty' => (float)($salesRow->post_qty ?? 0),
@@ -15244,12 +16192,21 @@ class ReportController extends Controller
                         'post_cost' => (float)($salesRow->post_cost ?? 0),
                     ];
                 } else {
-                    $salesCatalogQ->selectRaw(
-                        "sale_items.product_id, sale_items.product_variant_id, "
-                        . "SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END) as period_qty, "
-                        . "SUM(CASE WHEN sales.date > ? THEN {$saleBaseQtySql} ELSE 0 END) as post_qty",
-                        [$toDateTime, $toDateTime]
-                    )->groupBy('sale_items.product_id', 'sale_items.product_variant_id');
+                    if ($toDateTime !== null) {
+                        $salesCatalogQ->selectRaw(
+                            "sale_items.product_id, sale_items.product_variant_id, "
+                            . "SUM(CASE WHEN sales.date <= ? THEN {$saleBaseQtySql} ELSE 0 END) as period_qty, "
+                            . "SUM(CASE WHEN sales.date > ? THEN {$saleBaseQtySql} ELSE 0 END) as post_qty",
+                            [$toDateTime, $toDateTime]
+                        );
+                    } else {
+                        $salesCatalogQ->selectRaw(
+                            "sale_items.product_id, sale_items.product_variant_id, "
+                            . "SUM({$saleBaseQtySql}) as period_qty, "
+                            . "0 as post_qty"
+                        );
+                    }
+                    $salesCatalogQ->groupBy('sale_items.product_id', 'sale_items.product_variant_id');
                     $salesStats = $sumGroupedCostDelta($salesCatalogQ);
                 }
                 $totalSalesOut = $salesStats['period_qty'];
@@ -15270,28 +16227,45 @@ class ReportController extends Controller
                                 $vCostSql = 'COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)';
                             }
                             $applyCatProdFilter($q);
-                            $r = $q->selectRaw(
-                                "COALESCE(SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) * {$vCostSql} ELSE 0 END), 0) as period_cost, "
-                                . "COALESCE(SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) * {$vCostSql} ELSE 0 END), 0) as post_cost, "
-                                . "COALESCE(SUM(CASE WHEN {$dateExpr} > ? THEN ABS({$signedQtySql}) ELSE 0 END), 0) as post_abs_qty",
-                                [$toDateTime, $toDateTime, $toDateTime]
-                            )->first();
+                            $r = $toDateTime !== null
+                                ? $q->selectRaw(
+                                    "COALESCE(SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) * {$vCostSql} ELSE 0 END), 0) as period_cost, "
+                                    . "COALESCE(SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) * {$vCostSql} ELSE 0 END), 0) as post_cost, "
+                                    . "COALESCE(SUM(CASE WHEN {$dateExpr} > ? THEN ABS({$signedQtySql}) ELSE 0 END), 0) as post_abs_qty",
+                                    [$toDateTime, $toDateTime, $toDateTime]
+                                )->first()
+                                : $q->selectRaw(
+                                    "COALESCE(SUM(({$signedQtySql}) * {$vCostSql}), 0) as period_cost, "
+                                    . "0 as post_cost, "
+                                    . "0 as post_abs_qty"
+                                )->first();
                             return [(float)($r->period_cost ?? 0), (float)($r->post_cost ?? 0), (float)($r->post_abs_qty ?? 0)];
                         }
-                        $q->selectRaw(
-                            "{$itemTbl}.product_id, {$itemTbl}.product_variant_id, "
-                            . "SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) ELSE 0 END) as period_qty, "
-                            . "SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) ELSE 0 END) as post_qty",
-                            [$toDateTime, $toDateTime]
-                        )->groupBy("{$itemTbl}.product_id", "{$itemTbl}.product_variant_id");
+                        if ($toDateTime !== null) {
+                            $q->selectRaw(
+                                "{$itemTbl}.product_id, {$itemTbl}.product_variant_id, "
+                                . "SUM(CASE WHEN {$dateExpr} <= ? THEN ({$signedQtySql}) ELSE 0 END) as period_qty, "
+                                . "SUM(CASE WHEN {$dateExpr} > ? THEN ({$signedQtySql}) ELSE 0 END) as post_qty",
+                                [$toDateTime, $toDateTime]
+                            );
+                        } else {
+                            $q->selectRaw(
+                                "{$itemTbl}.product_id, {$itemTbl}.product_variant_id, "
+                                . "SUM({$signedQtySql}) as period_qty, "
+                                . "0 as post_qty"
+                            );
+                        }
+                        $q->groupBy("{$itemTbl}.product_id", "{$itemTbl}.product_variant_id");
                         $s = $sumGroupedCostDelta($q);
                         return [$s['period_cost'], $s['post_cost'], abs($s['post_qty'])];
                     };
 
                     // Adjustments
                     $adjCatalogQ = DB::table('stock_adjustment_items')
-                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id')
-                        ->where('stock_adjustments.date', '>=', $fromDateTime);
+                        ->join('stock_adjustments', 'stock_adjustment_items.stock_adjustment_id', '=', 'stock_adjustments.id');
+                    if ($fromDateTime !== null) {
+                        $adjCatalogQ->where('stock_adjustments.date', '>=', $fromDateTime);
+                    }
                     $applyWhScope($adjCatalogQ, 'stock_adjustments.warehouse_name', 'stock_adjustments.warehouse_id');
                     $adjSignSql = "CASE WHEN {$effAdjTypeSql} = 'addition' THEN ({$adjBaseQtySql}) ELSE -({$adjBaseQtySql}) END";
                     [$adjPer, $adjPost, $adjPostQty] = $evalCatalogDelta($adjCatalogQ, 'stock_adjustments.date', $adjSignSql);
@@ -15302,8 +16276,10 @@ class ReportController extends Controller
                     // Transfers Out & In
                     $trfOutCatalogQ = DB::table('stock_transfer_items')
                         ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                        ->whereIn('stock_transfers.status', ['Sent', 'Completed'])
-                        ->where('stock_transfers.date', '>=', $fromDateTime);
+                        ->whereIn('stock_transfers.status', ['Sent', 'Completed']);
+                    if ($fromDateTime !== null) {
+                        $trfOutCatalogQ->where('stock_transfers.date', '>=', $fromDateTime);
+                    }
                     $applyWhScope($trfOutCatalogQ, 'stock_transfers.from_warehouse', 'stock_transfers.from_warehouse_id');
                     [$trfOutPer, $trfOutPost, $trfOutPostQty] = $evalCatalogDelta($trfOutCatalogQ, 'stock_transfers.date', $trfBaseQtySql);
                     $periodNetCost -= $trfOutPer;
@@ -15312,8 +16288,10 @@ class ReportController extends Controller
 
                     $trfInCatalogQ = DB::table('stock_transfer_items')
                         ->join('stock_transfers', 'stock_transfer_items.stock_transfer_id', '=', 'stock_transfers.id')
-                        ->where('stock_transfers.status', 'Completed')
-                        ->where('stock_transfers.date', '>=', $fromDateTime);
+                        ->where('stock_transfers.status', 'Completed');
+                    if ($fromDateTime !== null) {
+                        $trfInCatalogQ->where('stock_transfers.date', '>=', $fromDateTime);
+                    }
                     $applyWhScope($trfInCatalogQ, 'stock_transfers.to_warehouse', 'stock_transfers.to_warehouse_id');
                     [$trfInPer, $trfInPost, $trfInPostQty] = $evalCatalogDelta($trfInCatalogQ, 'stock_transfers.date', $trfBaseQtySql);
                     $periodNetCost += $trfInPer;
@@ -15322,15 +16300,25 @@ class ReportController extends Controller
 
                     // Sale Returns, Purchase Returns & Variant-Addition Opening Stock (reference_type = 'product_update')
                     if ($accounting->schemaHasTable('stock_movements')) {
-                        $smNetQ = DB::table('stock_movements')
-                            ->where(function ($q) {
+                        $hasProductUpdateOpening = DB::table('stock_movements')
+                            ->where('reference_type', 'product_update')
+                            ->where('movement_type', 'opening_stock')
+                            ->exists();
+                        $smNetQ = DB::table('stock_movements');
+                        if ($hasProductUpdateOpening) {
+                            $smNetQ->where(function ($q) {
                                 $q->whereIn('stock_movements.movement_type', ['sale_return', 'sale_return_void', 'sale_return_edit_reverse', 'purchase_return', 'purchase_return_void'])
                                   ->orWhere(function ($op) {
                                       $op->where('stock_movements.movement_type', 'opening_stock')
                                          ->where('stock_movements.reference_type', 'product_update');
                                   });
-                            })
-                            ->where('stock_movements.created_at', '>=', $fromDateTime);
+                            });
+                        } else {
+                            $smNetQ->whereIn('stock_movements.movement_type', ['sale_return', 'sale_return_void', 'sale_return_edit_reverse', 'purchase_return', 'purchase_return_void']);
+                        }
+                        if ($fromDateTime !== null) {
+                            $smNetQ->where('stock_movements.created_at', '>=', $fromDateTime);
+                        }
                         if (!empty($allowedOutlets)) {
                             $smNetQ->whereIn('stock_movements.warehouse_id', $allowedOutlets);
                         }
@@ -15346,22 +16334,37 @@ class ReportController extends Controller
                                 $smCostSql = 'COALESCE(NULLIF(products.cost_price, 0), NULLIF(products.purchase_price, 0), 0)';
                             }
                             $applyCatProdFilter($smNetQ);
-                            $smNetRow = $smNetQ->selectRaw(
-                                "COALESCE(SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * {$smCostSql} ELSE 0 END), 0) as period_cost, "
-                                . "COALESCE(SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * {$smCostSql} ELSE 0 END), 0) as post_cost, "
-                                . 'COALESCE(SUM(CASE WHEN stock_movements.created_at > ? THEN ABS(stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END), 0) as post_abs_qty',
-                                [$toDateTime, $toDateTime, $toDateTime]
-                            )->first();
+                            $smNetRow = $toDateTime !== null
+                                ? $smNetQ->selectRaw(
+                                    "COALESCE(SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * {$smCostSql} ELSE 0 END), 0) as period_cost, "
+                                    . "COALESCE(SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) * {$smCostSql} ELSE 0 END), 0) as post_cost, "
+                                    . 'COALESCE(SUM(CASE WHEN stock_movements.created_at > ? THEN ABS(stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END), 0) as post_abs_qty',
+                                    [$toDateTime, $toDateTime, $toDateTime]
+                                )->first()
+                                : $smNetQ->selectRaw(
+                                    "COALESCE(SUM((stock_movements.quantity_in - stock_movements.quantity_out) * {$smCostSql}), 0) as period_cost, "
+                                    . "0 as post_cost, "
+                                    . "0 as post_abs_qty"
+                                )->first();
                             $periodNetCost += (float)($smNetRow->period_cost ?? 0);
                             $postNetCost += (float)($smNetRow->post_cost ?? 0);
                             if ((float)($smNetRow->post_abs_qty ?? 0) > 0.0001) $hasPostMovements = true;
                         } else {
-                            $smNetQ->selectRaw(
-                                'stock_movements.product_id, stock_movements.product_variant_id, '
-                                . 'SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as period_qty, '
-                                . 'SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as post_qty',
-                                [$toDateTime, $toDateTime]
-                            )->groupBy('stock_movements.product_id', 'stock_movements.product_variant_id');
+                            if ($toDateTime !== null) {
+                                $smNetQ->selectRaw(
+                                    'stock_movements.product_id, stock_movements.product_variant_id, '
+                                    . 'SUM(CASE WHEN stock_movements.created_at <= ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as period_qty, '
+                                    . 'SUM(CASE WHEN stock_movements.created_at > ? THEN (stock_movements.quantity_in - stock_movements.quantity_out) ELSE 0 END) as post_qty',
+                                    [$toDateTime, $toDateTime]
+                                );
+                            } else {
+                                $smNetQ->selectRaw(
+                                    'stock_movements.product_id, stock_movements.product_variant_id, '
+                                    . 'SUM(stock_movements.quantity_in - stock_movements.quantity_out) as period_qty, '
+                                    . '0 as post_qty'
+                                );
+                            }
+                            $smNetQ->groupBy('stock_movements.product_id', 'stock_movements.product_variant_id');
                             $smStats = $sumGroupedCostDelta($smNetQ);
                             $periodNetCost += $smStats['period_cost'];
                             $postNetCost += $smStats['post_cost'];

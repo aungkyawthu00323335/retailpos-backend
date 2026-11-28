@@ -332,6 +332,7 @@ class ListScrollPerformanceAuditTest extends TestCase
         $outlet = Outlet::create(['name' => 'Outlet 1', 'is_active' => true]);
         $customer = Customer::create(['name' => 'Cust 1', 'phone' => '09222222']);
         $staff = $this->createUserWithPermissions(['sale_returns.view'], 'Cashier');
+        $staff->outlets()->sync([$outlet->id]);
 
         for ($i = 1; $i <= 6; $i++) {
             $sale = Sale::create([

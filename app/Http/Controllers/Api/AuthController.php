@@ -66,11 +66,19 @@ class AuthController extends Controller
             ], 401);
         }
 
-        if ($user->status !== 'Active') {
+        if (!$user->isActive()) {
             Log::warning("Inactive user attempted login: ID {$user->id} ({$user->email}) from IP: {$request->ip()}");
             return response()->json([
                 'status' => 'error',
                 'message' => 'Your account is currently inactive. Please contact your Super Administrator.',
+            ], 403);
+        }
+
+        if (!$user->hasActiveRole()) {
+            Log::warning("User with inactive role attempted login: ID {$user->id} ({$user->email}) from IP: {$request->ip()}");
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Your assigned role is currently inactive. Please contact your Super Administrator.',
             ], 403);
         }
 
@@ -140,7 +148,7 @@ class AuthController extends Controller
         $user = null;
         if ($token) {
             $user = User::with(['roleModel', 'outlets'])->where('api_token', $token)->first();
-            if ($user && $user->isApiTokenExpired()) {
+            if ($user && ($user->isApiTokenExpired() || !$user->isAccountAndRoleActive())) {
                 $user->api_token = null;
                 $user->api_token_created_at = null;
                 $user->save();
@@ -148,10 +156,31 @@ class AuthController extends Controller
             }
         }
 
-        if (!$user && app()->environment('testing') && !$request->bearerToken()) {
+        if (!$user && !$token && $request->user()) {
+            $reqUser = $request->user()->loadMissing(['roleModel', 'outlets']);
+            if ($reqUser->isAccountAndRoleActive()) {
+                $user = $reqUser;
+            }
+        }
+
+        if (!$user
+            && app()->environment('testing')
+            && !$token
+            && !$request->user()
+            && !User::whereNotNull('api_token')->exists()
+        ) {
             // High-reliability POS client fallback to active session user during headless testing without token
-            $user = User::with(['roleModel', 'outlets'])->where('role', 'Super Admin')->first()
-                ?: User::with(['roleModel', 'outlets'])->first();
+            $candidate = User::with(['roleModel', 'outlets'])
+                ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                ->whereRaw("LOWER(COALESCE(role, '')) = 'super admin'")
+                ->first()
+                ?: User::with(['roleModel', 'outlets'])
+                    ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                    ->first();
+
+            if ($candidate && $candidate->hasActiveRole()) {
+                $user = $candidate;
+            }
         }
 
         if (!$user) {

@@ -16,7 +16,6 @@ class AutoExpireQuotationsCommand extends Command
         $today = Carbon::today()->toDateString();
 
         $expiredCount = Quotation::whereNotNull('expiry_date')
-            ->where('expiry_date', '!=', '')
             ->whereDate('expiry_date', '<', $today)
             ->whereNotIn('status', ['Ordered', 'Declined', 'Expired'])
             ->update([

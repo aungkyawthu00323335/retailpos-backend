@@ -34,11 +34,18 @@ class User extends Authenticatable
     protected $hidden = [
         'password',
         'remember_token',
+        'api_token',
+        'api_token_created_at',
+    ];
+
+    protected $attributes = [
+        'status' => 'Active',
     ];
 
     protected $appends = [
         'total_dependencies',
         'sales_count',
+        'is_super_admin',
     ];
 
     protected function casts(): array
@@ -105,17 +112,57 @@ class User extends Authenticatable
             (int) ($this->attributes['stock_adjustments_count'] ?? 0);
     }
 
+    public function getIsSuperAdminAttribute(): bool
+    {
+        return $this->isSuperAdmin();
+    }
+
     public function isSuperAdmin(): bool
     {
-        if (strtolower((string) $this->role) === 'super admin') {
+        if (strtolower(trim((string) $this->role)) === 'super admin') {
             return true;
         }
 
-        if ($this->roleModel && $this->roleModel->slug === 'super_admin') {
+        $roleModel = $this->relationLoaded('roleModel')
+            ? $this->roleModel
+            : ($this->role_id ? $this->roleModel()->first() : null);
+
+        if ($roleModel && $roleModel->slug === 'super_admin') {
             return true;
         }
 
         return false;
+    }
+
+    public function isActive(): bool
+    {
+        return strcasecmp(trim((string) ($this->status ?? '')), 'active') === 0;
+    }
+
+    public function hasActiveRole(): bool
+    {
+        if ($this->role_id === null) {
+            return true;
+        }
+
+        $roleModel = $this->relationLoaded('roleModel') ? $this->roleModel : $this->roleModel()->first();
+        return $roleModel !== null && $roleModel->isActive();
+    }
+
+    public function isAccountAndRoleActive(): bool
+    {
+        return $this->isActive() && $this->hasActiveRole();
+    }
+
+    public function canAccessOutlet(?int $outletId): bool
+    {
+        if ($this->isSuperAdmin()) {
+            return true;
+        }
+        if ($outletId === null || $outletId <= 0) {
+            return false;
+        }
+        return $this->outlets()->where('is_active', true)->where('outlets.id', $outletId)->exists();
     }
 
     public function getAllowedOutlets()
@@ -168,7 +215,15 @@ class User extends Authenticatable
      */
     public function getNormalizedPermissionMap(): array
     {
+        if (!$this->isActive()) {
+            return [];
+        }
+
         $roleModel = $this->relationLoaded('roleModel') ? $this->roleModel : $this->roleModel()->first();
+        if ($this->role_id !== null && (!$roleModel || !$roleModel->isActive())) {
+            return [];
+        }
+
         $userPermissions = $roleModel ? ($roleModel->permissions ?? []) : [];
         if (!is_array($userPermissions)) {
             $userPermissions = [];
@@ -219,6 +274,10 @@ class User extends Authenticatable
      */
     public function hasPermission(string $permission): bool
     {
+        if (!$this->isAccountAndRoleActive()) {
+            return false;
+        }
+
         if ($this->isSuperAdmin()) {
             return true;
         }
@@ -308,7 +367,7 @@ class User extends Authenticatable
         if ($token) {
             $user = static::with('roleModel')->where('api_token', $token)->first();
             if ($user) {
-                if ($user->isApiTokenExpired()) {
+                if ($user->isApiTokenExpired() || !$user->isAccountAndRoleActive()) {
                     $user->api_token = null;
                     $user->api_token_created_at = null;
                     $user->save();
@@ -321,19 +380,37 @@ class User extends Authenticatable
         }
 
         if ($resolved === null && $request->user()) {
-            $resolved = $request->user()->loadMissing('roleModel');
+            $reqUser = $request->user()->loadMissing('roleModel');
+            if ($reqUser->isAccountAndRoleActive()) {
+                $resolved = $reqUser;
+            }
         }
 
-        if ($resolved === null && app()->environment('testing') && !$token) {
-            $testUser = static::with('roleModel')->where('role', 'Super Admin')->first()
-                ?: static::with('roleModel')->first();
-            if (!$testUser) {
+        if ($resolved === null
+            && app()->environment('testing')
+            && !$token
+            && !$request->user()
+            && !static::whereNotNull('api_token')->exists()
+        ) {
+            $testUser = static::with('roleModel')
+                ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                ->whereRaw("LOWER(COALESCE(role, '')) = 'super admin'")
+                ->first()
+                ?: static::with('roleModel')
+                    ->whereRaw("LOWER(COALESCE(status, '')) = 'active'")
+                    ->first();
+
+            if ($testUser && !$testUser->hasActiveRole()) {
+                $testUser = null;
+            }
+
+            if (!$testUser && !static::query()->exists()) {
                 $testUser = static::create([
                     'user_id' => 'USR-TEST-ADMIN',
                     'name' => 'Test Super Admin',
                     'email' => 'test_super_admin@retailpos.local',
                     'role' => 'Super Admin',
-                    'status' => 'active',
+                    'status' => 'Active',
                     'password' => bcrypt('secret123'),
                 ]);
             }

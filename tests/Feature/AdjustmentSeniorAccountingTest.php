@@ -317,6 +317,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'role_id' => $role->id,
             'status' => 'active',
         ]);
+        $clerk->outlets()->sync([$outlet->id]);
 
         // Clerk submits update with masked unit_cost = 0, changing quantity 10 -> 12
         $updRes = $this->actingAs($clerk)->putJson("/api/adjustments/{$adjId}", [
@@ -580,6 +581,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'adj_bearer_token_restricted',
         ]);
+        $clerk->outlets()->sync([$outlet->id]);
 
         $viewerRole = Role::create([
             'name' => 'Cost Viewer Role',
@@ -595,6 +597,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'adj_bearer_token_viewer',
         ]);
+        $viewer->outlets()->sync([$outlet->id]);
 
         // P1 + P2: Store using product_code ONLY (omitting product_id), multi-unit Box (12), ISO-Z date, formula notes, Opening Stock + explicit affects_pnl=true
         $storeRes = $this->withToken($viewer->api_token)->postJson('/api/adjustments', [
@@ -741,6 +744,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'p2_4_real_clerk_tok',
         ]);
+        $realClerk->outlets()->sync([$outlet->id]);
         $secondEditor = User::create([
             'name' => 'Second Editor',
             'email' => 'second-editor-p2-4@test.local',
@@ -750,6 +754,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'p2_4_second_editor_tok',
         ]);
+        $secondEditor->outlets()->sync([$outlet->id]);
 
         $createRes = $this->withToken($realClerk->api_token)->postJson('/api/adjustments', [
             'warehouse_id' => $outlet->id,
@@ -823,6 +828,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'adj_admin_cost_tok',
         ]);
+        $admin->outlets()->sync([$outlet->id]);
 
         $blindRole = Role::create([
             'name' => 'Adj Blind Editor',
@@ -838,6 +844,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'adj_blind_editor_tok',
         ]);
+        $blindUser->outlets()->sync([$outlet->id]);
 
         $createRes = $this->withToken($admin->api_token)->postJson('/api/adjustments', [
             'warehouse_id' => $outlet->id,
@@ -912,6 +919,7 @@ class AdjustmentSeniorAccountingTest extends TestCase
             'status' => 'active',
             'api_token' => 'adj_no_approve_tok',
         ]);
+        $noApproveUser->outlets()->sync([$outletA->id, $outletB->id]);
 
         // 1. Reason direction mismatch rejected (422)
         $this->withToken($noApproveUser->api_token)->postJson('/api/adjustments', [

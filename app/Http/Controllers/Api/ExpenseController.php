@@ -67,7 +67,10 @@ class ExpenseController extends Controller
     private function assertExpenseOutletAccess(Request $request, ?int $warehouseId): void
     {
         $allowed = app(PurchaseAccountingService::class)->extractAllowedOutletIds($request);
-        if (!empty($allowed) && $warehouseId && !in_array((int)$warehouseId, $allowed, true)) {
+        if ($allowed === null) {
+            return;
+        }
+        if (empty($allowed) || in_array(-1, $allowed, true) || !$warehouseId || !in_array((int)$warehouseId, $allowed, true)) {
             abort(403, 'Unauthorized warehouse access.');
         }
     }

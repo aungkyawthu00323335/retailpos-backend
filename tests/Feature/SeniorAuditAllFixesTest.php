@@ -71,7 +71,7 @@ class SeniorAuditAllFixesTest extends TestCase
             'permissions' => $permissions,
         ]);
 
-        return User::create([
+        $user = User::create([
             'user_id' => 'USR-' . strtoupper(substr(md5($slug), 0, 6)),
             'name' => 'User ' . $slug,
             'email' => $slug . '@retailpos.test',
@@ -81,6 +81,8 @@ class SeniorAuditAllFixesTest extends TestCase
             'password' => bcrypt('password123'),
             'api_token' => 'tok_' . $slug . '_' . uniqid(),
         ]);
+        $user->outlets()->sync([$this->warehouse->id]);
+        return $user;
     }
 
     public function test_mixed_adjustment_update_does_not_double_deplete_and_preserves_affects_pnl(): void

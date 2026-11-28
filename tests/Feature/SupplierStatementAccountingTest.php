@@ -16,12 +16,12 @@ class SupplierStatementAccountingTest extends TestCase
 {
     use RefreshDatabase;
 
-    private function createUserWithPermissions(array $permissions): array
+    private function createUserWithPermissions(array $permissions, string $roleName = 'AP Auditor'): array
     {
         $role = Role::create([
-            'name' => 'AP Auditor ' . uniqid(),
-            'slug' => 'ap-auditor-' . uniqid(),
-            'display_name' => 'AP Auditor',
+            'name' => $roleName . ' ' . uniqid(),
+            'slug' => strtolower(str_replace(' ', '-', $roleName)) . '-' . uniqid(),
+            'display_name' => $roleName,
             'permissions' => $permissions,
             'is_system' => false,
         ]);
@@ -31,7 +31,7 @@ class SupplierStatementAccountingTest extends TestCase
             'name' => 'Senior AP Accountant',
             'email' => 'ap-accountant-' . uniqid() . '@example.com',
             'password' => bcrypt('password123'),
-            'role' => $role->name,
+            'role' => $roleName === 'Super Admin' ? 'Super Admin' : $role->name,
             'role_id' => $role->id,
             'status' => 'Active',
             'api_token' => $token,
@@ -43,7 +43,7 @@ class SupplierStatementAccountingTest extends TestCase
 
     public function test_supplier_statement_reconciles_double_entry_ap_opening_balance_and_pending_returns(): void
     {
-        [, $token] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view', 'products.view_cost']);
+        [$user, $token] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view', 'products.view_cost'], 'Super Admin');
 
         $outletA = Outlet::create([
             'name' => 'Yangon Central WH',
@@ -55,6 +55,7 @@ class SupplierStatementAccountingTest extends TestCase
             'code' => 'MDY',
             'status' => 'Active',
         ]);
+        $user->outlets()->sync([$outletA->id, $outletB->id]);
 
         // Supplier has 25,000 Ks prior opening balance + (90,000 open PO due - 60,000 unallocated PR credit) = 55,000 ledger balance_due
         $supplier = Supplier::create([
@@ -242,14 +243,16 @@ class SupplierStatementAccountingTest extends TestCase
 
     public function test_supplier_statement_surfaces_credit_balance_and_enforces_cost_masking(): void
     {
-        [, $adminToken] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view', 'products.view_cost']);
-        [, $staffToken] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view']);
+        [$adminUser, $adminToken] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view', 'products.view_cost']);
+        [$staffUser, $staffToken] = $this->createUserWithPermissions(['reports.view', 'report_supplier.view']);
 
         $outlet = Outlet::create([
             'name' => 'Main Warehouse',
             'code' => 'MAIN',
             'status' => 'Active',
         ]);
+        $adminUser->outlets()->sync([$outlet->id]);
+        $staffUser->outlets()->sync([$outlet->id]);
 
         $supplier = Supplier::create([
             'name' => 'Credit Vendor Ltd',
